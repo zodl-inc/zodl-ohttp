@@ -23,16 +23,20 @@ environment of the build (`option_env!`), validated by `build.rs`:
 | `ZODL_OHTTP_GATEWAY_HOST_MAINNET`, `ZODL_OHTTP_GATEWAY_HOST_TESTNET` | the gateway host name, which is also the inner `:authority` of light client server requests; a bare DNS name |
 | `ZODL_OHTTP_RELAY_URL_MAINNET`, `ZODL_OHTTP_RELAY_URL_TESTNET` | the relay URL sealed requests are posted to; `https://` with a host, no whitespace |
 | `ZODL_OHTTP_SIGNING_PUBKEY_MAINNET`, `ZODL_OHTTP_SIGNING_PUBKEY_TESTNET` | the gateway's key-configuration signing key, raw Ed25519, 64 hex digits |
-| `ZODL_OHTTP_KEYS_DNS_NAME_MAINNET`, `ZODL_OHTTP_KEYS_DNS_NAME_TESTNET` | optional: DNS TXT name of the signed key configuration (section 2) |
+| `ZODL_OHTTP_KEYS_DNS_NAME_MAINNET`, `ZODL_OHTTP_KEYS_DNS_NAME_TESTNET` | the DNS TXT name of the signed key configuration, a last-resort source (section 2) |
 
-A network is on only when its gateway host, relay URL and signing key are all set. An unset or
-empty variable turns OHTTP off for that network and never fails the build; there is no fallback
-value and no runtime override. Then `relay_for(host)` returns `None`, `NetworkRule::KnownHosts`
-refuses the host, and `Network::pinned_signing_key()` / `verify_signed_config` return
-`Error::KeyConfig`. A set value that fails the build script's checks (an `https://` URL with a
-non-empty authority and no whitespace, a bare DNS host name, 64 hex digits) fails the build with a
-message naming the variable; a value that is not valid Unicode counts as unset.
-Changing a variable triggers a rebuild.
+A network is configured with all four of its variables or with none: setting some and leaving
+another unset or empty fails the build with a message naming the network and the missing
+variables. With none set, OHTTP is off for that network; there is no fallback value and no
+runtime override. Then `relay_for(host)` returns `None`, `NetworkRule::KnownHosts` refuses the
+host, and `Network::pinned_signing_key()` / `verify_signed_config` return `Error::KeyConfig`.
+With nothing set at all the build succeeds with OHTTP off for both networks. `ZODL_OHTTP_REQUIRE=1`
+(opt-in, for release builds) fails the build unless all eight variables are set. When both
+networks are configured they must not share a gateway host, relay URL, keys DNS name or signing
+key. A set value that fails the build script's checks (an `https://` URL with a non-empty
+authority and no whitespace, a bare DNS host name, 64 hex digits) fails the build. Messages name
+variables and rules, never values; a value that is not valid Unicode counts as unset. Changing a
+variable triggers a rebuild.
 
 What the build set is visible as `GATEWAY_HOST_MAINNET`, `GATEWAY_HOST_TESTNET`,
 `MAINNET_SIGNING_KEY_HEX`, `TESTNET_SIGNING_KEY_HEX` (all `Option<&str>`), `key_config_dns_name`
@@ -43,6 +47,7 @@ a network that is on to its relay URL (no prefix or suffix matching).
 ZODL_OHTTP_GATEWAY_HOST_TESTNET=ohttp-gateway-testnet.example \
 ZODL_OHTTP_RELAY_URL_TESTNET=https://relay-testnet.example/relay \
 ZODL_OHTTP_SIGNING_PUBKEY_TESTNET="$SIGNING_PUBKEY_HEX" \
+ZODL_OHTTP_KEYS_DNS_NAME_TESTNET=testnet.ohttp-keys.example \
   cargo build --release
 ```
 

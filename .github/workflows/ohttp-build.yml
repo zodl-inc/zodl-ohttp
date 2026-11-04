@@ -247,17 +247,21 @@ jobs:
           file: ./e2e-client/Dockerfile
           platforms: linux/amd64
           # The client crate's build-time endpoint configuration (client/src/relays.rs), from
-          # repository variables: signed-config checks need the pinned signing keys, the DNS check the
-          # TXT names. An unset variable builds with OHTTP off for that network.
-          build-args: |
-            ZODL_OHTTP_GATEWAY_HOST_MAINNET=${{ vars.ZODL_OHTTP_GATEWAY_HOST_MAINNET }}
-            ZODL_OHTTP_GATEWAY_HOST_TESTNET=${{ vars.ZODL_OHTTP_GATEWAY_HOST_TESTNET }}
-            ZODL_OHTTP_RELAY_URL_MAINNET=${{ vars.ZODL_OHTTP_RELAY_URL_MAINNET }}
-            ZODL_OHTTP_RELAY_URL_TESTNET=${{ vars.ZODL_OHTTP_RELAY_URL_TESTNET }}
-            ZODL_OHTTP_KEYS_DNS_NAME_MAINNET=${{ vars.ZODL_OHTTP_KEYS_DNS_NAME_MAINNET }}
-            ZODL_OHTTP_KEYS_DNS_NAME_TESTNET=${{ vars.ZODL_OHTTP_KEYS_DNS_NAME_TESTNET }}
-            ZODL_OHTTP_SIGNING_PUBKEY_MAINNET=${{ vars.ZODL_OHTTP_SIGNING_PUBKEY_MAINNET }}
-            ZODL_OHTTP_SIGNING_PUBKEY_TESTNET=${{ vars.ZODL_OHTTP_SIGNING_PUBKEY_TESTNET }}
+          # repository secrets, passed as build secrets so that no value reaches the logs, a
+          # build argument or the image metadata. Signed-config checks need the pinned signing
+          # keys, the DNS check the TXT names. Without the secrets (fork pull requests) the
+          # client builds with OHTTP off. The stage that reads them is never taken from the
+          # cache, which does not key on secret values.
+          secrets: |
+            ZODL_OHTTP_GATEWAY_HOST_MAINNET=${{ secrets.ZODL_OHTTP_GATEWAY_HOST_MAINNET }}
+            ZODL_OHTTP_GATEWAY_HOST_TESTNET=${{ secrets.ZODL_OHTTP_GATEWAY_HOST_TESTNET }}
+            ZODL_OHTTP_RELAY_URL_MAINNET=${{ secrets.ZODL_OHTTP_RELAY_URL_MAINNET }}
+            ZODL_OHTTP_RELAY_URL_TESTNET=${{ secrets.ZODL_OHTTP_RELAY_URL_TESTNET }}
+            ZODL_OHTTP_KEYS_DNS_NAME_MAINNET=${{ secrets.ZODL_OHTTP_KEYS_DNS_NAME_MAINNET }}
+            ZODL_OHTTP_KEYS_DNS_NAME_TESTNET=${{ secrets.ZODL_OHTTP_KEYS_DNS_NAME_TESTNET }}
+            ZODL_OHTTP_SIGNING_PUBKEY_MAINNET=${{ secrets.ZODL_OHTTP_SIGNING_PUBKEY_MAINNET }}
+            ZODL_OHTTP_SIGNING_PUBKEY_TESTNET=${{ secrets.ZODL_OHTTP_SIGNING_PUBKEY_TESTNET }}
+          no-cache-filters: configured
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}

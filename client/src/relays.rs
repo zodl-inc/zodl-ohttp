@@ -26,14 +26,23 @@
 //! - `ZODL_OHTTP_SIGNING_PUBKEY_MAINNET`, `ZODL_OHTTP_SIGNING_PUBKEY_TESTNET`: the gateway's
 //!   key-configuration signing key (see `signed.rs`).
 //! - `ZODL_OHTTP_KEYS_DNS_NAME_MAINNET`, `ZODL_OHTTP_KEYS_DNS_NAME_TESTNET`: the DNS TXT name of
-//!   the signed key configuration, an optional last-resort source (see `dns.rs`).
+//!   the signed key configuration, a last-resort source (see `dns.rs`).
 //!
-//! A network is on only when its gateway host, relay URL and signing key are all set. An unset
-//! (or empty) one of these three turns OHTTP off for that network: [`relay_for`] returns `None`
-//! (and with no gateway host, [`crate::NetworkRule::KnownHosts`] refuses every host of it). The
-//! DNS names are optional. An unset variable never fails the build and there is
-//! no fallback value. A malformed value fails the build (`client/build.rs`), and changing a
-//! variable triggers a rebuild. There is no runtime override.
+//! The build script (`client/build.rs`) enforces these rules, so a build only ever has a network
+//! either fully configured or off:
+//!
+//! - A network is configured with all four of its variables or with none. Setting some of them
+//!   and leaving another unset or empty fails the build, naming the network and the missing
+//!   variables.
+//! - With none set, OHTTP is off for that network: [`relay_for`] returns `None` and
+//!   [`crate::NetworkRule::KnownHosts`] refuses every host of it. With nothing set at all the
+//!   build succeeds with OHTTP off for both networks.
+//! - `ZODL_OHTTP_REQUIRE=1` (opt-in) fails the build unless all eight variables are set.
+//! - When both networks are configured, they must not share a gateway host, relay URL, keys DNS
+//!   name or signing key.
+//! - A malformed value fails the build. Messages name the variable and the rule, never the value.
+//!
+//! There is no fallback value and no runtime override; changing a variable triggers a rebuild.
 
 use crate::signed::Network;
 
@@ -87,7 +96,9 @@ pub(crate) struct NetworkEndpoints {
 }
 
 impl NetworkEndpoints {
-    /// Whether OHTTP is on for this network: gateway host, relay URL and signing key set.
+    /// Whether OHTTP is on for this network: gateway host, relay URL and signing key set. The
+    /// build script also requires the keys DNS name with them, so a built-in network has all
+    /// four or none; test tables may leave the DNS name out.
     fn enabled(&self) -> bool {
         self.gateway_host.is_some() && self.relay_url.is_some() && self.signing_key_hex.is_some()
     }
@@ -147,8 +158,9 @@ impl Endpoints {
 /// Returns the relay URL for a gateway host, or `None` if the host is not the gateway of a
 /// network that this build turned on.
 ///
-/// A network is on when the build set its gateway host (`ZODL_OHTTP_GATEWAY_HOST_*`), relay URL
-/// (`ZODL_OHTTP_RELAY_URL_*`) and signing key (`ZODL_OHTTP_SIGNING_PUBKEY_*`). `None` means
+/// A network is on when the build configured it: gateway host (`ZODL_OHTTP_GATEWAY_HOST_*`),
+/// relay URL (`ZODL_OHTTP_RELAY_URL_*`), signing key (`ZODL_OHTTP_SIGNING_PUBKEY_*`) and keys DNS
+/// name (`ZODL_OHTTP_KEYS_DNS_NAME_*`), which the build script requires together. `None` means
 /// OHTTP is off for that host.
 ///
 /// Only exact host matches are supported; no prefix/suffix matching.
