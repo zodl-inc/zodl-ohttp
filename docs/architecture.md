@@ -1,0 +1,211 @@
+# OHTTP Architecture
+
+## Overview
+
+Oblivious HTTP (RFC 9458) splits what a light wallet reveals between two parties that do not
+collude:
+
+- the **relay**, run by an independent operator, sees the wallet's IP address but only an
+  encrypted blob;
+- the **gateway** (this repository, run by the gateway operator) sees the request but only the relay's address.
+
+The wallet encrypts every request with HPKE (RFC 9180) to the gateway's public key before it
+leaves the device. The gateway uses the chunked variant (draft-ietf-ohai-chunked-ohttp) only, so
+long answers such as a `GetBlockRange` stream back as they are produced.
+
+## Hops
+
+```
+┌───────────────┐
+│ Wallet (Zodl) │  1. obtain and verify the gateway's signed key configuration
+│ zodl-ohttp-   │  2. encode the request as Binary HTTP, seal it with HPKE
+│ client        │  3. POST message/ohttp-chunked-req to the relay
+└───────┬───────┘
+        │ sealed request (client IP visible here)
+┌───────▼───────┐
+│ Relay         │  forwards the body unchanged, drops client-identifying headers,
+│ (independent  │  adds its own X-Request-Id and X-Relay-Secret
+│  operator)    │
+└───────┬───────┘
+        │ sealed request (only the relay's address visible here)
+┌───────▼───────┐
+│ OHTTP Gateway │  authenticates the relay, checks replay, opens the request,
+│ (this repo)   │  enforces the routing policy, seals the answer as it streams
+└───┬───────┬───┘
+    │       │ plaintext inner request
+┌───▼────┐ ┌▼──────────────────────────┐
+│ light- │ │ allowlisted third-party   │
+│ walletd│ │ HTTP APIs (BACKENDS)      │
+│ (gRPC) │ │                           │
+└───┬────┘ └───────────────────────────┘
+┌───▼────┐
+│ Zebra  │  full node
+└────────┘
+```
+
+The answer travels back the same way: the gateway seals it under a key derived from the
+request's HPKE context, the relay returns it unchanged, and only the wallet can open it.
+
+The inner request's `:authority` selects the upstream: a `GATEWAY_HOSTS` name goes to
+lightwalletd, an exact `BACKENDS` alias to that alias's base URL, anything else is refused with
+an inner 403. Every alias has an explicit allowlist of methods and paths (`BACKENDS_POLICY`).
+Only an allowlist of request and response headers crosses the gateway; credentials an upstream
+needs are injected by the gateway (`BACKEND_HEADERS`) and never come from the client.
+
+## Privacy model
+
+| Party | Sees | Does not see |
+|---|---|---|
+| Relay | client IP, timing, sizes of sealed requests and responses | request or response content, which upstream is called |
+| Gateway | request and response content, timing, sizes, the relay's address | client IP |
+| Upstream (lightwalletd, third-party API) | the request the gateway forwards, the gateway's address | client IP, relay |
+
+Linking a client address to request content requires the relay operator and the gateway
+operator to combine their records. The gateway is built so that its own records do not help:
+
+- The gateway logs no client address (it never receives one) and no request content beyond the
+  method, the path (for third-party aliases, the policy pattern that admitted it, not the
+  concrete path or query) and status.
+- The relay's `X-Request-Id` is logged only as an HMAC under a random key that exists only in the
+  memory of the running process; after a restart nobody can map relay ids to gateway log lines.
+- Only `X-Client-Trace-Id`, which a client sends only when deliberately debugging, appears in
+  both the relay's and the gateway's logs.
+- Response padding (below) coarsens the answer sizes the relay sees.
+
+What remains is timing and size correlation by colluding operators, which OHTTP does not
+address.
+
+## Relay authentication
+
+`POST /gateway` requires exactly one `X-Relay-Secret` header whose value matches one entry of
+`RELAY_SECRET`; anything else is an outer 401. Each entry can be named (`name=secret`), so one
+gateway serves several relays and the metric `ohttp_relay_requests_total{relay}` and the log field
+`relay` say which relay forwarded a request. Rotating a relay's secret means listing the old and
+the new secret for that relay for the length of the switch. Secrets are compared as SHA-256
+digests against every entry in constant time.
+
+With `RELAY_SECRET_ON_KEY_CONFIG=require` the key-configuration GETs need the secret too, so the
+configuration is only obtainable through a relay. `ALLOW_UNAUTHENTICATED_RELAY` removes the
+check; it is meant for local tests, or for an origin that admits authorised relays by other means
+(source address allowlist, mutual TLS) in front of it.
+
+## Key configuration and rotation
+
+The gateway's HPKE keys are X25519 private keys from `HPKE_KEYS` (or `HPKE_PRIVATE_KEY`); it
+never generates one in `ohttp` mode. The suite is DHKEM(X25519, HKDF-SHA256), HKDF-SHA256,
+AES-128-GCM. `/ohttp-configs` publishes the advertised keys, preferred first;
+`HPKE_ACCEPT_ONLY_KEYS` are accepted for decapsulation but not published, which is what makes a
+rotation safe: a key is accepted before it is advertised and after it stops being advertised
+until every cached configuration has expired (procedure: `gateway/README.md`, "HPKE key
+rotation"). A request sealed to a key the gateway no longer has fails with an outer 400; the
+client then drops its cached configuration, fetches a fresh one and sends the request once more,
+sealed afresh.
+
+`/ohttp-configs/signed` wraps the same document in an Ed25519-signed JSON envelope bound to the
+network and to a validity window (`gateway/README.md`, "Signed key configuration"). The wallet
+trusts a key configuration only through that envelope.
+
+## Key configuration discovery
+
+A network is OHTTP-capable in a wallet build only when its gateway host
+(`ZODL_OHTTP_GATEWAY_HOST_MAINNET` / `_TESTNET`), relay URL (`ZODL_OHTTP_RELAY_URL_*`, `https://`
+only) and signing key (`ZODL_OHTTP_SIGNING_PUBKEY_*`, 64 hex digits) are all set at build time
+(`client/src/relays.rs`, validated by `client/build.rs`). There is no built-in value and no
+runtime override; an unset variable turns OHTTP off for that network, a malformed one fails the
+build.
+
+1. **Through the relay.** The client fetches `GET /ohttp-configs/signed` through its relay (the
+   URL is derived from the relay URL, `signed_config_url`). The relay forwards the GET to the
+   gateway and returns the answer unchanged, so the gateway never sees the client's address here
+   either.
+2. **DNS, last resort.** If that fails and the build set `ZODL_OHTTP_KEYS_DNS_NAME_MAINNET` /
+   `_TESTNET`, the client may read the envelope from a DNS TXT record of that name over
+   DNS-over-HTTPS, JSON API, using the public resolvers in `client/src/dns.rs` (`DOH_RESOLVERS`,
+   tried in order; `doh_query_url` builds the query and disables EDNS Client Subnet where the
+   resolver supports the parameter). `envelope_from_doh_json` accepts only a `Status` 0 answer
+   with TXT records (type 16) for exactly the queried name, concatenates the character-strings
+   of the record in order (presentation format, `\"`, `\\` and `\DDD` decimal escapes), requires
+   exactly one distinct TXT value, and base64-decodes it into the envelope, refusing anything
+   over 64 KiB (`MAX_KEY_CONFIG_BYTES`). Without a DNS name for the network this source is off.
+   The library supplies the parsing; the wallet SDK performs the HTTPS fetch over its own
+   transport.
+
+Either way the envelope is then verified the same way (`verify_signed_config`, `client/src/signed.rs`):
+
+- version 1, `network` equal to the network the build bound to the gateway host, `key_id`
+  equal to the first four bytes of SHA-256 of the pinned key, a valid Ed25519 signature by the
+  network's pinned key (`ZODL_OHTTP_SIGNING_PUBKEY_*`) over the exact signed message;
+- `not_before < not_after`, `not_after - not_before` at most 86400 s, `not_after` at most
+  86400 s ahead of the device clock, and the device clock within the window widened by
+  `CLOCK_SKEW_SECS` (60 s) on each side;
+- the envelope at most 64 KiB, the decoded document at most 4096 bytes, repeated JSON keys
+  refused, unknown fields ignored;
+- the remaining policy options (base64 strictness, strict or standard Ed25519 verification) as
+  the caller's `SignedConfigPolicy` sets them.
+
+A verified configuration is used until its `not_after`. The key selected from it is the first
+configuration that offers the suite.
+
+## Replay protection and freshness
+
+The gateway stores SHA-256 of every Encapsulated Request in the security Redis
+(`REDIS_SECURITY_URL`, no eviction) for 600 s; the same body again within that time is a replay
+(outer 409). The check fails closed: without the security Redis no request is served (outer
+503). Because a client seals every attempt afresh (new ephemeral key, new ciphertext), a
+legitimate retry never collides with its predecessor.
+
+Inner requests carry `ohttp-freshness: <unix seconds>`, the client's estimate of the gateway
+clock; every sealed response carries `ohttp-server-time`, from which the client learns its
+offset. With `REPLAY_FRESHNESS=enforce` the gateway refuses timestamps further than
+`REPLAY_FRESHNESS_WINDOW_SECS` (at most half the nonce TTL) from its clock with an inner 400
+marked `ohttp-freshness: rejected`; the client corrects its offset from that response and
+retries once. Together the two make an Encapsulated Request executable at most once: inside the
+window its nonce is still held, outside it the timestamp is refused.
+
+For a replicated security Redis, `REPLAY_WRITE_WAIT_REPLICAS` delays every WRITE (any inner request
+not on `REPLAY_READ_ROUTES`, which defaults to the read-only lightwalletd RPCs) until its nonce is on that many replicas, so a failover of the store
+cannot forget it. READs are not delayed: replaying one changes nothing and its answer is sealed
+to the original client.
+
+## Response framing: chunks and padding
+
+Every response is a chunked OHTTP message: a response nonce, then non-final chunks of
+`CHUNK_SIZE` plaintext bytes (shorter after a stall, below) and a final chunk, each sealed with AES-128-GCM under keys derived from the
+request's HPKE context. Chunk boundaries never follow message boundaries. When upstream data
+stalls for `CHUNK_FLUSH_MS`, the bytes collected so far go out as a shorter chunk, so a stream
+keeps moving. With `RESPONSE_PADDING=on` (default) the final chunk is zero-padded to
+`CHUNK_SIZE`, so a response that does not stall is a whole number of chunks and its size says
+little about which blocks or transactions were fetched. `sensitive` leaves a
+few small, uninformative answers unpadded.
+
+## Multiple origins
+
+Several gateways can serve one gateway host name, for example behind a load balancer that
+routes by geography or fails over between origins. They then must share the HPKE keys, the
+signing seed and the relay secrets; `ohttp_key_config_info` and the startup log line let an
+operator check that every origin publishes the same configuration (identical envelopes within an
+issuance slot, because signing is deterministic). `ORIGIN_ID` labels logs and metrics; it is never
+sent to clients.
+
+Replay protection spans origins when each one lists the others' security Redis in
+`REPLAY_PEER_URLS`: a nonce held by any store is a replay. `REPLAY_PEER_MODE` chooses how:
+
+- `sync`: every nonce is written to every peer before the request runs;
+- `async-reads`: READ requests (`REPLAY_READ_ROUTES`) are checked locally and replicated in the
+  background, WRITEs stay synchronous; when replication lags or a peer fails, READs fall back to
+  the synchronous path until the peers have recovered;
+- `failover`: every request is checked locally and replicated in the background, for an
+  active/passive pair whose passive store must already hold every nonce when traffic moves.
+
+The settings that decide what happens when a peer is unreachable (`REPLAY_PEER_FAIL_CLOSED`,
+`REPLAY_PEER_FAIL_CLOSED_WRITES`, `REPLAY_PEER_WAIT_REPLICAS`, `REPLAY_LOCAL_WAITAOF_MS`) are
+described in `gateway/CONFIG.md`. Without `REPLAY_PEER_URLS` none of this is active.
+
+## Bounded resources
+
+Every input is bounded before it is processed: the Encapsulated Request (10 MiB, read within
+30 s), concurrent requests, concurrent upstream calls in total, per alias and per lightwalletd
+call class (long scans cannot starve `SendTransaction` or `GetLatestBlock`), `GetBlockRange`
+spans, upstream response size and time, and the request header read time per connection. All
+limits are in `gateway/CONFIG.md`. Malformed `:authority` and `:path` values are refused before
+any upstream URI is built, and the URI built is checked against the selected upstream.

@@ -1,0 +1,92 @@
+[package]
+name = "ohttp-gateway"
+version = "1.0.0"
+license = "AGPL-3.0-only"
+edition = "2021"
+authors = ["ZODL Inc."]
+description = "RFC 9458 Oblivious HTTP Gateway for Zcash Lightwalletd"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1.42", features = ["full"] }
+tokio-util = "0.7"
+
+# HTTP server
+axum = "0.8"
+tower = "0.5"
+tower-http = { version = "0.6", features = ["trace", "timeout", "cors"] }
+hyper = { version = "1.5", features = ["full"] }
+# Used directly by `server.rs` (TokioTimer, auto::Builder, TowerToHyperService); these features
+# are already enabled through axum/tonic, listed here so the lock does not change.
+hyper-util = { version = "0.1", features = ["tokio", "server-auto", "service"] }
+hyper-tls = "0.6"
+http-body-util = "0.1"
+
+# OHTTP / HPKE
+hpke = { version = "0.13", features = ["std", "x25519", "alloc"] }
+bhttp = "0.5"  # Binary HTTP for OHTTP encapsulation
+hkdf = "0.12"
+sha2 = "0.10"
+aes-gcm = "0.10"
+rand = "0.8"
+bytes = "1.5"
+futures-util = "0.3"
+async-stream = "0.3"
+subtle = "2.6"
+
+# gRPC client (for lightwalletd backend)
+tonic = { version = "0.12", features = ["tls", "gzip"] }
+prost = "0.13"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+bincode = "1.3"
+base64 = "0.22"
+
+# Observability
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+prometheus = "0.13"
+lazy_static = "1.5"
+
+# Error handling
+anyhow = "1.0"
+thiserror = "2.0"
+
+# Response cache
+redis = { version = "0.25", features = ["tokio-comp", "connection-manager", "tokio-rustls-comp", "tls-rustls-webpki-roots"] }
+
+# Secrets
+hex = "0.4"
+
+# UUID for request correlation
+uuid = { version = "1.0", features = ["v4", "serde"] }
+scopeguard = "1.2"
+parking_lot = "0.12"
+arc-swap = "1.7"
+# Per-process in-memory LRU in front of Redis (blocks, tree states), weighed by bytes.
+moka = { version = "0.12", features = ["sync"] }
+
+# Ed25519 signing for config attestation
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+
+[dev-dependencies]
+# Paused-clock tests of the streaming encoder and the block cache.
+tokio = { version = "1.42", features = ["full", "test-util"] }
+# The client half of the chunked HPKE exchange in tests/streaming.rs (hpke 0.13's RNG trait).
+rand_core = { version = "0.9", features = ["os_rng"] }
+
+[features]
+## Private parsers exposed to the fuzz targets in `fuzz/`.
+fuzzing = []
+
+[lib]
+name = "ohttp_gateway"
+path = "src/lib.rs"
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = 3
+strip = true

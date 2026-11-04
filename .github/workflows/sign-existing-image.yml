@@ -1,0 +1,162 @@
+name: Sign Existing Image
+
+on:
+  workflow_dispatch:
+    branches:
+      - main
+    inputs:
+      image:
+        description: 'Image name (ohttp-gateway or ohttp-relay-simulator)'
+        required: true
+        type: choice
+        options:
+          - ohttp-gateway
+          - ohttp-relay-simulator
+      digest:
+        description: 'Image digest (sha256:...)'
+        required: true
+        type: string
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REGISTRY: ${{ vars.ECR_REGISTRY }}  # repository variable
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  sign:
+    name: Sign Image
+    runs-on: ubuntu-24.04
+    
+    # Inputs reach the scripts only through env (never as expressions inside run:) and are validated
+    # before any other step uses them.
+    env:
+      IMAGE: ${{ inputs.image }}
+      DIGEST: ${{ inputs.digest }}
+
+    steps:
+      - name: Validate inputs
+        run: |
+          if [[ "$GITHUB_REF" != "refs/heads/main" ]]; then
+            echo "Error: run this workflow from main (got $GITHUB_REF)"
+            exit 1
+          fi
+          case "$IMAGE" in
+            ohttp-gateway|ohttp-relay-simulator) ;;
+            *)
+              echo "Error: invalid image. Expected ohttp-gateway or ohttp-relay-simulator"
+              exit 1
+              ;;
+          esac
+          if [[ ! "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "Error: Invalid digest format. Expected sha256:<64-hex-chars>"
+            exit 1
+          fi
+          if [[ ! "$ECR_REGISTRY" =~ ^[A-Za-z0-9.-]+(:[0-9]+)?$ ]]; then
+            echo "Error: ECR_REGISTRY is not a registry host name"
+            exit 1
+          fi
+          echo "IMAGE_REF=${ECR_REGISTRY}/${IMAGE}@${DIGEST}" >> "$GITHUB_ENV"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@5579c002bb4778aa43395ef1df492868a9a1c83f # v4.0.2
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        uses: aws-actions/amazon-ecr-login@4625ce35226a7557230889aae2f52eb50ec3dcda # v2.0.1
+
+      - name: Verify image exists
+        run: |
+          aws ecr batch-get-image \
+            --repository-name "$IMAGE" \
+            --image-ids imageDigest="$DIGEST" \
+            --query 'images[0].imageId.imageDigest' \
+            --output text
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@1aa8e0f2454b781fbf0fbf306a4c9533a0c57409 # v3.7.0
+
+      - name: Sign image
+        run: |
+          cosign sign --yes "$IMAGE_REF"
+
+      - name: Verify signature
+        run: |
+          cosign verify \
+            --certificate-identity-regexp "^https://github\.com/zodl-inc/zodl-ohttp/\.github/workflows/sign-existing-image\.yml@refs/heads/main$" \
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+            "$IMAGE_REF"
+
+      - name: Install crane
+        env:
+          CRANE_VERSION: v0.20.2
+          # sha256 of go-containerregistry_Linux_x86_64.tar.gz v0.20.2 (release checksums.txt).
+          CRANE_SHA256: c14340087103ba9dadf61d45acd20675490fd0ccbd56ac7901fc1b502137f44b
+        run: |
+          curl -fsSL -o crane.tar.gz \
+            "https://github.com/google/go-containerregistry/releases/download/${CRANE_VERSION}/go-containerregistry_Linux_x86_64.tar.gz"
+          echo "${CRANE_SHA256}  crane.tar.gz" | sha256sum -c -
+          tar xzf crane.tar.gz crane
+          sudo install -m 0755 crane /usr/local/bin/crane
+          rm -f crane crane.tar.gz
+
+      - name: Extract source commit from image
+        id: extract
+        run: |
+          SOURCE_SHA=$(crane config "$IMAGE_REF" | jq -r '.config.Labels["org.opencontainers.image.revision"]')
+          if [[ ! "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Error: Could not extract a source commit SHA from image labels"
+            exit 1
+          fi
+          echo "source_sha=$SOURCE_SHA" >> "$GITHUB_OUTPUT"
+          echo "Extracted source commit: $SOURCE_SHA"
+
+      - name: Create SLSA provenance predicate
+        env:
+          SOURCE_SHA: ${{ steps.extract.outputs.source_sha }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+          RUN_ID: ${{ github.run_id }}
+          STARTED_ON: ${{ github.event.repository.updated_at }}
+        run: |
+          jq -n \
+            --arg builder "$WORKFLOW_REF" \
+            --arg sha "$SOURCE_SHA" \
+            --arg run_id "$RUN_ID" \
+            --arg started "$STARTED_ON" \
+            '{
+              builder: {id: $builder},
+              buildType: "https://github.com/zodl-inc/zodl-ohttp/.github/workflows/sign-existing-image.yml@main",
+              invocation: {
+                configSource: {
+                  uri: "https://github.com/zodl-inc/zodl-ohttp",
+                  digest: {sha1: $sha},
+                  entryPoint: ".github/workflows/sign-existing-image.yml"
+                }
+              },
+              metadata: {
+                buildInvocationId: $run_id,
+                buildStartedOn: $started,
+                completeness: {parameters: true, environment: false, materials: false}
+              },
+              materials: [{
+                uri: "https://github.com/zodl-inc/zodl-ohttp",
+                digest: {sha1: $sha}
+              }]
+            }' > provenance.json
+          cat provenance.json
+
+      - name: Attest with SLSA provenance
+        run: |
+          cosign attest --yes --predicate provenance.json --type slsaprovenance "$IMAGE_REF"
+
+      - name: Verify attestation
+        run: |
+          cosign verify-attestation \
+            --type slsaprovenance \
+            --certificate-identity-regexp "^https://github\.com/zodl-inc/zodl-ohttp/\.github/workflows/sign-existing-image\.yml@refs/heads/main$" \
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+            "$IMAGE_REF"

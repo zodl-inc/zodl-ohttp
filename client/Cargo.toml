@@ -1,0 +1,55 @@
+[package]
+name = "zodl-ohttp-client"
+version = "0.1.1"
+license = "AGPL-3.0-only"
+edition = "2021"
+# reqwest's dependency tree (url, idna, icu) needs 1.88.
+rust-version = "1.88"
+description = "Oblivious HTTP (RFC 9458) client for the ZODL gateway"
+publish = false
+
+[lib]
+name = "zodl_ohttp_client"
+
+[dependencies]
+# The gateway's suite, on the gateway's releases: DHKEM(X25519, HKDF-SHA256), HKDF-SHA256,
+# AES-128-GCM. Held at hpke 0.13 / sha2 0.10: wallets link this next to librustzcash, whose
+# RustCrypto pre-release pins do not resolve with hpke 0.14 / sha2 0.11.
+hpke = { version = "0.13", default-features = false, features = ["alloc", "x25519"] }
+aes-gcm = "0.10"
+hkdf = "0.12"
+sha2 = "0.10"
+# The RNG hpke 0.13 takes.
+rand_core = { version = "0.9", features = ["os_rng"] }
+zeroize = "1.7"
+# The signed key-configuration envelope (/ohttp-configs/signed).
+ed25519-dalek = "2"
+base64 = "0.22"
+hex = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+# `Client`: fetching key configurations and posting to the relay.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"], optional = true }
+
+[features]
+default = ["client"]
+## `Client`, over reqwest. Without it the crate is the encapsulation alone, for callers
+## that do their own I/O.
+client = ["dep:reqwest"]
+
+[[test]]
+name = "gateway"
+required-features = ["client"]
+
+[dev-dependencies]
+# The gateway's own decapsulation and key configuration, so the tests check this client
+# against the server it talks to.
+ohttp-gateway = { path = "../gateway" }
+axum = "0.8"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time", "test-util"] }
+# Driving the gateway's streaming encoder in the chunked round-trip tests (its frame stream
+# items are `anyhow::Result<UpFrame>`).
+futures-util = "0.3"
+bytes = "1"
+anyhow = "1"

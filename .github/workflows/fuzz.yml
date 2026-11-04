@@ -1,0 +1,79 @@
+name: Fuzz
+
+# cargo-fuzz (libFuzzer) targets in fuzz/: every parser of bytes from the relay, the client,
+# lightwalletd or a third-party backend. Pull requests and pushes run each target for 60 s; the
+# nightly schedule and a manual run, 10 min. Crashes are uploaded as the fuzz-artifacts artifact.
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+  schedule:
+    - cron: '23 2 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fuzz-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # cargo-fuzz needs nightly (-Zsanitizer); this job only.
+  FUZZ_TOOLCHAIN: nightly-2026-10-01
+  CARGO_FUZZ_VERSION: 0.13.2
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fuzz:
+    name: Fuzz
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Install the toolchain and cargo-fuzz
+        run: |
+          rustup toolchain install "$FUZZ_TOOLCHAIN" --profile minimal
+          cargo +"$FUZZ_TOOLCHAIN" install cargo-fuzz --locked --version "$CARGO_FUZZ_VERSION"
+
+      - name: Seed corpora
+        working-directory: fuzz
+        run: cargo +"$FUZZ_TOOLCHAIN" run --locked --release --example gen_corpus -- corpus
+
+      # --fuzz-dir: fuzz/ is not inside a crate of its own.
+      - name: Build the fuzz targets
+        run: cargo +"$FUZZ_TOOLCHAIN" fuzz build --fuzz-dir fuzz --debug-assertions
+
+      - name: Run the fuzz targets
+        env:
+          SECONDS_PER_TARGET: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '600' || '60' }}
+        run: |
+          failed=0
+          for target in $(cargo +"$FUZZ_TOOLCHAIN" fuzz list --fuzz-dir fuzz); do
+            echo "::group::$target"
+            if ! cargo +"$FUZZ_TOOLCHAIN" fuzz run --fuzz-dir fuzz --debug-assertions "$target" -- \
+                -max_total_time="$SECONDS_PER_TARGET" -rss_limit_mb=2048 -timeout=10 \
+                -max_len=65536 -print_final_stats=1; then
+              echo "::error title=fuzz::$target failed, see the fuzz-artifacts artifact"
+              failed=1
+            fi
+            echo "::endgroup::"
+          done
+          exit "$failed"
+
+      - name: Upload crashes
+        if: failure()
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
+        with:
+          name: fuzz-artifacts
+          path: fuzz/artifacts/
+          if-no-files-found: ignore
+          retention-days: 30

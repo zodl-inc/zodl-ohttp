@@ -1,0 +1,3451 @@
+// Copyright © 2026 Znewco, Inc. (d/b/a Zcash Open Development Lab)
+// SPDX-License-Identifier: AGPL-3.0-only
+//
+// This file is part of ZODL OHTTP.
+//
+// ZODL OHTTP is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License,
+// version 3 only, as published by the Free Software Foundation.
+//
+// ZODL OHTTP is distributed in the hope that it will be useful, but
+// WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
+// Affero General Public License for more details.
+//
+// Commercial licensing: see COMMERCIAL-LICENSE.md.
+
+// Response cache: the Redis plumbing behind the chain-validated cache.
+//
+// Two Redis roles:
+//   - cache Redis (allkeys-lru, fail-open): every cached answer, the per-block cache and the
+//     chain follower's index/tip/lock (`store::CacheStore` is implemented here);
+//   - security Redis (noeviction, fail-closed): replay nonces and the shared cache epoch.
+//
+// Key layout: cached entries live under
+//   ohttp:{network}:{backend_host}:{epoch}:v{KEY_VERSION}:{policy_hash}:
+// so an epoch bump (operator INCR of `epoch:{network}`) or a policy change flushes them; the
+// chain state lives under ohttp:{network}:{backend_host}:chain:v1: and the pinned tree-state
+// tier under pinned:{network}:{backend_host}:treestate:v1:, and both survive either.
+//
+// What is cached and for how long is decided by `rpc_cache` (validated, immutable and
+// tip-scoped entries; no TTLs) and `block_cache` (per-block entries validated against the
+// index). The tip comes from the chain follower (`chain::ChainFollower`) through `TipCell`.
+//
+// The pinned tier (REDIS_PINNED_URL + PINNED_TREESTATE_RANGE) is a third Redis (noeviction,
+// persistent) holding GetTreeState answers for a fixed finalized height range; it is served
+// first and written through.
+//
+// The permanent block tier (PERMANENT_REDIS_URL, `PermanentRedis` below) is a fourth store,
+// a disk-backed Redis-protocol store: every final CompactBlock (depth >= 100,
+// height >= Sapling activation), no TTL, never evicted. `block_cache` routes by height.
+
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+
+use arc_swap::ArcSwapOption;
+use bytes::Bytes;
+use futures_util::future::BoxFuture;
+use redis::{aio::ConnectionManager, AsyncCommands};
+use sha2::{Digest, Sha256};
+use tokio::time::timeout;
+use tracing::{debug, info, warn};
+
+use crate::origin::{ReplayPeerMode, RouteClass};
+use crate::replication::{AsyncReplicator, Effective, PeerSink, ReplicationConfig};
+use crate::rpc_cache::{self, grpc_message, BlockId, TreeStateHead};
+use crate::store::{CacheStore, PermanentStore, TipCell};
+
+pub use crate::rpc_cache::{grpc_block_id, height_key, CacheLookup, CacheMiss, MAX_CACHEABLE_SIZE};
+
+/// Finalized depth: pinned tree states are written only this far below the tip.
+pub const FINALIZED_DEPTH: u64 = 100;
+/// How often a caught-up pinned backfill worker checks for newly final heights.
+pub const PINNED_FOLLOW_INTERVAL: Duration = Duration::from_secs(60);
+/// Cache key version: bump to orphan old entries on a format change.
+const KEY_VERSION: u32 = 4;
+/// Epoch refresh interval for per-request sync (seconds).
+const EPOCH_REFRESH_SECS: u64 = 2;
+/// How often the housekeeping task syncs the epoch and pings Redis.
+const HOUSEKEEPING_SECS: u64 = 10;
+/// Replay nonce lifetime (ZIP "Replay protection": reference implementation 600 s).
+pub const REPLAY_TTL_SECS: u64 = 600;
+/// Consecutive failed housekeeping PINGs after which a replay peer connection is dropped and
+/// reopened. redis-rs' ConnectionManager reconnects on I/O errors only: after a managed Redis
+/// failover the old TCP connection can hang (no RST) and every command just times out until the
+/// kernel gives up, which can take minutes. 2 x HOUSEKEEPING_SECS = 20 s.
+const PEER_PING_FAILURES_RECONNECT: u32 = 2;
+/// Upper bound of the peer reconnect backoff: a connect attempt is cheap, and the peer should be
+/// back as soon as its DNS name points at the new primary.
+const PEER_RECONNECT_MAX_BACKOFF_SECS: u64 = 5;
+/// Budget for opening a replay peer connection (TCP, TLS, AUTH). Without it, a connect to an
+/// address that no longer answers (the old primary right after a failover, before its DNS name
+/// moves) waits for the kernel's SYN retries, which can take minutes; the next attempt resolves
+/// the name again. Above the ~6.3 s of ConnectionManager's own retries on a
+/// refused connection, so those still end with their own error.
+const PEER_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+#[derive(Clone)]
+pub struct ResponseCache {
+    /// Cache Redis (allkeys-lru, fail-open). ArcSwapOption allows lock-free swaps on reconnect.
+    cache_conn: Arc<ArcSwapOption<ConnectionManager>>,
+    /// Security Redis (noeviction, fail-closed): replay nonces and the shared epoch.
+    security_conn: Option<ConnectionManager>,
+    /// The chain tip, written by the follower.
+    tip: Arc<TipCell>,
+    /// Cache epoch, mirrored from Redis.
+    epoch: Arc<AtomicU64>,
+    network: String,
+    backend_host: String,
+    last_epoch_sync: Arc<AtomicU64>,
+    redis_timeout: Duration,
+    /// Policy/limits hash for cache namespace isolation (MAX_BLOCK_RANGE + BACKENDS_POLICY).
+    policy_hash: String,
+    pinned_conn: Option<ConnectionManager>,
+    /// Inclusive height range served from the pinned tier.
+    pinned_range: Option<(u64, u64)>,
+    cache_redis_url: String,
+    /// The other origins' security Redis (REPLAY_PEER_URLS); None in a single-origin deployment.
+    replay_peers: Option<Arc<ReplayPeers>>,
+    /// Asynchronous nonce replication (REPLAY_PEER_MODE=async-reads|failover); None otherwise.
+    replicator: Option<Arc<AsyncReplicator>>,
+    /// Replica acknowledgement of WRITE nonces (REPLAY_WRITE_WAIT_REPLICAS); None when off.
+    write_wait: Option<Arc<WriteWait>>,
+    /// Local AOF fsync of WRITE nonces no peer took (REPLAY_LOCAL_WAITAOF_MS); None when off.
+    local_aof: Option<Arc<LocalAof>>,
+}
+
+/// `REPLAY_WRITE_WAIT_REPLICAS` / `REPLAY_WRITE_WAIT_MS`: before a WRITE (anything not on
+/// `REPLAY_READ_ROUTES`) is executed, its replay nonce must be acknowledged by this many
+/// replicas of the security Redis (`WAIT`). An asynchronously replicated store (a managed Redis
+/// with automatic failover) otherwise loses the newest nonces when a replica is promoted, and a
+/// WRITE accepted just before the failover could be replayed once after it. READs are not
+/// delayed: replaying one yields the replayer nothing (the response is sealed to the original
+/// Client) and changes no state. 0 (default) disables the check.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WriteWaitConfig {
+    pub replicas: u32,
+    pub timeout_ms: u64,
+}
+
+pub const DEFAULT_REPLAY_WRITE_WAIT_MS: u64 = 100;
+
+/// `REPLAY_PEER_WAIT_REPLICAS` default: a WRITE checked at a peer (a peer origin's synchronous
+/// check at a shared store) waits for one replica of that store. `0` disables it,
+/// for a peer store without replicas.
+pub const DEFAULT_REPLAY_PEER_WAIT_REPLICAS: u32 = 1;
+
+/// Opening a peer's `WAIT` connection (normally done at startup by `ReplayPeers::with_wait`).
+const PEER_WAIT_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+const PEER_WAIT_ATTEMPTS: usize = 2;
+
+impl WriteWaitConfig {
+    pub fn from_env() -> anyhow::Result<Option<Self>> {
+        Self::parse(
+            std::env::var("REPLAY_WRITE_WAIT_REPLICAS").ok().as_deref(),
+            std::env::var("REPLAY_WRITE_WAIT_MS").ok().as_deref(),
+        )
+    }
+
+    /// `REPLAY_PEER_WAIT_REPLICAS` / `REPLAY_PEER_WAIT_MS`: the same acknowledgement for the
+    /// nonce of a WRITE written synchronously to a peer origin's store (`ReplayPeers`).
+    pub fn peer_from_env() -> anyhow::Result<Option<Self>> {
+        Self::parse_named(
+            std::env::var("REPLAY_PEER_WAIT_REPLICAS").ok().as_deref(),
+            std::env::var("REPLAY_PEER_WAIT_MS").ok().as_deref(),
+            DEFAULT_REPLAY_PEER_WAIT_REPLICAS,
+            "REPLAY_PEER_WAIT",
+        )
+    }
+
+    pub fn parse(replicas: Option<&str>, timeout_ms: Option<&str>) -> anyhow::Result<Option<Self>> {
+        Self::parse_named(replicas, timeout_ms, 0, "REPLAY_WRITE_WAIT")
+    }
+
+    pub fn parse_named(
+        replicas: Option<&str>,
+        timeout_ms: Option<&str>,
+        default_replicas: u32,
+        prefix: &str,
+    ) -> anyhow::Result<Option<Self>> {
+        let replicas = match replicas.map(str::trim).filter(|s| !s.is_empty()) {
+            None => default_replicas,
+            Some(r) => r.parse::<u32>().map_err(|_| {
+                anyhow::anyhow!("{prefix}_REPLICAS must be a non-negative integer, got '{r}'")
+            })?,
+        };
+        let timeout_ms = match timeout_ms.map(str::trim).filter(|s| !s.is_empty()) {
+            None => DEFAULT_REPLAY_WRITE_WAIT_MS,
+            Some(t) => match t.parse::<u64>() {
+                Ok(v) if v > 0 => v,
+                _ => anyhow::bail!("{prefix}_MS must be a positive integer, got '{t}'"),
+            },
+        };
+        Ok((replicas > 0).then_some(Self {
+            replicas,
+            timeout_ms,
+        }))
+    }
+}
+
+/// `REPLAY_LOCAL_WAITAOF_MS`: a WRITE whose nonce only the local security Redis holds (an
+/// origin with `REPLAY_PEER_FAIL_CLOSED_WRITES=0` while its peers are unreachable) runs
+/// only once that nonce is fsynced to the local AOF (`WAITAOF 1 0`, Redis >= 7.2 with
+/// `appendonly yes`). Without it a crash of the host loses up to the last second of nonces
+/// (`appendfsync everysec`) and such a WRITE could be replayed once after the restart. With
+/// `everysec` the wait is up to about one second (the next background fsync); with
+/// `appendfsync always` it ends with the write itself.
+/// Unset: on when the store supports it (probed at startup), off otherwise. `0`: off. A
+/// positive value: required (startup fails if the store cannot `WAITAOF`), with that timeout.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LocalAofConfig {
+    Off,
+    Auto(u64),
+    Required(u64),
+}
+
+pub const DEFAULT_REPLAY_LOCAL_WAITAOF_MS: u64 = 2000;
+
+impl LocalAofConfig {
+    pub fn from_env() -> anyhow::Result<Self> {
+        Self::parse(std::env::var("REPLAY_LOCAL_WAITAOF_MS").ok().as_deref())
+    }
+
+    pub fn parse(value: Option<&str>) -> anyhow::Result<Self> {
+        match value.map(str::trim).filter(|s| !s.is_empty()) {
+            None => Ok(Self::Auto(DEFAULT_REPLAY_LOCAL_WAITAOF_MS)),
+            Some("0") => Ok(Self::Off),
+            Some(t) => match t.parse::<u64>() {
+                Ok(v) if v > 0 => Ok(Self::Required(v)),
+                _ => anyhow::bail!(
+                    "REPLAY_LOCAL_WAITAOF_MS must be a non-negative integer, got '{t}'"
+                ),
+            },
+        }
+    }
+}
+
+/// The dedicated security-Redis connection for `WAITAOF` (blocks its connection, like `WAIT`).
+struct LocalAof {
+    conn: ConnectionManager,
+    timeout_ms: u64,
+}
+
+/// The dedicated security-Redis connection for `WAIT`. `WAIT` blocks the connection it runs on
+/// until the replicas acknowledge, so it must not share the multiplexed connection every
+/// request's `SET NX` goes through: a slow replica would stall READs too.
+struct WriteWait {
+    conn: ConnectionManager,
+    config: WriteWaitConfig,
+}
+
+/// One entry of REPLAY_PEER_URLS: the security Redis of another origin.
+struct ReplayPeer {
+    index: usize,
+    url: String,
+    /// None until the first successful connection (a background task retries); afterwards the
+    /// ConnectionManager reconnects by itself.
+    conn: Arc<ArcSwapOption<ConnectionManager>>,
+    /// The dedicated connection for `WAIT` (see `WriteWait`), opened in the background by
+    /// `with_wait`, else on first use.
+    wait_conn: Arc<ArcSwapOption<ConnectionManager>>,
+    /// Consecutive failed housekeeping PINGs (see PEER_PING_FAILURES_RECONNECT).
+    ping_failures: AtomicU32,
+}
+
+/// Replay nonces are written to every peer as well as to the local security Redis, and a nonce
+/// any store already holds is a replay ("write to all, replay if any"). See `origin.rs`.
+pub struct ReplayPeers {
+    peers: Vec<ReplayPeer>,
+    network: String,
+    /// Budget for the concurrent peer round trips of one request.
+    timeout: Duration,
+    /// Whether an unavailable peer refuses the request (sync mode, and READs on the strict path).
+    fail_closed: bool,
+    /// REPLAY_PEER_MODE.
+    mode: ReplayPeerMode,
+    /// async-reads: whether an unavailable peer refuses a WRITE.
+    fail_closed_writes: bool,
+    /// REPLAY_PEER_WAIT_REPLICAS: replica acknowledgement of a WRITE nonce at each peer that took it.
+    wait: Option<WriteWaitConfig>,
+}
+
+/// The outcome of one nonce write at one peer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PeerOutcome {
+    /// Stored: the peer had not seen the nonce.
+    Fresh,
+    /// The peer already held the nonce: another origin recorded it first.
+    Replay,
+    /// Redis error.
+    Error,
+    /// No answer within the budget.
+    Timeout,
+    /// Not connected (not reached since startup, or reconnecting).
+    Disconnected,
+}
+
+impl PeerOutcome {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PeerOutcome::Fresh => "fresh",
+            PeerOutcome::Replay => "replay",
+            PeerOutcome::Error => "error",
+            PeerOutcome::Timeout => "timeout",
+            PeerOutcome::Disconnected => "disconnected",
+        }
+    }
+}
+
+/// The joint verdict of all peers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PeerVerdict {
+    /// No peer had the nonce and every peer answered.
+    Fresh,
+    /// At least one peer had the nonce: a cross-origin replay.
+    Replay,
+    /// No peer had the nonce but at least one did not answer; the policy decides.
+    Unavailable,
+}
+
+/// A replay anywhere wins, even over errors elsewhere: a peer's "already seen" is a positive
+/// fact, while an unavailable peer only means that we do not know.
+pub fn combine_peer_outcomes(outcomes: &[PeerOutcome]) -> PeerVerdict {
+    if outcomes.contains(&PeerOutcome::Replay) {
+        PeerVerdict::Replay
+    } else if outcomes.iter().all(|o| *o == PeerOutcome::Fresh) {
+        PeerVerdict::Fresh
+    } else {
+        PeerVerdict::Unavailable
+    }
+}
+
+impl ReplayPeers {
+    /// Connect to every peer. A peer that is unreachable now is retried in the background
+    /// (and counted as `disconnected` meanwhile), so an outage of the link between origins never stops a gateway
+    /// from starting.
+    pub async fn connect(
+        urls: &[String],
+        network: String,
+        timeout_ms: u64,
+        fail_closed: bool,
+    ) -> Self {
+        let mut peers = Vec::with_capacity(urls.len());
+        for (index, url) in urls.iter().enumerate() {
+            let conn = Arc::new(ArcSwapOption::empty());
+            match ReplayPeer::open(url).await {
+                Ok(c) => {
+                    info!(network = %network, peer = index, "Replay peer connected");
+                    conn.store(Some(Arc::new(c)));
+                    crate::health::record_replay_peer_connected(&network, index, true);
+                }
+                Err(e) => {
+                    warn!(network = %network, peer = index, error = %e, "Replay peer unreachable at startup, retrying in background");
+                    crate::health::record_replay_peer_connected(&network, index, false);
+                }
+            }
+            peers.push(ReplayPeer {
+                index,
+                url: url.clone(),
+                conn,
+                wait_conn: Arc::new(ArcSwapOption::empty()),
+                ping_failures: AtomicU32::new(0),
+            });
+        }
+        let this = Self {
+            peers,
+            network,
+            timeout: Duration::from_millis(timeout_ms),
+            fail_closed,
+            mode: ReplayPeerMode::Sync,
+            fail_closed_writes: true,
+            wait: None,
+        };
+        for p in &this.peers {
+            if p.conn.load().is_none() {
+                spawn_peer_reconnect_task(
+                    this.network.clone(),
+                    p.index,
+                    p.url.clone(),
+                    p.conn.clone(),
+                );
+            }
+        }
+        this
+    }
+
+    pub fn len(&self) -> usize {
+        self.peers.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.peers.is_empty()
+    }
+
+    pub fn fail_closed(&self) -> bool {
+        self.fail_closed
+    }
+
+    /// REPLAY_PEER_MODE and REPLAY_PEER_FAIL_CLOSED_WRITES (defaults: `sync`, true).
+    pub fn with_mode(mut self, mode: ReplayPeerMode, fail_closed_writes: bool) -> Self {
+        self.mode = mode;
+        self.fail_closed_writes = fail_closed_writes;
+        self
+    }
+
+    pub fn mode(&self) -> ReplayPeerMode {
+        self.mode
+    }
+
+    pub fn fail_closed_writes(&self) -> bool {
+        self.fail_closed_writes
+    }
+
+    /// REPLAY_PEER_WAIT_REPLICAS / REPLAY_PEER_WAIT_MS (None = no acknowledgement). The
+    /// dedicated `WAIT` connections are opened now, in the background, so that the first WRITE
+    /// does not pay the connection setup (TCP, TLS, AUTH: several round trips).
+    pub fn with_wait(mut self, wait: Option<WriteWaitConfig>) -> Self {
+        self.wait = wait;
+        if wait.is_some() && tokio::runtime::Handle::try_current().is_ok() {
+            for p in &self.peers {
+                let (network, index, url, slot) = (
+                    self.network.clone(),
+                    p.index,
+                    p.url.clone(),
+                    p.wait_conn.clone(),
+                );
+                tokio::spawn(async move {
+                    let mut backoff_secs = 1u64;
+                    while slot.load().is_none() {
+                        match ReplayPeer::open(&url).await {
+                            Ok(c) => {
+                                slot.store(Some(Arc::new(c)));
+                            }
+                            Err(e) => {
+                                debug!(network = %network, peer = index, error = %e, "Replay peer WAIT connection attempt failed");
+                                tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
+                                backoff_secs = (backoff_secs * 2).min(60);
+                            }
+                        }
+                    }
+                });
+            }
+        }
+        self
+    }
+
+    pub fn wait(&self) -> Option<WriteWaitConfig> {
+        self.wait
+    }
+
+    /// For a WRITE whose nonce `key` was just stored at the peers `confirm(index)` selects:
+    /// rewrite it on the peer's dedicated connection (`SET XX`) and `WAIT` for the configured
+    /// replicas of that store, so that a failover of the shared store cannot forget it.
+    /// Each attempt is bounded by REPLAY_PEER_TIMEOUT_MS (the round trip) + REPLAY_PEER_WAIT_MS
+    /// (the server-side `WAIT`); opening the connection is not part of it. One failed attempt
+    /// (fewer acknowledgements, an error, a timeout) is retried once: `SET XX` and `WAIT` are
+    /// idempotent. Fail-closed: the nonce gone, or both attempts failing, is an `Err` (outer 503)
+    /// even where an unreachable peer would be tolerated, because that peer was reachable a
+    /// moment ago. No-op when peer acknowledgement is off (REPLAY_PEER_WAIT_REPLICAS=0).
+    pub async fn confirm_replicated(
+        &self,
+        key: &str,
+        confirm: impl Fn(usize) -> bool,
+    ) -> anyhow::Result<()> {
+        let Some(WriteWaitConfig {
+            replicas,
+            timeout_ms,
+        }) = self.wait
+        else {
+            return Ok(());
+        };
+        let budget = self.timeout + Duration::from_millis(timeout_ms);
+        let futures = self.peers.iter().filter(|p| confirm(p.index)).map(|p| async move {
+            let verdict = async {
+                let mut last = String::new();
+                for attempt in 0..PEER_WAIT_ATTEMPTS {
+                    if attempt > 0 {
+                        warn!(network = %self.network, peer = p.index, error = %last, "Replay peer WAIT failed, retrying once");
+                        crate::health::record_replay_peer(&self.network, p.index, "wait_retry");
+                    }
+                    // Opening the connection is not part of the budget.
+                    let conn = match p.wait_conn.load_full() {
+                        Some(c) => c,
+                        None => match timeout(PEER_WAIT_CONNECT_TIMEOUT, ReplayPeer::open(&p.url)).await {
+                            Ok(Ok(c)) => {
+                                let c = Arc::new(c);
+                                p.wait_conn.store(Some(c.clone()));
+                                c
+                            }
+                            Ok(Err(e)) => {
+                                last = format!("connect: {e}");
+                                continue;
+                            }
+                            Err(_) => {
+                                last = format!(
+                                    "connect timed out after {}ms",
+                                    PEER_WAIT_CONNECT_TIMEOUT.as_millis()
+                                );
+                                continue;
+                            }
+                        },
+                    };
+                    let mut conn = (*conn).clone();
+                    let result = timeout(budget, async {
+                        redis::pipe()
+                            .cmd("SET")
+                            .arg(key)
+                            .arg("1")
+                            .arg("XX")
+                            .arg("EX")
+                            .arg(REPLAY_TTL_SECS)
+                            .cmd("WAIT")
+                            .arg(replicas)
+                            .arg(timeout_ms)
+                            .query_async::<_, (Option<String>, i64)>(&mut conn)
+                            .await
+                    })
+                    .await;
+                    last = match result {
+                        Ok(Ok((Some(_), acked))) if acked >= replicas as i64 => return Ok(()),
+                        Ok(Ok((Some(_), acked))) => format!(
+                            "acknowledged by {acked} of {replicas} replica(s) within {timeout_ms}ms"
+                        ),
+                        Ok(Ok((None, _))) => return Err("nonce no longer at the peer".to_string()),
+                        // A broken or stuck connection: the retry opens a fresh one.
+                        Ok(Err(e)) => {
+                            p.wait_conn.store(None);
+                            e.to_string()
+                        }
+                        Err(_) => {
+                            p.wait_conn.store(None);
+                            format!("timed out after {}ms", budget.as_millis())
+                        }
+                    };
+                }
+                Err(last)
+            }
+            .await;
+            crate::health::record_replay_peer(
+                &self.network,
+                p.index,
+                if verdict.is_ok() { "acknowledged" } else { "unacknowledged" },
+            );
+            verdict.map_err(|e| format!("peer {}: {e}", p.index))
+        });
+        let failures: Vec<String> = futures_util::future::join_all(futures)
+            .await
+            .into_iter()
+            .filter_map(Result::err)
+            .collect();
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            anyhow::bail!(
+                "WRITE replay nonce not acknowledged by the peer replicas (fail-closed): {}",
+                failures.join("; ")
+            )
+        }
+    }
+
+    /// Whether peer `index` has a connection (it may still fail a command).
+    fn connected(&self, index: usize) -> bool {
+        self.peers
+            .get(index)
+            .is_some_and(|p| p.conn.load().is_some())
+    }
+
+    /// `SET key 1 NX EX ttl` at every peer concurrently, within one budget.
+    pub async fn write_nonce(&self, key: &str, ttl_secs: u64) -> Vec<PeerOutcome> {
+        let futures = self.peers.iter().map(|p| async move {
+            let outcome = match p.conn.load_full() {
+                None => PeerOutcome::Disconnected,
+                Some(conn) => {
+                    let mut conn = (*conn).clone();
+                    match timeout(self.timeout, async {
+                        redis::cmd("SET")
+                            .arg(key)
+                            .arg("1")
+                            .arg("NX")
+                            .arg("EX")
+                            .arg(ttl_secs)
+                            .query_async::<_, Option<String>>(&mut conn)
+                            .await
+                    })
+                    .await
+                    {
+                        Ok(Ok(Some(_))) => PeerOutcome::Fresh,
+                        Ok(Ok(None)) => PeerOutcome::Replay,
+                        Ok(Err(e)) => {
+                            warn!(network = %self.network, peer = p.index, error = %e, "Replay peer write failed");
+                            PeerOutcome::Error
+                        }
+                        Err(_) => PeerOutcome::Timeout,
+                    }
+                }
+            };
+            crate::health::record_replay_peer(&self.network, p.index, outcome.as_str());
+            outcome
+        });
+        futures_util::future::join_all(futures).await
+    }
+
+    /// PING every peer for the `ohttp_replay_peer_connected` gauge (housekeeping). A connection
+    /// that fails PEER_PING_FAILURES_RECONNECT PINGs in a row is dropped and reopened in the
+    /// background (a hung connection never errors, so ConnectionManager would keep it).
+    pub async fn ping_all(&self) {
+        for p in &self.peers {
+            let ok = match p.conn.load_full() {
+                // A reconnect task is running.
+                None => false,
+                Some(conn) => {
+                    let mut conn = (*conn).clone();
+                    let ok = matches!(
+                        timeout(
+                            self.timeout,
+                            redis::cmd("PING").query_async::<_, String>(&mut conn)
+                        )
+                        .await,
+                        Ok(Ok(pong)) if pong == "PONG"
+                    );
+                    if ok {
+                        p.ping_failures.store(0, Ordering::Relaxed);
+                    } else if p.ping_failures.fetch_add(1, Ordering::Relaxed) + 1
+                        >= PEER_PING_FAILURES_RECONNECT
+                    {
+                        p.ping_failures.store(0, Ordering::Relaxed);
+                        warn!(network = %self.network, peer = p.index, "Replay peer failed {PEER_PING_FAILURES_RECONNECT} PINGs in a row: reopening the connection");
+                        p.conn.store(None);
+                        p.wait_conn.store(None);
+                        spawn_peer_reconnect_task(
+                            self.network.clone(),
+                            p.index,
+                            p.url.clone(),
+                            p.conn.clone(),
+                        );
+                    }
+                    ok
+                }
+            };
+            crate::health::record_replay_peer_connected(&self.network, p.index, ok);
+        }
+    }
+}
+
+impl ReplayPeer {
+    async fn open(url: &str) -> anyhow::Result<ConnectionManager> {
+        let client = redis::Client::open(url)?;
+        match timeout(PEER_CONNECT_TIMEOUT, ConnectionManager::new(client)).await {
+            Ok(conn) => Ok(conn?),
+            Err(_) => anyhow::bail!(
+                "connect timed out after {}s",
+                PEER_CONNECT_TIMEOUT.as_secs()
+            ),
+        }
+    }
+}
+
+/// The asynchronous replicator's view of the peers: one pipelined `SET NX EX` per batch.
+impl PeerSink for ReplayPeers {
+    fn set_nx_batch(
+        &self,
+        peer: usize,
+        keys: Vec<String>,
+        ttl_secs: u64,
+    ) -> BoxFuture<'static, Result<Vec<Option<String>>, String>> {
+        let conn = self.peers.get(peer).and_then(|p| p.conn.load_full());
+        Box::pin(async move {
+            let Some(conn) = conn else {
+                return Err("disconnected".to_string());
+            };
+            let mut conn = (*conn).clone();
+            let mut pipe = redis::pipe();
+            for key in &keys {
+                pipe.cmd("SET")
+                    .arg(key)
+                    .arg("1")
+                    .arg("NX")
+                    .arg("EX")
+                    .arg(ttl_secs);
+            }
+            pipe.query_async::<_, Vec<Option<String>>>(&mut conn)
+                .await
+                .map_err(|e| e.to_string())
+        })
+    }
+
+    fn ping(&self, peer: usize) -> BoxFuture<'static, Result<(), String>> {
+        let conn = self.peers.get(peer).and_then(|p| p.conn.load_full());
+        Box::pin(async move {
+            let Some(conn) = conn else {
+                return Err("disconnected".to_string());
+            };
+            let mut conn = (*conn).clone();
+            match redis::cmd("PING").query_async::<_, String>(&mut conn).await {
+                Ok(pong) if pong == "PONG" => Ok(()),
+                Ok(other) => Err(format!("unexpected PING reply {other}")),
+                Err(e) => Err(e.to_string()),
+            }
+        })
+    }
+
+    fn peers(&self) -> usize {
+        self.peers.len()
+    }
+}
+
+/// Retry a peer connection with exponential backoff (1 s to PEER_RECONNECT_MAX_BACKOFF_SECS)
+/// until it succeeds.
+fn spawn_peer_reconnect_task(
+    network: String,
+    index: usize,
+    url: String,
+    conn: Arc<ArcSwapOption<ConnectionManager>>,
+) {
+    tokio::spawn(async move {
+        let mut backoff_secs = 1u64;
+        loop {
+            tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
+            match ReplayPeer::open(&url).await {
+                Ok(c) => {
+                    conn.store(Some(Arc::new(c)));
+                    crate::health::record_replay_peer_connected(&network, index, true);
+                    info!(network = %network, peer = index, "Replay peer connected");
+                    return;
+                }
+                Err(e) => {
+                    warn!(network = %network, peer = index, error = %e, "Replay peer reconnection attempt failed");
+                    backoff_secs = (backoff_secs * 2).min(PEER_RECONNECT_MAX_BACKOFF_SECS);
+                }
+            }
+        }
+    });
+}
+
+const GET_TREE_STATE_PATH: &str = "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetTreeState";
+
+/// Parse a PINNED_TREESTATE_RANGE value: "START-END" or "START-" (open-ended).
+pub fn parse_pinned_range(s: &str) -> Option<(u64, u64)> {
+    let (a, b) = s.trim().split_once('-')?;
+    let start: u64 = a.trim().parse().ok()?;
+    let end: u64 = if b.trim().is_empty() {
+        u64::MAX
+    } else {
+        b.trim().parse().ok()?
+    };
+    if start == 0 || end < start {
+        return None;
+    }
+    Some((start, end))
+}
+
+/// gRPC-framed GetTreeState request body (BlockId { height }).
+pub fn grpc_tree_state_request(height: u64) -> Vec<u8> {
+    grpc_block_id(height, &[])
+}
+
+pub fn tree_state_path() -> &'static str {
+    GET_TREE_STATE_PATH
+}
+
+impl ResponseCache {
+    pub async fn connect(
+        redis_url: &str,
+        redis_security_url: Option<&str>,
+        network: String,
+        backend_host: String,
+        redis_op_timeout_ms: u64,
+        max_block_range: u32,
+        backends_policy: &std::collections::HashMap<String, Vec<(String, String)>>,
+    ) -> anyhow::Result<Self> {
+        // Try to connect to cache Redis; if it fails, log and continue with None (fail-open).
+        // A background retry task will attempt reconnection.
+        let cache_conn = match redis::Client::open(redis_url) {
+            Ok(client) => match ConnectionManager::new(client).await {
+                Ok(conn) => {
+                    info!(network = %network, "Redis cache connected");
+                    Some(conn)
+                }
+                Err(e) => {
+                    warn!(
+                        "Failed to connect to Redis cache, continuing without cache (will retry in background): {}",
+                        e
+                    );
+                    None
+                }
+            },
+            Err(e) => {
+                warn!(
+                    "Invalid Redis cache URL, continuing without cache (will retry in background): {}",
+                    e
+                );
+                None
+            }
+        };
+
+        // Separate security connection if configured. Its failure still fails startup
+        // (fail-closed for replay protection).
+        let security_conn = if let Some(sec_url) = redis_security_url {
+            if !sec_url.is_empty() && sec_url != redis_url {
+                let sec_client = redis::Client::open(sec_url)?;
+                Some(ConnectionManager::new(sec_client).await?)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        // Policy hash from MAX_BLOCK_RANGE + serialized BACKENDS_POLICY (sorted by authority).
+        let policy_hash = {
+            let mut hasher = Sha256::new();
+            hasher.update(max_block_range.to_be_bytes());
+            let mut sorted_policies: Vec<_> = backends_policy.iter().collect();
+            sorted_policies.sort_by_key(|(k, _)| *k);
+            for (authority, policies) in sorted_policies {
+                hasher.update(authority.as_bytes());
+                for (method, path) in policies {
+                    hasher.update(method.as_bytes());
+                    hasher.update(path.as_bytes());
+                }
+            }
+            let hash = hasher.finalize();
+            format!(
+                "{:016x}",
+                u64::from_be_bytes([
+                    hash[0], hash[1], hash[2], hash[3], hash[4], hash[5], hash[6], hash[7],
+                ])
+            )
+        };
+
+        let cache = Self {
+            cache_conn: Arc::new(ArcSwapOption::from(cache_conn.map(Arc::new))),
+            security_conn,
+            tip: Arc::new(TipCell::new()),
+            epoch: Arc::new(AtomicU64::new(0)),
+            network,
+            backend_host,
+            last_epoch_sync: Arc::new(AtomicU64::new(0)),
+            redis_timeout: Duration::from_millis(redis_op_timeout_ms),
+            policy_hash,
+            pinned_conn: None,
+            pinned_range: None,
+            cache_redis_url: redis_url.to_string(),
+            replay_peers: None,
+            replicator: None,
+            write_wait: None,
+            local_aof: None,
+        };
+
+        if cache.cache_conn.load().is_none() {
+            spawn_cache_reconnect_task(cache.clone());
+        }
+
+        Ok(cache)
+    }
+
+    /// Attempt to (re)connect to the cache Redis. Returns true if successful.
+    async fn try_reconnect_cache(&self) -> bool {
+        match redis::Client::open(self.cache_redis_url.as_str()) {
+            Ok(client) => match ConnectionManager::new(client).await {
+                Ok(conn) => {
+                    self.cache_conn.store(Some(Arc::new(conn)));
+                    info!(network = %self.network, "Redis cache reconnected successfully");
+                    true
+                }
+                Err(e) => {
+                    debug!(network = %self.network, error = %e, "Redis cache reconnection attempt failed");
+                    false
+                }
+            },
+            Err(e) => {
+                warn!(network = %self.network, error = %e, "Invalid Redis cache URL during reconnect");
+                false
+            }
+        }
+    }
+
+    /// Attach the pinned tier (REDIS_PINNED_URL + PINNED_TREESTATE_RANGE).
+    pub async fn with_pinned(mut self, url: &str, range: (u64, u64)) -> anyhow::Result<Self> {
+        let client = redis::Client::open(url)?;
+        self.pinned_conn = Some(ConnectionManager::new(client).await?);
+        self.pinned_range = Some(range);
+        Ok(self)
+    }
+
+    pub fn pinned_range(&self) -> Option<(u64, u64)> {
+        self.pinned_range
+    }
+
+    /// Enable replica acknowledgement of WRITE nonces on a dedicated connection to `security_url`.
+    pub async fn with_write_wait(
+        mut self,
+        security_url: &str,
+        config: WriteWaitConfig,
+    ) -> anyhow::Result<Self> {
+        if security_url.is_empty() {
+            anyhow::bail!("REPLAY_WRITE_WAIT_REPLICAS needs REDIS_SECURITY_URL");
+        }
+        let client = redis::Client::open(security_url)?;
+        let conn = ConnectionManager::new(client).await?;
+        self.write_wait = Some(Arc::new(WriteWait { conn, config }));
+        Ok(self)
+    }
+
+    pub fn write_wait(&self) -> Option<WriteWaitConfig> {
+        self.write_wait.as_ref().map(|w| w.config)
+    }
+
+    /// For a WRITE: rewrite its nonce (`SET XX`, keeps it a write on this connection) and `WAIT`
+    /// until `replicas` replicas have it. Fail-closed: fewer acknowledgements, an error or a
+    /// timeout is an `Err` (outer 503), like an unavailable replay store. No-op when disabled.
+    pub async fn confirm_nonce_replicated(&self, body_hash: &[u8]) -> anyhow::Result<()> {
+        let Some(ww) = self.write_wait.as_ref() else {
+            return Ok(());
+        };
+        let key = format!("replay:{}:{}", self.network, hex::encode(body_hash));
+        let mut conn = ww.conn.clone();
+        let WriteWaitConfig {
+            replicas,
+            timeout_ms,
+        } = ww.config;
+        let round_trip = async {
+            // A connection that died since the last WRITE (a Redis failover closes it) fails
+            // the first command; ConnectionManager reconnects behind it, so one retry gets the new
+            // primary. SET XX and WAIT are idempotent. Without the retry, the first WRITE after a
+            // failover would answer 503.
+            let mut retried = false;
+            loop {
+                let r = async {
+                    redis::cmd("SET")
+                        .arg(&key)
+                        .arg("1")
+                        .arg("XX")
+                        .arg("EX")
+                        .arg(REPLAY_TTL_SECS)
+                        .query_async::<_, Option<String>>(&mut conn)
+                        .await?;
+                    redis::cmd("WAIT")
+                        .arg(replicas)
+                        .arg(timeout_ms)
+                        .query_async::<_, i64>(&mut conn)
+                        .await
+                }
+                .await;
+                match r {
+                    Err(e)
+                        if !retried
+                            && (e.is_io_error()
+                                || e.is_connection_dropped()
+                                || e.is_unrecoverable_error()) =>
+                    {
+                        warn!(network = %self.network, error = %e, "Replay nonce WAIT connection broken, retrying once");
+                        retried = true;
+                    }
+                    r => break r,
+                }
+            }
+        };
+        // WAIT returns after at most timeout_ms; the outer bound adds the round trips (and the
+        // retry's).
+        let budget = Duration::from_millis(timeout_ms) + self.redis_timeout * 4;
+        match timeout(budget, round_trip).await {
+            Ok(Ok(acked)) if acked >= replicas as i64 => Ok(()),
+            Ok(Ok(acked)) => anyhow::bail!(
+                "Replay nonce acknowledged by {acked} of {replicas} replica(s) within {timeout_ms}ms (fail-closed)"
+            ),
+            Ok(Err(e)) => anyhow::bail!("Replay nonce WAIT failed (fail-closed): {e}"),
+            Err(_) => anyhow::bail!("Replay nonce WAIT timed out after {}ms (fail-closed)", budget.as_millis()),
+        }
+    }
+
+    /// REPLAY_LOCAL_WAITAOF_MS (`LocalAofConfig`) on a dedicated connection to `security_url`.
+    /// The store is probed with `WAITAOF 1 0 1`: its refusal (AOF off, Redis < 7.2) leaves it
+    /// off in `Auto` and fails startup in `Required`; a timeout or a connection error fails
+    /// startup in both.
+    pub async fn with_local_waitaof(
+        mut self,
+        security_url: &str,
+        config: LocalAofConfig,
+    ) -> anyhow::Result<Self> {
+        let (timeout_ms, required) = match config {
+            LocalAofConfig::Off => return Ok(self),
+            LocalAofConfig::Auto(t) => (t, false),
+            LocalAofConfig::Required(t) => (t, true),
+        };
+        let probe_timeout = self.redis_timeout * 4;
+        let probe = async {
+            if security_url.is_empty() {
+                anyhow::bail!("REDIS_SECURITY_URL not configured");
+            }
+            let mut conn = ConnectionManager::new(redis::Client::open(security_url)?).await?;
+            let answer = timeout(
+                probe_timeout,
+                redis::cmd("WAITAOF")
+                    .arg(1)
+                    .arg(0)
+                    .arg(1)
+                    .query_async::<_, (i64, i64)>(&mut conn),
+            )
+            .await
+            .map_err(|_| anyhow::anyhow!("WAITAOF probe timed out"))?;
+            anyhow::Ok((conn, answer))
+        };
+        // Only the store's own refusal (AOF off, unknown command) means "unsupported"; a
+        // timeout or a connection error fails startup like the security connection itself.
+        let probe = match probe.await {
+            Ok((conn, Ok(_))) => Ok(conn),
+            Ok((_, Err(e)))
+                if matches!(
+                    e.kind(),
+                    redis::ErrorKind::ResponseError | redis::ErrorKind::ExtensionError
+                ) =>
+            {
+                Err(anyhow::Error::from(e))
+            }
+            Ok((_, Err(e))) => anyhow::bail!("REPLAY_LOCAL_WAITAOF_MS: WAITAOF probe failed: {e}"),
+            Err(e) => anyhow::bail!("REPLAY_LOCAL_WAITAOF_MS: WAITAOF probe failed: {e}"),
+        };
+        match probe {
+            Ok(conn) => {
+                self.local_aof = Some(Arc::new(LocalAof { conn, timeout_ms }));
+                Ok(self)
+            }
+            Err(e) if required => anyhow::bail!(
+                "REPLAY_LOCAL_WAITAOF_MS={timeout_ms} but the security Redis cannot WAITAOF (needs Redis >= 7.2 with appendonly yes): {e}"
+            ),
+            Err(e) => {
+                warn!(
+                    network = %self.network,
+                    error = %e,
+                    "Security Redis cannot WAITAOF: WRITE nonces held only locally are not fsync-confirmed"
+                );
+                Ok(self)
+            }
+        }
+    }
+
+    pub fn local_waitaof_ms(&self) -> Option<u64> {
+        self.local_aof.as_ref().map(|l| l.timeout_ms)
+    }
+
+    /// For a WRITE whose nonce only the local store holds: rewrite it on the dedicated
+    /// connection (`SET XX`) and `WAITAOF 1 0` until the local AOF has fsynced it. Fail-closed:
+    /// not fsynced in time, the nonce gone, an error or a timeout is an `Err` (outer 503).
+    /// No-op when off.
+    pub async fn confirm_nonce_local_aof(&self, key: &str) -> anyhow::Result<()> {
+        let Some(la) = self.local_aof.as_ref() else {
+            return Ok(());
+        };
+        let started = std::time::Instant::now();
+        let mut conn = la.conn.clone();
+        let budget = Duration::from_millis(la.timeout_ms) + self.redis_timeout * 2;
+        let result = timeout(budget, async {
+            redis::pipe()
+                .cmd("SET")
+                .arg(key)
+                .arg("1")
+                .arg("XX")
+                .arg("EX")
+                .arg(REPLAY_TTL_SECS)
+                .cmd("WAITAOF")
+                .arg(1)
+                .arg(0)
+                .arg(la.timeout_ms)
+                .query_async::<_, (Option<String>, (i64, i64))>(&mut conn)
+                .await
+        })
+        .await;
+        let verdict = match result {
+            Ok(Ok((Some(_), (local, _)))) if local >= 1 => Ok(()),
+            Ok(Ok((Some(_), _))) => Err(format!("not fsynced within {}ms", la.timeout_ms)),
+            Ok(Ok((None, _))) => Err("nonce no longer in the local store".to_string()),
+            Ok(Err(e)) => Err(e.to_string()),
+            Err(_) => Err(format!("timed out after {}ms", budget.as_millis())),
+        };
+        crate::health::observe_replay_local_aof(&self.network, verdict.is_ok(), started.elapsed());
+        verdict.map_err(|e| {
+            anyhow::anyhow!("WRITE replay nonce not fsynced to the local AOF (fail-closed): {e}")
+        })
+    }
+
+    pub fn with_replay_peers(mut self, peers: ReplayPeers) -> Self {
+        self.replay_peers = Some(Arc::new(peers));
+        self
+    }
+
+    /// Start the asynchronous nonce replication for REPLAY_PEER_MODE=async-reads|failover (a
+    /// no-op without peers or in `sync` mode). Must run inside the Tokio runtime.
+    pub fn with_async_replication(mut self, cfg: ReplicationConfig) -> Self {
+        let Some(peers) = self.replay_peers.clone() else {
+            return self;
+        };
+        if peers.mode() == ReplayPeerMode::Sync {
+            return self;
+        }
+        let cfg = ReplicationConfig {
+            mode: peers.mode(),
+            network: self.network.clone(),
+            ..cfg
+        };
+        let sink: Arc<dyn PeerSink> = peers;
+        self.replicator = Some(Arc::new(AsyncReplicator::start(sink, cfg)));
+        self
+    }
+
+    pub fn replay_peers(&self) -> Option<&ReplayPeers> {
+        self.replay_peers.as_deref()
+    }
+
+    pub fn replicator(&self) -> Option<&AsyncReplicator> {
+        self.replicator.as_deref()
+    }
+
+    /// The replay peer mode in force (`sync` without peers).
+    pub fn replay_peer_mode(&self) -> ReplayPeerMode {
+        self.replay_peers
+            .as_ref()
+            .map(|p| p.mode())
+            .unwrap_or(ReplayPeerMode::Sync)
+    }
+
+    pub fn network(&self) -> &str {
+        &self.network
+    }
+
+    fn pinned_key(&self, height: u64) -> String {
+        format!(
+            "pinned:{}:{}:treestate:v1:{}",
+            self.network, self.backend_host, height
+        )
+    }
+
+    fn pinned_cursor_key(&self) -> String {
+        format!(
+            "pinned:{}:{}:treestate:v1:backfill_cursor",
+            self.network, self.backend_host
+        )
+    }
+
+    /// Height of a height-only GetTreeState request inside the pinned range, if any.
+    fn pinned_height(&self, method: &str, path: &str, body: &[u8]) -> Option<u64> {
+        let (start, end) = self.pinned_range?;
+        self.pinned_conn.as_ref()?;
+        if method != "POST" || path != GET_TREE_STATE_PATH {
+            return None;
+        }
+        let id: BlockId = prost::Message::decode(grpc_message(body)?).ok()?;
+        if !id.hash.is_empty() || id.height < start || id.height > end {
+            return None;
+        }
+        Some(id.height)
+    }
+
+    async fn pinned_get(&self, height: u64) -> Option<Vec<u8>> {
+        let mut conn = self.pinned_conn.as_ref()?.clone();
+        match timeout(
+            self.redis_timeout,
+            conn.get::<_, Vec<u8>>(self.pinned_key(height)),
+        )
+        .await
+        {
+            Ok(Ok(v)) if !v.is_empty() => Some(v),
+            Ok(Ok(_)) => None,
+            Ok(Err(e)) => {
+                warn!(network = %self.network, height, error = %e, "pinned get error");
+                crate::health::record_cache_redis_timeout(&self.network, "pinned_get_error");
+                None
+            }
+            Err(_) => {
+                crate::health::record_cache_redis_timeout(&self.network, "pinned_get_timeout");
+                None
+            }
+        }
+    }
+
+    async fn pinned_exists(&self, height: u64) -> bool {
+        let Some(conn) = self.pinned_conn.as_ref() else {
+            return false;
+        };
+        let mut conn = conn.clone();
+        matches!(
+            timeout(
+                self.redis_timeout,
+                conn.exists::<_, bool>(self.pinned_key(height))
+            )
+            .await,
+            Ok(Ok(true))
+        )
+    }
+
+    /// True if `response` is a successful GetTreeState answer for exactly `height`.
+    fn is_tree_state_for(response: &[u8], height: u64) -> bool {
+        if !rpc_cache::should_admit(response, true) {
+            return false;
+        }
+        let Ok(resp) = bincode::deserialize::<crate::ohttp::InnerResponse>(response) else {
+            return false;
+        };
+        let Some(msg) = grpc_message(&resp.body) else {
+            return false;
+        };
+        match prost::Message::decode(msg) {
+            Ok(ts) => {
+                let ts: TreeStateHead = ts;
+                ts.height == height
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// Store a pinned entry. Only finalized heights (depth > FINALIZED_DEPTH against a fresh
+    /// tip) and only responses that decode to a TreeState for the same height. SET NX, no TTL.
+    async fn pinned_put(&self, height: u64, response: &[u8]) -> bool {
+        let Some(conn) = self.pinned_conn.as_ref() else {
+            return false;
+        };
+        let tip = self.tip_height();
+        if tip == 0 || tip.saturating_sub(height) <= FINALIZED_DEPTH {
+            return false;
+        }
+        if !Self::is_tree_state_for(response, height) {
+            return false;
+        }
+        let mut conn = conn.clone();
+        let res = timeout(
+            self.redis_timeout,
+            redis::cmd("SET")
+                .arg(self.pinned_key(height))
+                .arg(response)
+                .arg("NX")
+                .query_async::<_, Option<String>>(&mut conn),
+        )
+        .await;
+        match res {
+            Ok(Ok(_)) => true,
+            Ok(Err(e)) => {
+                warn!(network = %self.network, height, error = %e, "pinned set error");
+                crate::health::record_cache_redis_timeout(&self.network, "pinned_set_error");
+                false
+            }
+            Err(_) => {
+                crate::health::record_cache_redis_timeout(&self.network, "pinned_set_timeout");
+                false
+            }
+        }
+    }
+
+    /// The follower's tip height, 0 when unknown or stale.
+    pub fn tip_height(&self) -> u64 {
+        self.tip.get().map(|t| t.height).unwrap_or(0)
+    }
+
+    /// Whether a fresh tip is known.
+    pub fn is_tip_fresh(&self) -> bool {
+        self.tip.get().is_some()
+    }
+
+    /// Actual Redis PING check (cache, and security when configured). Updates
+    /// `ohttp_cache_redis_connected`.
+    async fn ping_redis(&self) -> bool {
+        let cache_ok = if let Some(cache_conn) = self.cache_conn.load_full() {
+            let mut cache_conn = (*cache_conn).clone();
+            match timeout(
+                self.redis_timeout,
+                redis::cmd("PING").query_async::<_, String>(&mut cache_conn),
+            )
+            .await
+            {
+                Ok(Ok(resp)) if resp == "PONG" => true,
+                Ok(Ok(_)) => {
+                    warn!("Redis PING returned unexpected response");
+                    false
+                }
+                Ok(Err(e)) => {
+                    warn!("Redis PING failed: {}", e);
+                    false
+                }
+                Err(_) => {
+                    warn!("Redis PING timeout");
+                    false
+                }
+            }
+        } else {
+            false
+        };
+        crate::health::record_cache_redis_connected(&self.network, cache_ok);
+
+        // Keep the WRITE-wait connection warm: a PING after a failover takes the broken
+        // connection's error here instead of in the next user's WRITE.
+        if let Some(ww) = &self.write_wait {
+            let mut conn = ww.conn.clone();
+            if let Ok(Err(e)) = timeout(
+                self.redis_timeout,
+                redis::cmd("PING").query_async::<_, String>(&mut conn),
+            )
+            .await
+            {
+                warn!(network = %self.network, error = %e, "Replay nonce WAIT connection PING failed (reconnecting)");
+            }
+        }
+
+        if let Some(peers) = &self.replay_peers {
+            peers.ping_all().await;
+        }
+
+        if let Some(ref sec) = self.security_conn {
+            let mut sec_conn = sec.clone();
+            let sec_ok = match timeout(
+                self.redis_timeout,
+                redis::cmd("PING").query_async::<_, String>(&mut sec_conn),
+            )
+            .await
+            {
+                Ok(Ok(resp)) if resp == "PONG" => true,
+                Ok(Ok(_)) => {
+                    warn!("Security Redis PING returned unexpected response");
+                    false
+                }
+                Ok(Err(e)) => {
+                    warn!("Security Redis PING failed: {}", e);
+                    false
+                }
+                Err(_) => {
+                    warn!("Security Redis PING timeout");
+                    false
+                }
+            };
+            crate::health::record_security_redis_connected(&self.network, sec_ok);
+            cache_ok && sec_ok
+        } else {
+            // No dedicated security Redis: replay checks fail closed, so the origin cannot serve.
+            crate::health::record_security_redis_connected(&self.network, false);
+            cache_ok
+        }
+    }
+
+    /// Check if a request is a replay (body hash already seen). Returns Ok(true) if replay detected.
+    /// Sets the hash in Redis with 600s TTL if not seen before.
+    /// Uses security_conn (noeviction) to prevent eviction of replay nonces.
+    /// Fails CLOSED if security_conn unavailable (replay protection is security-critical).
+    ///
+    /// Multi-origin (REPLAY_PEER_URLS) in `sync` mode: the nonce is written to every peer
+    /// origin's store at the same time as to the local one (so the peers add no latency beyond
+    /// their own round trip); a peer that already holds it makes the request a replay (recorded
+    /// first by that origin). Other modes consult the peers later, in `replicate_nonce`.
+    /// The local verdict is evaluated first and is fail-closed as before. A peer that does not
+    /// answer within REPLAY_PEER_TIMEOUT_MS is an error only with REPLAY_PEER_FAIL_CLOSED;
+    /// otherwise the local verdict stands and the outcome is counted (`ohttp_replay_peer_total`).
+    pub async fn check_replay(&self, body_hash: &[u8]) -> anyhow::Result<bool> {
+        let key = format!("replay:{}:{}", self.network, hex::encode(body_hash));
+
+        let mut conn = if let Some(ref sec) = self.security_conn {
+            sec.clone()
+        } else {
+            anyhow::bail!("Replay protection unavailable: REDIS_SECURITY_URL not configured");
+        };
+
+        let local = timeout(self.redis_timeout, async {
+            redis::cmd("SET")
+                .arg(&key)
+                .arg("1")
+                .arg("NX")
+                .arg("EX")
+                .arg(REPLAY_TTL_SECS)
+                .query_async::<_, Option<String>>(&mut conn)
+                .await
+        });
+        // Peers are consulted here, concurrently with the local store, in `sync` mode only. In
+        // `async-reads` and `failover` the inner request must be decapsulated and classified
+        // first (`replicate_nonce`), so this is the local verdict alone.
+        let sync_peers = self
+            .replay_peers
+            .as_ref()
+            .filter(|p| p.mode() == ReplayPeerMode::Sync);
+        let peers = async {
+            match sync_peers {
+                Some(p) => Some(p.write_nonce(&key, REPLAY_TTL_SECS).await),
+                None => None,
+            }
+        };
+        let (local, peer_outcomes) = tokio::join!(local, peers);
+
+        match local {
+            Ok(Ok(Some(_))) => {}
+            Ok(Ok(None)) => return Ok(true),
+            Ok(Err(e)) => {
+                anyhow::bail!(
+                    "Replay check failed on security connection (fail-closed): {}",
+                    e
+                );
+            }
+            Err(_) => {
+                anyhow::bail!(
+                    "Replay check timeout on security connection (fail-closed): {}ms",
+                    self.redis_timeout.as_millis()
+                );
+            }
+        }
+
+        let (Some(peers), Some(outcomes)) = (sync_peers, peer_outcomes) else {
+            return Ok(false);
+        };
+        self.peer_verdict(&outcomes, peers.fail_closed(), "REPLAY_PEER_FAIL_CLOSED")
+    }
+
+    fn peer_verdict(
+        &self,
+        outcomes: &[PeerOutcome],
+        fail_closed: bool,
+        policy: &str,
+    ) -> anyhow::Result<bool> {
+        match combine_peer_outcomes(outcomes) {
+            PeerVerdict::Fresh => Ok(false),
+            PeerVerdict::Replay => Ok(true),
+            PeerVerdict::Unavailable if fail_closed => {
+                anyhow::bail!(
+                    "Replay check failed at a peer origin ({policy}): {:?}",
+                    outcomes
+                )
+            }
+            PeerVerdict::Unavailable => {
+                warn!(
+                    network = %self.network,
+                    outcomes = ?outcomes,
+                    "Replay peer unavailable; proceeding on the local verdict"
+                );
+                Ok(false)
+            }
+        }
+    }
+
+    /// Cross-origin replay protection after the inner request is classified
+    /// (REPLAY_PEER_MODE=async-reads|failover). In `sync` mode `check_replay` already consulted
+    /// the peers: a READ is a no-op and a WRITE only waits for the peers' replica acknowledgement
+    /// (`confirm_replicated`). The nonce is already in the local store.
+    ///
+    /// - `failover`: enqueue for every peer, never wait. `Ok(false)`.
+    /// - `async-reads`, READ with healthy replication: enqueue. `Ok(false)`.
+    /// - `async-reads`, READ while replication is degraded (strict): synchronous `SET NX` at
+    ///   every peer; a peer that holds the nonce => `Ok(true)` (409); unavailable peers follow
+    ///   `REPLAY_PEER_FAIL_CLOSED`.
+    /// - `async-reads`, WRITE: synchronous, unavailable peers follow
+    ///   `REPLAY_PEER_FAIL_CLOSED_WRITES` (default fail-closed).
+    pub async fn replicate_nonce(
+        &self,
+        body_hash: &[u8],
+        class: RouteClass,
+    ) -> anyhow::Result<bool> {
+        let Some(peers) = &self.replay_peers else {
+            return Ok(false);
+        };
+        let key = format!("replay:{}:{}", self.network, hex::encode(body_hash));
+        match (peers.mode(), class) {
+            // check_replay already wrote the nonce to every peer; a WRITE waits for their
+            // replicas at the peers that are connected (a disconnected one was tolerated there).
+            (ReplayPeerMode::Sync, RouteClass::Write) => {
+                peers
+                    .confirm_replicated(&key, |i| peers.connected(i))
+                    .await?;
+                Ok(false)
+            }
+            (ReplayPeerMode::Sync, RouteClass::Read) => Ok(false),
+            (ReplayPeerMode::Failover, _) => {
+                if let Some(r) = &self.replicator {
+                    r.enqueue(&key);
+                }
+                Ok(false)
+            }
+            (ReplayPeerMode::AsyncReads, RouteClass::Read) => {
+                let strict = match &self.replicator {
+                    Some(r) if r.health().effective() == Effective::Relaxed => {
+                        r.enqueue(&key);
+                        return Ok(false);
+                    }
+                    Some(_) => true,
+                    // No replicator (cannot happen in main; tests): synchronous.
+                    None => true,
+                };
+                debug_assert!(strict);
+                let outcomes = peers.write_nonce(&key, REPLAY_TTL_SECS).await;
+                self.peer_verdict(&outcomes, peers.fail_closed(), "REPLAY_PEER_FAIL_CLOSED")
+            }
+            (ReplayPeerMode::AsyncReads, RouteClass::Write) => {
+                let outcomes = peers.write_nonce(&key, REPLAY_TTL_SECS).await;
+                let replay = self.peer_verdict(
+                    &outcomes,
+                    peers.fail_closed_writes(),
+                    "REPLAY_PEER_FAIL_CLOSED_WRITES",
+                )?;
+                // The peers that stored the nonce (the shared store, while reachable) must have
+                // it on their replicas before the WRITE runs. A peer that did not answer was
+                // tolerated by the verdict above (REPLAY_PEER_FAIL_CLOSED_WRITES=0 while the peers
+                // are down).
+                if !replay {
+                    let fresh = |i: usize| outcomes.get(i) == Some(&PeerOutcome::Fresh);
+                    peers.confirm_replicated(&key, fresh).await?;
+                    // No peer took it (tolerated): only the local store holds the nonce, so it
+                    // must survive a crash of this host (REPLAY_LOCAL_WAITAOF_MS).
+                    if !outcomes.contains(&PeerOutcome::Fresh) {
+                        self.confirm_nonce_local_aof(&key).await?;
+                    }
+                }
+                Ok(replay)
+            }
+        }
+    }
+
+    /// The shared epoch from Redis, initialised atomically (SET NX) to the current Unix time
+    /// when missing (an existing epoch is kept). Returns the local value on error.
+    pub async fn get_shared_epoch(&self) -> u64 {
+        let key = format!("epoch:{}", self.network);
+
+        let mut conn = if let Some(ref sec) = self.security_conn {
+            sec.clone()
+        } else if let Some(cache) = self.cache_conn.load_full().map(|c| (*c).clone()) {
+            cache
+        } else {
+            return self.epoch.load(Ordering::Relaxed);
+        };
+
+        let initial_epoch = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let _ = timeout(self.redis_timeout, async {
+            redis::cmd("SET")
+                .arg(&key)
+                .arg(initial_epoch)
+                .arg("NX")
+                .query_async::<_, Option<String>>(&mut conn)
+                .await
+        })
+        .await;
+
+        match timeout(self.redis_timeout, conn.get::<_, Option<u64>>(&key)).await {
+            Ok(Ok(Some(epoch))) => {
+                self.epoch.store(epoch, Ordering::Relaxed);
+                self.last_epoch_sync.store(
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs(),
+                    Ordering::Relaxed,
+                );
+                epoch
+            }
+            Ok(Ok(None)) => {
+                let fallback_epoch = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs();
+                warn!(
+                    fallback_epoch,
+                    "Epoch key vanished after SET NX, using timestamp"
+                );
+                fallback_epoch
+            }
+            Ok(Err(e)) => {
+                warn!(network = %self.network, error = %e, "Failed to read shared epoch from Redis");
+                crate::health::record_cache_redis_timeout(&self.network, "epoch_error");
+                self.epoch.load(Ordering::Relaxed)
+            }
+            Err(_) => {
+                warn!(network = %self.network, timeout_ms = self.redis_timeout.as_millis(), "Epoch GET timeout");
+                crate::health::record_cache_redis_timeout(&self.network, "epoch_timeout");
+                self.epoch.load(Ordering::Relaxed)
+            }
+        }
+    }
+
+    /// Refresh epoch from Redis if stale (> EPOCH_REFRESH_SECS since last sync).
+    async fn refresh_epoch_if_stale(&self) -> u64 {
+        let last_sync = self.last_epoch_sync.load(Ordering::Relaxed);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        if now.saturating_sub(last_sync) > EPOCH_REFRESH_SECS {
+            self.get_shared_epoch().await
+        } else {
+            self.epoch.load(Ordering::Relaxed)
+        }
+    }
+
+    /// Prefix of every cached entry of this epoch.
+    pub fn key_prefix_for_epoch(&self, epoch: u64) -> String {
+        format!(
+            "ohttp:{}:{}:{}:v{}:{}:",
+            self.network, self.backend_host, epoch, KEY_VERSION, self.policy_hash
+        )
+    }
+
+    /// Prefix of the chain state (index, tip, leader lock).
+    pub fn chain_key_prefix(&self) -> String {
+        format!("ohttp:{}:{}:chain:v1:", self.network, self.backend_host)
+    }
+
+    /// Writes `value` under `cache_key` only if the shared epoch still equals `epoch_at_read`.
+    /// Returns whether the entry was written.
+    ///
+    /// The epoch lives in the security Redis while entries live in the cache Redis, so the
+    /// check reads the epoch from the security connection; no single-server script can span
+    /// both servers. A reorg or operator bump landing between the epoch read and the write is
+    /// harmless because the key embeds `epoch_at_read` and readers use the new epoch's keys.
+    /// Without a security connection (single Redis) the check stays one atomic script.
+    async fn write_if_epoch_current(
+        &self,
+        cache_key: &str,
+        epoch_at_read: u64,
+        value: &[u8],
+        ttl: Option<u64>,
+    ) -> redis::RedisResult<bool> {
+        let epoch_key = format!("epoch:{}", self.network);
+        let mut cache_conn = match self.cache_conn.load_full().map(|c| (*c).clone()) {
+            Some(c) => c,
+            None => return Ok(false),
+        };
+
+        if let Some(ref sec) = self.security_conn {
+            let mut sec = sec.clone();
+            let current: Option<u64> = redis::cmd("GET")
+                .arg(&epoch_key)
+                .query_async(&mut sec)
+                .await?;
+            if current != Some(epoch_at_read) {
+                return Ok(false);
+            }
+            let mut cmd = redis::cmd("SET");
+            cmd.arg(cache_key).arg(value);
+            if let Some(t) = ttl {
+                cmd.arg("EX").arg(t);
+            }
+            cmd.query_async::<_, ()>(&mut cache_conn).await?;
+            return Ok(true);
+        }
+
+        let lua_script = r#"
+            local epoch_key = KEYS[1]
+            local cache_key = KEYS[2]
+            local expected_epoch = tonumber(ARGV[1])
+            local value = ARGV[2]
+            local ttl = tonumber(ARGV[3])
+
+            local current_epoch = tonumber(redis.call('GET', epoch_key) or '0')
+            if current_epoch == expected_epoch then
+                if ttl > 0 then
+                    redis.call('SET', cache_key, value, 'EX', ttl)
+                else
+                    redis.call('SET', cache_key, value)
+                end
+                return 1
+            else
+                return 0
+            end
+        "#;
+        let written: i32 = redis::Script::new(lua_script)
+            .key(&epoch_key)
+            .key(cache_key)
+            .arg(epoch_at_read)
+            .arg(value)
+            .arg(ttl.unwrap_or(0))
+            .invoke_async(&mut cache_conn)
+            .await?;
+        Ok(written == 1)
+    }
+
+    /// Serve from cache, or call `fetch`, store and return (the collecting proxy path).
+    /// `fetch` returns a bincode `InnerResponse`.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn get_or_fetch<F, Fut>(
+        &self,
+        method: &str,
+        content_type: &str,
+        path: &str,
+        headers: &[(String, String)],
+        body: &[u8],
+        cache_get_semaphore: &tokio::sync::Semaphore,
+        fetch: F,
+    ) -> anyhow::Result<Vec<u8>>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = anyhow::Result<Vec<u8>>>,
+    {
+        match self
+            .lookup(
+                method,
+                content_type,
+                path,
+                headers,
+                body,
+                cache_get_semaphore,
+            )
+            .await
+        {
+            CacheLookup::Hit(bytes) => Ok(bytes),
+            CacheLookup::Bypass => fetch().await,
+            CacheLookup::Miss(ticket) => {
+                let response = fetch().await?;
+                self.store(ticket, &response).await;
+                Ok(response)
+            }
+        }
+    }
+
+    /// The read half: Authorization bypass, the pinned tier first, then the chain-validated
+    /// policy of `rpc_cache`. Records the cache metrics.
+    pub async fn lookup(
+        &self,
+        method: &str,
+        content_type: &str,
+        path: &str,
+        headers: &[(String, String)],
+        body: &[u8],
+        cache_get_semaphore: &tokio::sync::Semaphore,
+    ) -> CacheLookup {
+        let rpc = crate::health::normalize_rpc_name(path, method);
+        if headers
+            .iter()
+            .any(|(k, _)| k.eq_ignore_ascii_case("authorization"))
+        {
+            debug!(path, network = %self.network, "cache bypass (authorization header)");
+            crate::health::record_cache_request(&self.network, &rpc, "bypass");
+            return CacheLookup::Bypass;
+        }
+        if self.cache_conn.load().is_none() {
+            debug!(network = %self.network, "Cache not connected, bypassing");
+            crate::health::record_cache_request(&self.network, &rpc, "bypass");
+            return CacheLookup::Bypass;
+        }
+        let Ok(_permit) = cache_get_semaphore.try_acquire() else {
+            debug!("Cache-get semaphore exhausted, bypassing cache");
+            crate::health::record_cache_request(&self.network, &rpc, "semaphore_full");
+            return CacheLookup::Bypass;
+        };
+
+        let pinned_height = self.pinned_height(method, path, body);
+        if let Some(height) = pinned_height {
+            if let Some(bytes) = self.pinned_get(height).await {
+                debug!(height, network = %self.network, "pinned hit");
+                crate::health::record_cache_request(&self.network, &rpc, "pinned_hit");
+                return CacheLookup::Hit(bytes);
+            }
+            crate::health::record_cache_request(&self.network, &rpc, "pinned_miss");
+        }
+
+        match rpc_cache::lookup(self, &self.network, method, content_type, path, body).await {
+            CacheLookup::Miss(mut miss) => {
+                miss.pinned_height = pinned_height;
+                CacheLookup::Miss(miss)
+            }
+            other => other,
+        }
+    }
+
+    /// The write half: admit `response` (a bincode `InnerResponse`) under the miss ticket and
+    /// write it through to the pinned tier when the request was pinned.
+    pub async fn store(&self, miss: CacheMiss, response: &[u8]) {
+        let pinned_height = miss.pinned_height;
+        rpc_cache::store(self, &self.network, miss, response).await;
+        if let Some(height) = pinned_height {
+            self.pinned_put(height, response).await;
+        }
+    }
+
+    /// The current cache epoch: third-party answer keys include it, so an epoch bump flushes
+    /// them with the other epoch-scoped entries.
+    pub fn current_epoch(&self) -> u64 {
+        self.epoch.load(Ordering::Relaxed)
+    }
+
+    /// Read a third-party answer (`third_party_cache`). Fail-open: a Redis error or timeout is
+    /// a miss.
+    pub async fn get_third_party(&self, key: &str) -> Option<Vec<u8>> {
+        let conn = self.cache_conn.load_full()?;
+        let mut conn = (*conn).clone();
+        match timeout(self.redis_timeout, conn.get::<_, Option<Vec<u8>>>(key)).await {
+            Ok(Ok(data)) => data,
+            Ok(Err(e)) => {
+                warn!(error = %e, "third-party cache get error");
+                None
+            }
+            Err(_) => {
+                crate::health::record_cache_redis_timeout(&self.network, "third_party_get");
+                None
+            }
+        }
+    }
+
+    /// Store a third-party answer for `ttl_secs`. Fail-open: an error only logs.
+    pub async fn put_third_party(&self, key: &str, data: &[u8], ttl_secs: u64) {
+        let Some(conn) = self.cache_conn.load_full() else {
+            return;
+        };
+        let mut conn = (*conn).clone();
+        match timeout(
+            self.redis_timeout,
+            conn.set_ex::<_, _, ()>(key, data, ttl_secs),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => warn!(error = %e, "third-party cache put error"),
+            Err(_) => crate::health::record_cache_redis_timeout(&self.network, "third_party_put"),
+        }
+    }
+}
+
+/// The chain-validated cache's store, on the cache Redis (allkeys-lru, fail-open).
+impl CacheStore for ResponseCache {
+    fn epoch(&self) -> BoxFuture<'_, u64> {
+        Box::pin(self.refresh_epoch_if_stale())
+    }
+
+    fn key_prefix(&self, epoch: u64) -> String {
+        self.key_prefix_for_epoch(epoch)
+    }
+
+    fn chain_prefix(&self) -> String {
+        self.chain_key_prefix()
+    }
+
+    fn tip_cell(&self) -> &TipCell {
+        &self.tip
+    }
+
+    fn mget(&self, keys: Vec<String>) -> BoxFuture<'_, Vec<Option<Bytes>>> {
+        Box::pin(async move {
+            let n = keys.len();
+            if n == 0 {
+                return Vec::new();
+            }
+            let Some(conn) = self.cache_conn.load_full() else {
+                return vec![None; n];
+            };
+            let mut conn = (*conn).clone();
+            let mut cmd = redis::cmd("MGET");
+            cmd.arg(&keys);
+            let fut = cmd.query_async::<_, Vec<Option<Vec<u8>>>>(&mut conn);
+            match timeout(self.redis_timeout, fut).await {
+                Ok(Ok(values)) if values.len() == n => {
+                    values.into_iter().map(|v| v.map(Bytes::from)).collect()
+                }
+                Ok(Ok(_)) => vec![None; n],
+                Ok(Err(e)) => {
+                    warn!(network = %self.network, error = %e, "cache mget error");
+                    crate::health::record_cache_redis_timeout(&self.network, "mget_error");
+                    vec![None; n]
+                }
+                Err(_) => {
+                    warn!(network = %self.network, timeout_ms = self.redis_timeout.as_millis(), "cache mget timeout");
+                    crate::health::record_cache_redis_timeout(&self.network, "mget_timeout");
+                    vec![None; n]
+                }
+            }
+        })
+    }
+
+    fn set(
+        &self,
+        key: String,
+        value: Bytes,
+        ttl_secs: Option<u64>,
+        epoch: Option<u64>,
+    ) -> BoxFuture<'_, ()> {
+        Box::pin(async move {
+            let result = match epoch {
+                Some(e) => {
+                    timeout(
+                        self.redis_timeout,
+                        self.write_if_epoch_current(&key, e, &value, ttl_secs),
+                    )
+                    .await
+                }
+                None => {
+                    let Some(conn) = self.cache_conn.load_full() else {
+                        return;
+                    };
+                    let mut conn = (*conn).clone();
+                    let mut cmd = redis::cmd("SET");
+                    cmd.arg(&key).arg(&value[..]);
+                    if let Some(t) = ttl_secs {
+                        cmd.arg("EX").arg(t);
+                    }
+                    timeout(self.redis_timeout, async move {
+                        cmd.query_async::<_, ()>(&mut conn).await.map(|_| true)
+                    })
+                    .await
+                }
+            };
+            match result {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => {
+                    warn!(network = %self.network, error = %e, "cache set error");
+                    crate::health::record_cache_redis_timeout(&self.network, "set_error");
+                }
+                Err(_) => {
+                    crate::health::record_cache_redis_timeout(&self.network, "set_timeout");
+                }
+            }
+        })
+    }
+
+    fn del(&self, keys: Vec<String>) -> BoxFuture<'_, ()> {
+        Box::pin(async move {
+            if keys.is_empty() {
+                return;
+            }
+            let Some(conn) = self.cache_conn.load_full() else {
+                return;
+            };
+            let mut conn = (*conn).clone();
+            let mut cmd = redis::cmd("DEL");
+            cmd.arg(&keys);
+            let fut = cmd.query_async::<_, i64>(&mut conn);
+            match timeout(self.redis_timeout, fut).await {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => {
+                    warn!(network = %self.network, error = %e, "cache del error");
+                    crate::health::record_cache_redis_timeout(&self.network, "del_error");
+                }
+                Err(_) => {
+                    crate::health::record_cache_redis_timeout(&self.network, "del_timeout");
+                }
+            }
+        })
+    }
+
+    fn set_nx_px(&self, key: String, value: String, ttl_ms: u64) -> BoxFuture<'_, Option<bool>> {
+        Box::pin(async move {
+            let conn = self.cache_conn.load_full()?;
+            let mut conn = (*conn).clone();
+            let mut cmd = redis::cmd("SET");
+            cmd.arg(&key).arg(&value).arg("NX").arg("PX").arg(ttl_ms);
+            let fut = cmd.query_async::<_, Option<String>>(&mut conn);
+            match timeout(self.redis_timeout, fut).await {
+                Ok(Ok(v)) => Some(v.is_some()),
+                Ok(Err(e)) => {
+                    warn!(network = %self.network, error = %e, "leader lock set error");
+                    crate::health::record_cache_redis_timeout(&self.network, "lock_error");
+                    None
+                }
+                Err(_) => {
+                    crate::health::record_cache_redis_timeout(&self.network, "lock_timeout");
+                    None
+                }
+            }
+        })
+    }
+
+    fn pexpire_if_equal(
+        &self,
+        key: String,
+        value: String,
+        ttl_ms: u64,
+    ) -> BoxFuture<'_, Option<bool>> {
+        Box::pin(async move {
+            let conn = self.cache_conn.load_full()?;
+            let mut conn = (*conn).clone();
+            let script = r#"
+                if redis.call('GET', KEYS[1]) == ARGV[1] then
+                    return redis.call('PEXPIRE', KEYS[1], ARGV[2])
+                else
+                    return 0
+                end
+            "#;
+            let script = redis::Script::new(script);
+            let mut invocation = script.key(&key);
+            invocation.arg(&value).arg(ttl_ms);
+            let fut = invocation.invoke_async::<_, i64>(&mut conn);
+            match timeout(self.redis_timeout, fut).await {
+                Ok(Ok(v)) => Some(v == 1),
+                Ok(Err(e)) => {
+                    warn!(network = %self.network, error = %e, "leader lock renew error");
+                    crate::health::record_cache_redis_timeout(&self.network, "lock_error");
+                    None
+                }
+                Err(_) => {
+                    crate::health::record_cache_redis_timeout(&self.network, "lock_timeout");
+                    None
+                }
+            }
+        })
+    }
+}
+
+/// The permanent block tier on a disk-backed Redis-protocol store. Plain PING/GET/MGET/SET/MSET/DEL
+/// only: no TTL, no epoch check, no Lua, so it works on any store that implements those.
+/// Fail-open with the same operation timeout as the cache; errors are counted under
+/// `ohttp_redis_op_timeout_total` with `perm_*` operations.
+#[derive(Clone)]
+pub struct PermanentRedis {
+    conn: ConnectionManager,
+    timeout: Duration,
+    network: String,
+}
+
+impl PermanentRedis {
+    pub async fn connect(url: &str, op_timeout_ms: u64, network: String) -> anyhow::Result<Self> {
+        let client = redis::Client::open(url)?;
+        let conn = ConnectionManager::new(client).await?;
+        let this = Self {
+            conn,
+            timeout: Duration::from_millis(op_timeout_ms),
+            network,
+        };
+        // Fail startup on an unreachable store so a misconfiguration is visible; the request
+        // paths stay fail-open afterwards.
+        let mut c = this.conn.clone();
+        let pong: String = timeout(this.timeout, redis::cmd("PING").query_async(&mut c)).await??;
+        anyhow::ensure!(pong == "PONG", "permanent store PING answered {pong}");
+        Ok(this)
+    }
+
+    /// `PING`, for the housekeeping gauge.
+    pub async fn ping(&self) -> bool {
+        let mut c = self.conn.clone();
+        matches!(
+            timeout(self.timeout, redis::cmd("PING").query_async::<_, String>(&mut c)).await,
+            Ok(Ok(p)) if p == "PONG"
+        )
+    }
+
+    /// Run `cmd`, mapping errors and timeouts to `None` and counting them.
+    async fn run<T: redis::FromRedisValue + Send>(&self, op: &str, cmd: redis::Cmd) -> Option<T> {
+        let mut c = self.conn.clone();
+        match timeout(self.timeout, cmd.query_async::<_, T>(&mut c)).await {
+            Ok(Ok(v)) => Some(v),
+            Ok(Err(e)) => {
+                warn!(network = %self.network, op, error = %e, "permanent store error");
+                crate::health::record_cache_redis_timeout(
+                    &self.network,
+                    &format!("perm_{op}_error"),
+                );
+                None
+            }
+            Err(_) => {
+                crate::health::record_cache_redis_timeout(
+                    &self.network,
+                    &format!("perm_{op}_timeout"),
+                );
+                None
+            }
+        }
+    }
+}
+
+impl PermanentStore for PermanentRedis {
+    fn mget(&self, keys: Vec<String>) -> BoxFuture<'_, Vec<Option<Bytes>>> {
+        Box::pin(async move {
+            let n = keys.len();
+            if n == 0 {
+                return Vec::new();
+            }
+            let mut cmd = redis::cmd("MGET");
+            cmd.arg(&keys);
+            match self.run::<Vec<Option<Vec<u8>>>>("mget", cmd).await {
+                Some(values) if values.len() == n => {
+                    values.into_iter().map(|v| v.map(Bytes::from)).collect()
+                }
+                _ => vec![None; n],
+            }
+        })
+    }
+
+    fn set(&self, key: String, value: Bytes) -> BoxFuture<'_, bool> {
+        Box::pin(async move {
+            let mut cmd = redis::cmd("SET");
+            cmd.arg(&key).arg(&value[..]);
+            self.run::<()>("set", cmd).await.is_some()
+        })
+    }
+
+    /// `MSET` in chunks, flushed at 64 entries or once ~8 MiB is reached.
+    fn set_many(&self, entries: Vec<(String, Bytes)>) -> BoxFuture<'_, bool> {
+        Box::pin(async move {
+            let mut ok = true;
+            let mut chunk: Vec<&(String, Bytes)> = Vec::new();
+            let mut bytes = 0usize;
+            let flush = |chunk: &mut Vec<&(String, Bytes)>, bytes: &mut usize| {
+                let mut cmd = redis::cmd("MSET");
+                for (k, v) in chunk.iter() {
+                    cmd.arg(k).arg(&v[..]);
+                }
+                chunk.clear();
+                *bytes = 0;
+                cmd
+            };
+            for e in &entries {
+                chunk.push(e);
+                bytes += e.1.len();
+                if chunk.len() >= 64 || bytes >= 8 * 1024 * 1024 {
+                    let cmd = flush(&mut chunk, &mut bytes);
+                    ok &= self.run::<()>("mset", cmd).await.is_some();
+                }
+            }
+            if !chunk.is_empty() {
+                let cmd = flush(&mut chunk, &mut bytes);
+                ok &= self.run::<()>("mset", cmd).await.is_some();
+            }
+            ok
+        })
+    }
+
+    fn del(&self, keys: Vec<String>) -> BoxFuture<'_, ()> {
+        Box::pin(async move {
+            if keys.is_empty() {
+                return;
+            }
+            let mut cmd = redis::cmd("DEL");
+            cmd.arg(&keys);
+            self.run::<i64>("del", cmd).await;
+        })
+    }
+}
+
+/// Ping the permanent store every `HOUSEKEEPING_SECS` for `ohttp_permanent_store_connected`.
+pub fn spawn_permanent_housekeeping(store: PermanentRedis) {
+    tokio::spawn(async move {
+        loop {
+            let ok = store.ping().await;
+            crate::health::record_permanent_connected(&store.network, ok);
+            if !ok {
+                warn!(network = %store.network, "permanent store PING failed");
+            }
+            tokio::time::sleep(Duration::from_secs(HOUSEKEEPING_SECS)).await;
+        }
+    });
+}
+
+/// Spawn the Redis housekeeping task: sync the shared epoch and PING both Redis roles every
+/// `HOUSEKEEPING_SECS`, updating `ohttp_redis_connected`. (The tip is the chain follower's.)
+pub fn spawn_redis_housekeeping(cache: ResponseCache) {
+    tokio::spawn(async move {
+        cache.get_shared_epoch().await;
+        let redis_ok = cache.ping_redis().await;
+        crate::health::record_redis_connected(&cache.network, redis_ok);
+        if redis_ok {
+            info!(network = %cache.network, "Redis PING successful on startup");
+        } else {
+            warn!(network = %cache.network, "Redis PING failed on startup, will retry");
+        }
+        loop {
+            tokio::time::sleep(Duration::from_secs(HOUSEKEEPING_SECS)).await;
+            let epoch = cache.get_shared_epoch().await;
+            debug!(network = %cache.network, epoch, "Synced shared cache epoch from Redis");
+            let redis_ok = cache.ping_redis().await;
+            crate::health::record_redis_connected(&cache.network, redis_ok);
+            if !redis_ok {
+                warn!(network = %cache.network, "Redis connectivity check failed, will retry");
+            }
+        }
+    });
+}
+
+/// Spawn a background task that retries cache Redis connection with exponential backoff.
+/// Backs off from 1s to 60s max. Stops once connection succeeds.
+fn spawn_cache_reconnect_task(cache: ResponseCache) {
+    tokio::spawn(async move {
+        let mut backoff_secs = 1u64;
+        const MAX_BACKOFF: u64 = 60;
+
+        loop {
+            tokio::time::sleep(tokio::time::Duration::from_secs(backoff_secs)).await;
+
+            info!(
+                network = %cache.network,
+                backoff_secs,
+                "Attempting to reconnect to Redis cache..."
+            );
+
+            if cache.try_reconnect_cache().await {
+                crate::health::record_cache_redis_connected(&cache.network, true);
+                info!(network = %cache.network, "Redis cache connection established, stopping retry task");
+                return;
+            }
+
+            backoff_secs = (backoff_secs * 2).min(MAX_BACKOFF);
+            crate::health::record_cache_redis_connected(&cache.network, false);
+        }
+    });
+}
+
+/// Spawn `workers` tasks that fill the pinned tier for every height in PINNED_TREESTATE_RANGE.
+/// Heights are claimed with INCR on a cursor in the pinned Redis, so all gateway processes share
+/// one pass and a restart resumes where it stopped. A height that keeps failing is skipped (the
+/// write-through path fills it later). Stops at the range end; at tip - FINALIZED_DEPTH it gives
+/// the height back to the cursor and waits, then follows the tip as blocks become final, so the
+/// tier keeps up with the tip (origins that read it from a replica of that Redis stay current too).
+pub fn spawn_pinned_backfill<F, Fut>(cache: ResponseCache, workers: usize, fetch: F)
+where
+    F: Fn(u64) -> Fut + Clone + Send + Sync + 'static,
+    Fut: std::future::Future<Output = anyhow::Result<Vec<u8>>> + Send + 'static,
+{
+    let (Some((start, end)), Some(conn)) = (cache.pinned_range, cache.pinned_conn.clone()) else {
+        return;
+    };
+    for worker in 0..workers {
+        let cache = cache.clone();
+        let fetch = fetch.clone();
+        let mut conn = conn.clone();
+        tokio::spawn(async move {
+            // Wait for a fresh tip so pinned_put's finality check can pass.
+            while !cache.is_tip_fresh() {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+            info!(network = %cache.network, worker, start, end, "pinned backfill worker started");
+            loop {
+                let n: u64 = match redis::cmd("INCR")
+                    .arg(cache.pinned_cursor_key())
+                    .query_async(&mut conn)
+                    .await
+                {
+                    Ok(n) => n,
+                    Err(e) => {
+                        warn!(network = %cache.network, error = %e, "pinned backfill cursor error");
+                        tokio::time::sleep(Duration::from_secs(10)).await;
+                        continue;
+                    }
+                };
+                let height = start.saturating_add(n - 1);
+                let limit = end.min(cache.tip_height().saturating_sub(FINALIZED_DEPTH + 1));
+                if height > end {
+                    info!(network = %cache.network, worker, height, "pinned backfill done");
+                    return;
+                }
+                if height > limit {
+                    // Caught up: hand the height back and wait for the next final block.
+                    let _: redis::RedisResult<i64> = redis::cmd("DECR")
+                        .arg(cache.pinned_cursor_key())
+                        .query_async(&mut conn)
+                        .await;
+                    tokio::time::sleep(PINNED_FOLLOW_INTERVAL).await;
+                    continue;
+                }
+                if cache.pinned_exists(height).await {
+                    continue;
+                }
+                let mut stored = false;
+                for attempt in 0..3u64 {
+                    match fetch(height).await {
+                        Ok(resp) => {
+                            if cache.pinned_put(height, &resp).await {
+                                stored = true;
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            debug!(network = %cache.network, height, error = %e, "pinned backfill fetch error");
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_secs(1 + attempt * 2)).await;
+                }
+                let result = if stored {
+                    "pinned_backfill"
+                } else {
+                    "pinned_backfill_failed"
+                };
+                crate::health::record_cache_request(&cache.network, "GetTreeState", result);
+                if height.is_multiple_of(1000) {
+                    info!(network = %cache.network, worker, height, "pinned backfill progress");
+                }
+            }
+        });
+    }
+}
+
+#[cfg(test)]
+mod pinned_tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_pinned_range() {
+        assert_eq!(
+            parse_pinned_range("1710000-2050000"),
+            Some((1_710_000, 2_050_000))
+        );
+        assert_eq!(parse_pinned_range("1-"), Some((1, u64::MAX)));
+        assert_eq!(parse_pinned_range("0-10"), None);
+        assert_eq!(parse_pinned_range("10-5"), None);
+        assert_eq!(parse_pinned_range("abc"), None);
+    }
+
+    #[test]
+    fn test_tree_state_request_roundtrip() {
+        let body = grpc_tree_state_request(1_775_116);
+        let id: BlockId = prost::Message::decode(&body[5..]).unwrap();
+        assert_eq!(id.height, 1_775_116);
+        assert!(id.hash.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A cache on `conn` (and optionally a security connection) for the Redis-gated tests.
+    fn test_cache(
+        conn: ConnectionManager,
+        security: Option<ConnectionManager>,
+        network: &str,
+    ) -> ResponseCache {
+        ResponseCache {
+            cache_conn: Arc::new(ArcSwapOption::from(Some(Arc::new(conn)))),
+            security_conn: security,
+            tip: Arc::new(TipCell::new()),
+            epoch: Arc::new(AtomicU64::new(0)),
+            network: network.to_string(),
+            backend_host: "lwd.example.com:9067".to_string(),
+            last_epoch_sync: Arc::new(AtomicU64::new(0)),
+            redis_timeout: Duration::from_millis(250),
+            policy_hash: "test".to_string(),
+            pinned_conn: None,
+            pinned_range: None,
+            cache_redis_url: "redis://127.0.0.1:6379".to_string(),
+            replay_peers: None,
+            replicator: None,
+            write_wait: None,
+            local_aof: None,
+        }
+    }
+
+    async fn local_redis() -> Option<ConnectionManager> {
+        let client = redis::Client::open("redis://127.0.0.1:6379").ok()?;
+        ConnectionManager::new(client).await.ok()
+    }
+
+    /// `cargo test` runs these tests twice (lib and bin targets) against the same Redis, and
+    /// replay nonces live 600 s: hash inputs must differ per process.
+    fn unique(s: &str) -> Vec<u8> {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        format!("{s} {nanos} {}", std::process::id()).into_bytes()
+    }
+
+    #[test]
+    fn test_write_wait_config_parse() {
+        assert_eq!(
+            WriteWaitConfig::parse(None, None).unwrap(),
+            None,
+            "off by default"
+        );
+        assert_eq!(
+            WriteWaitConfig::parse(Some("0"), Some("50")).unwrap(),
+            None,
+            "0 = off"
+        );
+        assert_eq!(WriteWaitConfig::parse(Some(" "), None).unwrap(), None);
+        assert_eq!(
+            WriteWaitConfig::parse(Some("1"), None).unwrap(),
+            Some(WriteWaitConfig {
+                replicas: 1,
+                timeout_ms: DEFAULT_REPLAY_WRITE_WAIT_MS
+            })
+        );
+        assert_eq!(
+            WriteWaitConfig::parse(Some("2"), Some("250")).unwrap(),
+            Some(WriteWaitConfig {
+                replicas: 2,
+                timeout_ms: 250
+            })
+        );
+        assert!(WriteWaitConfig::parse(Some("-1"), None).is_err());
+        assert!(WriteWaitConfig::parse(Some("one"), None).is_err());
+        assert!(WriteWaitConfig::parse(Some("1"), Some("0")).is_err());
+        assert!(WriteWaitConfig::parse(Some("1"), Some("fast")).is_err());
+    }
+
+    #[tokio::test]
+    async fn test_confirm_nonce_replicated_is_a_noop_when_off() {
+        let Some(conn) = local_redis().await else {
+            return;
+        };
+        let c = test_cache(conn.clone(), Some(conn), "testnet-writewait-off");
+        assert_eq!(c.write_wait(), None);
+        assert!(c.confirm_nonce_replicated(b"anything").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_confirm_nonce_replicated_fails_closed_without_replicas() {
+        let Some(conn) = local_redis().await else {
+            return;
+        };
+        // A standalone test Redis has no replica, so WAIT 1 returns 0 after the timeout.
+        let c = test_cache(conn.clone(), Some(conn), "testnet-writewait")
+            .with_write_wait(
+                "redis://127.0.0.1:6379",
+                WriteWaitConfig {
+                    replicas: 1,
+                    timeout_ms: 30,
+                },
+            )
+            .await
+            .unwrap();
+        let h = sha2::Sha256::digest(unique("write wait"));
+        assert!(!c.check_replay(&h).await.unwrap(), "first sight");
+        let t = std::time::Instant::now();
+        let err = c
+            .confirm_nonce_replicated(&h)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("0 of 1 replica"), "{err}");
+        assert!(
+            t.elapsed() >= Duration::from_millis(25),
+            "WAIT honoured its timeout: {:?}",
+            t.elapsed()
+        );
+        assert!(
+            c.check_replay(&h).await.unwrap(),
+            "the nonce is still held (SET XX kept it)"
+        );
+    }
+
+    #[test]
+    fn test_authorization_bypass() {
+        let headers_with_auth = [
+            ("content-type".to_string(), "application/grpc".to_string()),
+            ("Authorization".to_string(), "Bearer token".to_string()),
+        ];
+        let headers_without_auth = [("content-type".to_string(), "application/grpc".to_string())];
+
+        assert!(headers_with_auth
+            .iter()
+            .any(|(k, _)| k.eq_ignore_ascii_case("authorization")));
+        assert!(!headers_without_auth
+            .iter()
+            .any(|(k, _)| k.eq_ignore_ascii_case("authorization")));
+    }
+
+    #[tokio::test]
+    async fn test_key_prefixes() {
+        // Skip without a local Redis.
+        let Some(conn) = local_redis().await else {
+            return;
+        };
+        let cache = test_cache(conn, None, "testnet");
+        assert_eq!(
+            cache.key_prefix_for_epoch(7),
+            "ohttp:testnet:lwd.example.com:9067:7:v4:test:"
+        );
+        assert_eq!(
+            cache.chain_key_prefix(),
+            "ohttp:testnet:lwd.example.com:9067:chain:v1:"
+        );
+        assert_ne!(cache.key_prefix_for_epoch(7), cache.key_prefix_for_epoch(8));
+    }
+
+    #[tokio::test]
+    async fn test_replay_cache() {
+        let Some(conn) = local_redis().await else {
+            return;
+        };
+        let cache = test_cache(conn.clone(), Some(conn), "testnet");
+
+        let body1 = &unique("unique request body 1");
+        let body2 = &unique("unique request body 2");
+
+        let is_replay = cache.check_replay(body1).await.unwrap();
+        assert!(!is_replay, "First request should not be replay");
+        let is_replay = cache.check_replay(body1).await.unwrap();
+        assert!(is_replay, "Second request with same body should be replay");
+        let is_replay = cache.check_replay(body2).await.unwrap();
+        assert!(!is_replay, "Different body should not be replay");
+        let is_replay = cache.check_replay(body2).await.unwrap();
+        assert!(is_replay, "Second request with body2 should be replay");
+    }
+
+    #[tokio::test]
+    async fn test_epoch_nx_init_no_overwrite() {
+        let Some(mut conn) = local_redis().await else {
+            return;
+        };
+        let key = "epoch:testnet-nx-test";
+        let _: () = conn.set(key, 5u64).await.unwrap();
+        let cache = test_cache(conn.clone(), None, "testnet-nx-test");
+        let epoch = cache.get_shared_epoch().await;
+        assert_eq!(epoch, 5, "Should return existing epoch, not overwrite");
+        let redis_value: u64 = conn.get(key).await.unwrap();
+        assert_eq!(redis_value, 5);
+        let _: () = conn.del(key).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_per_request_epoch_refresh() {
+        let Some(conn) = local_redis().await else {
+            return;
+        };
+        let cache = test_cache(conn, None, "testnet-refresh-test");
+
+        let epoch1 = cache.refresh_epoch_if_stale().await;
+        let sync_time1 = cache.last_epoch_sync.load(Ordering::Relaxed);
+        assert!(sync_time1 > 0, "Sync timestamp should be set");
+
+        let epoch2 = cache.refresh_epoch_if_stale().await;
+        let sync_time2 = cache.last_epoch_sync.load(Ordering::Relaxed);
+        assert_eq!(
+            sync_time1, sync_time2,
+            "Should reuse cached epoch within 2s"
+        );
+        assert_eq!(epoch1, epoch2);
+
+        cache
+            .last_epoch_sync
+            .store(sync_time1 - 10, Ordering::Relaxed);
+        let _epoch3 = cache.refresh_epoch_if_stale().await;
+        let sync_time3 = cache.last_epoch_sync.load(Ordering::Relaxed);
+        // The timestamp is in whole seconds, so "refreshed" means it moved back from the stale
+        // value to now (>= sync_time1), not strictly past sync_time2.
+        assert!(
+            sync_time3 >= sync_time1,
+            "Should refresh from Redis after staleness"
+        );
+    }
+
+    #[test]
+    fn test_combine_peer_outcomes() {
+        use PeerOutcome::*;
+        assert_eq!(combine_peer_outcomes(&[]), PeerVerdict::Fresh);
+        assert_eq!(combine_peer_outcomes(&[Fresh, Fresh]), PeerVerdict::Fresh);
+        // A replay anywhere wins, whatever the other peers did.
+        assert_eq!(combine_peer_outcomes(&[Fresh, Replay]), PeerVerdict::Replay);
+        assert_eq!(
+            combine_peer_outcomes(&[Timeout, Replay, Error]),
+            PeerVerdict::Replay
+        );
+        // Otherwise one silent peer makes the verdict unknown.
+        assert_eq!(
+            combine_peer_outcomes(&[Fresh, Timeout]),
+            PeerVerdict::Unavailable
+        );
+        assert_eq!(combine_peer_outcomes(&[Error]), PeerVerdict::Unavailable);
+        assert_eq!(
+            combine_peer_outcomes(&[Disconnected, Fresh]),
+            PeerVerdict::Unavailable
+        );
+    }
+
+    #[tokio::test]
+    async fn test_replay_peer_check_any_write_all() {
+        // Two origins, each with its own security Redis (DB 12 and DB 13 here), each listing the
+        // other as a peer. A nonce seen by origin A is a replay at origin B.
+        let Some(_) = local_redis().await else {
+            return;
+        };
+        let open = |db: u8| async move {
+            ConnectionManager::new(
+                redis::Client::open(format!("redis://127.0.0.1:6379/{db}")).unwrap(),
+            )
+            .await
+            .unwrap()
+        };
+        let (mut a_sec, mut b_sec) = (open(12).await, open(13).await);
+        let _: () = redis::cmd("FLUSHDB").query_async(&mut a_sec).await.unwrap();
+        let _: () = redis::cmd("FLUSHDB").query_async(&mut b_sec).await.unwrap();
+
+        let net = "testnet-peer-test";
+        let peers_of_a = ReplayPeers::connect(
+            &["redis://127.0.0.1:6379/13".to_string()],
+            net.to_string(),
+            250,
+            false,
+        )
+        .await;
+        let peers_of_b = ReplayPeers::connect(
+            &["redis://127.0.0.1:6379/12".to_string()],
+            net.to_string(),
+            250,
+            false,
+        )
+        .await;
+        let a = test_cache(a_sec.clone(), Some(a_sec.clone()), net).with_replay_peers(peers_of_a);
+        let b = test_cache(b_sec.clone(), Some(b_sec.clone()), net).with_replay_peers(peers_of_b);
+
+        let h1 = sha2::Sha256::digest(b"request one");
+        let h2 = sha2::Sha256::digest(b"request two");
+        assert!(!a.check_replay(&h1).await.unwrap(), "first sight at A");
+        assert!(b.check_replay(&h1).await.unwrap(), "replayed to B: refused");
+        assert!(
+            a.check_replay(&h1).await.unwrap(),
+            "replayed to A: refused locally"
+        );
+        assert!(!b.check_replay(&h2).await.unwrap(), "another request at B");
+        assert!(
+            a.check_replay(&h2).await.unwrap(),
+            "replayed to A: refused via B's store"
+        );
+
+        // The nonce was written to both stores with a TTL.
+        let key = format!("replay:{net}:{}", hex::encode(h1));
+        let ttl_a: i64 = redis::cmd("TTL")
+            .arg(&key)
+            .query_async(&mut a_sec)
+            .await
+            .unwrap();
+        let ttl_b: i64 = redis::cmd("TTL")
+            .arg(&key)
+            .query_async(&mut b_sec)
+            .await
+            .unwrap();
+        assert!(ttl_a > 0 && ttl_a <= REPLAY_TTL_SECS as i64);
+        assert!(ttl_b > 0 && ttl_b <= REPLAY_TTL_SECS as i64);
+        let _: () = redis::cmd("FLUSHDB").query_async(&mut a_sec).await.unwrap();
+        let _: () = redis::cmd("FLUSHDB").query_async(&mut b_sec).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_replay_peer_unreachable_policy() {
+        // An unreachable peer: the local verdict stands by default, refuses with fail-closed.
+        let Some(conn) = local_redis().await else {
+            return;
+        };
+        let net = "testnet-peer-down";
+        let dead = "redis://127.0.0.1:1".to_string();
+        let open_peers = |fail_closed: bool| {
+            let dead = dead.clone();
+            async move { ReplayPeers::connect(&[dead], net.to_string(), 100, fail_closed).await }
+        };
+        let cache_open = test_cache(conn.clone(), Some(conn.clone()), net)
+            .with_replay_peers(open_peers(false).await);
+        let h = sha2::Sha256::digest(unique("peer down request"));
+        assert!(!cache_open.check_replay(&h).await.unwrap());
+        assert!(
+            cache_open.check_replay(&h).await.unwrap(),
+            "local store still works"
+        );
+
+        let cache_closed = test_cache(conn.clone(), Some(conn.clone()), net)
+            .with_replay_peers(open_peers(true).await);
+        let h2 = sha2::Sha256::digest(unique("peer down request 2"));
+        assert!(
+            cache_closed.check_replay(&h2).await.is_err(),
+            "fail-closed refuses"
+        );
+    }
+
+    /// Two origins A (DB `a`) and B (DB `b`), each listing the other as a peer, in `mode`.
+    /// Replication tunables are short so the tests stay fast; `batch_interval` is the
+    /// replication window the "before/after" tests rely on.
+    async fn two_origins(
+        net: &str,
+        a: u8,
+        b: u8,
+        mode: ReplayPeerMode,
+        fail_closed_writes: bool,
+        batch_interval_ms: u64,
+    ) -> (
+        ResponseCache,
+        ResponseCache,
+        ConnectionManager,
+        ConnectionManager,
+    ) {
+        let open = |db: u8| async move {
+            ConnectionManager::new(
+                redis::Client::open(format!("redis://127.0.0.1:6379/{db}")).unwrap(),
+            )
+            .await
+            .unwrap()
+        };
+        let (mut a_sec, mut b_sec) = (open(a).await, open(b).await);
+        let _: () = redis::cmd("FLUSHDB").query_async(&mut a_sec).await.unwrap();
+        let _: () = redis::cmd("FLUSHDB").query_async(&mut b_sec).await.unwrap();
+        let cfg = |network: &str| {
+            // max_lag above the longest batch window used here (400 ms), recovery 1 s.
+            let mut c = ReplicationConfig::new(network, mode, 1000, 1, 250, REPLAY_TTL_SECS, 3);
+            c.batch_interval = Duration::from_millis(batch_interval_ms);
+            c.probe_interval = Duration::from_millis(100);
+            c
+        };
+        let peers_of_a = ReplayPeers::connect(
+            &[format!("redis://127.0.0.1:6379/{b}")],
+            net.to_string(),
+            250,
+            false,
+        )
+        .await
+        .with_mode(mode, fail_closed_writes);
+        let peers_of_b = ReplayPeers::connect(
+            &[format!("redis://127.0.0.1:6379/{a}")],
+            net.to_string(),
+            250,
+            false,
+        )
+        .await
+        .with_mode(mode, fail_closed_writes);
+        let ca = test_cache(a_sec.clone(), Some(a_sec.clone()), net)
+            .with_replay_peers(peers_of_a)
+            .with_async_replication(cfg(net));
+        let cb = test_cache(b_sec.clone(), Some(b_sec.clone()), net)
+            .with_replay_peers(peers_of_b)
+            .with_async_replication(cfg(net));
+        (ca, cb, a_sec, b_sec)
+    }
+
+    /// Wait until the replicator has left its startup strict phase (recovery 1 s here).
+    async fn wait_relaxed(c: &ResponseCache) {
+        for _ in 0..60 {
+            if c.replicator().unwrap().health().effective() == Effective::Relaxed {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("replication never became healthy");
+    }
+
+    const READ: RouteClass = RouteClass::Read;
+    const WRITE: RouteClass = RouteClass::Write;
+
+    #[tokio::test]
+    async fn test_async_reads_mode_replicates_reads_and_keeps_writes_synchronous() {
+        let Some(_) = local_redis().await else {
+            return;
+        };
+        let net = "testnet-async-reads";
+        let (a, b, mut a_sec, mut b_sec) =
+            two_origins(net, 8, 9, ReplayPeerMode::AsyncReads, true, 20).await;
+        assert_eq!(a.replay_peer_mode(), ReplayPeerMode::AsyncReads);
+        wait_relaxed(&a).await;
+        wait_relaxed(&b).await;
+
+        // READ at A: the local check is synchronous, the peer write asynchronous.
+        let h1 = sha2::Sha256::digest(b"read one");
+        let t = std::time::Instant::now();
+        assert!(!a.check_replay(&h1).await.unwrap());
+        assert!(!a.replicate_nonce(&h1, READ).await.unwrap());
+        assert!(t.elapsed() < Duration::from_millis(200));
+        // check_replay did NOT touch the peer store in this mode (only sync mode does).
+        let key1 = format!("replay:{net}:{}", hex::encode(h1));
+        let at_b_now: Option<String> = redis::cmd("GET")
+            .arg(&key1)
+            .query_async(&mut b_sec)
+            .await
+            .unwrap();
+        // ... but it arrives within the batch window.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let at_b_later: Option<String> = redis::cmd("GET")
+            .arg(&key1)
+            .query_async(&mut b_sec)
+            .await
+            .unwrap();
+        assert!(at_b_later.is_some(), "replicated asynchronously");
+        let ttl_b: i64 = redis::cmd("TTL")
+            .arg(&key1)
+            .query_async(&mut b_sec)
+            .await
+            .unwrap();
+        assert!(ttl_b > 0 && ttl_b <= REPLAY_TTL_SECS as i64);
+        let _ = at_b_now; // may or may not have landed yet: timing, not a contract
+                          // Replay to B after replication: refused by B's local check.
+        assert!(
+            b.check_replay(&h1).await.unwrap(),
+            "replayed to B after replication: 409"
+        );
+
+        // WRITE at A: synchronous at the peer, so an immediate replay at B is refused.
+        let h2 = sha2::Sha256::digest(b"write one");
+        assert!(!a.check_replay(&h2).await.unwrap());
+        assert!(!a.replicate_nonce(&h2, WRITE).await.unwrap());
+        let key2 = format!("replay:{net}:{}", hex::encode(h2));
+        let at_b: Option<String> = redis::cmd("GET")
+            .arg(&key2)
+            .query_async(&mut b_sec)
+            .await
+            .unwrap();
+        assert!(
+            at_b.is_some(),
+            "WRITE nonce is at the peer before the request proceeds"
+        );
+        assert!(
+            b.check_replay(&h2).await.unwrap(),
+            "immediate replay of a WRITE at B: 409"
+        );
+        // A WRITE at B lands in A's store synchronously, so A refuses it locally.
+        let h3 = sha2::Sha256::digest(b"write seen at b first");
+        assert!(!b.check_replay(&h3).await.unwrap());
+        assert!(!b.replicate_nonce(&h3, WRITE).await.unwrap());
+        assert!(
+            a.check_replay(&h3).await.unwrap(),
+            "B's synchronous write is in A's store"
+        );
+        // A nonce only the peer holds (e.g. written there by a third origin): A's local store is
+        // fresh, the synchronous WRITE check at the peer refuses it (check-any).
+        let h4 = sha2::Sha256::digest(b"write known to b only");
+        let key4 = format!("replay:{net}:{}", hex::encode(h4));
+        let _: () = redis::cmd("SET")
+            .arg(&key4)
+            .arg("1")
+            .arg("EX")
+            .arg(600)
+            .query_async(&mut b_sec)
+            .await
+            .unwrap();
+        assert!(
+            !a.check_replay(&h4).await.unwrap(),
+            "A's local store is fresh..."
+        );
+        assert!(
+            a.replicate_nonce(&h4, WRITE).await.unwrap(),
+            "...but the peer check refuses it"
+        );
+
+        let _: () = redis::cmd("FLUSHDB").query_async(&mut a_sec).await.unwrap();
+        let _: () = redis::cmd("FLUSHDB").query_async(&mut b_sec).await.unwrap();
+    }
+
+    /// A WRITE checked at a peer waits for that peer's replicas: the CI Redis has none, so a
+    /// required acknowledgement fails closed, `0` replicas passes, and an unreachable peer the
+    /// policy tolerates (`REPLAY_PEER_FAIL_CLOSED_WRITES=0`, peer down) is not waited for.
+    #[tokio::test]
+    async fn test_peer_write_nonce_waits_for_the_peer_replicas() {
+        let Some(_) = local_redis().await else {
+            return;
+        };
+        let net = "testnet-peer-wait";
+        let open = |db: u8| async move {
+            ConnectionManager::new(
+                redis::Client::open(format!("redis://127.0.0.1:6379/{db}")).unwrap(),
+            )
+            .await
+            .unwrap()
+        };
+        let (mut a_sec, mut peer_store) = (open(2).await, open(3).await);
+        let _: () = redis::cmd("FLUSHDB").query_async(&mut a_sec).await.unwrap();
+        let _: () = redis::cmd("FLUSHDB")
+            .query_async(&mut peer_store)
+            .await
+            .unwrap();
+        let read_origin = |wait: WriteWaitConfig| {
+            let a_sec = a_sec.clone();
+            async move {
+                let peers = ReplayPeers::connect(
+                    &["redis://127.0.0.1:6379/3".to_string()],
+                    net.to_string(),
+                    250,
+                    false,
+                )
+                .await
+                .with_mode(ReplayPeerMode::AsyncReads, true)
+                .with_wait(Some(wait));
+                test_cache(a_sec.clone(), Some(a_sec), net).with_replay_peers(peers)
+            }
+        };
+
+        let strict = read_origin(WriteWaitConfig {
+            replicas: 1,
+            timeout_ms: 50,
+        })
+        .await;
+        // The WAIT connection is opened at startup, not inside the first WRITE's budget.
+        let peers = strict.replay_peers.clone().unwrap();
+        for _ in 0..40 {
+            if peers.peers[0].wait_conn.load().is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            peers.peers[0].wait_conn.load().is_some(),
+            "WAIT connection opened in the background"
+        );
+        let h1 = sha2::Sha256::digest(unique("write without a replica"));
+        assert!(!strict.check_replay(&h1).await.unwrap());
+        let started = std::time::Instant::now();
+        let err = strict.replicate_nonce(&h1, WRITE).await.unwrap_err();
+        assert!(err.to_string().contains("not acknowledged"), "{err}");
+        // Retried once: two full server-side WAITs.
+        assert!(
+            started.elapsed() >= Duration::from_millis(100),
+            "{:?}",
+            started.elapsed()
+        );
+        // READs are not delayed.
+        let h2 = sha2::Sha256::digest(unique("read without a replica"));
+        assert!(!strict.check_replay(&h2).await.unwrap());
+        assert!(!strict.replicate_nonce(&h2, READ).await.unwrap());
+
+        let none_needed = read_origin(WriteWaitConfig {
+            replicas: 0,
+            timeout_ms: 50,
+        })
+        .await;
+        let h3 = sha2::Sha256::digest(unique("write, zero replicas"));
+        assert!(!none_needed.check_replay(&h3).await.unwrap());
+        assert!(!none_needed.replicate_nonce(&h3, WRITE).await.unwrap());
+        let key3 = format!("replay:{net}:{}", hex::encode(h3));
+        let ttl: i64 = redis::cmd("TTL")
+            .arg(&key3)
+            .query_async(&mut peer_store)
+            .await
+            .unwrap();
+        assert!(
+            ttl > 0 && ttl <= REPLAY_TTL_SECS as i64,
+            "the nonce keeps its TTL at the peer store"
+        );
+
+        // Peer unreachable, WRITEs tolerated on the local check, nothing to wait for.
+        let peers = ReplayPeers::connect(
+            &["redis://127.0.0.1:1".to_string()],
+            net.to_string(),
+            100,
+            false,
+        )
+        .await
+        .with_mode(ReplayPeerMode::AsyncReads, false)
+        .with_wait(Some(WriteWaitConfig {
+            replicas: 1,
+            timeout_ms: 50,
+        }));
+        let peer_origin =
+            test_cache(a_sec.clone(), Some(a_sec.clone()), net).with_replay_peers(peers);
+        let h4 = sha2::Sha256::digest(unique("local write, shared store down"));
+        assert!(!peer_origin.check_replay(&h4).await.unwrap());
+        assert!(!peer_origin.replicate_nonce(&h4, WRITE).await.unwrap());
+
+        let _: () = redis::cmd("FLUSHDB").query_async(&mut a_sec).await.unwrap();
+        let _: () = redis::cmd("FLUSHDB")
+            .query_async(&mut peer_store)
+            .await
+            .unwrap();
+    }
+
+    #[test]
+    fn test_local_waitaof_config_parse() {
+        assert_eq!(
+            LocalAofConfig::parse(None).unwrap(),
+            LocalAofConfig::Auto(DEFAULT_REPLAY_LOCAL_WAITAOF_MS)
+        );
+        assert_eq!(
+            LocalAofConfig::parse(Some(" ")).unwrap(),
+            LocalAofConfig::Auto(DEFAULT_REPLAY_LOCAL_WAITAOF_MS)
+        );
+        assert_eq!(
+            LocalAofConfig::parse(Some("0")).unwrap(),
+            LocalAofConfig::Off
+        );
+        assert_eq!(
+            LocalAofConfig::parse(Some("250")).unwrap(),
+            LocalAofConfig::Required(250)
+        );
+        assert!(LocalAofConfig::parse(Some("-1")).is_err());
+        assert!(LocalAofConfig::parse(Some("x")).is_err());
+    }
+
+    /// An origin whose peer store is down: a WRITE on the local check alone waits for the
+    /// local AOF fsync. Without AOF the probe leaves it off (auto) or fails startup (required).
+    #[tokio::test]
+    async fn test_peer_down_local_write_waits_for_the_aof_fsync() {
+        let Some(admin) = local_redis().await else {
+            return;
+        };
+        let net = "testnet-local-waitaof";
+        let url = "redis://127.0.0.1:6379/4";
+        let sec = ConnectionManager::new(redis::Client::open(url).unwrap())
+            .await
+            .unwrap();
+        let peer_origin = || {
+            let sec = sec.clone();
+            async move {
+                let peers = ReplayPeers::connect(
+                    &["redis://127.0.0.1:1".to_string()],
+                    net.to_string(),
+                    100,
+                    false,
+                )
+                .await
+                .with_mode(ReplayPeerMode::AsyncReads, false);
+                test_cache(sec.clone(), Some(sec), net).with_replay_peers(peers)
+            }
+        };
+        let set_aof = |on: bool| {
+            let mut admin = admin.clone();
+            async move {
+                redis::cmd("CONFIG")
+                    .arg("SET")
+                    .arg("appendonly")
+                    .arg(if on { "yes" } else { "no" })
+                    .arg("appendfsync")
+                    .arg(if on { "always" } else { "everysec" })
+                    .query_async::<_, ()>(&mut admin)
+                    .await
+            }
+        };
+        if set_aof(false).await.is_err() {
+            return;
+        }
+
+        let auto = peer_origin()
+            .await
+            .with_local_waitaof(url, LocalAofConfig::Auto(500))
+            .await
+            .unwrap();
+        assert_eq!(auto.local_waitaof_ms(), None, "no AOF: auto leaves it off");
+        let h0 = sha2::Sha256::digest(unique("local write, no aof"));
+        assert!(!auto.check_replay(&h0).await.unwrap());
+        assert!(!auto.replicate_nonce(&h0, WRITE).await.unwrap());
+        let err = peer_origin()
+            .await
+            .with_local_waitaof(url, LocalAofConfig::Required(500))
+            .await
+            .err()
+            .expect("required without AOF fails");
+        assert!(err.to_string().contains("REPLAY_LOCAL_WAITAOF_MS"), "{err}");
+
+        set_aof(true).await.unwrap();
+        let mut on = None;
+        for _ in 0..100 {
+            if let Ok(c) = peer_origin()
+                .await
+                .with_local_waitaof(url, LocalAofConfig::Required(500))
+                .await
+            {
+                on = Some(c);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let on = on.expect("WAITAOF available once the AOF rewrite is done");
+        assert_eq!(on.local_waitaof_ms(), Some(500));
+        let h1 = sha2::Sha256::digest(unique("local write, aof"));
+        assert!(!on.check_replay(&h1).await.unwrap());
+        assert!(!on.replicate_nonce(&h1, WRITE).await.unwrap());
+        // READs are not delayed, and a nonce gone from the store fails closed.
+        let h2 = sha2::Sha256::digest(unique("local read, aof"));
+        assert!(!on.check_replay(&h2).await.unwrap());
+        assert!(!on.replicate_nonce(&h2, READ).await.unwrap());
+        let h3 = sha2::Sha256::digest(unique("local write, nonce gone"));
+        assert!(!on.check_replay(&h3).await.unwrap());
+        let mut sec_conn = sec.clone();
+        let _: () = redis::cmd("DEL")
+            .arg(format!("replay:{net}:{}", hex::encode(h3)))
+            .query_async(&mut sec_conn)
+            .await
+            .unwrap();
+        let err = on.replicate_nonce(&h3, WRITE).await.unwrap_err();
+        assert!(err.to_string().contains("local AOF"), "{err}");
+
+        // One peer took the nonce, another is down: the nonce is not only local, no WAITAOF
+        // (the local copy is gone here, so a WAITAOF would fail).
+        let mixed_peers = ReplayPeers::connect(
+            &[
+                "redis://127.0.0.1:6379/5".to_string(),
+                "redis://127.0.0.1:1".to_string(),
+            ],
+            net.to_string(),
+            100,
+            false,
+        )
+        .await
+        .with_mode(ReplayPeerMode::AsyncReads, false);
+        let mixed = test_cache(sec.clone(), Some(sec.clone()), net)
+            .with_replay_peers(mixed_peers)
+            .with_local_waitaof(url, LocalAofConfig::Required(500))
+            .await
+            .unwrap();
+        let h4 = sha2::Sha256::digest(unique("write, one peer took it"));
+        assert!(!mixed.check_replay(&h4).await.unwrap());
+        let _: () = redis::cmd("DEL")
+            .arg(format!("replay:{net}:{}", hex::encode(h4)))
+            .query_async(&mut sec_conn)
+            .await
+            .unwrap();
+        assert!(!mixed.replicate_nonce(&h4, WRITE).await.unwrap());
+
+        set_aof(false).await.unwrap();
+        let _: () = redis::cmd("FLUSHDB")
+            .query_async(&mut sec_conn)
+            .await
+            .unwrap();
+        let mut peer5 =
+            ConnectionManager::new(redis::Client::open("redis://127.0.0.1:6379/5").unwrap())
+                .await
+                .unwrap();
+        let _: () = redis::cmd("FLUSHDB").query_async(&mut peer5).await.unwrap();
+    }
+
+    #[test]
+    fn test_peer_wait_config_defaults_to_one_replica() {
+        let parse = |replicas: Option<&str>| {
+            WriteWaitConfig::parse_named(
+                replicas,
+                None,
+                DEFAULT_REPLAY_PEER_WAIT_REPLICAS,
+                "REPLAY_PEER_WAIT",
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            parse(None),
+            Some(WriteWaitConfig {
+                replicas: 1,
+                timeout_ms: DEFAULT_REPLAY_WRITE_WAIT_MS
+            })
+        );
+        assert_eq!(parse(Some("0")), None, "0 turns it off");
+        let err = WriteWaitConfig::parse_named(Some("x"), None, 1, "REPLAY_PEER_WAIT").unwrap_err();
+        assert!(err.to_string().contains("REPLAY_PEER_WAIT_REPLICAS"));
+    }
+
+    #[tokio::test]
+    async fn test_async_reads_window_before_and_after_replication() {
+        // Documents the bounded window: a READ replayed to the other origin BEFORE replication
+        // lands is accepted there (and nothing else), the same replay later is refused.
+        let Some(_) = local_redis().await else {
+            return;
+        };
+        let net = "testnet-async-window";
+        // A 400 ms batch window makes "before" deterministic.
+        let (a, b, mut a_sec, mut b_sec) =
+            two_origins(net, 10, 11, ReplayPeerMode::AsyncReads, true, 400).await;
+        wait_relaxed(&a).await;
+        wait_relaxed(&b).await;
+
+        let h = sha2::Sha256::digest(b"read replayed fast");
+        assert!(!a.check_replay(&h).await.unwrap());
+        assert!(!a.replicate_nonce(&h, READ).await.unwrap());
+        // Inside the window: B accepts (its store does not have it yet) and enqueues its own
+        // replication, which will find the nonce already at A.
+        assert!(
+            !b.check_replay(&h).await.unwrap(),
+            "inside the replication window: accepted at B"
+        );
+        assert!(!b.replicate_nonce(&h, READ).await.unwrap());
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        // After the window: both stores hold it, both refuse.
+        assert!(a.check_replay(&h).await.unwrap());
+        assert!(b.check_replay(&h).await.unwrap());
+        // The late detection is counted at the peer that replicated second.
+        let key = format!("replay:{net}:{}", hex::encode(h));
+        let ttl_a: i64 = redis::cmd("TTL")
+            .arg(&key)
+            .query_async(&mut a_sec)
+            .await
+            .unwrap();
+        let ttl_b: i64 = redis::cmd("TTL")
+            .arg(&key)
+            .query_async(&mut b_sec)
+            .await
+            .unwrap();
+        assert!(ttl_a > 0 && ttl_b > 0);
+
+        let _: () = redis::cmd("FLUSHDB").query_async(&mut a_sec).await.unwrap();
+        let _: () = redis::cmd("FLUSHDB").query_async(&mut b_sec).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_async_reads_peer_down_is_strict_and_writes_fail_closed() {
+        let Some(conn) = local_redis().await else {
+            return;
+        };
+        let net = "testnet-async-peer-down";
+        let dead = "redis://127.0.0.1:1".to_string();
+        let mk = |fail_closed_writes: bool| {
+            let dead = dead.clone();
+            let conn = conn.clone();
+            async move {
+                let peers = ReplayPeers::connect(&[dead], net.to_string(), 100, false)
+                    .await
+                    .with_mode(ReplayPeerMode::AsyncReads, fail_closed_writes);
+                test_cache(conn.clone(), Some(conn.clone()), net)
+                    .with_replay_peers(peers)
+                    .with_async_replication(ReplicationConfig::new(
+                        net,
+                        ReplayPeerMode::AsyncReads,
+                        300,
+                        1,
+                        100,
+                        REPLAY_TTL_SECS,
+                        3,
+                    ))
+            }
+        };
+        let c = mk(true).await;
+        tokio::time::sleep(Duration::from_millis(1300)).await;
+        // Never healthy: the peer is unreachable, so the probes fail and the mode stays strict.
+        assert_eq!(
+            c.replicator().unwrap().health().effective(),
+            Effective::Strict
+        );
+        assert_eq!(
+            c.replicator().unwrap().health().effective_label(),
+            "async-reads-strict"
+        );
+
+        // READ on the strict path: synchronous peer attempt, local verdict stands
+        // (REPLAY_PEER_FAIL_CLOSED=0) and nothing is enqueued.
+        let h = sha2::Sha256::digest(unique("read with peer down"));
+        assert!(!c.check_replay(&h).await.unwrap());
+        assert!(!c.replicate_nonce(&h, READ).await.unwrap());
+        assert_eq!(
+            c.replicator().unwrap().queue_depth(0),
+            0,
+            "strict READs are not enqueued"
+        );
+        assert!(
+            c.check_replay(&h).await.unwrap(),
+            "local store still refuses the replay"
+        );
+
+        // WRITE: fail-closed by default.
+        let h2 = sha2::Sha256::digest(unique("write with peer down"));
+        assert!(!c.check_replay(&h2).await.unwrap());
+        let err = c.replicate_nonce(&h2, WRITE).await.unwrap_err();
+        assert!(
+            err.to_string().contains("REPLAY_PEER_FAIL_CLOSED_WRITES"),
+            "{err}"
+        );
+
+        // WRITE with REPLAY_PEER_FAIL_CLOSED_WRITES=0: local verdict.
+        let c_open = mk(false).await;
+        let h3 = sha2::Sha256::digest(unique("write with peer down, open"));
+        assert!(!c_open.check_replay(&h3).await.unwrap());
+        assert!(!c_open.replicate_nonce(&h3, WRITE).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_failover_mode_never_waits_for_peers() {
+        let Some(conn) = local_redis().await else {
+            return;
+        };
+        let net = "testnet-failover-dead";
+        // A peer that accepts TCP but never answers would be the worst case; an unreachable one
+        // shows the same property: no synchronous peer call, whatever the class or the flags.
+        let peers = ReplayPeers::connect(
+            &["redis://127.0.0.1:1".to_string()],
+            net.to_string(),
+            2000,
+            true,
+        )
+        .await
+        .with_mode(ReplayPeerMode::Failover, true);
+        let c = test_cache(conn.clone(), Some(conn.clone()), net)
+            .with_replay_peers(peers)
+            .with_async_replication(ReplicationConfig::new(
+                net,
+                ReplayPeerMode::Failover,
+                300,
+                1,
+                2000,
+                REPLAY_TTL_SECS,
+                3,
+            ));
+        for (i, class) in [READ, WRITE, READ, WRITE].into_iter().enumerate() {
+            let h = sha2::Sha256::digest(unique(&format!("failover {i}")));
+            let t = std::time::Instant::now();
+            assert!(!c.check_replay(&h).await.unwrap());
+            assert!(!c.replicate_nonce(&h, class).await.unwrap(), "{class:?}");
+            assert!(
+                t.elapsed() < Duration::from_millis(100),
+                "{class:?} waited {:?}",
+                t.elapsed()
+            );
+            assert!(
+                c.check_replay(&h).await.unwrap(),
+                "local replay still refused"
+            );
+        }
+        assert_eq!(
+            c.replicator().unwrap().health().effective_label(),
+            "failover"
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            c.replicator().unwrap().queue_depth(0) >= 1,
+            "nonces wait for the peer to come back"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_failover_mode_replicates_everything() {
+        let Some(_) = local_redis().await else {
+            return;
+        };
+        let net = "testnet-failover-live";
+        let (a, b, mut a_sec, mut b_sec) =
+            two_origins(net, 4, 5, ReplayPeerMode::Failover, true, 20).await;
+        let hr = sha2::Sha256::digest(b"failover read");
+        let hw = sha2::Sha256::digest(b"failover write");
+        // No strict phase matters here: everything is local + async from the first request.
+        for (h, class) in [(hr, READ), (hw, WRITE)] {
+            assert!(!a.check_replay(&h).await.unwrap());
+            assert!(!a.replicate_nonce(&h, class).await.unwrap());
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            b.check_replay(&hr).await.unwrap(),
+            "READ nonce replicated to the passive origin"
+        );
+        assert!(
+            b.check_replay(&hw).await.unwrap(),
+            "WRITE nonce replicated to the passive origin"
+        );
+        let _: () = redis::cmd("FLUSHDB").query_async(&mut a_sec).await.unwrap();
+        let _: () = redis::cmd("FLUSHDB").query_async(&mut b_sec).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_sync_mode_is_unchanged_by_replicate_nonce() {
+        let Some(_) = local_redis().await else {
+            return;
+        };
+        let net = "testnet-sync-noop";
+        let (a, b, mut a_sec, mut b_sec) =
+            two_origins(net, 6, 7, ReplayPeerMode::Sync, true, 20).await;
+        assert!(a.replicator().is_none(), "no replicator in sync mode");
+        let h = sha2::Sha256::digest(b"sync request");
+        assert!(
+            !a.check_replay(&h).await.unwrap(),
+            "check_replay wrote local + peer"
+        );
+        assert!(!a.replicate_nonce(&h, READ).await.unwrap(), "no-op");
+        assert!(!a.replicate_nonce(&h, WRITE).await.unwrap(), "no-op");
+        assert!(
+            b.check_replay(&h).await.unwrap(),
+            "already at B through the synchronous write"
+        );
+        let _: () = redis::cmd("FLUSHDB").query_async(&mut a_sec).await.unwrap();
+        let _: () = redis::cmd("FLUSHDB").query_async(&mut b_sec).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_replay_failclosed_on_unreachable_security_redis() {
+        // When the security Redis is unavailable, check_replay fails closed (Err).
+        let Some(cache_conn) = local_redis().await else {
+            return;
+        };
+        // ConnectionManager::new connects eagerly, so the "security Redis" is a TCP listener that
+        // accepts and then never answers (a black-holed store): the connect succeeds, the SET
+        // times out. Should construction itself need a reply, fall back to "not configured",
+        // which is the other fail-closed path, rather than hang the test.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            loop {
+                let Ok((sock, _)) = listener.accept().await else {
+                    return;
+                };
+                held.push(sock);
+            }
+        });
+        let security_client = redis::Client::open(format!("redis://127.0.0.1:{port}")).unwrap();
+        let security_conn = timeout(
+            Duration::from_secs(5),
+            ConnectionManager::new(security_client),
+        )
+        .await
+        .ok()
+        .and_then(|r| r.ok());
+        let cache = test_cache(cache_conn, security_conn, "testnet-failclosed");
+
+        let body_hash = {
+            let mut h = sha2::Sha256::new();
+            h.update(b"test-request-body");
+            h.finalize()
+        };
+        let result = cache.check_replay(&body_hash).await;
+        assert!(
+            result.is_err(),
+            "check_replay should return Err when security Redis is unreachable (fail closed)"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore] // Only run with local Redis: cargo test test_cache_write_with_split_redis -- --ignored
+    async fn test_cache_write_with_split_redis() {
+        // With separate cache and security Redis the epoch lives only in the security Redis;
+        // the write check must read it there. DB 14 is the cache Redis, DB 15 the security one.
+        let cache_conn =
+            ConnectionManager::new(redis::Client::open("redis://127.0.0.1:6379/14").unwrap())
+                .await
+                .unwrap();
+        let security_conn =
+            ConnectionManager::new(redis::Client::open("redis://127.0.0.1:6379/15").unwrap())
+                .await
+                .unwrap();
+        let cache = test_cache(
+            cache_conn.clone(),
+            Some(security_conn.clone()),
+            "split-redis-test",
+        );
+        cache.tip.set(crate::store::Tip {
+            height: 100,
+            hash: vec![1u8; 32],
+        });
+        let epoch_key = format!("epoch:{}", cache.network);
+        let mut sec = security_conn.clone();
+        let mut cc = cache_conn.clone();
+        let _: () = redis::cmd("FLUSHDB").query_async(&mut cc).await.unwrap();
+        let _: () = redis::cmd("DEL")
+            .arg(&epoch_key)
+            .query_async(&mut sec)
+            .await
+            .unwrap();
+
+        let path = "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetLightdInfo";
+        let response = bincode::serialize(&crate::ohttp::InnerResponse {
+            status: 200,
+            headers: vec![("grpc-status".to_string(), "0".to_string())],
+            body: b"lightd-info".to_vec(),
+        })
+        .unwrap();
+        let sem = tokio::sync::Semaphore::new(4);
+        let fetches = std::sync::atomic::AtomicUsize::new(0);
+        let fetch = || async {
+            fetches.fetch_add(1, Ordering::SeqCst);
+            Ok::<_, anyhow::Error>(response.clone())
+        };
+
+        let first = cache
+            .get_or_fetch("POST", "application/grpc", path, &[], b"", &sem, fetch)
+            .await
+            .unwrap();
+        assert_eq!(first, response);
+
+        let cache_epoch: Option<u64> = redis::cmd("GET")
+            .arg(&epoch_key)
+            .query_async(&mut cc)
+            .await
+            .unwrap();
+        assert_eq!(cache_epoch, None, "epoch must not live in the cache Redis");
+        let dbsize: u64 = redis::cmd("DBSIZE").query_async(&mut cc).await.unwrap();
+        assert_eq!(dbsize, 1, "response must be written to the cache Redis");
+
+        let second = cache
+            .get_or_fetch("POST", "application/grpc", path, &[], b"", &sem, fetch)
+            .await
+            .unwrap();
+        assert_eq!(second, response);
+        assert_eq!(
+            fetches.load(Ordering::SeqCst),
+            1,
+            "second request must be a cache hit"
+        );
+
+        let epoch_at_read = cache.epoch.load(Ordering::Relaxed);
+        let _: u64 = redis::cmd("INCR")
+            .arg(&epoch_key)
+            .query_async(&mut sec)
+            .await
+            .unwrap();
+        let written = cache
+            .write_if_epoch_current("stale-key", epoch_at_read, b"stale", Some(10))
+            .await
+            .unwrap();
+        assert!(!written, "write with a superseded epoch must be skipped");
+
+        let _: () = redis::cmd("FLUSHDB").query_async(&mut cc).await.unwrap();
+        let _: () = redis::cmd("DEL")
+            .arg(&epoch_key)
+            .query_async(&mut sec)
+            .await
+            .unwrap();
+    }
+}
+
+#[path = "cache_retry_test.rs"]
+#[cfg(test)]
+mod cache_retry_test;

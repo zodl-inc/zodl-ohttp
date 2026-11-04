@@ -1,0 +1,466 @@
+name: OHTTP Build & Push
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REGISTRY: ${{ vars.ECR_REGISTRY }}  # repository variable
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-24.04
+    # The gateway's Redis-backed tests (replay peers, async replication, cache) run against this
+    # service and are skipped silently without it.
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Test verify-image identity regexes
+        run: bash scripts/verify-image-test.sh
+
+      - name: Test gateway
+        working-directory: gateway
+        run: cargo test --locked
+
+      - name: Test relay-simulator
+        working-directory: relay-simulator
+        run: cargo test --locked
+
+      - name: Client (fmt, clippy, tests)
+        working-directory: client
+        run: |
+          cargo fmt --check
+          cargo clippy --locked --all-targets -- -D warnings
+          cargo clippy --locked --no-default-features --all-targets -- -D warnings
+          cargo test --locked
+
+      - name: Build e2e-client
+        working-directory: e2e-client
+        run: cargo build --locked
+
+  build-gateway:
+    name: Build OHTTP Gateway
+    runs-on: ubuntu-24.04
+    needs: test
+    permissions:
+      id-token: write
+      contents: read
+      packages: write
+
+    outputs:
+      image-digest: ${{ steps.build.outputs.digest }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Configure AWS credentials
+        if: github.event_name != 'pull_request'
+        uses: aws-actions/configure-aws-credentials@5579c002bb4778aa43395ef1df492868a9a1c83f # v4.0.2
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        if: github.event_name != 'pull_request'
+        uses: aws-actions/amazon-ecr-login@4625ce35226a7557230889aae2f52eb50ec3dcda # v2.0.1
+
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@369eb591f429131d6889c46b94e711f089e6ca96 # v5.6.1
+        with:
+          images: ${{ env.ECR_REGISTRY }}/ohttp-gateway
+          tags: |
+            type=ref,event=pr,prefix=pr-
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,format=short
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@c47758b77c9736f4b2ef4073d4d51994fabfe349 # v3.7.1
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@4f58ea79222b3b9dc2c8bbdd6debcef730109a75 # v6.9.0
+        with:
+          context: ./gateway
+          file: ./gateway/Dockerfile
+          platforms: linux/amd64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Generate SBOM
+        if: github.event_name != 'pull_request'
+        uses: anchore/sbom-action@251a468eed47e5082b105c3ba6ee500c0e65a764 # v0.17.6
+        with:
+          image: ${{ env.ECR_REGISTRY }}/ohttp-gateway@${{ steps.build.outputs.digest }}
+          format: spdx-json
+          output-file: gateway-sbom.spdx.json
+
+      - name: Upload SBOM artifact
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
+        with:
+          name: gateway-sbom
+          path: gateway-sbom.spdx.json
+
+  build-relay-simulator:
+    name: Build Relay Simulator
+    runs-on: ubuntu-24.04
+    needs: test
+    permissions:
+      id-token: write
+      contents: read
+      packages: write
+
+    outputs:
+      image-digest: ${{ steps.build.outputs.digest }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Configure AWS credentials
+        if: github.event_name != 'pull_request'
+        uses: aws-actions/configure-aws-credentials@5579c002bb4778aa43395ef1df492868a9a1c83f # v4.0.2
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        if: github.event_name != 'pull_request'
+        uses: aws-actions/amazon-ecr-login@4625ce35226a7557230889aae2f52eb50ec3dcda # v2.0.1
+
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@369eb591f429131d6889c46b94e711f089e6ca96 # v5.6.1
+        with:
+          images: ${{ env.ECR_REGISTRY }}/ohttp-relay-simulator
+          tags: |
+            type=ref,event=pr,prefix=pr-
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,format=short
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@c47758b77c9736f4b2ef4073d4d51994fabfe349 # v3.7.1
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@4f58ea79222b3b9dc2c8bbdd6debcef730109a75 # v6.9.0
+        with:
+          context: ./relay-simulator
+          file: ./relay-simulator/Dockerfile
+          platforms: linux/amd64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Generate SBOM
+        if: github.event_name != 'pull_request'
+        uses: anchore/sbom-action@251a468eed47e5082b105c3ba6ee500c0e65a764 # v0.17.6
+        with:
+          image: ${{ env.ECR_REGISTRY }}/ohttp-relay-simulator@${{ steps.build.outputs.digest }}
+          format: spdx-json
+          output-file: relay-simulator-sbom.spdx.json
+
+      - name: Upload SBOM artifact
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
+        with:
+          name: relay-simulator-sbom
+          path: relay-simulator-sbom.spdx.json
+
+  build-e2e:
+    name: Build e2e client (ohttp-e2e)
+    runs-on: ubuntu-24.04
+    needs: test
+    permissions:
+      id-token: write
+      contents: read
+      packages: write
+
+    outputs:
+      image-digest: ${{ steps.build.outputs.digest }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Configure AWS credentials
+        if: github.event_name != 'pull_request'
+        uses: aws-actions/configure-aws-credentials@5579c002bb4778aa43395ef1df492868a9a1c83f # v4.0.2
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        if: github.event_name != 'pull_request'
+        uses: aws-actions/amazon-ecr-login@4625ce35226a7557230889aae2f52eb50ec3dcda # v2.0.1
+
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@369eb591f429131d6889c46b94e711f089e6ca96 # v5.6.1
+        with:
+          images: ${{ env.ECR_REGISTRY }}/ohttp-e2e
+          tags: |
+            type=ref,event=pr,prefix=pr-
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,format=short
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@c47758b77c9736f4b2ef4073d4d51994fabfe349 # v3.7.1
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@4f58ea79222b3b9dc2c8bbdd6debcef730109a75 # v6.9.0
+        with:
+          context: .
+          file: ./e2e-client/Dockerfile
+          platforms: linux/amd64
+          # The client crate's build-time endpoint configuration (client/src/relays.rs), from
+          # repository variables: signed-config checks need the pinned signing keys, the DNS check the
+          # TXT names. An unset variable builds with OHTTP off for that network.
+          build-args: |
+            ZODL_OHTTP_GATEWAY_HOST_MAINNET=${{ vars.ZODL_OHTTP_GATEWAY_HOST_MAINNET }}
+            ZODL_OHTTP_GATEWAY_HOST_TESTNET=${{ vars.ZODL_OHTTP_GATEWAY_HOST_TESTNET }}
+            ZODL_OHTTP_RELAY_URL_MAINNET=${{ vars.ZODL_OHTTP_RELAY_URL_MAINNET }}
+            ZODL_OHTTP_RELAY_URL_TESTNET=${{ vars.ZODL_OHTTP_RELAY_URL_TESTNET }}
+            ZODL_OHTTP_KEYS_DNS_NAME_MAINNET=${{ vars.ZODL_OHTTP_KEYS_DNS_NAME_MAINNET }}
+            ZODL_OHTTP_KEYS_DNS_NAME_TESTNET=${{ vars.ZODL_OHTTP_KEYS_DNS_NAME_TESTNET }}
+            ZODL_OHTTP_SIGNING_PUBKEY_MAINNET=${{ vars.ZODL_OHTTP_SIGNING_PUBKEY_MAINNET }}
+            ZODL_OHTTP_SIGNING_PUBKEY_TESTNET=${{ vars.ZODL_OHTTP_SIGNING_PUBKEY_TESTNET }}
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  sign-attest-gateway:
+    name: Sign & Attest Gateway
+    runs-on: ubuntu-24.04
+    needs: build-gateway
+    if: github.event_name != 'pull_request'
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@5579c002bb4778aa43395ef1df492868a9a1c83f # v4.0.2
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        uses: aws-actions/amazon-ecr-login@4625ce35226a7557230889aae2f52eb50ec3dcda # v2.0.1
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@1aa8e0f2454b781fbf0fbf306a4c9533a0c57409 # v3.7.0
+
+      - name: Sign image
+        env:
+          DIGEST: ${{ needs.build-gateway.outputs.image-digest }}
+        run: |
+          cosign sign --yes "${ECR_REGISTRY}/ohttp-gateway@${DIGEST}"
+
+      - name: Generate SLSA provenance
+        env:
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+          SOURCE_SHA: ${{ github.sha }}
+          RUN_ID: ${{ github.run_id }}
+          STARTED_ON: ${{ github.event.head_commit.timestamp }}
+        run: |
+          jq -n \
+            --arg builder "$WORKFLOW_REF" \
+            --arg sha "$SOURCE_SHA" \
+            --arg run_id "$RUN_ID" \
+            --arg started "$STARTED_ON" \
+            '{
+              builder: {id: $builder},
+              buildType: "https://github.com/zodl-inc/zodl-ohttp/.github/workflows/ohttp-build.yml@main",
+              invocation: {
+                configSource: {
+                  uri: "https://github.com/zodl-inc/zodl-ohttp",
+                  digest: {sha1: $sha},
+                  entryPoint: ".github/workflows/ohttp-build.yml"
+                }
+              },
+              metadata: {
+                buildInvocationId: $run_id,
+                buildStartedOn: $started,
+                completeness: {parameters: true, environment: false, materials: false}
+              },
+              materials: [{
+                uri: "https://github.com/zodl-inc/zodl-ohttp",
+                digest: {sha1: $sha}
+              }]
+            }' > provenance.json
+
+      - name: Attest with SLSA provenance
+        env:
+          DIGEST: ${{ needs.build-gateway.outputs.image-digest }}
+        run: |
+          cosign attest --yes --predicate provenance.json --type slsaprovenance "${ECR_REGISTRY}/ohttp-gateway@${DIGEST}"
+
+  sign-attest-relay-simulator:
+    name: Sign & Attest Relay Simulator
+    runs-on: ubuntu-24.04
+    needs: build-relay-simulator
+    if: github.event_name != 'pull_request'
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@5579c002bb4778aa43395ef1df492868a9a1c83f # v4.0.2
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        uses: aws-actions/amazon-ecr-login@4625ce35226a7557230889aae2f52eb50ec3dcda # v2.0.1
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@1aa8e0f2454b781fbf0fbf306a4c9533a0c57409 # v3.7.0
+
+      - name: Sign image
+        env:
+          DIGEST: ${{ needs.build-relay-simulator.outputs.image-digest }}
+        run: |
+          cosign sign --yes "${ECR_REGISTRY}/ohttp-relay-simulator@${DIGEST}"
+
+      - name: Generate SLSA provenance
+        env:
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+          SOURCE_SHA: ${{ github.sha }}
+          RUN_ID: ${{ github.run_id }}
+          STARTED_ON: ${{ github.event.head_commit.timestamp }}
+        run: |
+          jq -n \
+            --arg builder "$WORKFLOW_REF" \
+            --arg sha "$SOURCE_SHA" \
+            --arg run_id "$RUN_ID" \
+            --arg started "$STARTED_ON" \
+            '{
+              builder: {id: $builder},
+              buildType: "https://github.com/zodl-inc/zodl-ohttp/.github/workflows/ohttp-build.yml@main",
+              invocation: {
+                configSource: {
+                  uri: "https://github.com/zodl-inc/zodl-ohttp",
+                  digest: {sha1: $sha},
+                  entryPoint: ".github/workflows/ohttp-build.yml"
+                }
+              },
+              metadata: {
+                buildInvocationId: $run_id,
+                buildStartedOn: $started,
+                completeness: {parameters: true, environment: false, materials: false}
+              },
+              materials: [{
+                uri: "https://github.com/zodl-inc/zodl-ohttp",
+                digest: {sha1: $sha}
+              }]
+            }' > provenance.json
+
+      - name: Attest with SLSA provenance
+        env:
+          DIGEST: ${{ needs.build-relay-simulator.outputs.image-digest }}
+        run: |
+          cosign attest --yes --predicate provenance.json --type slsaprovenance "${ECR_REGISTRY}/ohttp-relay-simulator@${DIGEST}"
+
+  sign-attest-e2e:
+    name: Sign & Attest e2e client (ohttp-e2e)
+    runs-on: ubuntu-24.04
+    needs: build-e2e
+    if: github.event_name != 'pull_request'
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@5579c002bb4778aa43395ef1df492868a9a1c83f # v4.0.2
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        uses: aws-actions/amazon-ecr-login@4625ce35226a7557230889aae2f52eb50ec3dcda # v2.0.1
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@1aa8e0f2454b781fbf0fbf306a4c9533a0c57409 # v3.7.0
+
+      - name: Sign image
+        env:
+          DIGEST: ${{ needs.build-e2e.outputs.image-digest }}
+        run: |
+          cosign sign --yes "${ECR_REGISTRY}/ohttp-e2e@${DIGEST}"
+
+      - name: Generate SLSA provenance
+        env:
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+          SOURCE_SHA: ${{ github.sha }}
+          RUN_ID: ${{ github.run_id }}
+          STARTED_ON: ${{ github.event.head_commit.timestamp }}
+        run: |
+          jq -n \
+            --arg builder "$WORKFLOW_REF" \
+            --arg sha "$SOURCE_SHA" \
+            --arg run_id "$RUN_ID" \
+            --arg started "$STARTED_ON" \
+            '{
+              builder: {id: $builder},
+              buildType: "https://github.com/zodl-inc/zodl-ohttp/.github/workflows/ohttp-build.yml@main",
+              invocation: {
+                configSource: {
+                  uri: "https://github.com/zodl-inc/zodl-ohttp",
+                  digest: {sha1: $sha},
+                  entryPoint: ".github/workflows/ohttp-build.yml"
+                }
+              },
+              metadata: {
+                buildInvocationId: $run_id,
+                buildStartedOn: $started,
+                completeness: {parameters: true, environment: false, materials: false}
+              },
+              materials: [{
+                uri: "https://github.com/zodl-inc/zodl-ohttp",
+                digest: {sha1: $sha}
+              }]
+            }' > provenance.json
+
+      - name: Attest with SLSA provenance
+        env:
+          DIGEST: ${{ needs.build-e2e.outputs.image-digest }}
+        run: |
+          cosign attest --yes --predicate provenance.json --type slsaprovenance "${ECR_REGISTRY}/ohttp-e2e@${DIGEST}"
