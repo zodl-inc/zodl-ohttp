@@ -109,10 +109,11 @@ trusts a key configuration only through that envelope.
 
 A network is OHTTP-capable in a wallet build only when its gateway host
 (`ZODL_OHTTP_GATEWAY_HOST_MAINNET` / `_TESTNET`), relay URL (`ZODL_OHTTP_RELAY_URL_*`, `https://`
-only) and signing key (`ZODL_OHTTP_SIGNING_PUBKEY_*`, 64 hex digits) are all set at build time
-(`client/src/relays.rs`, validated by `client/build.rs`). There is no built-in value and no
-runtime override; an unset variable turns OHTTP off for that network, a malformed one fails the
-build.
+only), signing key (`ZODL_OHTTP_SIGNING_PUBKEY_*`, 64 hex digits) and keys DNS name
+(`ZODL_OHTTP_KEYS_DNS_NAME_*`) are all set at build time (`client/src/relays.rs`, validated by
+`client/build.rs`). There is no built-in value and no runtime override. With none of a network's
+four values set, OHTTP is off for that network; a partial set, a malformed value or a value
+shared by mainnet and testnet fails the build.
 
 1. **Through the relay.** The client fetches `GET /ohttp-configs/signed` through its relay (the
    URL is derived from the relay URL, `signed_config_url`). The relay forwards the GET to the

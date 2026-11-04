@@ -22,11 +22,15 @@ cargo run --release -- <config_url> <relay_url> <authority> <method> <path> [tra
 
 Signed key configurations (`.../ohttp-configs/signed`) are verified against the signing key the
 client crate was built with (`ZODL_OHTTP_SIGNING_PUBKEY_MAINNET` / `_TESTNET`, see
-`../client/src/relays.rs`); `--key-config-source dns` also needs `ZODL_OHTTP_KEYS_DNS_NAME_*`.
-Without them the binary still builds and refuses signed configurations for that network.
+`../client/src/relays.rs`); `--key-config-source dns` uses `ZODL_OHTTP_KEYS_DNS_NAME_*`. A
+network is configured with all four of its variables (gateway host, relay URL, signing key, keys
+DNS name) or none; without them the binary still builds and refuses signed configurations for
+that network.
 
 ```
-ZODL_OHTTP_SIGNING_PUBKEY_TESTNET=<64 hex digits> cargo build --release
+ZODL_OHTTP_GATEWAY_HOST_TESTNET=<host> ZODL_OHTTP_RELAY_URL_TESTNET=<https URL> \
+ZODL_OHTTP_SIGNING_PUBKEY_TESTNET=<64 hex digits> ZODL_OHTTP_KEYS_DNS_NAME_TESTNET=<DNS name> \
+  cargo build --release
 ```
 
 Examples (placeholder hosts, RFC 2606):

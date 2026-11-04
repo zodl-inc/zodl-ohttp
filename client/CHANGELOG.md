@@ -2,6 +2,26 @@
 
 [Keep a Changelog](https://keepachangelog.com).
 
+## 0.1.2
+
+### Changed
+
+- The build-time endpoint configuration is all or nothing per network: when any of a network's
+  four variables (`ZODL_OHTTP_GATEWAY_HOST_*`, `ZODL_OHTTP_RELAY_URL_*`,
+  `ZODL_OHTTP_KEYS_DNS_NAME_*`, `ZODL_OHTTP_SIGNING_PUBKEY_*`) is set while another of the same
+  network is unset or empty, the build fails with a message naming the network and the missing
+  variables. Before, a partial configuration built and silently left OHTTP off for that
+  network. With no variable set the build still succeeds with OHTTP off.
+- When both networks are configured, the build fails if mainnet and testnet share a gateway
+  host, relay URL, keys DNS name or signing key (compared ignoring ASCII case).
+- Build script error messages name the variable and the rule only; they no longer include the
+  rejected value.
+
+### Added
+
+- Opt-in strict mode: with `ZODL_OHTTP_REQUIRE=1` the build fails unless all eight endpoint
+  variables are set. Unset, empty or `0` leaves it off; any other value fails the build.
+
 ## 0.1.1
 
 ### Changed

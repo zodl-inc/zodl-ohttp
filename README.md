@@ -102,9 +102,9 @@ Images can be pushed to any OCI registry (`REGISTRY_URL`, see `scripts/deploy.sh
 - `.github/workflows/ohttp-build.yml`: `cargo test` for the gateway and the relay simulator,
   `rustfmt` + `clippy` + `cargo test` for the client library and a build of the e2e client, on pull
   requests and pushes to `main`; gateway, relay-simulator and e2e-client images are built on every run and,
-  from `main` and `v*` tags only, pushed (tags `sha-<short>`, semver for `v*` tags); the gateway
-  and relay-simulator images also get an SBOM, a cosign signature and a SLSA provenance
-  attestation.
+  from `main` and `v*` tags only, pushed (tags `sha-<short>`, semver for `v*` tags); pushed
+  gateway, relay-simulator and e2e-client images get a cosign signature and a SLSA provenance
+  attestation, and the gateway and relay-simulator images also an SBOM.
 - `.github/workflows/fuzz.yml`: every fuzz target for 60 s on pull requests and pushes, 10 min
   nightly.
 - `.github/workflows/sign-existing-image.yml` (manual) signs an already pushed image;
