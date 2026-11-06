@@ -207,7 +207,9 @@ trace ids are never labels. `network` is `NETWORK`.
 | `ohttp_key_config_info` | `network, fingerprint, signing_key_id` | Always 1: first 16 hex of SHA-256 of `/ohttp-configs` and the signing key id. |
 | `ohttp_origin_info` | `network, origin` | Always 1: `ORIGIN_ID`. |
 | `ohttp_replay_peers_configured` | `network` | Number of `REPLAY_PEER_URLS`. |
+| `ohttp_replay_standby_stores_configured` | `network` | Number of `REPLAY_STANDBY_URLS`. Their per-peer series use `peer` labels after the `REPLAY_PEER_URLS` ones (one peer: the first standby store is `peer="1"`). |
 | `ohttp_replay_peer_connected` | `network, peer` | Peer store PING, per peer index. |
+| `ohttp_replay_standby_connected` | `network, peer` | Standby store (`REPLAY_STANDBY_URLS`) PING; separate from `ohttp_replay_peer_connected`, which only covers the peers. |
 | `ohttp_replay_peer_total` | `network, peer, result` | Nonce writes to peers: `fresh`, `replay`, `replay_async`, `error`, `timeout`, `disconnected`. |
 | `ohttp_replay_peer_consecutive_failures` | `network, peer` | Failures since the last success. |
 | `ohttp_replay_class_total` | `network, class` | Inner requests classified `read` / `write` (only with peers). |

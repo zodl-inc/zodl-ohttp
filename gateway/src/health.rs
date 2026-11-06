@@ -408,6 +408,21 @@ lazy_static::lazy_static! {
     .unwrap();
 }
 
+// A second block: one more static in the first exceeds the macro recursion limit.
+lazy_static::lazy_static! {
+    static ref OHTTP_REPLAY_STANDBY_CONNECTED: IntGaugeVec = IntGaugeVec::new(
+        Opts::new("ohttp_replay_standby_connected", "Standby store (REPLAY_STANDBY_URLS) PING, per peer label; kept apart from ohttp_replay_peer_connected, which means the peers"),
+        &["network", "peer"]
+    )
+    .unwrap();
+
+    static ref OHTTP_REPLAY_STANDBY_STORES_CONFIGURED: IntGaugeVec = IntGaugeVec::new(
+        Opts::new("ohttp_replay_standby_stores_configured", "Number of REPLAY_STANDBY_URLS (standby origins' security Redis) this gateway replicates WRITE nonces to; their peer labels follow the REPLAY_PEER_URLS ones"),
+        &["network"]
+    )
+    .unwrap();
+}
+
 pub fn init_metrics() {
     REGISTRY
         .register(Box::new(OHTTP_REQUESTS_TOTAL.clone()))
@@ -492,6 +507,8 @@ pub fn init_metrics() {
         &*OHTTP_KEY_CONFIG_INFO,
         &*OHTTP_SECURITY_REDIS_CONNECTED,
         &*OHTTP_REPLAY_PEERS_CONFIGURED,
+        &*OHTTP_REPLAY_STANDBY_STORES_CONFIGURED,
+        &*OHTTP_REPLAY_STANDBY_CONNECTED,
         &*OHTTP_REPLAY_PEER_CONNECTED,
     ] {
         REGISTRY.register(Box::new(g.clone())).ok();
@@ -887,6 +904,18 @@ pub fn record_replay_peers_configured(network: &str, n: usize) {
     OHTTP_REPLAY_PEERS_CONFIGURED
         .with_label_values(&[network])
         .set(n as i64);
+}
+
+pub fn record_replay_standby_stores_configured(network: &str, n: usize) {
+    OHTTP_REPLAY_STANDBY_STORES_CONFIGURED
+        .with_label_values(&[network])
+        .set(n as i64);
+}
+
+pub fn record_replay_standby_connected(network: &str, peer: usize, connected: bool) {
+    OHTTP_REPLAY_STANDBY_CONNECTED
+        .with_label_values(&[network, &peer.to_string()])
+        .set(if connected { 1 } else { 0 });
 }
 
 pub fn record_replay_peer_connected(network: &str, peer: usize, connected: bool) {
