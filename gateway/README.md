@@ -204,6 +204,9 @@ trace ids are never labels. `network` is `NETWORK`.
 | `ohttp_replay_rejected_total` | `network` | Requests refused as replays. |
 | `ohttp_replay_write_wait_total` | `network, result` | WRITE nonces checked for replica acknowledgement (`REPLAY_WRITE_WAIT_REPLICAS`). |
 | `ohttp_replay_write_wait_seconds` | `network` | Time to that acknowledgement (histogram). |
+| `ohttp_replay_write_fallback_total` | `network, path, result` | WRITE nonces confirmed at the peer stores. `path`: `short_ack` (the local acknowledgement was short) or `window` (`failover` mode, one nonce TTL after a local store failover). `result`: `accepted`, `replay`, `unavailable`, `unacknowledged`, `overflow`. |
+| `ohttp_replay_write_back_total` | `network, result` | Nonces admitted through the peers rewritten to the local store: `written` (acknowledged by its replicas) or `expired`. |
+| `ohttp_replay_write_back_pending` | `network` | Such nonces still waiting for the local replicas. |
 | `ohttp_key_config_info` | `network, fingerprint, signing_key_id` | Always 1: first 16 hex of SHA-256 of `/ohttp-configs` and the signing key id. |
 | `ohttp_origin_info` | `network, origin` | Always 1: `ORIGIN_ID`. |
 | `ohttp_replay_peers_configured` | `network` | Number of `REPLAY_PEER_URLS`. |

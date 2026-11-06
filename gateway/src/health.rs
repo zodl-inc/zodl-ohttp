@@ -498,6 +498,8 @@ pub fn init_metrics() {
         &*OHTTP_BLOCK_PERMANENT_TOTAL,
         &*OHTTP_CHAIN_REORGS_TOTAL,
         &*OHTTP_STORE_RECONNECT_TOTAL,
+        &*OHTTP_REPLAY_WRITE_FALLBACK_TOTAL,
+        &*OHTTP_REPLAY_WRITE_BACK_TOTAL,
     ] {
         REGISTRY.register(Box::new(c.clone())).ok();
     }
@@ -510,6 +512,7 @@ pub fn init_metrics() {
         &*OHTTP_REPLAY_STANDBY_STORES_CONFIGURED,
         &*OHTTP_REPLAY_STANDBY_CONNECTED,
         &*OHTTP_REPLAY_PEER_CONNECTED,
+        &*OHTTP_REPLAY_WRITE_BACK_PENDING,
     ] {
         REGISTRY.register(Box::new(g.clone())).ok();
     }
@@ -1030,13 +1033,48 @@ pub fn healthz_ok(security_redis_ok: bool, lwd_ok: bool) -> bool {
 lazy_static::lazy_static! {
     // Its own block: the main one is at the macro recursion limit.
     static ref OHTTP_STORE_RECONNECT_TOTAL: IntCounterVec = IntCounterVec::new(
-        Opts::new("ohttp_store_reconnect_total", "Store connection failover signals and replacements, by store and reason: READONLY, MOVED, UNBLOCKED, LOADING, MASTERDOWN, ERR (WAIT refused on a replica), role (ROLE is not master), timeout, error (broken connection); replaced = a new connection is in use"),
+        Opts::new("ohttp_store_reconnect_total", "Store connection failover signals and replacements, by store and reason: READONLY, MOVED, UNBLOCKED, LOADING, MASTERDOWN, ERR (WAIT refused on a replica), role (ROLE is not master), timeout, error (broken connection), short_ack (write-back: no replica acknowledgement for ~10 s); replaced = a new connection is in use"),
         &["network", "store", "reason"]
+    )
+    .unwrap();
+    static ref OHTTP_REPLAY_WRITE_FALLBACK_TOTAL: IntCounterVec = IntCounterVec::new(
+        Opts::new("ohttp_replay_write_fallback_total", "WRITE replay nonces confirmed at the peer stores (write_fallback.rs). path: short_ack (the local replica acknowledgement was short, e.g. a resync after a failover of the local store) or window (failover mode, after a local store failover). result: accepted (the WRITE runs), replay (a peer held the nonce: refused), unavailable (a peer did not answer: short_ack fails closed, window keeps the local verdict), unacknowledged (the peer's own replicas did not confirm: fail-closed), overflow (write-back queue full: fail-closed)"),
+        &["network", "path", "result"]
+    )
+    .unwrap();
+    static ref OHTTP_REPLAY_WRITE_BACK_TOTAL: IntCounterVec = IntCounterVec::new(
+        Opts::new("ohttp_replay_write_back_total", "Nonces of WRITEs admitted through the peer stores, rewritten to the local security store: written (acknowledged by its replicas) or expired (TTL over before that)"),
+        &["network", "result"]
+    )
+    .unwrap();
+    static ref OHTTP_REPLAY_WRITE_BACK_PENDING: IntGaugeVec = IntGaugeVec::new(
+        Opts::new("ohttp_replay_write_back_pending", "Nonces of WRITEs admitted through the peer stores still waiting for the local replicas"),
+        &["network"]
     )
     .unwrap();
 }
 
-/// `store`: security | write_wait | local_aof | pinned | permanent (no URLs: they carry
+/// `path`: short_ack | window; `result`: accepted | replay | unavailable | unacknowledged | overflow.
+pub fn record_replay_write_fallback(network: &str, path: &str, result: &str) {
+    OHTTP_REPLAY_WRITE_FALLBACK_TOTAL
+        .with_label_values(&[network, path, result])
+        .inc();
+}
+
+/// `result`: written | expired.
+pub fn record_replay_write_back(network: &str, result: &str, n: u64) {
+    OHTTP_REPLAY_WRITE_BACK_TOTAL
+        .with_label_values(&[network, result])
+        .inc_by(n);
+}
+
+pub fn record_replay_write_back_pending(network: &str, n: usize) {
+    OHTTP_REPLAY_WRITE_BACK_PENDING
+        .with_label_values(&[network])
+        .set(n as i64);
+}
+
+/// `store`: security | write_wait | write_back | local_aof | pinned | permanent (no URLs: they carry
 /// credentials).
 pub fn record_store_reconnect(network: &str, store: &str, reason: &str) {
     OHTTP_STORE_RECONNECT_TOTAL

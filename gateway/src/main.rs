@@ -71,6 +71,7 @@ mod store;
 mod store_conn;
 mod subtree_cache;
 mod third_party_cache;
+mod write_fallback;
 
 mod signing;
 use config::Config;
@@ -1861,6 +1862,7 @@ async fn gateway_handler(
     // store; a WRITE (anything not on REPLAY_READ_ROUTES) is checked at the peers synchronously
     // and a nonce a peer holds is refused like a local replay.
     // Returns inner responses so the relay learns nothing about side effects.
+    let mut peer_check = cache::PeerCheck::default();
     if let Some(cache) = state.cache.as_ref().filter(|c| c.replay_peers().is_some()) {
         let class = state.origin.replay_read_routes.classify(
             cache_allowed,
@@ -1869,9 +1871,9 @@ async fn gateway_handler(
             &inner_request.path,
         );
         health::record_replay_class(&network, class.as_str());
-        match cache.replicate_nonce(&body_hash, class).await {
-            Ok(false) => {}
-            Ok(true) => {
+        match cache.replicate_nonce_checked(&body_hash, class).await {
+            Ok(check) if !check.replay => peer_check = check,
+            Ok(_) => {
                 warn!(
                     request_id = %request_id,
                     network = %network,
@@ -1954,6 +1956,8 @@ async fn gateway_handler(
 
     // GW-REPLAY-INNER: Same-store failover window (REPLAY_WRITE_WAIT_REPLICAS): a WRITE runs only once its
     // replay nonce is on the security Redis replicas, so promoting a replica cannot forget it.
+    // While the local replicas cannot acknowledge (a resync after a failover) the WRITE is
+    // confirmed at the peer stores instead, when there are any (write_fallback.rs).
     // READs skip this: a replayed READ changes no state. Decided before
     // anything is executed or served from the cache; fail-closed like the replay check.
     // Returns inner responses so the relay learns nothing about side effects.
@@ -1965,9 +1969,38 @@ async fn gateway_handler(
             &inner_request.path,
         );
         if class == origin::RouteClass::Write {
-            let started = Instant::now();
-            let result = cache.confirm_nonce_replicated(&body_hash).await;
-            health::observe_replay_write_wait(&network, result.is_ok(), started.elapsed());
+            let result = cache.confirm_write_nonce(&body_hash, peer_check).await;
+            if let Ok(cache::WriteAdmission::Replay) = result {
+                warn!(
+                    request_id = %request_id,
+                    network = %network,
+                    body_hash = %hex::encode(body_hash),
+                    origin = state.origin.label(),
+                    "Replay detected at a peer origin (WRITE confirmed at the peer stores)"
+                );
+                crate::health::OHTTP_REPLAY_REJECTED
+                    .with_label_values(&[&network])
+                    .inc();
+                // GW-REPLAY-INNER: gRPC requests get grpc-status, third-party HTTP gets HTTP 409
+                if inner_request.is_grpc() {
+                    health::record_request_detailed(
+                        "replay", "ohttp", &network, "ohttp", "-", 200, "10", "-", "other",
+                    );
+                    log.served("replay", "10", 0);
+                    return responder
+                        .grpc_error("10", "Request aborted: replay detected at peer origin");
+                } else {
+                    health::record_request_detailed(
+                        "replay", "ohttp", &network, "ohttp", "-", 409, "-", "-", "other",
+                    );
+                    log.served("replay", "-", 0);
+                    return responder.collected(ohttp::InnerResponse {
+                        status: 409,
+                        headers: vec![("content-type".to_string(), "text/plain".to_string())],
+                        body: b"Conflict: replay detected".to_vec(),
+                    });
+                }
+            }
             if let Err(e) = result {
                 warn!(
                     request_id = %request_id,
