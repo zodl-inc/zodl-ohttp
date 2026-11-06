@@ -56,6 +56,7 @@ use crate::replication::{AsyncReplicator, Effective, PeerSink, ReplicationConfig
 use crate::rpc_cache::{self, grpc_message, BlockId, TreeStateHead};
 use crate::store::{CacheStore, PermanentStore, TipCell};
 use crate::store_conn::{is_failover_signal, Role, StoreConn};
+use crate::write_fallback::WriteFallback;
 
 pub use crate::rpc_cache::{grpc_block_id, height_key, CacheLookup, CacheMiss, MAX_CACHEABLE_SIZE};
 
@@ -125,6 +126,40 @@ pub struct ResponseCache {
     write_wait: Option<Arc<WriteWait>>,
     /// Local AOF fsync of WRITE nonces no peer took (REPLAY_LOCAL_WAITAOF_MS); None when off.
     local_aof: Option<Arc<LocalAof>>,
+    /// The peer fallback of the WRITE replica wait (write_fallback.rs); with `write_wait`.
+    write_fallback: Option<Arc<WriteFallback>>,
+}
+
+/// What the peers said about a WRITE nonce in `replicate_nonce_checked`, for the replica wait
+/// that follows (`confirm_write_nonce`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PeerCheck {
+    /// A peer already held the nonce: a cross-origin replay.
+    pub replay: bool,
+    /// Every peer (at least one) stored the nonce as new and acknowledged it on its own
+    /// replicas (`REPLAY_PEER_WAIT_REPLICAS` >= 1), synchronously, before the local wait.
+    pub durable_at_peers: bool,
+    /// `failover` mode, a WRITE with `REPLAY_WRITE_WAIT_REPLICAS`: the asynchronous replication
+    /// to the peers is left to `confirm_write_nonce`, after the local verdict, so that a
+    /// synchronous check at the peers there never meets this request's own nonce.
+    pub deferred: bool,
+}
+
+/// The decision of `confirm_write_nonce` for a WRITE whose nonce is new locally.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WriteAdmission {
+    Run,
+    /// A peer store already held the nonce.
+    Replay,
+}
+
+/// The outcome of the local replica wait of a WRITE nonce.
+enum LocalWait {
+    Acked,
+    /// The nonce is on the local primary (`SET XX` succeeded) but fewer replicas acknowledged
+    /// it than required: the only case the peer fallback may cover.
+    Short(anyhow::Error),
+    Failed(anyhow::Error),
 }
 
 /// `REPLAY_WRITE_WAIT_REPLICAS` / `REPLAY_WRITE_WAIT_MS`: before a WRITE (anything not on
@@ -977,6 +1012,7 @@ impl ResponseCache {
             standby_replicator: None,
             write_wait: None,
             local_aof: None,
+            write_fallback: None,
         };
 
         if cache.cache_conn.load().is_none() {
@@ -1035,8 +1071,25 @@ impl ResponseCache {
             Role::Primary,
         )
         .await?;
+        let fb = Arc::new(WriteFallback::new(
+            &self.network,
+            self.store_generation_of(&conn),
+        ));
+        crate::write_fallback::spawn_write_back(
+            fb.clone(),
+            conn.clone(),
+            config,
+            self.redis_timeout,
+        );
+        self.write_fallback = Some(fb);
         self.write_wait = Some(Arc::new(WriteWait { conn, config }));
         Ok(self)
+    }
+
+    /// Sum of the security and `WAIT` connection generations: it changes whenever one of them
+    /// was replaced (a failover of the local store, or a hung connection).
+    fn store_generation_of(&self, wait_conn: &StoreConn) -> u64 {
+        wait_conn.generation() + self.security_conn.as_ref().map_or(0, |c| c.generation())
     }
 
     pub fn write_wait(&self) -> Option<WriteWaitConfig> {
@@ -1051,6 +1104,13 @@ impl ResponseCache {
             return Ok(());
         };
         let key = format!("replay:{}:{}", self.network, hex::encode(body_hash));
+        match self.wait_local(ww, &key).await {
+            LocalWait::Acked => Ok(()),
+            LocalWait::Short(e) | LocalWait::Failed(e) => Err(e),
+        }
+    }
+
+    async fn wait_local(&self, ww: &WriteWait, key: &str) -> LocalWait {
         let WriteWaitConfig {
             replicas,
             timeout_ms,
@@ -1097,19 +1157,25 @@ impl ResponseCache {
             let r = tokio::time::timeout_at(deadline, round_trip).await;
             ww.conn.observe_timed(&r);
             let e = match r {
-                Ok(Ok(Some(acked))) if acked >= replicas as i64 => return Ok(()),
+                Ok(Ok(Some(acked))) if acked >= replicas as i64 => return LocalWait::Acked,
                 Ok(Ok(Some(acked))) => {
                     ww.conn.observe_short_ack();
-                    anyhow::bail!(
+                    return LocalWait::Short(anyhow::anyhow!(
                         "Replay nonce acknowledged by {acked} of {replicas} replica(s) within {timeout_ms}ms (fail-closed)"
-                    )
+                    ));
                 }
                 Ok(Ok(None)) => {
-                    anyhow::bail!("Replay nonce no longer in the security store (fail-closed)")
+                    return LocalWait::Failed(anyhow::anyhow!(
+                        "Replay nonce no longer in the security store (fail-closed)"
+                    ))
                 }
                 Ok(Err(e)) if !retried && is_failover_signal(&e, Role::Primary) => e,
-                Ok(Err(e)) => anyhow::bail!("Replay nonce WAIT failed (fail-closed): {e}"),
-                Err(_) => return Err(timed_out()),
+                Ok(Err(e)) => {
+                    return LocalWait::Failed(anyhow::anyhow!(
+                        "Replay nonce WAIT failed (fail-closed): {e}"
+                    ))
+                }
+                Err(_) => return LocalWait::Failed(timed_out()),
             };
             retried = true;
             warn!(network = %self.network, error = %e, "Replay nonce WAIT connection lost the primary, retrying once on a new connection");
@@ -1117,9 +1183,156 @@ impl ResponseCache {
             // An I/O error is also repaired by ConnectionManager itself; a READONLY connection
             // only by the replacement.
             if !ww.conn.wait_for_reconnect(generation, left).await && !e.is_io_error() {
-                anyhow::bail!("Replay nonce WAIT failed (fail-closed): {e}");
+                return LocalWait::Failed(anyhow::anyhow!(
+                    "Replay nonce WAIT failed (fail-closed): {e}"
+                ));
             }
         }
+    }
+
+    pub fn write_fallback(&self) -> Option<&WriteFallback> {
+        self.write_fallback.as_deref()
+    }
+
+    /// For a WRITE whose nonce is new everywhere it was checked so far (`check_replay`, then
+    /// `replicate_nonce_checked` gave `check`): the local replica wait
+    /// (`REPLAY_WRITE_WAIT_REPLICAS`), with the peer fallback of `write_fallback.rs` when only
+    /// the acknowledgement is short. `Err` = fail-closed (outer 503 / grpc-status 14), as an
+    /// unacknowledged nonce always was. `Run` when the wait is off.
+    pub async fn confirm_write_nonce(
+        &self,
+        body_hash: &[u8],
+        check: PeerCheck,
+    ) -> anyhow::Result<WriteAdmission> {
+        let key = format!("replay:{}:{}", self.network, hex::encode(body_hash));
+        let Some(ww) = self.write_wait.as_ref() else {
+            // `deferred` is only ever set with the wait on; keep the replication anyway.
+            if check.deferred {
+                if let Some(r) = &self.replicator {
+                    r.enqueue(&key);
+                }
+            }
+            return Ok(WriteAdmission::Run);
+        };
+        let started = std::time::Instant::now();
+        let local = self.wait_local(ww, &key).await;
+        crate::health::observe_replay_write_wait(
+            &self.network,
+            matches!(local, LocalWait::Acked),
+            started.elapsed(),
+        );
+        if let Some(fb) = &self.write_fallback {
+            fb.note_generation(self.store_generation_of(&ww.conn));
+        }
+        match local {
+            LocalWait::Acked => Ok(self.after_local_ack(&key, check).await),
+            LocalWait::Failed(e) => Err(e),
+            LocalWait::Short(e) => {
+                if let Some(fb) = &self.write_fallback {
+                    fb.open_window();
+                }
+                self.short_ack_fallback(key, check, e).await
+            }
+        }
+    }
+
+    /// The local replicas have the nonce. In `failover` mode the deferred replication to the
+    /// peers happens now: asynchronously as always, or, inside the window after a local store
+    /// failover, synchronously with the peers' verdict.
+    async fn after_local_ack(&self, key: &str, check: PeerCheck) -> WriteAdmission {
+        if !check.deferred {
+            return WriteAdmission::Run;
+        }
+        let window = self
+            .write_fallback
+            .as_ref()
+            .is_some_and(|fb| fb.window_open());
+        let peers = self.replay_peers.as_ref();
+        let (Some(peers), true) = (peers, window) else {
+            if let Some(r) = &self.replicator {
+                r.enqueue(key);
+            }
+            return WriteAdmission::Run;
+        };
+        let outcomes = peers.write_nonce(key, REPLAY_TTL_SECS).await;
+        let verdict = combine_peer_outcomes(&outcomes);
+        let result = match verdict {
+            PeerVerdict::Fresh => "accepted",
+            PeerVerdict::Replay => "replay",
+            PeerVerdict::Unavailable => "unavailable",
+        };
+        crate::health::record_replay_write_fallback(&self.network, "window", result);
+        match verdict {
+            PeerVerdict::Replay => WriteAdmission::Replay,
+            PeerVerdict::Fresh => WriteAdmission::Run,
+            PeerVerdict::Unavailable => {
+                // The local verdict stands, as outside the window; the peers that did not take
+                // the nonce get it asynchronously.
+                if let Some(r) = &self.replicator {
+                    r.enqueue_to(key, |i| outcomes.get(i) != Some(&PeerOutcome::Fresh));
+                }
+                WriteAdmission::Run
+            }
+        }
+    }
+
+    /// The local replica acknowledgement was short (the nonce is on the local primary only):
+    /// confirm the WRITE at the peer stores instead, or fail closed with `e`.
+    async fn short_ack_fallback(
+        &self,
+        key: String,
+        check: PeerCheck,
+        e: anyhow::Error,
+    ) -> anyhow::Result<WriteAdmission> {
+        // No peer store that can acknowledge on its replicas: as without the fallback.
+        let (Some(peers), Some(fb)) = (
+            self.replay_peers.as_ref().filter(|p| p.wait().is_some()),
+            self.write_fallback.as_ref(),
+        ) else {
+            return Err(e);
+        };
+        let record = |result: &str| {
+            crate::health::record_replay_write_fallback(&self.network, "short_ack", result)
+        };
+        if !fb.has_room() {
+            record("overflow");
+            return Err(e.context("write-back queue full, no peer fallback"));
+        }
+        if !check.durable_at_peers {
+            if !check.deferred {
+                // async-reads / sync: the peers were asked already and did not all take and
+                // acknowledge the nonce (unreachable, tolerated by the policy).
+                record("unavailable");
+                return Err(e.context("no peer store acknowledged the nonce"));
+            }
+            let outcomes = peers.write_nonce(&key, REPLAY_TTL_SECS).await;
+            match combine_peer_outcomes(&outcomes) {
+                PeerVerdict::Replay => {
+                    record("replay");
+                    return Ok(WriteAdmission::Replay);
+                }
+                PeerVerdict::Unavailable => {
+                    record("unavailable");
+                    return Err(e.context(format!("peer fallback unavailable: {outcomes:?}")));
+                }
+                PeerVerdict::Fresh => {}
+            }
+            if let Err(pe) = peers.confirm_replicated(&key, |_| true).await {
+                record("unacknowledged");
+                return Err(e.context(format!("peer fallback: {pe}")));
+            }
+        }
+        if !fb.push_write_back(key) {
+            record("overflow");
+            return Err(e.context("write-back queue full, no peer fallback"));
+        }
+        record("accepted");
+        warn!(
+            network = %self.network,
+            reason = %e,
+            "WRITE replay nonce confirmed at the peer stores (local replica acknowledgement short); written back locally later"
+        );
+        Ok(WriteAdmission::Run)
     }
 
     /// REPLAY_LOCAL_WAITAOF_MS (`LocalAofConfig`) on a dedicated connection to `security_url`.
@@ -1683,8 +1896,21 @@ impl ResponseCache {
         body_hash: &[u8],
         class: RouteClass,
     ) -> anyhow::Result<bool> {
+        Ok(self.replicate_nonce_checked(body_hash, class).await?.replay)
+    }
+
+    /// `replicate_nonce` with what the replica wait that follows needs to know (`PeerCheck`).
+    pub async fn replicate_nonce_checked(
+        &self,
+        body_hash: &[u8],
+        class: RouteClass,
+    ) -> anyhow::Result<PeerCheck> {
+        let replay = |replay: bool| PeerCheck {
+            replay,
+            ..PeerCheck::default()
+        };
         let Some(peers) = &self.replay_peers else {
-            return Ok(false);
+            return Ok(replay(false));
         };
         let key = format!("replay:{}:{}", self.network, hex::encode(body_hash));
         match (peers.mode(), class) {
@@ -1694,20 +1920,27 @@ impl ResponseCache {
                 peers
                     .confirm_replicated(&key, |i| peers.connected(i))
                     .await?;
-                Ok(false)
+                Ok(replay(false))
             }
-            (ReplayPeerMode::Sync, RouteClass::Read) => Ok(false),
-            (ReplayPeerMode::Failover, _) => {
-                if let Some(r) = &self.replicator {
-                    r.enqueue(&key);
+            (ReplayPeerMode::Sync, RouteClass::Read) => Ok(replay(false)),
+            (ReplayPeerMode::Failover, class) => {
+                // A WRITE with the local replica wait: replicated after it (confirm_write_nonce).
+                let deferred = class == RouteClass::Write && self.write_wait.is_some();
+                if !deferred {
+                    if let Some(r) = &self.replicator {
+                        r.enqueue(&key);
+                    }
                 }
-                Ok(false)
+                Ok(PeerCheck {
+                    deferred,
+                    ..PeerCheck::default()
+                })
             }
             (ReplayPeerMode::AsyncReads, RouteClass::Read) => {
                 let strict = match &self.replicator {
                     Some(r) if r.health().effective() == Effective::Relaxed => {
                         r.enqueue(&key);
-                        return Ok(false);
+                        return Ok(replay(false));
                     }
                     Some(_) => true,
                     // No replicator (cannot happen in main; tests): synchronous.
@@ -1716,6 +1949,7 @@ impl ResponseCache {
                 debug_assert!(strict);
                 let outcomes = peers.write_nonce(&key, REPLAY_TTL_SECS).await;
                 self.peer_verdict(&outcomes, peers.fail_closed(), "REPLAY_PEER_FAIL_CLOSED")
+                    .map(replay)
             }
             (ReplayPeerMode::AsyncReads, RouteClass::Write) => {
                 let outcomes = peers.write_nonce(&key, REPLAY_TTL_SECS).await;
@@ -1746,7 +1980,17 @@ impl ResponseCache {
                         }
                     }
                 }
-                Ok(replay)
+                // Every peer took the nonce and (confirm_replicated above, with a wait) has it
+                // on its replicas: the local replica wait may fall back on that.
+                let durable_at_peers = !replay
+                    && peers.wait().is_some()
+                    && !outcomes.is_empty()
+                    && outcomes.iter().all(|o| *o == PeerOutcome::Fresh);
+                Ok(PeerCheck {
+                    replay,
+                    durable_at_peers,
+                    deferred: false,
+                })
             }
         }
     }
@@ -2601,6 +2845,7 @@ mod tests {
             standby_replicator: None,
             write_wait: None,
             local_aof: None,
+            write_fallback: None,
         }
     }
 
