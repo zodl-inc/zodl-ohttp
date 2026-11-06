@@ -198,6 +198,14 @@ Replay protection spans origins when each one lists the others' security Redis i
 - `failover`: every request is checked locally and replicated in the background, for an
   active/passive pair whose passive store must already hold every nonce when traffic moves.
 
+A standby origin, one that runs WRITEs on its own store only while the peers' store is
+unreachable, refuses a replay of a WRITE only if its store already holds the nonce. The origin
+that owns the shared store replicates its own requests there (`failover`); an origin that checks
+its WRITEs at the shared store lists the standby store in `REPLAY_STANDBY_URLS`, which hands every
+WRITE nonce it admits to that store in the background. In the other direction, a WRITE the standby
+ran on its own store reaches the shared store once it is reachable again; until the standby has
+reconnected (backoff up to 5 s) an origin checking only at the shared store would not see it.
+
 The settings that decide what happens when a peer is unreachable (`REPLAY_PEER_FAIL_CLOSED`,
 `REPLAY_PEER_FAIL_CLOSED_WRITES`, `REPLAY_PEER_WAIT_REPLICAS`, `REPLAY_LOCAL_WAITAOF_MS`) are
 described in `gateway/CONFIG.md`. Without `REPLAY_PEER_URLS` none of this is active.

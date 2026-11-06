@@ -117,6 +117,10 @@ pub struct ResponseCache {
     replay_peers: Option<Arc<ReplayPeers>>,
     /// Asynchronous nonce replication (REPLAY_PEER_MODE=async-reads|failover); None otherwise.
     replicator: Option<Arc<AsyncReplicator>>,
+    /// The standby origins' security stores (REPLAY_STANDBY_URLS) and the replication of every
+    /// admitted WRITE nonce to them; None without standby stores.
+    standby_peers: Option<Arc<ReplayPeers>>,
+    standby_replicator: Option<Arc<AsyncReplicator>>,
     /// Replica acknowledgement of WRITE nonces (REPLAY_WRITE_WAIT_REPLICAS); None when off.
     write_wait: Option<Arc<WriteWait>>,
     /// Local AOF fsync of WRITE nonces no peer took (REPLAY_LOCAL_WAITAOF_MS); None when off.
@@ -247,8 +251,10 @@ struct WriteWait {
     config: WriteWaitConfig,
 }
 
-/// One entry of REPLAY_PEER_URLS: the security Redis of another origin.
+/// One entry of REPLAY_PEER_URLS (or REPLAY_STANDBY_URLS): the security Redis of another origin.
 struct ReplayPeer {
+    /// The `peer` metric label: the position in REPLAY_PEER_URLS, or for a standby store the
+    /// number of peers plus its position in REPLAY_STANDBY_URLS.
     index: usize,
     url: String,
     /// None until the first successful connection (a background task retries); afterwards the
@@ -259,6 +265,9 @@ struct ReplayPeer {
     wait_conn: Arc<ArcSwapOption<ConnectionManager>>,
     /// Consecutive failed housekeeping PINGs (see PEER_PING_FAILURES_RECONNECT).
     ping_failures: AtomicU32,
+    /// A standby store (REPLAY_STANDBY_URLS): its connectivity is `ohttp_replay_standby_connected`,
+    /// never `ohttp_replay_peer_connected` (which watchdogs read as "the peers are reachable").
+    standby: bool,
 }
 
 /// Replay nonces are written to every peer as well as to the local security Redis, and a nonce
@@ -338,18 +347,51 @@ impl ReplayPeers {
         timeout_ms: u64,
         fail_closed: bool,
     ) -> Self {
+        Self::connect_labeled(urls, network, timeout_ms, fail_closed, 0, false).await
+    }
+
+    /// The standby stores (REPLAY_STANDBY_URLS): labelled from `first_label` on (the number of
+    /// REPLAY_PEER_URLS), so their metrics never share a `peer` value with a peer. Only the
+    /// asynchronous replicator uses them; nothing on the request path waits for them.
+    pub async fn connect_standby(
+        urls: &[String],
+        network: String,
+        timeout_ms: u64,
+        first_label: usize,
+    ) -> Self {
+        Self::connect_labeled(urls, network, timeout_ms, false, first_label, true)
+            .await
+            .with_mode(ReplayPeerMode::Failover, false)
+    }
+
+    async fn connect_labeled(
+        urls: &[String],
+        network: String,
+        timeout_ms: u64,
+        fail_closed: bool,
+        first_label: usize,
+        standby: bool,
+    ) -> Self {
         let mut peers = Vec::with_capacity(urls.len());
         for (index, url) in urls.iter().enumerate() {
+            let index = first_label + index;
             let conn = Arc::new(ArcSwapOption::empty());
-            match ReplayPeer::open(url).await {
-                Ok(c) => {
-                    info!(network = %network, peer = index, "Replay peer connected");
-                    conn.store(Some(Arc::new(c)));
-                    crate::health::record_replay_peer_connected(&network, index, true);
-                }
-                Err(e) => {
-                    warn!(network = %network, peer = index, error = %e, "Replay peer unreachable at startup, retrying in background");
-                    crate::health::record_replay_peer_connected(&network, index, false);
+            // A standby store is only replicated to, so startup never waits for it (an
+            // unreachable one would delay readiness by PEER_CONNECT_TIMEOUT): the background
+            // task below connects it, and nonces queue meanwhile.
+            if standby {
+                record_peer_connected(&network, index, true, false);
+            } else {
+                match ReplayPeer::open(url).await {
+                    Ok(c) => {
+                        info!(network = %network, peer = index, "Replay peer connected");
+                        conn.store(Some(Arc::new(c)));
+                        record_peer_connected(&network, index, false, true);
+                    }
+                    Err(e) => {
+                        warn!(network = %network, peer = index, error = %e, "Replay peer unreachable at startup, retrying in background");
+                        record_peer_connected(&network, index, false, false);
+                    }
                 }
             }
             peers.push(ReplayPeer {
@@ -358,6 +400,7 @@ impl ReplayPeers {
                 conn,
                 wait_conn: Arc::new(ArcSwapOption::empty()),
                 ping_failures: AtomicU32::new(0),
+                standby,
             });
         }
         let this = Self {
@@ -376,6 +419,7 @@ impl ReplayPeers {
                     p.index,
                     p.url.clone(),
                     p.conn.clone(),
+                    p.standby,
                 );
             }
         }
@@ -384,6 +428,11 @@ impl ReplayPeers {
 
     pub fn len(&self) -> usize {
         self.peers.len()
+    }
+
+    /// The `peer` label of the first store (0, or the first standby label).
+    pub fn first_label(&self) -> usize {
+        self.peers.first().map_or(0, |p| p.index)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -635,12 +684,13 @@ impl ReplayPeers {
                             p.index,
                             p.url.clone(),
                             p.conn.clone(),
+                            p.standby,
                         );
                     }
                     ok
                 }
             };
-            crate::health::record_replay_peer_connected(&self.network, p.index, ok);
+            record_peer_connected(&self.network, p.index, p.standby, ok);
         }
     }
 }
@@ -672,7 +722,15 @@ impl ReplayPeer {
         if !is_failover_signal(e, Role::Primary) {
             return;
         }
-        drop_peer_conn(network, self.index, &self.url, &self.conn, used, e);
+        drop_peer_conn(
+            network,
+            self.index,
+            &self.url,
+            &self.conn,
+            used,
+            e,
+            self.standby,
+        );
     }
 }
 
@@ -684,6 +742,7 @@ fn drop_peer_conn(
     slot: &Arc<ArcSwapOption<ConnectionManager>>,
     used: &Arc<ConnectionManager>,
     e: &redis::RedisError,
+    standby: bool,
 ) {
     let current = Some(used.clone());
     let prev = slot.compare_and_swap(&current, None::<Arc<ConnectionManager>>);
@@ -695,7 +754,13 @@ fn drop_peer_conn(
             "replay_peer",
             crate::store_conn::signal_reason(e),
         );
-        spawn_peer_reconnect_task(network.to_string(), index, url.to_string(), slot.clone());
+        spawn_peer_reconnect_task(
+            network.to_string(),
+            index,
+            url.to_string(),
+            slot.clone(),
+            standby,
+        );
     }
 }
 
@@ -709,10 +774,10 @@ impl PeerSink for ReplayPeers {
     ) -> BoxFuture<'static, Result<Vec<Option<String>>, String>> {
         let p = self.peers.get(peer);
         let conn = p.and_then(|p| p.conn.load_full());
-        let slot = p.map(|p| (p.conn.clone(), p.url.clone()));
+        let slot = p.map(|p| (p.conn.clone(), p.url.clone(), p.index, p.standby));
         let network = self.network.clone();
         Box::pin(async move {
-            let (Some(used), Some((slot, url))) = (conn, slot) else {
+            let (Some(used), Some((slot, url, label, standby))) = (conn, slot) else {
                 return Err("disconnected".to_string());
             };
             let mut conn = (*used).clone();
@@ -729,7 +794,7 @@ impl PeerSink for ReplayPeers {
                 .await
                 .map_err(|e| {
                     if is_failover_signal(&e, Role::Primary) {
-                        drop_peer_conn(&network, peer, &url, &slot, &used, &e);
+                        drop_peer_conn(&network, label, &url, &slot, &used, &e, standby);
                     }
                     e.to_string()
                 })
@@ -756,6 +821,16 @@ impl PeerSink for ReplayPeers {
     }
 }
 
+/// The connectivity gauge of a peer: `ohttp_replay_peer_connected` for REPLAY_PEER_URLS,
+/// `ohttp_replay_standby_connected` for REPLAY_STANDBY_URLS.
+fn record_peer_connected(network: &str, index: usize, standby: bool, connected: bool) {
+    if standby {
+        crate::health::record_replay_standby_connected(network, index, connected);
+    } else {
+        crate::health::record_replay_peer_connected(network, index, connected);
+    }
+}
+
 /// Retry a peer connection with exponential backoff (200 ms to PEER_RECONNECT_MAX_BACKOFF_SECS)
 /// until it succeeds. The first attempt is quick: after a failover the peer's endpoint name
 /// usually points at the promoted replica within seconds.
@@ -764,6 +839,7 @@ fn spawn_peer_reconnect_task(
     index: usize,
     url: String,
     conn: Arc<ArcSwapOption<ConnectionManager>>,
+    standby: bool,
 ) {
     tokio::spawn(async move {
         let mut backoff = Duration::from_millis(200);
@@ -772,8 +848,8 @@ fn spawn_peer_reconnect_task(
             match ReplayPeer::open(&url).await {
                 Ok(c) => {
                     conn.store(Some(Arc::new(c)));
-                    crate::health::record_replay_peer_connected(&network, index, true);
-                    info!(network = %network, peer = index, "Replay peer connected");
+                    record_peer_connected(&network, index, standby, true);
+                    info!(network = %network, peer = index, standby, "Replay peer connected");
                     return;
                 }
                 Err(e) => {
@@ -897,6 +973,8 @@ impl ResponseCache {
             cache_redis_url: redis_url.to_string(),
             replay_peers: None,
             replicator: None,
+            standby_peers: None,
+            standby_replicator: None,
             write_wait: None,
             local_aof: None,
         };
@@ -1196,6 +1274,48 @@ impl ResponseCache {
         self.replicator.as_deref()
     }
 
+    /// REPLAY_STANDBY_URLS: replicate every admitted WRITE nonce to the standby stores
+    /// (`replicate_write_to_standby`), with the `failover` mechanism (queue per store,
+    /// pipelined batches, retried until the nonce TTL, never on the request path). A no-op
+    /// without stores. Must run inside the Tokio runtime.
+    pub fn with_standby_replication(mut self, peers: ReplayPeers, cfg: ReplicationConfig) -> Self {
+        if peers.is_empty() {
+            return self;
+        }
+        let cfg = ReplicationConfig {
+            network: self.network.clone(),
+            ..cfg
+        }
+        .for_standby(peers.first_label());
+        let peers = Arc::new(peers);
+        let sink: Arc<dyn PeerSink> = peers.clone();
+        self.standby_replicator = Some(Arc::new(AsyncReplicator::start(sink, cfg)));
+        self.standby_peers = Some(peers);
+        self
+    }
+
+    pub fn standby_replicator(&self) -> Option<&AsyncReplicator> {
+        self.standby_replicator.as_deref()
+    }
+
+    /// A WRITE that passed every replay check and is about to run: hand its nonce to the
+    /// standby stores (REPLAY_STANDBY_URLS). Never blocks, never fails the request: a standby
+    /// store that is unreachable gets the nonce when it is back, until the nonce TTL.
+    ///
+    /// This is what keeps a standby origin, which admits WRITEs on its own store while the
+    /// shared store is unreachable, from admitting a WRITE that this origin already ran: this
+    /// origin's WRITE check went to the shared store, whose owner replicates only its own
+    /// requests to the standby.
+    pub fn replicate_write_to_standby(&self, body_hash: &[u8]) {
+        if let Some(r) = &self.standby_replicator {
+            r.enqueue(&format!(
+                "replay:{}:{}",
+                self.network,
+                hex::encode(body_hash)
+            ));
+        }
+    }
+
     /// The replay peer mode in force (`sync` without peers).
     pub fn replay_peer_mode(&self) -> ReplayPeerMode {
         self.replay_peers
@@ -1407,6 +1527,16 @@ impl ResponseCache {
             peers.ping_all().await;
         }
 
+        let ok = self.ping_security(cache_ok).await;
+        // Standby stores last: an unreachable one (up to REPLAY_PEER_TIMEOUT_MS each) must not
+        // delay the security store's check above.
+        if let Some(peers) = &self.standby_peers {
+            peers.ping_all().await;
+        }
+        ok
+    }
+
+    async fn ping_security(&self, cache_ok: bool) -> bool {
         if let Some(sec) = self.security_conn.as_ref() {
             let ping = timeout(
                 self.redis_timeout,
@@ -1605,6 +1735,15 @@ impl ResponseCache {
                     // must survive a crash of this host (REPLAY_LOCAL_WAITAOF_MS).
                     if !outcomes.contains(&PeerOutcome::Fresh) {
                         self.confirm_nonce_local_aof(&key).await?;
+                    }
+                    // A peer that did not take it (tolerated: REPLAY_PEER_FAIL_CLOSED_WRITES=0)
+                    // gets it asynchronously once it is reachable again, until the nonce TTL:
+                    // after the switch back, the origins that check there must refuse a replay
+                    // of a WRITE that ran here meanwhile.
+                    if let Some(r) = &self.replicator {
+                        if !outcomes.iter().all(|o| *o == PeerOutcome::Fresh) {
+                            r.enqueue_to(&key, |i| !fresh(i));
+                        }
                     }
                 }
                 Ok(replay)
@@ -2458,6 +2597,8 @@ mod tests {
             cache_redis_url: "redis://127.0.0.1:6379".to_string(),
             replay_peers: None,
             replicator: None,
+            standby_peers: None,
+            standby_replicator: None,
             write_wait: None,
             local_aof: None,
         }

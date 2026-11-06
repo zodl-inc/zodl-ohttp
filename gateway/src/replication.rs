@@ -101,6 +101,13 @@ pub struct ReplicationConfig {
     pub probe_interval: Duration,
     /// Number of consecutive failures before degrading to strict.
     pub failures_before_strict: usize,
+    /// Added to the peer position for the per-peer metric labels and logs, so a second
+    /// replicator next to the peers' one (`REPLAY_STANDBY_URLS`) reports under its own `peer`
+    /// values. 0 for the peers.
+    pub peer_label_offset: usize,
+    /// Whether this replicator owns the network-wide `ohttp_replay_mode_*` series (the peers'
+    /// replicator does; a standby replicator must not overwrite them).
+    pub publishes_mode: bool,
 }
 
 impl ReplicationConfig {
@@ -127,7 +134,19 @@ impl ReplicationConfig {
             batch_interval: BATCH_INTERVAL,
             probe_interval: PROBE_INTERVAL,
             failures_before_strict,
+            peer_label_offset: 0,
+            publishes_mode: true,
         }
+    }
+
+    /// The replication to standby stores (`REPLAY_STANDBY_URLS`): `failover` semantics (never on
+    /// the request path, its health never changes it), metric labels from `peer_label_offset`
+    /// on, no network-wide mode series.
+    pub fn for_standby(mut self, peer_label_offset: usize) -> Self {
+        self.mode = ReplayPeerMode::Failover;
+        self.peer_label_offset = peer_label_offset;
+        self.publishes_mode = false;
+        self
     }
 }
 
@@ -179,6 +198,9 @@ pub struct ReplicationHealth {
     max_lag: Duration,
     recovery: Duration,
     failures_before_strict: usize,
+    /// See `ReplicationConfig::peer_label_offset` / `publishes_mode`.
+    label_offset: usize,
+    publishes_mode: bool,
     strict: AtomicBool,
     inner: Mutex<HealthInner>,
 }
@@ -193,6 +215,31 @@ impl ReplicationHealth {
         recovery: Duration,
         failures_before_strict: usize,
     ) -> Self {
+        Self::new_labeled(
+            network,
+            mode,
+            peers,
+            max_lag,
+            recovery,
+            failures_before_strict,
+            0,
+            true,
+        )
+    }
+
+    /// `new` with the metric labelling of `ReplicationConfig` (`peer_label_offset`,
+    /// `publishes_mode`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_labeled(
+        network: &str,
+        mode: ReplayPeerMode,
+        peers: usize,
+        max_lag: Duration,
+        recovery: Duration,
+        failures_before_strict: usize,
+        label_offset: usize,
+        publishes_mode: bool,
+    ) -> Self {
         let now = Instant::now();
         let h = Self {
             network: network.to_string(),
@@ -200,6 +247,8 @@ impl ReplicationHealth {
             max_lag,
             recovery,
             failures_before_strict,
+            label_offset,
+            publishes_mode,
             strict: AtomicBool::new(true),
             inner: Mutex::new(HealthInner {
                 last_bad: now,
@@ -209,17 +258,24 @@ impl ReplicationHealth {
                 consecutive_failures: vec![0; peers],
             }),
         };
-        crate::health::record_replay_mode_switch(
-            network,
-            "strict",
-            DegradeReason::Startup.as_str(),
-        );
+        if publishes_mode {
+            crate::health::record_replay_mode_switch(
+                network,
+                "strict",
+                DegradeReason::Startup.as_str(),
+            );
+        }
         for p in 0..peers {
-            crate::health::record_replay_replication_healthy(network, p, false);
-            crate::health::record_replay_peer_consecutive_failures(network, p, 0);
+            crate::health::record_replay_replication_healthy(network, h.label(p), false);
+            crate::health::record_replay_peer_consecutive_failures(network, h.label(p), 0);
         }
         h.publish_effective();
         h
+    }
+
+    /// The `peer` label of position `peer`.
+    fn label(&self, peer: usize) -> usize {
+        peer + self.label_offset
     }
 
     pub fn mode(&self) -> ReplayPeerMode {
@@ -253,12 +309,18 @@ impl ReplicationHealth {
     }
 
     fn publish_effective(&self) {
-        crate::health::record_replay_mode_effective(&self.network, self.effective_label());
+        if self.publishes_mode {
+            crate::health::record_replay_mode_effective(&self.network, self.effective_label());
+        }
     }
 
     /// A nonce (or probe) acknowledged by `peer` after `lag`.
     pub fn record_ack(&self, peer: usize, lag: Duration) {
-        crate::health::observe_replay_replication_lag(&self.network, peer, lag.as_secs_f64());
+        crate::health::observe_replay_replication_lag(
+            &self.network,
+            self.label(peer),
+            lag.as_secs_f64(),
+        );
         let now = Instant::now();
         let p99 = {
             let mut g = self.inner.lock();
@@ -268,14 +330,22 @@ impl ReplicationHealth {
             if let Some(ok) = g.peer_ok.get_mut(peer) {
                 if !*ok {
                     *ok = true;
-                    crate::health::record_replay_replication_healthy(&self.network, peer, true);
+                    crate::health::record_replay_replication_healthy(
+                        &self.network,
+                        self.label(peer),
+                        true,
+                    );
                 }
             }
             // Reset consecutive failures on success.
             if let Some(count) = g.consecutive_failures.get_mut(peer) {
                 if *count > 0 {
                     *count = 0;
-                    crate::health::record_replay_peer_consecutive_failures(&self.network, peer, 0);
+                    crate::health::record_replay_peer_consecutive_failures(
+                        &self.network,
+                        self.label(peer),
+                        0,
+                    );
                 }
             }
             g.lags.push_back((now, lag));
@@ -301,7 +371,11 @@ impl ReplicationHealth {
             let mut g = self.inner.lock();
             if let Some(count) = g.consecutive_failures.get_mut(peer) {
                 *count += 1;
-                crate::health::record_replay_peer_consecutive_failures(&self.network, peer, *count);
+                crate::health::record_replay_peer_consecutive_failures(
+                    &self.network,
+                    self.label(peer),
+                    *count,
+                );
                 *count
             } else {
                 0
@@ -316,7 +390,7 @@ impl ReplicationHealth {
                         *ok = false;
                         crate::health::record_replay_replication_healthy(
                             &self.network,
-                            peer,
+                            self.label(peer),
                             false,
                         );
                     }
@@ -324,7 +398,7 @@ impl ReplicationHealth {
             }
             debug!(
                 network = %self.network,
-                peer,
+                peer = self.label(peer),
                 what,
                 consecutive,
                 threshold = self.failures_before_strict,
@@ -334,7 +408,7 @@ impl ReplicationHealth {
         } else {
             debug!(
                 network = %self.network,
-                peer,
+                peer = self.label(peer),
                 what,
                 consecutive,
                 threshold = self.failures_before_strict,
@@ -345,7 +419,7 @@ impl ReplicationHealth {
 
     /// A nonce could not be enqueued for `peer`.
     pub fn record_overflow(&self, peer: usize) {
-        crate::health::record_replay_async_dropped(&self.network, peer, "overflow");
+        crate::health::record_replay_async_dropped(&self.network, self.label(peer), "overflow");
         self.degrade(DegradeReason::Overflow, Some(peer), None);
     }
 
@@ -354,12 +428,12 @@ impl ReplicationHealth {
             let mut g = self.inner.lock();
             g.last_bad = Instant::now();
         }
-        if !self.strict.swap(true, Ordering::AcqRel) {
+        if !self.strict.swap(true, Ordering::AcqRel) && self.publishes_mode {
             warn!(
                 network = %self.network,
                 mode = %self.mode,
                 reason = reason.as_str(),
-                peer = ?peer,
+                peer = ?peer.map(|p| self.label(p)),
                 lag_p99_ms = ?p99.map(|d| d.as_millis()),
                 max_lag_ms = self.max_lag.as_millis(),
                 recovery_secs = self.recovery.as_secs(),
@@ -383,7 +457,7 @@ impl ReplicationHealth {
                     .all(|ok| ok.is_some_and(|t| t > g.last_bad))
                 && g.peer_ok.iter().all(|ok| *ok)
         };
-        if recovered && self.strict.swap(false, Ordering::AcqRel) {
+        if recovered && self.strict.swap(false, Ordering::AcqRel) && self.publishes_mode {
             info!(
                 network = %self.network,
                 mode = %self.mode,
@@ -429,18 +503,22 @@ pub struct AsyncReplicator {
     backlogs: Vec<Arc<AtomicUsize>>,
     health: Arc<ReplicationHealth>,
     capacity: usize,
+    /// `ReplicationConfig::peer_label_offset`.
+    label_offset: usize,
 }
 
 impl AsyncReplicator {
     pub fn start(sink: Arc<dyn PeerSink>, cfg: ReplicationConfig) -> Self {
         let peers = sink.peers();
-        let health = Arc::new(ReplicationHealth::new(
+        let health = Arc::new(ReplicationHealth::new_labeled(
             &cfg.network,
             cfg.mode,
             peers,
             cfg.max_lag,
             cfg.recovery,
             cfg.failures_before_strict,
+            cfg.peer_label_offset,
+            cfg.publishes_mode,
         ));
         let mut queues = Vec::with_capacity(peers);
         let mut backlogs = Vec::with_capacity(peers);
@@ -462,6 +540,7 @@ impl AsyncReplicator {
             network = %cfg.network,
             mode = %cfg.mode,
             peers,
+            first_peer_label = cfg.peer_label_offset,
             max_lag_ms = cfg.max_lag.as_millis(),
             recovery_secs = cfg.recovery.as_secs(),
             queue_capacity = cfg.queue_capacity,
@@ -475,6 +554,7 @@ impl AsyncReplicator {
             backlogs,
             health,
             capacity: cfg.queue_capacity,
+            label_offset: cfg.peer_label_offset,
         }
     }
 
@@ -484,8 +564,16 @@ impl AsyncReplicator {
 
     /// Hand a locally stored nonce key to every peer's queue.
     pub fn enqueue(&self, key: &str) {
+        self.enqueue_to(key, |_| true);
+    }
+
+    /// Hand a locally stored nonce key to the queues of the peers (positions) `to` selects.
+    pub fn enqueue_to(&self, key: &str, to: impl Fn(usize) -> bool) {
         let now = Instant::now();
         for (peer, tx) in self.queues.iter().enumerate() {
+            if !to(peer) {
+                continue;
+            }
             match tx.try_send(Pending {
                 key: key.to_string(),
                 enqueued_at: now,
@@ -498,7 +586,7 @@ impl AsyncReplicator {
             }
             crate::health::record_replay_async_queue_depth(
                 &self.network,
-                peer,
+                peer + self.label_offset,
                 self.queue_depth(peer),
             );
         }
@@ -529,6 +617,8 @@ async fn worker(
     backlog_gauge: Arc<AtomicUsize>,
 ) {
     let network = cfg.network.clone();
+    // The position selects the peer; the label names it in metrics and logs.
+    let label = peer + cfg.peer_label_offset;
     let mut backlog: VecDeque<Pending> = VecDeque::new();
     let ttl = Duration::from_secs(cfg.nonce_ttl_secs);
     loop {
@@ -570,7 +660,7 @@ async fn worker(
         let before = backlog.len();
         backlog.retain(|p| now.duration_since(p.enqueued_at) < ttl);
         for _ in backlog.len()..before {
-            crate::health::record_replay_async_dropped(&network, peer, "expired");
+            crate::health::record_replay_async_dropped(&network, label, "expired");
         }
         backlog_gauge.store(backlog.len(), Ordering::Relaxed);
         if backlog.is_empty() {
@@ -594,12 +684,12 @@ async fn worker(
                     max_lag = max_lag.max(lag);
                     crate::health::record_replay_peer(
                         &network,
-                        peer,
+                        label,
                         if r.is_some() { "fresh" } else { "replay_async" },
                     );
                     health.record_ack(peer, lag);
                 }
-                debug!(network = %network, peer, batch = batch.len(), max_lag_ms = max_lag.as_millis(), "Replay nonces replicated");
+                debug!(network = %network, peer = label, batch = batch.len(), max_lag_ms = max_lag.as_millis(), "Replay nonces replicated");
                 backlog_gauge.store(backlog.len(), Ordering::Relaxed);
             }
             other => {
@@ -613,8 +703,8 @@ async fn worker(
                     Ok(_) => "error",
                     Err(_) => "timeout",
                 };
-                crate::health::record_replay_peer(&network, peer, result);
-                warn!(network = %network, peer, batch = batch.len(), error = %what, "Replay nonce batch failed at peer; will retry");
+                crate::health::record_replay_peer(&network, label, result);
+                warn!(network = %network, peer = label, batch = batch.len(), error = %what, "Replay nonce batch failed at peer; will retry");
                 health.record_failure(peer, result);
                 // Back to the front, oldest first; bounded.
                 for p in batch.into_iter().rev() {
@@ -748,7 +838,98 @@ mod tests {
             batch_interval: Duration::from_millis(20),
             probe_interval: Duration::from_millis(100),
             failures_before_strict: 3,
+            peer_label_offset: 0,
+            publishes_mode: true,
         }
+    }
+
+    /// The value of one series of a metric family (gauge or counter), None when absent.
+    fn metric(name: &str, labels: &[(&str, &str)]) -> Option<f64> {
+        crate::health::REGISTRY
+            .gather()
+            .iter()
+            .find(|f| f.get_name() == name)?
+            .get_metric()
+            .iter()
+            .find(|m| {
+                labels.iter().all(|(k, v)| {
+                    m.get_label()
+                        .iter()
+                        .any(|l| l.get_name() == *k && l.get_value() == *v)
+                })
+            })
+            .map(|m| m.get_gauge().get_value() + m.get_counter().get_value())
+    }
+
+    #[tokio::test]
+    async fn enqueue_to_selects_the_peers() {
+        crate::health::init_metrics();
+        let fake = FakePeer::new(2);
+        let r = AsyncReplicator::start(Arc::new(fake.clone()), cfg(ReplayPeerMode::AsyncReads));
+        r.enqueue_to("replay:t:only-1", |p| p == 1);
+        r.enqueue("replay:t:both");
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(fake.keys(0), vec!["replay:t:both".to_string()]);
+        let mut at_1 = fake.keys(1);
+        at_1.sort();
+        assert_eq!(
+            at_1,
+            vec!["replay:t:both".to_string(), "replay:t:only-1".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn standby_replicator_uses_its_own_labels_and_never_the_mode_series() {
+        crate::health::init_metrics();
+        let net = "repl-standby-labels";
+        let fake = FakePeer::new(1);
+        let mut c = cfg(ReplayPeerMode::AsyncReads).for_standby(3);
+        c.network = net.into();
+        assert_eq!(c.mode, ReplayPeerMode::Failover);
+        let r = AsyncReplicator::start(Arc::new(fake.clone()), c);
+        r.enqueue("replay:t:standby");
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(fake.keys(0), vec!["replay:t:standby".to_string()]);
+        // Position 0 reports as peer 3, so it cannot collide with REPLAY_PEER_URLS positions.
+        assert_eq!(
+            metric(
+                "ohttp_replay_peer_total",
+                &[("network", net), ("peer", "3"), ("result", "fresh")]
+            ),
+            Some(1.0)
+        );
+        assert_eq!(
+            metric(
+                "ohttp_replay_peer_total",
+                &[("network", net), ("peer", "0")]
+            ),
+            None
+        );
+        // The peers' replicator owns the network-wide mode series.
+        assert_eq!(
+            metric("ohttp_replay_mode_effective", &[("network", net)]),
+            None
+        );
+        assert_eq!(
+            metric("ohttp_replay_mode_switches_total", &[("network", net)]),
+            None
+        );
+
+        // A standby that is down keeps the nonce until it is back (bounded by the TTL).
+        fake.fail.store(true, Ordering::Relaxed);
+        r.enqueue("replay:t:standby-down");
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        assert!(r.queue_depth(0) >= 1, "kept for retry");
+        assert!(
+            metric(
+                "ohttp_replay_replication_healthy",
+                &[("network", net), ("peer", "3")]
+            ) == Some(0.0)
+        );
+        fake.fail.store(false, Ordering::Relaxed);
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert!(fake.keys(0).contains(&"replay:t:standby-down".to_string()));
+        assert_eq!(r.queue_depth(0), 0);
     }
 
     #[test]

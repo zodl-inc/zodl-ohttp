@@ -53,6 +53,17 @@
 //!     replicated asynchronously to the peers; no synchronous peer round trip at all. For a load
 //!     balancer that sends all traffic to one origin: the passive origin's store is kept warm so
 //!     that a switch-over opens a replay window only for nonces still being replicated.
+//! - `REPLAY_STANDBY_URLS`: the security store of each standby origin, comma-separated (same
+//!   syntax as `REPLAY_PEER_URLS`, no entry may also be a peer). A standby origin is one that
+//!   takes WRITEs only while the shared store of the peers is unreachable (it checks its own
+//!   store then). Every WRITE this gateway admits is also replicated there, asynchronously, off
+//!   the request path (the `failover` mechanism: per-store queue, pipelined batches, retried
+//!   until the nonce TTL). A standby store never refuses or delays a request here; it only keeps
+//!   the standby from admitting the same WRITE once more after a switch-over. Needed where the
+//!   WRITE check goes to a shared store whose owner replicates only its own requests to the
+//!   standby (a read origin in `async-reads` checking WRITEs at the primary origin's store):
+//!   without it, a WRITE admitted there within the nonce TTL before the primary origin is lost
+//!   is unknown to the standby.
 //! - `REPLAY_READ_ROUTES`: the READ allowlist for `async-reads`, in the `BACKENDS_POLICY`
 //!   syntax (`authority=METHOD /path,...;authority2=...`; `/*` suffix = segment-bounded prefix,
 //!   `*` method = any). The pseudo-authority `lwd` stands for the gateway's own lightwalletd (any
@@ -314,6 +325,8 @@ impl fmt::Display for ReadRoutes {
 pub struct OriginSettings {
     pub origin_id: String,
     pub replay_peer_urls: Vec<String>,
+    /// `REPLAY_STANDBY_URLS`.
+    pub replay_standby_urls: Vec<String>,
     pub replay_peer_timeout_ms: u64,
     pub replay_peer_fail_closed: bool,
     /// `REPLAY_PEER_MODE`.
@@ -335,6 +348,7 @@ pub struct OriginSettings {
 pub struct RawOriginEnv<'a> {
     pub origin_id: Option<&'a str>,
     pub peer_urls: Option<&'a str>,
+    pub standby_urls: Option<&'a str>,
     pub peer_timeout_ms: Option<&'a str>,
     pub peer_fail_closed: Option<&'a str>,
     pub peer_mode: Option<&'a str>,
@@ -351,6 +365,7 @@ impl OriginSettings {
         let (
             origin_id,
             peer_urls,
+            standby_urls,
             peer_timeout_ms,
             peer_fail_closed,
             peer_mode,
@@ -362,6 +377,7 @@ impl OriginSettings {
         ) = (
             get("ORIGIN_ID"),
             get("REPLAY_PEER_URLS"),
+            get("REPLAY_STANDBY_URLS"),
             get("REPLAY_PEER_TIMEOUT_MS"),
             get("REPLAY_PEER_FAIL_CLOSED"),
             get("REPLAY_PEER_MODE"),
@@ -374,6 +390,7 @@ impl OriginSettings {
         Self::parse_env(RawOriginEnv {
             origin_id: origin_id.as_deref(),
             peer_urls: peer_urls.as_deref(),
+            standby_urls: standby_urls.as_deref(),
             peer_timeout_ms: peer_timeout_ms.as_deref(),
             peer_fail_closed: peer_fail_closed.as_deref(),
             peer_mode: peer_mode.as_deref(),
@@ -413,28 +430,15 @@ impl OriginSettings {
             );
         }
 
-        let mut replay_peer_urls = Vec::new();
-        let raw_urls = raw.peer_urls.unwrap_or_default();
-        if !raw_urls.trim().is_empty() {
-            for (i, url) in raw_urls.split(',').enumerate() {
-                let url = url.trim();
-                if url.is_empty() {
-                    anyhow::bail!(
-                        "Malformed REPLAY_PEER_URLS: empty entry at position {i} (check for trailing commas)"
-                    );
-                }
-                if !url.starts_with("redis://") && !url.starts_with("rediss://") {
-                    anyhow::bail!(
-                        "Malformed REPLAY_PEER_URLS entry at position {i}: must start with redis:// or rediss://"
-                    );
-                }
-                if replay_peer_urls.iter().any(|u| u == url) {
-                    anyhow::bail!(
-                        "Malformed REPLAY_PEER_URLS: entry at position {i} is a duplicate"
-                    );
-                }
-                replay_peer_urls.push(url.to_string());
-            }
+        let replay_peer_urls = parse_store_urls("REPLAY_PEER_URLS", raw.peer_urls)?;
+        let replay_standby_urls = parse_store_urls("REPLAY_STANDBY_URLS", raw.standby_urls)?;
+        if let Some(i) = replay_standby_urls
+            .iter()
+            .position(|u| replay_peer_urls.contains(u))
+        {
+            anyhow::bail!(
+                "Malformed REPLAY_STANDBY_URLS: entry at position {i} is also in REPLAY_PEER_URLS"
+            );
         }
 
         let replay_peer_timeout_ms = parse_positive_u64(
@@ -466,6 +470,7 @@ impl OriginSettings {
         Ok(Self {
             origin_id,
             replay_peer_urls,
+            replay_standby_urls,
             replay_peer_timeout_ms,
             replay_peer_fail_closed,
             replay_peer_mode,
@@ -490,6 +495,34 @@ impl OriginSettings {
     pub fn uses_async_replication(&self) -> bool {
         !self.replay_peer_urls.is_empty() && self.replay_peer_mode != ReplayPeerMode::Sync
     }
+}
+
+/// A comma-separated list of `redis://` / `rediss://` URLs (credentials in the URL): no empty
+/// entries, no duplicates. Errors name the position only, never the URL.
+fn parse_store_urls(name: &str, raw: Option<&str>) -> anyhow::Result<Vec<String>> {
+    let mut urls: Vec<String> = Vec::new();
+    let raw = raw.unwrap_or_default();
+    if raw.trim().is_empty() {
+        return Ok(urls);
+    }
+    for (i, url) in raw.split(',').enumerate() {
+        let url = url.trim();
+        if url.is_empty() {
+            anyhow::bail!(
+                "Malformed {name}: empty entry at position {i} (check for trailing commas)"
+            );
+        }
+        if !url.starts_with("redis://") && !url.starts_with("rediss://") {
+            anyhow::bail!(
+                "Malformed {name} entry at position {i}: must start with redis:// or rediss://"
+            );
+        }
+        if urls.iter().any(|u| u == url) {
+            anyhow::bail!("Malformed {name}: entry at position {i} is a duplicate");
+        }
+        urls.push(url.to_string());
+    }
+    Ok(urls)
 }
 
 fn parse_positive_u64(name: &str, raw: Option<&str>, default: u64) -> anyhow::Result<u64> {
@@ -623,6 +656,57 @@ mod tests {
         assert!(err.to_string().contains("duplicate"), "{err}");
         assert!(OriginSettings::parse(None, None, Some("0"), None).is_err());
         assert!(OriginSettings::parse(None, None, Some("fast"), None).is_err());
+    }
+
+    #[test]
+    fn standby_stores_are_parsed_strictly() {
+        let s = OriginSettings::parse_env(RawOriginEnv {
+            peer_urls: Some("rediss://:pw@hub:6379"),
+            standby_urls: Some(" rediss://:pw@standby:6379 "),
+            peer_mode: Some("async-reads"),
+            ..RawOriginEnv::default()
+        })
+        .unwrap();
+        assert_eq!(s.replay_peer_urls, vec!["rediss://:pw@hub:6379"]);
+        assert_eq!(s.replay_standby_urls, vec!["rediss://:pw@standby:6379"]);
+
+        // Unset or blank: none, whatever the peers.
+        let s = OriginSettings::parse_env(RawOriginEnv {
+            standby_urls: Some("  "),
+            ..RawOriginEnv::default()
+        })
+        .unwrap();
+        assert!(s.replay_standby_urls.is_empty());
+
+        let parse = |peers: Option<&'static str>, standby: &'static str| {
+            OriginSettings::parse_env(RawOriginEnv {
+                peer_urls: peers,
+                standby_urls: Some(standby),
+                ..RawOriginEnv::default()
+            })
+        };
+        let err = parse(None, "redis://a,").unwrap_err();
+        assert!(
+            err.to_string().contains("REPLAY_STANDBY_URLS: empty entry"),
+            "{err}"
+        );
+        let err = parse(None, "http://a").unwrap_err();
+        assert!(
+            err.to_string().contains("REPLAY_STANDBY_URLS entry"),
+            "{err}"
+        );
+        let err = parse(None, "redis://a, redis://a").unwrap_err();
+        assert!(err.to_string().contains("duplicate"), "{err}");
+        // A store is either a peer (checked) or a standby (replicated to), never both.
+        let err = parse(Some("redis://hub,redis://b"), "redis://c,redis://b").unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("position 1 is also in REPLAY_PEER_URLS"),
+            "{err}"
+        );
+        // The URL (credentials) is never part of an error.
+        let err = parse(None, "http://:secret@a").unwrap_err();
+        assert!(!err.to_string().contains("secret"), "{err}");
     }
 
     #[test]
@@ -927,6 +1011,7 @@ pay.example=GET /*";
             Self {
                 origin_id: String::new(),
                 replay_peer_urls: vec![],
+                replay_standby_urls: vec![],
                 replay_peer_timeout_ms: DEFAULT_REPLAY_PEER_TIMEOUT_MS,
                 replay_peer_fail_closed: false,
                 replay_peer_mode: ReplayPeerMode::Sync,

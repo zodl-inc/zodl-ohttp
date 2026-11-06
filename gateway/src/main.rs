@@ -165,6 +165,7 @@ async fn main() -> anyhow::Result<()> {
         relay_secrets_count = config.relay_secrets.len(),
         relay_secret_fingerprints = %relay_secret_fingerprints.join(","),
         replay_peers = origin.replay_peer_urls.len(),
+        replay_standby_stores = origin.replay_standby_urls.len(),
         replay_peer_timeout_ms = origin.replay_peer_timeout_ms,
         replay_peer_fail_closed = origin.replay_peer_fail_closed,
         replay_peer_mode = %origin.replay_peer_mode,
@@ -184,6 +185,10 @@ async fn main() -> anyhow::Result<()> {
     }
     health::record_origin_info(&config.network, &origin.origin_id);
     health::record_replay_peers_configured(&config.network, origin.replay_peer_urls.len());
+    health::record_replay_standby_stores_configured(
+        &config.network,
+        origin.replay_standby_urls.len(),
+    );
     if origin.replay_peer_urls.is_empty() {
         health::record_replay_mode_effective(&config.network, "sync");
     } else {
@@ -372,6 +377,38 @@ async fn main() -> anyhow::Result<()> {
                         replication::ReplicationConfig::new(
                             &network,
                             origin.replay_peer_mode,
+                            origin.replay_async_max_lag_ms,
+                            origin.replay_async_recovery_secs,
+                            origin.replay_peer_timeout_ms,
+                            cache::REPLAY_TTL_SECS,
+                            origin.replay_async_failures_before_strict,
+                        ),
+                    )
+                };
+
+                // Standby stores (REPLAY_STANDBY_URLS): every admitted WRITE nonce is replicated
+                // there asynchronously; never on the request path.
+                let c = if origin.replay_standby_urls.is_empty() {
+                    c
+                } else {
+                    let standby = cache::ReplayPeers::connect_standby(
+                        &origin.replay_standby_urls,
+                        network.clone(),
+                        origin.replay_peer_timeout_ms,
+                        origin.replay_peer_urls.len(),
+                    )
+                    .await;
+                    info!(
+                        network = %network,
+                        stores = standby.len(),
+                        first_peer_label = standby.first_label(),
+                        "WRITE replay nonces are also replicated to the standby stores (asynchronous, never refusing a request)"
+                    );
+                    c.with_standby_replication(
+                        standby,
+                        replication::ReplicationConfig::new(
+                            &network,
+                            origin::ReplayPeerMode::Failover,
                             origin.replay_async_max_lag_ms,
                             origin.replay_async_recovery_secs,
                             origin.replay_peer_timeout_ms,
@@ -1976,6 +2013,25 @@ async fn gateway_handler(
                     });
                 }
             }
+        }
+    }
+
+    // GW-REPLAY-STANDBY: The WRITE passed every replay check and is about to run: its nonce goes
+    // to the standby origins' stores too (REPLAY_STANDBY_URLS), asynchronously. A standby that
+    // later takes over the WRITEs (shared store unreachable) then refuses a replay of it.
+    if let Some(cache) = state
+        .cache
+        .as_ref()
+        .filter(|c| c.standby_replicator().is_some())
+    {
+        let class = state.origin.replay_read_routes.classify(
+            cache_allowed,
+            &inner_request.authority,
+            &inner_request.method,
+            &inner_request.path,
+        );
+        if class == origin::RouteClass::Write {
+            cache.replicate_write_to_standby(&body_hash);
         }
     }
 

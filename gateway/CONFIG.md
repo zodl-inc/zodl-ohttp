@@ -101,7 +101,7 @@ The Encapsulated Request body is limited to 10 MiB (outer 413 above it) and must
 ## Multiple origins
 
 All of these are inert unless `REPLAY_PEER_URLS` is set (except `ORIGIN_ID`, which is a label
-only). See `docs/architecture.md`, "Multiple origins".
+only, and `REPLAY_STANDBY_URLS`). See `docs/architecture.md`, "Multiple origins".
 
 | Variable | Default | Meaning |
 |---|---|---|
@@ -110,7 +110,8 @@ only). See `docs/architecture.md`, "Multiple origins".
 | `REPLAY_PEER_TIMEOUT_MS` | `150` | Budget for the concurrent peer round trips of one request. |
 | `REPLAY_PEER_FAIL_CLOSED` | `false` | `1`/`true`: a peer error or timeout refuses the request like a local security Redis failure. Default: the local verdict stands and the failure is counted. |
 | `REPLAY_PEER_MODE` | `sync` | `sync`: every nonce is written to every peer before the request runs. `async-reads`: READ requests are checked locally and their nonces replicated to the peers in the background; WRITEs stay synchronous. `failover`: every request is checked locally and every nonce replicated in the background (active/passive pair). |
-| `REPLAY_PEER_FAIL_CLOSED_WRITES` | `true` | In `async-reads`: whether an unreachable peer refuses a WRITE. `0`/`false`: a WRITE runs on the local check alone while the peers are unreachable. |
+| `REPLAY_PEER_FAIL_CLOSED_WRITES` | `true` | In `async-reads`: whether an unreachable peer refuses a WRITE. `0`/`false`: a WRITE runs on the local check alone while the peers are unreachable; the nonce is then replicated to those peers in the background once they are reachable again (until the nonce TTL). |
+| `REPLAY_STANDBY_URLS` | unset | The security Redis of each standby origin (one that runs WRITEs on its own store while the peers' store is unreachable), comma-separated `redis://` / `rediss://` URLs, none of them also in `REPLAY_PEER_URLS`. Every WRITE that passed the replay checks is also replicated there in the background (queue per store, retried until the nonce TTL). Never delays or refuses a request. Set it on every origin whose WRITE check goes to a store the standby does not receive from (for example a read origin in `async-reads` checking WRITEs at the primary origin's store). |
 | `REPLAY_READ_ROUTES` | every read-only lightwalletd RPC | READ allowlist for `async-reads`, in `BACKENDS_POLICY` syntax; the pseudo-authority `lwd` stands for the gateway's own lightwalletd. Anything not listed is a WRITE. The default lists no third-party route; a value replaces the default entirely, so include the `lwd=` entry. |
 | `REPLAY_ASYNC_MAX_LAG_MS` | `500` | Background replication counts as degraded when its lag exceeds this; READs then use the synchronous path. |
 | `REPLAY_ASYNC_RECOVERY_SECS` | `30` | How long replication must be healthy again before READs return to the background path. |

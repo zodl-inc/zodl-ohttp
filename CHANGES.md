@@ -20,6 +20,16 @@ keeps its own log in [client/CHANGELOG.md](client/CHANGELOG.md).
   cache, pinned and permanent stores replace broken or hung connections only (some are read
   replicas on purpose). Housekeeping checks `ROLE` on the replay store connections, so an idle
   gateway also moves. New counter `ohttp_store_reconnect_total{network,store,reason}`.
+- `REPLAY_STANDBY_URLS`: the security stores of standby origins. Every WRITE that passed the
+  replay checks is also replicated there in the background (the `failover` queue: pipelined
+  batches, retried until the nonce TTL), never delaying or refusing the request. An origin that
+  checks its WRITEs at another origin's store sets it, so that a standby which takes over the
+  WRITEs after losing that store refuses a replay of a WRITE admitted here shortly before. New
+  gauge `ohttp_replay_standby_stores_configured`; the standby stores' per-peer series continue
+  the `peer` numbering after `REPLAY_PEER_URLS`.
+- `async-reads` with `REPLAY_PEER_FAIL_CLOSED_WRITES=0`: a WRITE that ran while a peer did not take
+  its nonce is replicated to that peer in the background once it is reachable again (until the
+  nonce TTL), so the origins checking at that peer refuse its replay after the switch back.
 
 ## 0.1.0 — initial public release
 
