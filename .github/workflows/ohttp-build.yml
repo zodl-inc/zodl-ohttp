@@ -40,8 +40,14 @@ jobs:
       - name: Test verify-image identity regexes
         run: bash scripts/verify-image-test.sh
 
+      - name: Start the failover test stores (Redis primary + replica)
+        run: docker compose -f gateway/tests/failover/docker-compose.yml up -d --wait
+
       - name: Test gateway
         working-directory: gateway
+        env:
+          # tests/store_failover.rs: promotion of a real replica under a WRITE load.
+          OHTTP_FAILOVER_REDIS: "1"
         run: cargo test --locked
 
       - name: Test relay-simulator

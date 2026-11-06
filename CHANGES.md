@@ -10,6 +10,16 @@ keeps its own log in [client/CHANGELOG.md](client/CHANGELOG.md).
 - `CHUNK_SIZE` is bounded above as well: a value over 65536 refuses to start, since the client
   (0.1.1) refuses response chunks with more than 64 KiB of plaintext. The default stays 16384
   and the minimum 1024.
+- The replay stores follow a failover of a managed Redis. A connection whose node was demoted
+  (`READONLY`, `MOVED`, a `WAIT` refused on a replica, `UNBLOCKED`, `LOADING`, `MASTERDOWN`), broke,
+  or stopped answering is replaced by a new one, which resolves the endpoint name again and is
+  used only once its node reports `ROLE master`; until then requests keep failing closed. The
+  WRITE acknowledgement retries once on the new connection within its budget, and refuses a
+  WRITE whose nonce is not on the node it reached (`SET XX` found nothing) instead of confirming
+  it. The same applies to the `REPLAY_LOCAL_WAITAOF_MS` connection and the replay peers; the
+  cache, pinned and permanent stores replace broken or hung connections only (some are read
+  replicas on purpose). Housekeeping checks `ROLE` on the replay store connections, so an idle
+  gateway also moves. New counter `ohttp_store_reconnect_total{network,store,reason}`.
 
 ## 0.1.0 — initial public release
 

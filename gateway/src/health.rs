@@ -482,6 +482,7 @@ pub fn init_metrics() {
         &*OHTTP_LOCAL_CACHE_TOTAL,
         &*OHTTP_BLOCK_PERMANENT_TOTAL,
         &*OHTTP_CHAIN_REORGS_TOTAL,
+        &*OHTTP_STORE_RECONNECT_TOTAL,
     ] {
         REGISTRY.register(Box::new(c.clone())).ok();
     }
@@ -995,6 +996,23 @@ pub fn record_replay_class(network: &str, class: &str) {
 /// is a 503) and lightwalletd (else every uncached RPC is a 502). Pure so that it is testable.
 pub fn healthz_ok(security_redis_ok: bool, lwd_ok: bool) -> bool {
     security_redis_ok && lwd_ok
+}
+
+lazy_static::lazy_static! {
+    // Its own block: the main one is at the macro recursion limit.
+    static ref OHTTP_STORE_RECONNECT_TOTAL: IntCounterVec = IntCounterVec::new(
+        Opts::new("ohttp_store_reconnect_total", "Store connection failover signals and replacements, by store and reason: READONLY, MOVED, UNBLOCKED, LOADING, MASTERDOWN, ERR (WAIT refused on a replica), role (ROLE is not master), timeout, error (broken connection); replaced = a new connection is in use"),
+        &["network", "store", "reason"]
+    )
+    .unwrap();
+}
+
+/// `store`: security | write_wait | local_aof | pinned | permanent (no URLs: they carry
+/// credentials).
+pub fn record_store_reconnect(network: &str, store: &str, reason: &str) {
+    OHTTP_STORE_RECONNECT_TOTAL
+        .with_label_values(&[network, store, reason])
+        .inc();
 }
 
 pub fn record_cache_redis_timeout(network: &str, operation: &str) {

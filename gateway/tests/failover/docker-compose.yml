@@ -1,0 +1,29 @@
+# A Redis primary and its replica for tests/store_failover.rs (real_redis_promotion_under_write_load):
+#   docker compose -f gateway/tests/failover/docker-compose.yml up -d --wait
+#   OHTTP_FAILOVER_REDIS=1 cargo test --test store_failover
+# The test promotes the replica (REPLICAOF NO ONE) and demotes the primary under a WRITE load.
+# It also needs the plain test Redis on 127.0.0.1:6379 (the cache store).
+services:
+  redis-a:
+    image: redis:7-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no", "--repl-diskless-sync-delay", "0"]
+    ports:
+      - "127.0.0.1:6391:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+  redis-b:
+    image: redis:7-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no", "--repl-diskless-sync-delay", "0", "--replicaof", "redis-a", "6379"]
+    ports:
+      - "127.0.0.1:6392:6379"
+    depends_on:
+      redis-a:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
