@@ -50,9 +50,12 @@
 //!     unreachable, READs fall back to the synchronous path until the peers have been healthy
 //!     for `REPLAY_ASYNC_RECOVERY_SECS` (default 30).
 //!   - `failover`: active-passive. Every request is checked locally only and its nonce
-//!     replicated asynchronously to the peers; no synchronous peer round trip at all. For a load
+//!     replicated asynchronously to the peers (a WRITE's after its local verdict). For a load
 //!     balancer that sends all traffic to one origin: the passive origin's store is kept warm so
-//!     that a switch-over opens a replay window only for nonces still being replicated.
+//!     that a switch-over opens a replay window only for nonces still being replicated. With
+//!     `REPLAY_WRITE_WAIT_REPLICAS` and `REPLAY_PEER_WAIT_REPLICAS` >= 1 a WRITE also has a
+//!     synchronous peer round trip when the local replica acknowledgement is short, and for one
+//!     nonce TTL after startup or a local store failover (`write_fallback.rs`).
 //! - `REPLAY_STANDBY_URLS`: the security store of each standby origin, comma-separated (same
 //!   syntax as `REPLAY_PEER_URLS`, no entry may also be a peer). A standby origin is one that
 //!   takes WRITEs only while the shared store of the peers is unreachable (it checks its own

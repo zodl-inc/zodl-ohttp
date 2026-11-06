@@ -35,16 +35,23 @@
 //! copy is on one node only:
 //!
 //! - **Write-back**: the nonce is queued and rewritten to the local store (`SET ... EX <rest of
-//!   the TTL>` + `WAIT`) until the local replicas acknowledge it, or until its TTL is over. This
-//!   also repairs the case where the local `SET NX` landed on a demoted primary that the endpoint
-//!   no longer points at: the rewrite goes to whatever node is the primary when it succeeds.
+//!   the TTL>` + `WAIT`, on a connection of its own, so request `WAIT`s never queue behind it)
+//!   until the local replicas acknowledge it, or until its TTL is over. When the local `SET NX`
+//!   landed on a node the endpoint no longer points at, the rewrite reaches the new primary once
+//!   that connection is replaced: by a failover signal, or, for a node that keeps saying
+//!   `ROLE master` without acknowledging anything, after `WRITE_BACK_SHORT_RECONNECT` short
+//!   acknowledgements in a row (a reconnect resolves the endpoint again). The queue is in memory:
+//!   a gateway that stops before it is written back leaves the nonce at the peers only, which is
+//!   what the window below covers for the gateways that consult the peers.
 //! - **Window** (`failover` mode only, where WRITEs are otherwise never checked at the peers):
-//!   for `REPLAY_TTL_SECS` after this gateway saw a short acknowledgement or a replaced
-//!   security-store connection, every WRITE whose local wait succeeded is also `SET NX` at the
-//!   peers synchronously, and a peer that holds the nonce refuses it. A replay of a WRITE
-//!   admitted through the peers is then refused here even if the local store lost its copy
-//!   before the write-back. An unreachable peer there keeps the local verdict (as outside the
-//!   window).
+//!   for `REPLAY_TTL_SECS` after this gateway process started, saw a short acknowledgement, or
+//!   had a security-store connection replaced (watched in the background, not only on WRITEs),
+//!   every WRITE whose local wait succeeded is also `SET NX` at the peers synchronously, and a
+//!   peer that holds the nonce refuses it. A replay of a WRITE admitted through the peers (here
+//!   or at another gateway of the same store) is then refused even if the local store lost its
+//!   copy before the write-back. An unreachable peer there keeps the local verdict, as outside
+//!   the window (the window never fails a request closed). The window is per process, in
+//!   memory; a gateway that only checks at another origin's store (a read origin) has none.
 //!
 //! Metrics: `ohttp_replay_write_fallback_total{network,path,result}` (path `short_ack` |
 //! `window`; result `accepted` | `replay` | `unavailable` | `unacknowledged` | `overflow`) and
@@ -70,6 +77,13 @@ pub const WRITE_BACK_CAPACITY: usize = 10_000;
 const WRITE_BACK_BATCH_MAX: usize = 256;
 /// Pause between write-back attempts while nonces are pending.
 const WRITE_BACK_INTERVAL: Duration = Duration::from_millis(500);
+/// Short acknowledgements in a row (one per attempt) after which the write-back connection is
+/// replaced: ~10 s, longer than a resync never is not a goal, but a node that answers `ROLE
+/// master` and never acknowledges is either resyncing (a reconnect reaches it again, harmless)
+/// or one the endpoint has left behind (a reconnect reaches the real primary).
+pub const WRITE_BACK_SHORT_RECONNECT: u32 = 20;
+/// Failed attempts in a row between two warnings.
+const WRITE_BACK_WARN_EVERY: u32 = 20;
 
 /// Per-gateway state of the fallback (one per network, next to the `WAIT` connection).
 pub struct WriteFallback {
@@ -97,11 +111,13 @@ impl WriteFallback {
         )
     }
 
+    /// The window starts open: a gateway that just started cannot know whether the local store
+    /// lost a nonce that another gateway admitted through the peers shortly before.
     pub fn with_limits(network: &str, generation: u64, window: Duration, capacity: usize) -> Self {
         Self {
             network: network.to_string(),
             base: Instant::now(),
-            window_until_ms: AtomicU64::new(0),
+            window_until_ms: AtomicU64::new(window.as_millis() as u64 + 1),
             window,
             seen_generation: AtomicU64::new(generation),
             pending: Mutex::new(VecDeque::new()),
@@ -125,6 +141,11 @@ impl WriteFallback {
         if self.seen_generation.swap(generation, Ordering::Relaxed) != generation {
             self.open_window();
         }
+    }
+
+    /// Close the window now (tests).
+    pub fn close_window(&self) {
+        self.window_until_ms.store(0, Ordering::Relaxed);
     }
 
     pub fn window_open(&self) -> bool {
@@ -184,7 +205,21 @@ impl WriteFallback {
     }
 }
 
+/// Open the window whenever `conn` is replaced (a failover of the local store), also on a
+/// gateway that serves no WRITE meanwhile.
+pub fn spawn_window_watch(fb: Arc<WriteFallback>, conn: Arc<StoreConn>) {
+    tokio::spawn(async move {
+        loop {
+            let g = conn.generation();
+            if conn.wait_for_reconnect(g, Duration::from_secs(3600)).await {
+                fb.open_window();
+            }
+        }
+    });
+}
+
 /// The write-back task: rewrite pending nonces to the local store until its replicas have them.
+/// `conn` is its own connection to the local store.
 pub fn spawn_write_back(
     fb: Arc<WriteFallback>,
     conn: Arc<StoreConn>,
@@ -192,8 +227,12 @@ pub fn spawn_write_back(
     redis_timeout: Duration,
 ) {
     tokio::spawn(async move {
+        let mut short_in_a_row = 0u32;
+        let mut failed_in_a_row = 0u32;
         loop {
             if fb.pending_len() == 0 {
+                short_in_a_row = 0;
+                failed_in_a_row = 0;
                 // A push notifies; the timeout is only a safety net.
                 let _ = timeout(Duration::from_secs(5), fb.notify.notified()).await;
                 continue;
@@ -219,21 +258,31 @@ pub fn spawn_write_back(
             let budget = Duration::from_millis(wait.timeout_ms) + redis_timeout * 4;
             let r = timeout(budget, pipe.query_async::<_, (i64,)>(&mut c)).await;
             conn.observe_timed(&r);
-            match r {
+            let failure = match r {
                 Ok(Ok((acked,))) if acked >= wait.replicas as i64 => {
                     debug!(network = %fb.network, n = batch.len(), "Replay nonces admitted through the peers written back to the local store");
                     fb.done(batch.len());
+                    short_in_a_row = 0;
+                    failed_in_a_row = 0;
+                    continue;
                 }
                 Ok(Ok((acked,))) => {
                     conn.observe_short_ack();
-                    debug!(network = %fb.network, acked, pending = fb.pending_len(), "Write-back not yet acknowledged by the local replicas");
+                    short_in_a_row += 1;
+                    if short_in_a_row >= WRITE_BACK_SHORT_RECONNECT {
+                        short_in_a_row = 0;
+                        conn.force_reconnect("short_ack");
+                    }
+                    format!("acknowledged by {acked} of {} replica(s)", wait.replicas)
                 }
-                Ok(Err(e)) => {
-                    debug!(network = %fb.network, error = %e, "Write-back to the local store failed, retrying");
-                }
-                Err(_) => {
-                    debug!(network = %fb.network, "Write-back to the local store timed out, retrying");
-                }
+                Ok(Err(e)) => e.to_string(),
+                Err(_) => format!("timed out after {}ms", budget.as_millis()),
+            };
+            failed_in_a_row += 1;
+            if failed_in_a_row % WRITE_BACK_WARN_EVERY == 0 {
+                warn!(network = %fb.network, attempts = failed_in_a_row, pending = fb.pending_len(), error = %failure, "Write-back of replay nonces admitted through the peers still failing");
+            } else {
+                debug!(network = %fb.network, pending = fb.pending_len(), error = %failure, "Write-back to the local store not done, retrying");
             }
         }
     });
@@ -244,8 +293,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn window_opens_on_a_new_generation_only() {
+    fn window_starts_open_and_reopens_on_a_new_generation_only() {
         let fb = WriteFallback::new("testnet-wfb-unit", 3);
+        assert!(fb.window_open(), "open after startup");
+        fb.close_window();
         assert!(!fb.window_open());
         fb.note_generation(3);
         assert!(!fb.window_open(), "same generation");
@@ -256,6 +307,9 @@ mod tests {
     #[tokio::test]
     async fn window_closes_after_its_duration() {
         let fb = WriteFallback::with_limits("testnet-wfb-unit", 0, Duration::from_millis(50), 10);
+        assert!(fb.window_open());
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert!(!fb.window_open(), "the startup window ends");
         fb.open_window();
         assert!(fb.window_open());
         tokio::time::sleep(Duration::from_millis(80)).await;

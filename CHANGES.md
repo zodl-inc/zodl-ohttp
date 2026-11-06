@@ -14,9 +14,10 @@ keeps its own log in [client/CHANGELOG.md](client/CHANGELOG.md).
   took the nonce as new and acknowledged it; a peer holding it makes the request a replay; any
   other outcome fails closed as before. The nonce is written back to the local store until its
   replicas acknowledge it. In `failover` mode the background replication of a WRITE nonce now
-  starts after the local verdict, and for one nonce TTL after a short acknowledgement or a
-  replaced store connection every WRITE is also checked at the peers. Without peers nothing
-  changes. New series `ohttp_replay_write_fallback_total{network,path,result}`,
+  starts after the local verdict, and for one nonce TTL after startup, a short acknowledgement or a
+  replaced store connection every WRITE is also checked at the peers. The write-back has its own
+  store connection and replaces it after ~10 s of short acknowledgements. Without peers that
+  acknowledge on their replicas nothing changes. New series `ohttp_replay_write_fallback_total{network,path,result}`,
   `ohttp_replay_write_back_total{network,result}`, `ohttp_replay_write_back_pending{network}`.
 - `CHUNK_SIZE` is bounded above as well: a value over 65536 refuses to start, since the client
   (0.1.1) refuses response chunks with more than 64 KiB of plaintext. The default stays 16384

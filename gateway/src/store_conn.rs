@@ -280,6 +280,13 @@ impl StoreConn {
         }
     }
 
+    /// Replace the connection (new name resolution, primary only) although no command reported a
+    /// failover signal: for a node that still says `ROLE master` but has stopped acknowledging
+    /// writes on any replica for a long time (a primary the endpoint may have left behind).
+    pub fn force_reconnect(self: &Arc<Self>, reason: &'static str) {
+        self.trigger(reason);
+    }
+
     /// Start a reconnect unless one is running or the connection was just replaced.
     fn trigger(self: &Arc<Self>, reason: &'static str) {
         let last = self.last_swap_ms.load(Ordering::Relaxed);

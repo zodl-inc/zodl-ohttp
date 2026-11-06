@@ -93,6 +93,10 @@ impl Link {
         self.down.store(true, Ordering::SeqCst);
         self.epoch.fetch_add(1, Ordering::SeqCst);
     }
+
+    fn restore(&self) {
+        self.down.store(false, Ordering::SeqCst);
+    }
 }
 
 async fn pump(
@@ -266,6 +270,16 @@ async fn origin(
     security: &str,
     peer: Option<(&str, ReplayPeerMode, bool)>,
 ) -> ResponseCache {
+    origin_with_peer_wait(network, cache, security, peer, Some(WAIT)).await
+}
+
+async fn origin_with_peer_wait(
+    network: &str,
+    cache: &str,
+    security: &str,
+    peer: Option<(&str, ReplayPeerMode, bool)>,
+    peer_wait: Option<WriteWaitConfig>,
+) -> ResponseCache {
     ohttp_gateway::health::init_metrics();
     let c = ResponseCache::connect(
         cache,
@@ -284,7 +298,7 @@ async fn origin(
             let peers = ReplayPeers::connect(&[url.to_string()], network.to_string(), 250, false)
                 .await
                 .with_mode(mode, fail_closed_writes)
-                .with_wait(Some(WAIT));
+                .with_wait(peer_wait);
             c.with_replay_peers(peers)
                 .with_async_replication(replication(network, mode))
         }
@@ -463,12 +477,76 @@ async fn failover_mode_write_fails_closed_when_the_peer_cannot_confirm() {
     let write = request("local ack, peer unreachable");
     assert!(admit(&w.origin, &write, RouteClass::Write).await.unwrap());
     assert_eq!(fallback(net, "window", "unavailable"), 1.0);
+    // ... and the peer gets that nonce once it is reachable again.
+    w.peer_link.restore();
+    until(
+        "replicated after the peer is back",
+        Duration::from_secs(10),
+        || w.peer.has(&key(net, &write)),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_gateway_that_just_started_checks_writes_at_the_peer() {
+    let net = "testnet-wfb-newpod";
+    let (_cache, cache_addr) = Store::start().await;
+    let (local, l_addr) = Store::start().await;
+    let (peer, p_addr) = Store::start().await;
+    // Another gateway admitted a WRITE through the peer, and the local store lost its copy
+    // before the write-back (that gateway was replaced). A new gateway of the same store,
+    // which never saw the failover, refuses the replay.
+    let elsewhere = request("admitted by a gateway that is gone");
+    peer.put(&key(net, &elsewhere));
+    let c = origin(
+        net,
+        &addr_url(cache_addr),
+        &addr_url(l_addr),
+        Some((&addr_url(p_addr), ReplayPeerMode::Failover, true)),
+    )
+    .await;
+    assert!(c.write_fallback().unwrap().window_open());
+    assert!(!admit(&c, &elsewhere, RouteClass::Write).await.unwrap());
+    assert_eq!(fallback(net, "window", "replay"), 1.0);
+    assert!(local.has(&key(net, &elsewhere)), "checked locally first");
+}
+
+#[tokio::test]
+async fn peers_without_replica_acknowledgement_get_no_fallback() {
+    let net = "testnet-wfb-nopeerwait";
+    let (_cache, cache_addr) = Store::start().await;
+    let (local, l_addr) = Store::start().await;
+    let (_peer, p_addr) = Store::start().await;
+    // REPLAY_PEER_WAIT_REPLICAS=0.
+    let c = origin_with_peer_wait(
+        net,
+        &addr_url(cache_addr),
+        &addr_url(l_addr),
+        Some((&addr_url(p_addr), ReplayPeerMode::Failover, true)),
+        None,
+    )
+    .await;
+    assert!(c.write_fallback().is_none());
+    local.set_acks(0);
+    let write = request("peer without wait");
+    assert!(admit(&c, &write, RouteClass::Write).await.is_err());
+    for r in [
+        "accepted",
+        "unavailable",
+        "replay",
+        "unacknowledged",
+        "overflow",
+    ] {
+        assert_eq!(fallback(net, "short_ack", r), 0.0, "{r}");
+    }
 }
 
 #[tokio::test]
 async fn failover_mode_outside_the_window_replicates_after_the_local_ack() {
     let net = "testnet-wfb-normal";
     let w = world(net, ReplayPeerMode::Failover, true).await;
+    // The startup window is over.
+    w.origin.write_fallback().unwrap().close_window();
     let write = request("normal write");
     assert!(admit(&w.origin, &write, RouteClass::Write).await.unwrap());
     // Asynchronously, after the local verdict (never before: the peer must not hold a nonce
@@ -521,6 +599,7 @@ async fn without_a_peer_nothing_changes() {
     let (_cache, cache_addr) = Store::start().await;
     let (local, l_addr) = Store::start().await;
     let c = origin(net, &addr_url(cache_addr), &addr_url(l_addr), None).await;
+    assert!(c.write_fallback().is_none());
     local.set_acks(0);
     let write = request("no peer");
     assert!(admit(&c, &write, RouteClass::Write).await.is_err());

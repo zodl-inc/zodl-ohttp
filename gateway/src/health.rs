@@ -1033,7 +1033,7 @@ pub fn healthz_ok(security_redis_ok: bool, lwd_ok: bool) -> bool {
 lazy_static::lazy_static! {
     // Its own block: the main one is at the macro recursion limit.
     static ref OHTTP_STORE_RECONNECT_TOTAL: IntCounterVec = IntCounterVec::new(
-        Opts::new("ohttp_store_reconnect_total", "Store connection failover signals and replacements, by store and reason: READONLY, MOVED, UNBLOCKED, LOADING, MASTERDOWN, ERR (WAIT refused on a replica), role (ROLE is not master), timeout, error (broken connection); replaced = a new connection is in use"),
+        Opts::new("ohttp_store_reconnect_total", "Store connection failover signals and replacements, by store and reason: READONLY, MOVED, UNBLOCKED, LOADING, MASTERDOWN, ERR (WAIT refused on a replica), role (ROLE is not master), timeout, error (broken connection), short_ack (write-back: no replica acknowledgement for ~10 s); replaced = a new connection is in use"),
         &["network", "store", "reason"]
     )
     .unwrap();
@@ -1074,7 +1074,7 @@ pub fn record_replay_write_back_pending(network: &str, n: usize) {
         .set(n as i64);
 }
 
-/// `store`: security | write_wait | local_aof | pinned | permanent (no URLs: they carry
+/// `store`: security | write_wait | write_back | local_aof | pinned | permanent (no URLs: they carry
 /// credentials).
 pub fn record_store_reconnect(network: &str, store: &str, reason: &str) {
     OHTTP_STORE_RECONNECT_TOTAL

@@ -174,10 +174,12 @@ nonce the local primary took as new but whose acknowledgement came back short is
 the peer stores instead: the nonce must be new there too and acknowledged by the peer's own
 replicas (`REPLAY_PEER_WAIT_REPLICAS`), else the WRITE fails closed as before; a peer holding the
 nonce makes it a replay. The nonce is then written back to the local store until its replicas
-have it. In `failover` mode, where WRITEs are not otherwise checked at the peers, a gateway that
-saw a short acknowledgement or a replaced store connection also checks every WRITE at the peers
-for one nonce TTL afterwards, so a replay is refused even if the local store lost the nonce
-before the write-back. Without peers nothing changes.
+have it. In `failover` mode, where WRITEs are not otherwise checked at the peers, a gateway also
+checks every WRITE at the peers for one nonce TTL after it started, saw a short acknowledgement or
+had a store connection replaced, so a replay is refused even if the local store lost the nonce
+before the write-back (for example because the gateway that admitted it stopped). This state is
+per process and in memory; a gateway that checks WRITEs only at another origin's store has no such
+window. Without peers that acknowledge on their replicas nothing changes.
 
 ## Response framing: chunks and padding
 

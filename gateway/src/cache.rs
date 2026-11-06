@@ -1071,17 +1071,37 @@ impl ResponseCache {
             Role::Primary,
         )
         .await?;
-        let fb = Arc::new(WriteFallback::new(
-            &self.network,
-            self.store_generation_of(&conn),
-        ));
-        crate::write_fallback::spawn_write_back(
-            fb.clone(),
-            conn.clone(),
-            config,
-            self.redis_timeout,
-        );
-        self.write_fallback = Some(fb);
+        // The peer fallback needs peers that acknowledge on their replicas (the replay peers
+        // are attached before this, see main.rs); without them nothing changes.
+        if self
+            .replay_peers
+            .as_ref()
+            .is_some_and(|p| p.wait().is_some())
+        {
+            let fb = Arc::new(WriteFallback::new(
+                &self.network,
+                self.store_generation_of(&conn),
+            ));
+            // Its own connection: its WAITs must not delay the requests' WAITs.
+            let write_back = StoreConn::connect(
+                security_url,
+                "write_back",
+                self.network.clone(),
+                Role::Primary,
+            )
+            .await?;
+            crate::write_fallback::spawn_write_back(
+                fb.clone(),
+                write_back,
+                config,
+                self.redis_timeout,
+            );
+            crate::write_fallback::spawn_window_watch(fb.clone(), conn.clone());
+            if let Some(sec) = &self.security_conn {
+                crate::write_fallback::spawn_window_watch(fb.clone(), sec.clone());
+            }
+            self.write_fallback = Some(fb);
+        }
         self.write_wait = Some(Arc::new(WriteWait { conn, config }));
         Ok(self)
     }
@@ -1291,6 +1311,10 @@ impl ResponseCache {
         ) else {
             return Err(e);
         };
+        // sync mode: check_replay asked the peers but its outcomes are not kept; unchanged.
+        if peers.mode() == ReplayPeerMode::Sync {
+            return Err(e);
+        }
         let record = |result: &str| {
             crate::health::record_replay_write_fallback(&self.network, "short_ack", result)
         };
@@ -1303,7 +1327,7 @@ impl ResponseCache {
                 // async-reads / sync: the peers were asked already and did not all take and
                 // acknowledge the nonce (unreachable, tolerated by the policy).
                 record("unavailable");
-                return Err(e.context("no peer store acknowledged the nonce"));
+                return Err(e.context("not every peer store took and acknowledged the nonce"));
             }
             let outcomes = peers.write_nonce(&key, REPLAY_TTL_SECS).await;
             match combine_peer_outcomes(&outcomes) {
