@@ -56,5 +56,6 @@ pub mod rpc_cache;
 pub mod server;
 pub mod singleflight;
 pub mod store;
+pub mod store_conn;
 pub mod subtree_cache;
 pub mod third_party_cache;

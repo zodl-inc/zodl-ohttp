@@ -55,6 +55,7 @@ use crate::origin::{ReplayPeerMode, RouteClass};
 use crate::replication::{AsyncReplicator, Effective, PeerSink, ReplicationConfig};
 use crate::rpc_cache::{self, grpc_message, BlockId, TreeStateHead};
 use crate::store::{CacheStore, PermanentStore, TipCell};
+use crate::store_conn::{is_failover_signal, Role, StoreConn};
 
 pub use crate::rpc_cache::{grpc_block_id, height_key, CacheLookup, CacheMiss, MAX_CACHEABLE_SIZE};
 
@@ -84,13 +85,20 @@ const PEER_RECONNECT_MAX_BACKOFF_SECS: u64 = 5;
 /// the name again. Above the ~6.3 s of ConnectionManager's own retries on a
 /// refused connection, so those still end with their own error.
 const PEER_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Consecutive failed housekeeping PINGs after which the cache Redis connection is dropped and
+/// reopened (a hung connection never errors, so ConnectionManager would keep it). The cache is
+/// fail-open: meanwhile requests are cache misses.
+const CACHE_PING_FAILURES_RECONNECT: u32 = 2;
 
 #[derive(Clone)]
 pub struct ResponseCache {
     /// Cache Redis (allkeys-lru, fail-open). ArcSwapOption allows lock-free swaps on reconnect.
     cache_conn: Arc<ArcSwapOption<ConnectionManager>>,
-    /// Security Redis (noeviction, fail-closed): replay nonces and the shared epoch.
-    security_conn: Option<ConnectionManager>,
+    /// Consecutive failed housekeeping PINGs of the cache Redis (see CACHE_PING_FAILURES_RECONNECT).
+    cache_ping_failures: Arc<AtomicU32>,
+    /// Security Redis (noeviction, fail-closed): replay nonces and the shared epoch. Follows a
+    /// failover of the store (`StoreConn`, `Role::Primary`).
+    security_conn: Option<Arc<StoreConn>>,
     /// The chain tip, written by the follower.
     tip: Arc<TipCell>,
     /// Cache epoch, mirrored from Redis.
@@ -101,7 +109,7 @@ pub struct ResponseCache {
     redis_timeout: Duration,
     /// Policy/limits hash for cache namespace isolation (MAX_BLOCK_RANGE + BACKENDS_POLICY).
     policy_hash: String,
-    pinned_conn: Option<ConnectionManager>,
+    pinned_conn: Option<Arc<StoreConn>>,
     /// Inclusive height range served from the pinned tier.
     pinned_range: Option<(u64, u64)>,
     cache_redis_url: String,
@@ -227,7 +235,7 @@ impl LocalAofConfig {
 
 /// The dedicated security-Redis connection for `WAITAOF` (blocks its connection, like `WAIT`).
 struct LocalAof {
-    conn: ConnectionManager,
+    conn: Arc<StoreConn>,
     timeout_ms: u64,
 }
 
@@ -235,7 +243,7 @@ struct LocalAof {
 /// until the replicas acknowledge, so it must not share the multiplexed connection every
 /// request's `SET NX` goes through: a slow replica would stall READs too.
 struct WriteWait {
-    conn: ConnectionManager,
+    conn: Arc<StoreConn>,
     config: WriteWaitConfig,
 }
 
@@ -512,9 +520,13 @@ impl ReplayPeers {
                             "acknowledged by {acked} of {replicas} replica(s) within {timeout_ms}ms"
                         ),
                         Ok(Ok((None, _))) => return Err("nonce no longer at the peer".to_string()),
-                        // A broken or stuck connection: the retry opens a fresh one.
+                        // A broken or stuck connection: the retry opens a fresh one (on the
+                        // primary). A failover signal also replaces the peer's main connection.
                         Ok(Err(e)) => {
                             p.wait_conn.store(None);
+                            if let Some(main) = p.conn.load_full() {
+                                p.on_error(&self.network, &main, &e);
+                            }
                             e.to_string()
                         }
                         Err(_) => {
@@ -560,8 +572,8 @@ impl ReplayPeers {
         let futures = self.peers.iter().map(|p| async move {
             let outcome = match p.conn.load_full() {
                 None => PeerOutcome::Disconnected,
-                Some(conn) => {
-                    let mut conn = (*conn).clone();
+                Some(used) => {
+                    let mut conn = (*used).clone();
                     match timeout(self.timeout, async {
                         redis::cmd("SET")
                             .arg(key)
@@ -578,6 +590,7 @@ impl ReplayPeers {
                         Ok(Ok(None)) => PeerOutcome::Replay,
                         Ok(Err(e)) => {
                             warn!(network = %self.network, peer = p.index, error = %e, "Replay peer write failed");
+                            p.on_error(&self.network, &used, &e);
                             PeerOutcome::Error
                         }
                         Err(_) => PeerOutcome::Timeout,
@@ -633,15 +646,56 @@ impl ReplayPeers {
 }
 
 impl ReplayPeer {
+    /// A new connection (the name is resolved again), accepted only on a primary: right after
+    /// a failover of the peer's store its endpoint name can still reach the demoted node.
     async fn open(url: &str) -> anyhow::Result<ConnectionManager> {
         let client = redis::Client::open(url)?;
-        match timeout(PEER_CONNECT_TIMEOUT, ConnectionManager::new(client)).await {
-            Ok(conn) => Ok(conn?),
+        match timeout(
+            PEER_CONNECT_TIMEOUT,
+            crate::store_conn::open_checked(&client, Role::Primary),
+        )
+        .await
+        {
+            Ok(conn) => conn,
             Err(_) => anyhow::bail!(
                 "connect timed out after {}s",
                 PEER_CONNECT_TIMEOUT.as_secs()
             ),
         }
+    }
+
+    /// A command on `used` reported that the connection no longer reaches the peer's primary
+    /// (READONLY on a demoted primary, a broken connection): drop it and reconnect in the
+    /// background, unless that already happened. Meanwhile the peer counts as disconnected,
+    /// which every policy treats like an error.
+    fn on_error(&self, network: &str, used: &Arc<ConnectionManager>, e: &redis::RedisError) {
+        if !is_failover_signal(e, Role::Primary) {
+            return;
+        }
+        drop_peer_conn(network, self.index, &self.url, &self.conn, used, e);
+    }
+}
+
+/// Replace `used` in `slot` by None and start the reconnect task, once per connection.
+fn drop_peer_conn(
+    network: &str,
+    index: usize,
+    url: &str,
+    slot: &Arc<ArcSwapOption<ConnectionManager>>,
+    used: &Arc<ConnectionManager>,
+    e: &redis::RedisError,
+) {
+    let current = Some(used.clone());
+    let prev = slot.compare_and_swap(&current, None::<Arc<ConnectionManager>>);
+    let swapped = (*prev).as_ref().is_some_and(|p| Arc::ptr_eq(p, used));
+    if swapped {
+        warn!(network = %network, peer = index, error = %e, "Replay peer connection lost the primary: reconnecting");
+        crate::health::record_store_reconnect(
+            network,
+            "replay_peer",
+            crate::store_conn::signal_reason(e),
+        );
+        spawn_peer_reconnect_task(network.to_string(), index, url.to_string(), slot.clone());
     }
 }
 
@@ -653,12 +707,15 @@ impl PeerSink for ReplayPeers {
         keys: Vec<String>,
         ttl_secs: u64,
     ) -> BoxFuture<'static, Result<Vec<Option<String>>, String>> {
-        let conn = self.peers.get(peer).and_then(|p| p.conn.load_full());
+        let p = self.peers.get(peer);
+        let conn = p.and_then(|p| p.conn.load_full());
+        let slot = p.map(|p| (p.conn.clone(), p.url.clone()));
+        let network = self.network.clone();
         Box::pin(async move {
-            let Some(conn) = conn else {
+            let (Some(used), Some((slot, url))) = (conn, slot) else {
                 return Err("disconnected".to_string());
             };
-            let mut conn = (*conn).clone();
+            let mut conn = (*used).clone();
             let mut pipe = redis::pipe();
             for key in &keys {
                 pipe.cmd("SET")
@@ -670,7 +727,12 @@ impl PeerSink for ReplayPeers {
             }
             pipe.query_async::<_, Vec<Option<String>>>(&mut conn)
                 .await
-                .map_err(|e| e.to_string())
+                .map_err(|e| {
+                    if is_failover_signal(&e, Role::Primary) {
+                        drop_peer_conn(&network, peer, &url, &slot, &used, &e);
+                    }
+                    e.to_string()
+                })
         })
     }
 
@@ -694,8 +756,9 @@ impl PeerSink for ReplayPeers {
     }
 }
 
-/// Retry a peer connection with exponential backoff (1 s to PEER_RECONNECT_MAX_BACKOFF_SECS)
-/// until it succeeds.
+/// Retry a peer connection with exponential backoff (200 ms to PEER_RECONNECT_MAX_BACKOFF_SECS)
+/// until it succeeds. The first attempt is quick: after a failover the peer's endpoint name
+/// usually points at the promoted replica within seconds.
 fn spawn_peer_reconnect_task(
     network: String,
     index: usize,
@@ -703,9 +766,9 @@ fn spawn_peer_reconnect_task(
     conn: Arc<ArcSwapOption<ConnectionManager>>,
 ) {
     tokio::spawn(async move {
-        let mut backoff_secs = 1u64;
+        let mut backoff = Duration::from_millis(200);
         loop {
-            tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
+            tokio::time::sleep(backoff).await;
             match ReplayPeer::open(&url).await {
                 Ok(c) => {
                     conn.store(Some(Arc::new(c)));
@@ -715,7 +778,8 @@ fn spawn_peer_reconnect_task(
                 }
                 Err(e) => {
                     warn!(network = %network, peer = index, error = %e, "Replay peer reconnection attempt failed");
-                    backoff_secs = (backoff_secs * 2).min(PEER_RECONNECT_MAX_BACKOFF_SECS);
+                    backoff =
+                        (backoff * 2).min(Duration::from_secs(PEER_RECONNECT_MAX_BACKOFF_SECS));
                 }
             }
         }
@@ -787,8 +851,7 @@ impl ResponseCache {
         // (fail-closed for replay protection).
         let security_conn = if let Some(sec_url) = redis_security_url {
             if !sec_url.is_empty() && sec_url != redis_url {
-                let sec_client = redis::Client::open(sec_url)?;
-                Some(ConnectionManager::new(sec_client).await?)
+                Some(StoreConn::connect(sec_url, "security", network.clone(), Role::Primary).await?)
             } else {
                 None
             }
@@ -820,6 +883,7 @@ impl ResponseCache {
 
         let cache = Self {
             cache_conn: Arc::new(ArcSwapOption::from(cache_conn.map(Arc::new))),
+            cache_ping_failures: Arc::new(AtomicU32::new(0)),
             security_conn,
             tip: Arc::new(TipCell::new()),
             epoch: Arc::new(AtomicU64::new(0)),
@@ -867,8 +931,8 @@ impl ResponseCache {
 
     /// Attach the pinned tier (REDIS_PINNED_URL + PINNED_TREESTATE_RANGE).
     pub async fn with_pinned(mut self, url: &str, range: (u64, u64)) -> anyhow::Result<Self> {
-        let client = redis::Client::open(url)?;
-        self.pinned_conn = Some(ConnectionManager::new(client).await?);
+        self.pinned_conn =
+            Some(StoreConn::connect(url, "pinned", self.network.clone(), Role::Any).await?);
         self.pinned_range = Some(range);
         Ok(self)
     }
@@ -886,8 +950,13 @@ impl ResponseCache {
         if security_url.is_empty() {
             anyhow::bail!("REPLAY_WRITE_WAIT_REPLICAS needs REDIS_SECURITY_URL");
         }
-        let client = redis::Client::open(security_url)?;
-        let conn = ConnectionManager::new(client).await?;
+        let conn = StoreConn::connect(
+            security_url,
+            "write_wait",
+            self.network.clone(),
+            Role::Primary,
+        )
+        .await?;
         self.write_wait = Some(Arc::new(WriteWait { conn, config }));
         Ok(self)
     }
@@ -904,58 +973,74 @@ impl ResponseCache {
             return Ok(());
         };
         let key = format!("replay:{}:{}", self.network, hex::encode(body_hash));
-        let mut conn = ww.conn.clone();
         let WriteWaitConfig {
             replicas,
             timeout_ms,
         } = ww.config;
-        let round_trip = async {
-            // A connection that died since the last WRITE (a Redis failover closes it) fails
-            // the first command; ConnectionManager reconnects behind it, so one retry gets the new
-            // primary. SET XX and WAIT are idempotent. Without the retry, the first WRITE after a
-            // failover would answer 503.
-            let mut retried = false;
-            loop {
-                let r = async {
-                    redis::cmd("SET")
-                        .arg(&key)
-                        .arg("1")
-                        .arg("XX")
-                        .arg("EX")
-                        .arg(REPLAY_TTL_SECS)
-                        .query_async::<_, Option<String>>(&mut conn)
-                        .await?;
-                    redis::cmd("WAIT")
-                        .arg(replicas)
-                        .arg(timeout_ms)
-                        .query_async::<_, i64>(&mut conn)
-                        .await
-                }
-                .await;
-                match r {
-                    Err(e)
-                        if !retried
-                            && (e.is_io_error()
-                                || e.is_connection_dropped()
-                                || e.is_unrecoverable_error()) =>
-                    {
-                        warn!(network = %self.network, error = %e, "Replay nonce WAIT connection broken, retrying once");
-                        retried = true;
-                    }
-                    r => break r,
-                }
-            }
-        };
-        // WAIT returns after at most timeout_ms; the outer bound adds the round trips (and the
-        // retry's).
+        // WAIT returns after at most timeout_ms; the budget adds the round trips (and the
+        // retry's, including the wait for a replaced connection).
         let budget = Duration::from_millis(timeout_ms) + self.redis_timeout * 4;
-        match timeout(budget, round_trip).await {
-            Ok(Ok(acked)) if acked >= replicas as i64 => Ok(()),
-            Ok(Ok(acked)) => anyhow::bail!(
-                "Replay nonce acknowledged by {acked} of {replicas} replica(s) within {timeout_ms}ms (fail-closed)"
-            ),
-            Ok(Err(e)) => anyhow::bail!("Replay nonce WAIT failed (fail-closed): {e}"),
-            Err(_) => anyhow::bail!("Replay nonce WAIT timed out after {}ms (fail-closed)", budget.as_millis()),
+        let deadline = tokio::time::Instant::now() + budget;
+        let timed_out = || {
+            anyhow::anyhow!(
+                "Replay nonce WAIT timed out after {}ms (fail-closed)",
+                budget.as_millis()
+            )
+        };
+        // A connection that no longer reaches the primary (a failover: the old primary answers
+        // READONLY / refuses WAIT, or the socket broke) fails the first command. The connection
+        // is then replaced (a new name resolution, accepted only on a primary), and one retry
+        // runs on the new one within the same budget. SET XX and WAIT are idempotent, and SET XX
+        // only succeeds where the nonce is: on a promoted replica that never received it, the
+        // WRITE is refused instead of confirmed.
+        let mut retried = false;
+        loop {
+            let generation = ww.conn.generation();
+            let mut conn = ww.conn.get();
+            let round_trip = async {
+                let set = redis::cmd("SET")
+                    .arg(&key)
+                    .arg("1")
+                    .arg("XX")
+                    .arg("EX")
+                    .arg(REPLAY_TTL_SECS)
+                    .query_async::<_, Option<String>>(&mut conn)
+                    .await?;
+                if set.is_none() {
+                    return Ok(None);
+                }
+                redis::cmd("WAIT")
+                    .arg(replicas)
+                    .arg(timeout_ms)
+                    .query_async::<_, i64>(&mut conn)
+                    .await
+                    .map(Some)
+            };
+            let r = tokio::time::timeout_at(deadline, round_trip).await;
+            ww.conn.observe_timed(&r);
+            let e = match r {
+                Ok(Ok(Some(acked))) if acked >= replicas as i64 => return Ok(()),
+                Ok(Ok(Some(acked))) => {
+                    ww.conn.observe_short_ack();
+                    anyhow::bail!(
+                        "Replay nonce acknowledged by {acked} of {replicas} replica(s) within {timeout_ms}ms (fail-closed)"
+                    )
+                }
+                Ok(Ok(None)) => {
+                    anyhow::bail!("Replay nonce no longer in the security store (fail-closed)")
+                }
+                Ok(Err(e)) if !retried && is_failover_signal(&e, Role::Primary) => e,
+                Ok(Err(e)) => anyhow::bail!("Replay nonce WAIT failed (fail-closed): {e}"),
+                Err(_) => return Err(timed_out()),
+            };
+            retried = true;
+            warn!(network = %self.network, error = %e, "Replay nonce WAIT connection lost the primary, retrying once on a new connection");
+            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+            // An I/O error is also repaired by ConnectionManager itself; a READONLY connection
+            // only by the replacement.
+            if !ww.conn.wait_for_reconnect(generation, left).await && !e.is_io_error() {
+                anyhow::bail!("Replay nonce WAIT failed (fail-closed): {e}");
+            }
         }
     }
 
@@ -978,14 +1063,20 @@ impl ResponseCache {
             if security_url.is_empty() {
                 anyhow::bail!("REDIS_SECURITY_URL not configured");
             }
-            let mut conn = ConnectionManager::new(redis::Client::open(security_url)?).await?;
+            let conn = StoreConn::connect(
+                security_url,
+                "local_aof",
+                self.network.clone(),
+                Role::Primary,
+            )
+            .await?;
             let answer = timeout(
                 probe_timeout,
                 redis::cmd("WAITAOF")
                     .arg(1)
                     .arg(0)
                     .arg(1)
-                    .query_async::<_, (i64, i64)>(&mut conn),
+                    .query_async::<_, (i64, i64)>(&mut conn.get()),
             )
             .await
             .map_err(|_| anyhow::anyhow!("WAITAOF probe timed out"))?;
@@ -1038,7 +1129,7 @@ impl ResponseCache {
             return Ok(());
         };
         let started = std::time::Instant::now();
-        let mut conn = la.conn.clone();
+        let mut conn = la.conn.get();
         let budget = Duration::from_millis(la.timeout_ms) + self.redis_timeout * 2;
         let result = timeout(budget, async {
             redis::pipe()
@@ -1056,9 +1147,13 @@ impl ResponseCache {
                 .await
         })
         .await;
+        la.conn.observe_timed(&result);
         let verdict = match result {
             Ok(Ok((Some(_), (local, _)))) if local >= 1 => Ok(()),
-            Ok(Ok((Some(_), _))) => Err(format!("not fsynced within {}ms", la.timeout_ms)),
+            Ok(Ok((Some(_), _))) => {
+                la.conn.observe_short_ack();
+                Err(format!("not fsynced within {}ms", la.timeout_ms))
+            }
             Ok(Ok((None, _))) => Err("nonce no longer in the local store".to_string()),
             Ok(Err(e)) => Err(e.to_string()),
             Err(_) => Err(format!("timed out after {}ms", budget.as_millis())),
@@ -1142,13 +1237,14 @@ impl ResponseCache {
     }
 
     async fn pinned_get(&self, height: u64) -> Option<Vec<u8>> {
-        let mut conn = self.pinned_conn.as_ref()?.clone();
-        match timeout(
+        let pinned = self.pinned_conn.as_ref()?;
+        let r = timeout(
             self.redis_timeout,
-            conn.get::<_, Vec<u8>>(self.pinned_key(height)),
+            pinned.get().get::<_, Vec<u8>>(self.pinned_key(height)),
         )
-        .await
-        {
+        .await;
+        pinned.observe_timed(&r);
+        match r {
             Ok(Ok(v)) if !v.is_empty() => Some(v),
             Ok(Ok(_)) => None,
             Ok(Err(e)) => {
@@ -1164,18 +1260,16 @@ impl ResponseCache {
     }
 
     async fn pinned_exists(&self, height: u64) -> bool {
-        let Some(conn) = self.pinned_conn.as_ref() else {
+        let Some(pinned) = self.pinned_conn.as_ref() else {
             return false;
         };
-        let mut conn = conn.clone();
-        matches!(
-            timeout(
-                self.redis_timeout,
-                conn.exists::<_, bool>(self.pinned_key(height))
-            )
-            .await,
-            Ok(Ok(true))
+        let r = timeout(
+            self.redis_timeout,
+            pinned.get().exists::<_, bool>(self.pinned_key(height)),
         )
+        .await;
+        pinned.observe_timed(&r);
+        matches!(r, Ok(Ok(true)))
     }
 
     /// True if `response` is a successful GetTreeState answer for exactly `height`.
@@ -1201,7 +1295,7 @@ impl ResponseCache {
     /// Store a pinned entry. Only finalized heights (depth > FINALIZED_DEPTH against a fresh
     /// tip) and only responses that decode to a TreeState for the same height. SET NX, no TTL.
     async fn pinned_put(&self, height: u64, response: &[u8]) -> bool {
-        let Some(conn) = self.pinned_conn.as_ref() else {
+        let Some(pinned) = self.pinned_conn.as_ref() else {
             return false;
         };
         let tip = self.tip_height();
@@ -1211,16 +1305,16 @@ impl ResponseCache {
         if !Self::is_tree_state_for(response, height) {
             return false;
         }
-        let mut conn = conn.clone();
         let res = timeout(
             self.redis_timeout,
             redis::cmd("SET")
                 .arg(self.pinned_key(height))
                 .arg(response)
                 .arg("NX")
-                .query_async::<_, Option<String>>(&mut conn),
+                .query_async::<_, Option<String>>(&mut pinned.get()),
         )
         .await;
+        pinned.observe_timed(&res);
         match res {
             Ok(Ok(_)) => true,
             Ok(Err(e)) => {
@@ -1274,33 +1368,54 @@ impl ResponseCache {
             false
         };
         crate::health::record_cache_redis_connected(&self.network, cache_ok);
+        if cache_ok {
+            self.cache_ping_failures.store(0, Ordering::Relaxed);
+        } else if self.cache_conn.load().is_some()
+            && self.cache_ping_failures.fetch_add(1, Ordering::Relaxed) + 1
+                >= CACHE_PING_FAILURES_RECONNECT
+        {
+            self.cache_ping_failures.store(0, Ordering::Relaxed);
+            warn!(network = %self.network, "Cache Redis failed {CACHE_PING_FAILURES_RECONNECT} PINGs in a row: reopening the connection");
+            crate::health::record_store_reconnect(&self.network, "cache", "timeout");
+            self.cache_conn.store(None);
+            spawn_cache_reconnect_task(self.clone());
+        }
 
         // Keep the WRITE-wait connection warm: a PING after a failover takes the broken
         // connection's error here instead of in the next user's WRITE.
-        if let Some(ww) = &self.write_wait {
-            let mut conn = ww.conn.clone();
-            if let Ok(Err(e)) = timeout(
+        // The same for the WAITAOF connection. A PING also succeeds on a demoted primary, so
+        // these connections (and the security one) also check that their node is still the
+        // primary (`ROLE`): an idle gateway sees no READONLY to react to.
+        let dedicated = [
+            self.write_wait.as_ref().map(|w| &w.conn),
+            self.local_aof.as_ref().map(|l| &l.conn),
+        ];
+        for conn in dedicated.into_iter().flatten() {
+            let r = timeout(
                 self.redis_timeout,
-                redis::cmd("PING").query_async::<_, String>(&mut conn),
+                redis::cmd("PING").query_async::<_, String>(&mut conn.get()),
             )
-            .await
-            {
+            .await;
+            conn.observe_timed(&r);
+            if let Ok(Err(e)) = &r {
                 warn!(network = %self.network, error = %e, "Replay nonce WAIT connection PING failed (reconnecting)");
             }
+            conn.verify_primary().await;
         }
 
         if let Some(peers) = &self.replay_peers {
             peers.ping_all().await;
         }
 
-        if let Some(ref sec) = self.security_conn {
-            let mut sec_conn = sec.clone();
-            let sec_ok = match timeout(
+        if let Some(sec) = self.security_conn.as_ref() {
+            let ping = timeout(
                 self.redis_timeout,
-                redis::cmd("PING").query_async::<_, String>(&mut sec_conn),
+                redis::cmd("PING").query_async::<_, String>(&mut sec.get()),
             )
-            .await
-            {
+            .await;
+            sec.observe_timed(&ping);
+            sec.verify_primary().await;
+            let sec_ok = match ping {
                 Ok(Ok(resp)) if resp == "PONG" => true,
                 Ok(Ok(_)) => {
                     warn!("Security Redis PING returned unexpected response");
@@ -1339,11 +1454,10 @@ impl ResponseCache {
     pub async fn check_replay(&self, body_hash: &[u8]) -> anyhow::Result<bool> {
         let key = format!("replay:{}:{}", self.network, hex::encode(body_hash));
 
-        let mut conn = if let Some(ref sec) = self.security_conn {
-            sec.clone()
-        } else {
+        let Some(sec) = self.security_conn.as_ref() else {
             anyhow::bail!("Replay protection unavailable: REDIS_SECURITY_URL not configured");
         };
+        let mut conn = sec.get();
 
         let local = timeout(self.redis_timeout, async {
             redis::cmd("SET")
@@ -1369,6 +1483,9 @@ impl ResponseCache {
             }
         };
         let (local, peer_outcomes) = tokio::join!(local, peers);
+        // A failover signal (READONLY on a demoted primary, a hung or broken connection) replaces
+        // the connection in the background; this request still fails closed below.
+        sec.observe_timed(&local);
 
         match local {
             Ok(Ok(Some(_))) => {}
@@ -1500,8 +1617,9 @@ impl ResponseCache {
     pub async fn get_shared_epoch(&self) -> u64 {
         let key = format!("epoch:{}", self.network);
 
-        let mut conn = if let Some(ref sec) = self.security_conn {
-            sec.clone()
+        let sec = self.security_conn.as_ref();
+        let mut conn = if let Some(sec) = sec {
+            sec.get()
         } else if let Some(cache) = self.cache_conn.load_full().map(|c| (*c).clone()) {
             cache
         } else {
@@ -1513,7 +1631,7 @@ impl ResponseCache {
             .unwrap()
             .as_secs();
 
-        let _ = timeout(self.redis_timeout, async {
+        let init = timeout(self.redis_timeout, async {
             redis::cmd("SET")
                 .arg(&key)
                 .arg(initial_epoch)
@@ -1522,6 +1640,9 @@ impl ResponseCache {
                 .await
         })
         .await;
+        if let Some(sec) = sec {
+            sec.observe_timed(&init);
+        }
 
         match timeout(self.redis_timeout, conn.get::<_, Option<u64>>(&key)).await {
             Ok(Ok(Some(epoch))) => {
@@ -1608,12 +1729,13 @@ impl ResponseCache {
             None => return Ok(false),
         };
 
-        if let Some(ref sec) = self.security_conn {
-            let mut sec = sec.clone();
-            let current: Option<u64> = redis::cmd("GET")
+        if let Some(sec) = self.security_conn.as_ref() {
+            let current: redis::RedisResult<Option<u64>> = redis::cmd("GET")
                 .arg(&epoch_key)
-                .query_async(&mut sec)
-                .await?;
+                .query_async(&mut sec.get())
+                .await;
+            sec.observe(&current);
+            let current = current?;
             if current != Some(epoch_at_read) {
                 return Ok(false);
             }
@@ -1981,15 +2103,16 @@ impl CacheStore for ResponseCache {
 /// `ohttp_redis_op_timeout_total` with `perm_*` operations.
 #[derive(Clone)]
 pub struct PermanentRedis {
-    conn: ConnectionManager,
+    /// `Role::Any`: some origins read a replica of this store on purpose, so only a broken or
+    /// hung connection is replaced.
+    conn: Arc<StoreConn>,
     timeout: Duration,
     network: String,
 }
 
 impl PermanentRedis {
     pub async fn connect(url: &str, op_timeout_ms: u64, network: String) -> anyhow::Result<Self> {
-        let client = redis::Client::open(url)?;
-        let conn = ConnectionManager::new(client).await?;
+        let conn = StoreConn::connect(url, "permanent", network.clone(), Role::Any).await?;
         let this = Self {
             conn,
             timeout: Duration::from_millis(op_timeout_ms),
@@ -1997,7 +2120,7 @@ impl PermanentRedis {
         };
         // Fail startup on an unreachable store so a misconfiguration is visible; the request
         // paths stay fail-open afterwards.
-        let mut c = this.conn.clone();
+        let mut c = this.conn.get();
         let pong: String = timeout(this.timeout, redis::cmd("PING").query_async(&mut c)).await??;
         anyhow::ensure!(pong == "PONG", "permanent store PING answered {pong}");
         Ok(this)
@@ -2005,17 +2128,21 @@ impl PermanentRedis {
 
     /// `PING`, for the housekeeping gauge.
     pub async fn ping(&self) -> bool {
-        let mut c = self.conn.clone();
-        matches!(
-            timeout(self.timeout, redis::cmd("PING").query_async::<_, String>(&mut c)).await,
-            Ok(Ok(p)) if p == "PONG"
+        let r = timeout(
+            self.timeout,
+            redis::cmd("PING").query_async::<_, String>(&mut self.conn.get()),
         )
+        .await;
+        self.conn.observe_timed(&r);
+        matches!(r, Ok(Ok(p)) if p == "PONG")
     }
 
     /// Run `cmd`, mapping errors and timeouts to `None` and counting them.
     async fn run<T: redis::FromRedisValue + Send>(&self, op: &str, cmd: redis::Cmd) -> Option<T> {
-        let mut c = self.conn.clone();
-        match timeout(self.timeout, cmd.query_async::<_, T>(&mut c)).await {
+        let mut c = self.conn.get();
+        let r = timeout(self.timeout, cmd.query_async::<_, T>(&mut c)).await;
+        self.conn.observe_timed(&r);
+        match r {
             Ok(Ok(v)) => Some(v),
             Ok(Err(e)) => {
                 warn!(network = %self.network, op, error = %e, "permanent store error");
@@ -2189,7 +2316,7 @@ where
     for worker in 0..workers {
         let cache = cache.clone();
         let fetch = fetch.clone();
-        let mut conn = conn.clone();
+        let conn = conn.clone();
         tokio::spawn(async move {
             // Wait for a fresh tip so pinned_put's finality check can pass.
             while !cache.is_tip_fresh() {
@@ -2197,13 +2324,24 @@ where
             }
             info!(network = %cache.network, worker, start, end, "pinned backfill worker started");
             loop {
-                let n: u64 = match redis::cmd("INCR")
-                    .arg(cache.pinned_cursor_key())
-                    .query_async(&mut conn)
-                    .await
-                {
-                    Ok(n) => n,
-                    Err(e) => {
+                // Bounded, so that a hung connection is reported (and replaced) instead of
+                // stopping the worker.
+                let incr = timeout(
+                    cache.redis_timeout * 4,
+                    redis::cmd("INCR")
+                        .arg(cache.pinned_cursor_key())
+                        .query_async::<_, u64>(&mut conn.get()),
+                )
+                .await;
+                conn.observe_timed(&incr);
+                let n: u64 = match incr {
+                    Ok(Ok(n)) => n,
+                    Err(_) => {
+                        warn!(network = %cache.network, "pinned backfill cursor timeout");
+                        tokio::time::sleep(Duration::from_secs(10)).await;
+                        continue;
+                    }
+                    Ok(Err(e)) => {
                         warn!(network = %cache.network, error = %e, "pinned backfill cursor error");
                         tokio::time::sleep(Duration::from_secs(10)).await;
                         continue;
@@ -2217,10 +2355,13 @@ where
                 }
                 if height > limit {
                     // Caught up: hand the height back and wait for the next final block.
-                    let _: redis::RedisResult<i64> = redis::cmd("DECR")
-                        .arg(cache.pinned_cursor_key())
-                        .query_async(&mut conn)
-                        .await;
+                    let _ = timeout(
+                        cache.redis_timeout * 4,
+                        redis::cmd("DECR")
+                            .arg(cache.pinned_cursor_key())
+                            .query_async::<_, i64>(&mut conn.get()),
+                    )
+                    .await;
                     tokio::time::sleep(PINNED_FOLLOW_INTERVAL).await;
                     continue;
                 }
@@ -2293,7 +2434,18 @@ mod tests {
     ) -> ResponseCache {
         ResponseCache {
             cache_conn: Arc::new(ArcSwapOption::from(Some(Arc::new(conn)))),
-            security_conn: security,
+            // The client is only used to reconnect after a failover signal, which these tests
+            // do not produce (store_failover.rs does).
+            security_conn: security.map(|c| {
+                StoreConn::from_parts(
+                    redis::Client::open("redis://127.0.0.1:6379").unwrap(),
+                    c,
+                    "security",
+                    network.to_string(),
+                    Role::Primary,
+                )
+            }),
+            cache_ping_failures: Arc::new(AtomicU32::new(0)),
             tip: Arc::new(TipCell::new()),
             epoch: Arc::new(AtomicU64::new(0)),
             network: network.to_string(),

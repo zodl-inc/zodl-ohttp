@@ -68,6 +68,7 @@ mod rpc_cache;
 mod server;
 mod singleflight;
 mod store;
+mod store_conn;
 mod subtree_cache;
 mod third_party_cache;
 

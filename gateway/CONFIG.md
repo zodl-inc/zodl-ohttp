@@ -96,7 +96,7 @@ The Encapsulated Request body is limited to 10 MiB (outer 413 above it) and must
 | `REPLAY_FRESHNESS` | `observe` | Inner `ohttp-freshness` timestamp check. `off`: ignored. `observe`: missing or stale timestamps are counted (`ohttp_freshness_total`) but served. `enforce`: refused with inner 400 carrying `ohttp-freshness: rejected`. |
 | `REPLAY_FRESHNESS_WINDOW_SECS` | `300` | Accepted distance from the gateway clock, either direction. At most half the nonce TTL (600 s). |
 | `REPLAY_WRITE_WAIT_REPLICAS` | `0` | When above 0, a WRITE request (anything not on `REPLAY_READ_ROUTES`) runs only after its nonce is acknowledged by this many replicas of the security Redis (`WAIT` on a dedicated connection); otherwise it is refused with inner 503 (grpc-status 14 for lightwalletd calls). For a replicated store with automatic failover. |
-| `REPLAY_WRITE_WAIT_MS` | `100` | `WAIT` timeout for `REPLAY_WRITE_WAIT_REPLICAS`. |
+| `REPLAY_WRITE_WAIT_MS` | `100` | `WAIT` timeout for `REPLAY_WRITE_WAIT_REPLICAS`. After a failover of the store, WRITEs are admitted again once the promoted primary has this many replicas: with one replica in total, that is when the old primary has rejoined as a replica. |
 
 ## Multiple origins
 
