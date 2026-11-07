@@ -162,7 +162,7 @@ pub enum WriteAdmission {
     Replay,
 }
 
-/// The outcome of the local replica wait of a WRITE nonce.
+/// What the hub path of the fallback decided (`hub_short_ack_fallback`).
 enum HubFallback {
     Replay,
     AtStandby,
@@ -314,6 +314,9 @@ struct ReplayPeer {
     /// The dedicated connection for `WAIT` (see `WriteWait`), opened in the background by
     /// `with_wait`, else on first use.
     wait_conn: Arc<ArcSwapOption<ConnectionManager>>,
+    /// The write-back's own connection (`rewrite_replicated`): its `WAIT`s must not delay the
+    /// requests' on `wait_conn`. Opened on first use.
+    write_back_conn: Arc<ArcSwapOption<ConnectionManager>>,
     /// Consecutive failed housekeeping PINGs (see PEER_PING_FAILURES_RECONNECT).
     ping_failures: AtomicU32,
     /// A standby store (REPLAY_STANDBY_URLS): its connectivity is `ohttp_replay_standby_connected`,
@@ -405,8 +408,9 @@ impl ReplayPeers {
     }
 
     /// The standby stores (REPLAY_STANDBY_URLS): labelled from `first_label` on (the number of
-    /// REPLAY_PEER_URLS), so their metrics never share a `peer` value with a peer. Only the
-    /// asynchronous replicator uses them; nothing on the request path waits for them.
+    /// REPLAY_PEER_URLS), so their metrics never share a `peer` value with a peer. The
+    /// asynchronous replicator uses them, and, with `with_wait`, the hub path of the WRITE
+    /// fallback (write_fallback.rs) on the request path.
     pub async fn connect_standby(
         urls: &[String],
         network: String,
@@ -453,6 +457,7 @@ impl ReplayPeers {
                 url: url.clone(),
                 conn,
                 wait_conn: Arc::new(ArcSwapOption::empty()),
+                write_back_conn: Arc::new(ArcSwapOption::empty()),
                 ping_failures: AtomicU32::new(0),
                 standby,
             });
@@ -706,12 +711,12 @@ impl ReplayPeers {
         };
         let budget = self.timeout + Duration::from_millis(timeout_ms);
         let futures = self.peers.iter().map(|p| async move {
-            let conn = match p.wait_conn.load_full() {
+            let conn = match p.write_back_conn.load_full() {
                 Some(c) => c,
                 None => match timeout(PEER_WAIT_CONNECT_TIMEOUT, ReplayPeer::open(&p.url)).await {
                     Ok(Ok(c)) => {
                         let c = Arc::new(c);
-                        p.wait_conn.store(Some(c.clone()));
+                        p.write_back_conn.store(Some(c.clone()));
                         c
                     }
                     Ok(Err(e)) => return WriteBackResult::Failed(format!("connect: {e}")),
@@ -736,14 +741,11 @@ impl ReplayPeers {
                     p.index
                 )),
                 Ok(Err(e)) => {
-                    p.wait_conn.store(None);
-                    if let Some(main) = p.conn.load_full() {
-                        p.on_error(&self.network, &main, &e);
-                    }
+                    p.write_back_conn.store(None);
                     WriteBackResult::Failed(format!("peer {}: {e}", p.index))
                 }
                 Err(_) => {
-                    p.wait_conn.store(None);
+                    p.write_back_conn.store(None);
                     WriteBackResult::Failed(format!("peer {}: timed out", p.index))
                 }
             }
@@ -762,10 +764,10 @@ impl ReplayPeers {
         }
     }
 
-    /// Drop the `WAIT` connections, so the next use resolves the endpoints again.
-    fn reset_wait_conns(&self) {
+    /// Drop the write-back connections, so the next attempt resolves the endpoints again.
+    fn reset_write_back_conns(&self) {
         for p in &self.peers {
-            p.wait_conn.store(None);
+            p.write_back_conn.store(None);
         }
     }
 }
@@ -780,7 +782,7 @@ impl WriteBackSink for PeerWriteBack {
     }
 
     fn reconnect(&self) {
-        self.0.reset_wait_conns();
+        self.0.reset_write_back_conns();
     }
 }
 
@@ -1413,12 +1415,18 @@ impl ResponseCache {
                         warn!(network = %self.network, "WRITE replay nonce confirmed by the local replicas (hub replica acknowledgement short); written back to the hub later");
                         Ok(self.after_local_ack(&key, check).await)
                     }
-                    _ => {
+                    Some(_) => {
                         record("overflow");
                         anyhow::bail!("WRITE replay nonce not acknowledged by the hub replicas, write-back queue full (fail-closed)")
                     }
+                    None => anyhow::bail!(
+                        "WRITE replay nonce not acknowledged by the hub replicas (fail-closed)"
+                    ),
                 },
                 LocalWait::Short(e) | LocalWait::Failed(e) => {
+                    if let Some(fb) = &self.write_fallback {
+                        fb.open_window();
+                    }
                     record("unacknowledged");
                     Err(e.context("hub replicas did not acknowledge either"))
                 }
@@ -2201,7 +2209,9 @@ impl ResponseCache {
                                             ..PeerCheck::default()
                                         })
                                     }
-                                    Some(false) => at_standby = true,
+                                    // SET NX only (no WAIT): the asynchronous hand-off
+                                    // still follows (it finds the nonce: replay_async).
+                                    Some(false) => {}
                                     None => {}
                                 }
                             }
@@ -2297,6 +2307,9 @@ impl ResponseCache {
         let Some(fb) = self.hub_fallback.as_ref() else {
             anyhow::bail!(f.message);
         };
+        if self.confirming_standby().is_none() && self.write_wait.is_none() {
+            anyhow::bail!(f.message);
+        }
         fb.open_window();
         let record = |result: &str| {
             crate::health::record_replay_write_fallback(&self.network, "hub_short_ack", result)

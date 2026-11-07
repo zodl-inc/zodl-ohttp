@@ -519,14 +519,23 @@ async fn read_origin_without_standby_wait_is_unchanged() {
 
 #[tokio::test]
 async fn standby_origin_relies_on_its_own_replicas_while_the_hub_resyncs() {
-    let net = "testnet-hub-fb-standby";
+    local_replicas_decide("testnet-hub-fb-standby", false).await;
+}
+
+/// The spoke: same stores, WRITEs refused while the hub is unreachable.
+#[tokio::test]
+async fn spoke_relies_on_its_own_replicas_while_the_hub_resyncs() {
+    local_replicas_decide("testnet-hub-fb-spoke", true).await;
+}
+
+async fn local_replicas_decide(net: &str, fail_closed_writes: bool) {
     let (hub, h_addr) = Store::start().await;
     let (local, l_addr) = Store::start().await;
     let c = origin(
         net,
         &addr_url(l_addr),
         &addr_url(h_addr),
-        false,
+        fail_closed_writes,
         None,
         false,
         true,

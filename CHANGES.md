@@ -10,12 +10,13 @@ keeps its own log in [client/CHANGELOG.md](client/CHANGELOG.md).
 - Hub path of the WRITE fallback. In `async-reads`, when the peer store (the hub) took a WRITE
   nonce as new but its replica acknowledgement was short (the hub resyncs after a failover), the
   WRITE is confirmed at a second store instead of failing closed: at the standby stores
-  (`REPLAY_STANDBY_URLS`, now also subject to `REPLAY_PEER_WAIT_REPLICAS`, `SET NX` + `WAIT`), or,
+  (`REPLAY_STANDBY_URLS`: `SET NX` + `WAIT` there, `REPLAY_PEER_WAIT_REPLICAS` and `REPLAY_PEER_WAIT_MS`
+  apply to that fallback; the background hand-off is unchanged), or,
   where the origin has its own replica wait, by its local replicas. Same rules as the local
   fallback (new and acknowledged = runs, held = replay, otherwise fail-closed); the nonce is
   written back to the hub. A read origin with standby stores also checks every WRITE there for
-  one nonce TTL after startup or a hub disruption, and does not hand a nonce confirmed there to
-  them again. New `path` values `hub_short_ack`, `hub_window` of
+  one nonce TTL after startup or a hub disruption (`SET NX`, a held nonce = replay, an unreachable
+  store keeps the hub's verdict). The hub write-back has its own peer connection. New `path` values `hub_short_ack`, `hub_window` of
   `ohttp_replay_write_fallback_total`.
 - Peer fallback of the WRITE replica wait. With `REPLAY_PEER_URLS` and `REPLAY_PEER_WAIT_REPLICAS`
   >= 1, a WRITE whose nonce the local primary stored as new but whose `WAIT` came back short (the

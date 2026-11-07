@@ -406,7 +406,7 @@ async fn main() -> anyhow::Result<()> {
                         network = %network,
                         stores = standby.len(),
                         first_peer_label = standby.first_label(),
-                        "WRITE replay nonces are also replicated to the standby stores (asynchronous, never refusing a request)"
+                        "WRITE replay nonces are also replicated to the standby stores (asynchronously; synchronously in the hub path of the WRITE fallback)"
                     );
                     c.with_standby_replication(
                         standby,
