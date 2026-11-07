@@ -7,6 +7,42 @@ keeps its own log in [client/CHANGELOG.md](client/CHANGELOG.md).
 
 ### Gateway
 
+- Every WRITE is checked at the fallback store. Where the WRITE fallback exists (`failover` mode
+  with peers that acknowledge on their replicas; `async-reads` with standby stores that do), the
+  nonce of every WRITE admitted by the deciding store is also `SET NX` at the fallback store
+  synchronously, not only for one nonce TTL after startup or a disruption; a nonce held there is
+  a replay, an unreachable store keeps the first verdict. One more round trip to that store per
+  WRITE. New `path` values `check`, `hub_check` of `ohttp_replay_write_fallback_total` (`window`,
+  `hub_window` now only mark checks inside that time).
+- `REPLAY_UNAVAILABLE_FALLBACK` (off by default): a deciding store that gives no verdict at all
+  (unreachable, a timeout, an error) is replaced by the fallback store instead of failing closed.
+  A `failover`-mode gateway decapsulates and classifies the request first, then decides READs by
+  `SET NX` and WRITEs by `SET NX` + `WAIT` at its peers; a WRITE whose local `WAIT` got no answer
+  takes the short-acknowledgement path. An `async-reads` origin confirms WRITEs whose hub gave no
+  verdict at its standby stores or by its local replicas. Same rules as the other fallbacks, WRITE
+  nonces written back. Turn it on only once every origin with peers reports
+  `ohttp_replay_fallback_check` 1 (this version, with the settings of the WRITE fallback); a
+  gateway that would not check WRITEs at the fallback store logs a warning at startup. New `path`
+  values `local_unavailable`, `hub_unavailable`, new series `ohttp_replay_read_fallback_total`,
+  `ohttp_replay_unavailable_fallback`, `ohttp_replay_fallback_check`.
+- Chain follower: a stored tip that has not moved for `CHAIN_TIP_STALE_SECS` (default 150) makes
+  the other processes compare it with their own lightwalletd; one that is ahead serves its own tip
+  at once and, still ahead on the next check (10 s later), takes the leader lock over while the
+  stored tip is unchanged, then leads from that tick on. The leader stores when it moved the tip
+  (`{chain}tip_at`), and writes the tip only while it holds the lock (one script), so a leader
+  replaced during a tick cannot move the stored tip back. A lightwalletd answering with a lower
+  tip that is on the indexed chain is now treated as behind, not as a reorg. New series `ohttp_chain_tip_age_seconds`, `ohttp_chain_stale_leader_total`.
+- The permanent tier store's role is checked (`INFO replication` at startup and every 10 s, and a
+  write refused with `READONLY`): while it is a read-only replica its writes are skipped and final
+  blocks stay in the cache tier. New series `ohttp_permanent_store_replica`,
+  `ohttp_permanent_writes_skipped_total`.
+- Per-class lightwalletd deadlines: an RPC with one answer is bounded by
+  `LWD_UNARY_TIMEOUT_SECS` (default 10), a server-streaming RPC by `LWD_STREAM_IDLE_SECS` (default
+  20) for its head and between frames (it still runs up to `LWD_TIMEOUT_SECS` while it keeps
+  sending); the transparent-address RPCs keep `LWD_TIMEOUT_SECS` for their first answer. With
+  `LWD_CONNECTION_POOL` a call cut by a deadline replaces the pooled client, and a
+  keep-alive PING not answered within 5 s closes its connection. New series
+  `ohttp_lwd_timeouts_total`, `ohttp_lwd_pool_resets_total`.
 - Hub path of the WRITE fallback. In `async-reads`, when the peer store (the hub) took a WRITE
   nonce as new but its replica acknowledgement was short (the hub resyncs after a failover), the
   WRITE is confirmed at a second store instead of failing closed: at the standby stores

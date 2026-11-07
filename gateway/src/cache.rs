@@ -39,7 +39,7 @@
 // a disk-backed Redis-protocol store: every final CompactBlock (depth >= 100,
 // height >= Sapling activation), no TTL, never evicted. `block_cache` routes by height.
 
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -131,6 +131,9 @@ pub struct ResponseCache {
     /// The hub path of the fallback (write_fallback.rs): async-reads with peers that wait;
     /// its queue writes back to the peers.
     hub_fallback: Option<Arc<WriteFallback>>,
+    /// REPLAY_UNAVAILABLE_FALLBACK: confirm at the fallback store when the store that normally
+    /// decides gives no verdict at all (write_fallback.rs, "Unavailable store").
+    unavailable_fallback: bool,
 }
 
 /// What the peers said about a WRITE nonce in `replicate_nonce_checked`, for the replica wait
@@ -152,6 +155,24 @@ pub struct PeerCheck {
     /// The hub took the nonce but its replicas did not acknowledge it: the WRITE runs only if
     /// the local replicas do (`confirm_write_nonce`).
     pub hub_needs_local_ack: bool,
+    /// With `hub_needs_local_ack`: the hub gave no verdict at all (unreachable), rather than a
+    /// short acknowledgement. Only the metric label differs.
+    pub hub_unavailable: bool,
+    /// The local store gave no verdict and the request was decided at the peer stores instead
+    /// (`admit_without_local`): the local replica wait does not apply.
+    pub local_bypassed: bool,
+}
+
+/// The local verdict of `check_replay_detailed`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LocalReplayCheck {
+    /// The local store took the nonce as new.
+    New,
+    /// The local store already held the nonce.
+    Replay,
+    /// The local store gave no verdict (unreachable, a timeout or an error) and the unavailable
+    /// fallback can decide instead, once the request is classified (`admit_without_local`).
+    Unavailable,
 }
 
 /// The decision of `confirm_write_nonce` for a WRITE whose nonce is new locally.
@@ -173,8 +194,12 @@ enum HubFallback {
 enum LocalWait {
     Acked,
     /// The nonce is on the local primary (`SET XX` succeeded) but fewer replicas acknowledged
-    /// it than required: the only case the peer fallback may cover.
+    /// it than required: the case the peer fallback covers.
     Short(anyhow::Error),
+    /// The store gave no answer (a timeout, a broken connection or a failover signal): covered
+    /// by the peer fallback only with REPLAY_UNAVAILABLE_FALLBACK.
+    Unavailable(anyhow::Error),
+    /// Any other outcome, notably a nonce that is not on the node reached: never covered.
     Failed(anyhow::Error),
 }
 
@@ -795,6 +820,11 @@ pub struct ConfirmFailure {
 }
 
 impl ReplayPeers {
+    /// Whether at least one peer has a connection right now.
+    pub fn any_connected(&self) -> bool {
+        self.peers.iter().any(|p| p.conn.load().is_some())
+    }
+
     /// Whether peer `index` has a connection (it may still fail a command).
     fn connected(&self, index: usize) -> bool {
         self.peers
@@ -1171,6 +1201,7 @@ impl ResponseCache {
             local_aof: None,
             write_fallback: None,
             hub_fallback: None,
+            unavailable_fallback: false,
         };
 
         if cache.cache_conn.load().is_none() {
@@ -1286,7 +1317,7 @@ impl ResponseCache {
         let key = format!("replay:{}:{}", self.network, hex::encode(body_hash));
         match self.wait_local(ww, &key).await {
             LocalWait::Acked => Ok(()),
-            LocalWait::Short(e) | LocalWait::Failed(e) => Err(e),
+            LocalWait::Short(e) | LocalWait::Unavailable(e) | LocalWait::Failed(e) => Err(e),
         }
     }
 
@@ -1350,12 +1381,17 @@ impl ResponseCache {
                     ))
                 }
                 Ok(Err(e)) if !retried && is_failover_signal(&e, Role::Primary) => e,
+                Ok(Err(e)) if is_failover_signal(&e, Role::Primary) => {
+                    return LocalWait::Unavailable(anyhow::anyhow!(
+                        "Replay nonce WAIT failed (fail-closed): {e}"
+                    ))
+                }
                 Ok(Err(e)) => {
                     return LocalWait::Failed(anyhow::anyhow!(
                         "Replay nonce WAIT failed (fail-closed): {e}"
                     ))
                 }
-                Err(_) => return LocalWait::Failed(timed_out()),
+                Err(_) => return LocalWait::Unavailable(timed_out()),
             };
             retried = true;
             warn!(network = %self.network, error = %e, "Replay nonce WAIT connection lost the primary, retrying once on a new connection");
@@ -1363,7 +1399,7 @@ impl ResponseCache {
             // An I/O error is also repaired by ConnectionManager itself; a READONLY connection
             // only by the replacement.
             if !ww.conn.wait_for_reconnect(generation, left).await && !e.is_io_error() {
-                return LocalWait::Failed(anyhow::anyhow!(
+                return LocalWait::Unavailable(anyhow::anyhow!(
                     "Replay nonce WAIT failed (fail-closed): {e}"
                 ));
             }
@@ -1405,14 +1441,19 @@ impl ResponseCache {
             fb.note_generation(self.store_generation_of(&ww.conn));
         }
         if check.hub_needs_local_ack {
+            let path = if check.hub_unavailable {
+                "hub_unavailable"
+            } else {
+                "hub_short_ack"
+            };
             let record = |result: &str| {
-                crate::health::record_replay_write_fallback(&self.network, "hub_short_ack", result)
+                crate::health::record_replay_write_fallback(&self.network, path, result)
             };
             return match local {
                 LocalWait::Acked => match self.hub_fallback.as_ref() {
                     Some(fb) if fb.push_write_back(key.clone()) => {
                         record("accepted");
-                        warn!(network = %self.network, "WRITE replay nonce confirmed by the local replicas (hub replica acknowledgement short); written back to the hub later");
+                        warn!(network = %self.network, path, "WRITE replay nonce confirmed by the local replicas (no acknowledged verdict from the hub); written back to the hub later");
                         Ok(self.after_local_ack(&key, check).await)
                     }
                     Some(_) => {
@@ -1423,45 +1464,55 @@ impl ResponseCache {
                         "WRITE replay nonce not acknowledged by the hub replicas (fail-closed)"
                     ),
                 },
-                LocalWait::Short(e) | LocalWait::Failed(e) => {
+                LocalWait::Short(e) | LocalWait::Unavailable(e) | LocalWait::Failed(e) => {
                     if let Some(fb) = &self.write_fallback {
                         fb.open_window();
                     }
                     record("unacknowledged");
-                    Err(e.context("hub replicas did not acknowledge either"))
+                    Err(e.context(
+                        "the hub gave no acknowledged verdict, the local replicas neither",
+                    ))
                 }
             };
         }
         match local {
             LocalWait::Acked => Ok(self.after_local_ack(&key, check).await),
             LocalWait::Failed(e) => Err(e),
+            LocalWait::Unavailable(e) if !self.unavailable_fallback => Err(e),
+            LocalWait::Unavailable(e) => {
+                if let Some(fb) = &self.write_fallback {
+                    fb.open_window();
+                }
+                self.short_ack_fallback(key, check, e, "local_unavailable")
+                    .await
+            }
             LocalWait::Short(e) => {
                 if let Some(fb) = &self.write_fallback {
                     fb.open_window();
                 }
-                self.short_ack_fallback(key, check, e).await
+                self.short_ack_fallback(key, check, e, "short_ack").await
             }
         }
     }
 
     /// The local replicas have the nonce. In `failover` mode the deferred replication to the
-    /// peers happens now: asynchronously as always, or, inside the window after a local store
-    /// failover, synchronously with the peers' verdict.
+    /// peers happens now: with a peer fallback (peers that acknowledge on their replicas)
+    /// synchronously, with the peers' verdict, on every WRITE (write_fallback.rs, "Check at
+    /// the fallback store"); without one asynchronously.
     async fn after_local_ack(&self, key: &str, check: PeerCheck) -> WriteAdmission {
         if !check.deferred {
             return WriteAdmission::Run;
         }
-        let window = self
-            .write_fallback
-            .as_ref()
-            .is_some_and(|fb| fb.window_open());
         let peers = self.replay_peers.as_ref();
-        let (Some(peers), true) = (peers, window) else {
+        let (Some(peers), Some(fb)) = (peers, self.write_fallback.as_ref()) else {
             if let Some(r) = &self.replicator {
                 r.enqueue(key);
             }
             return WriteAdmission::Run;
         };
+        // The label tells a check inside the window (after startup or a local store failover)
+        // from the steady state; both are decided the same way.
+        let path = if fb.window_open() { "window" } else { "check" };
         let outcomes = peers.write_nonce(key, REPLAY_TTL_SECS).await;
         let verdict = combine_peer_outcomes(&outcomes);
         let result = match verdict {
@@ -1469,7 +1520,7 @@ impl ResponseCache {
             PeerVerdict::Replay => "replay",
             PeerVerdict::Unavailable => "unavailable",
         };
-        crate::health::record_replay_write_fallback(&self.network, "window", result);
+        crate::health::record_replay_write_fallback(&self.network, path, result);
         match verdict {
             PeerVerdict::Replay => WriteAdmission::Replay,
             PeerVerdict::Fresh => WriteAdmission::Run,
@@ -1484,13 +1535,16 @@ impl ResponseCache {
         }
     }
 
-    /// The local replica acknowledgement was short (the nonce is on the local primary only):
-    /// confirm the WRITE at the peer stores instead, or fail closed with `e`.
+    /// The local replica acknowledgement was short (the nonce is on the local primary only), or
+    /// with REPLAY_UNAVAILABLE_FALLBACK the local store did not answer the wait (`path`
+    /// `local_unavailable`): confirm the WRITE at the peer stores instead, or fail closed with
+    /// `e`.
     async fn short_ack_fallback(
         &self,
         key: String,
         check: PeerCheck,
         e: anyhow::Error,
+        path: &'static str,
     ) -> anyhow::Result<WriteAdmission> {
         // No peer store that can acknowledge on its replicas: as without the fallback.
         let (Some(peers), Some(fb)) = (
@@ -1503,9 +1557,8 @@ impl ResponseCache {
         if peers.mode() == ReplayPeerMode::Sync {
             return Err(e);
         }
-        let record = |result: &str| {
-            crate::health::record_replay_write_fallback(&self.network, "short_ack", result)
-        };
+        let record =
+            |result: &str| crate::health::record_replay_write_fallback(&self.network, path, result);
         if !fb.has_room() {
             record("overflow");
             return Err(e.context("write-back queue full, no peer fallback"));
@@ -1541,9 +1594,155 @@ impl ResponseCache {
         record("accepted");
         warn!(
             network = %self.network,
+            path,
             reason = %e,
-            "WRITE replay nonce confirmed at the peer stores (local replica acknowledgement short); written back locally later"
+            "WRITE replay nonce confirmed at the peer stores (no acknowledged local verdict); written back locally later"
         );
+        Ok(WriteAdmission::Run)
+    }
+
+    /// REPLAY_UNAVAILABLE_FALLBACK (write_fallback.rs, "Unavailable store"). Off by default:
+    /// every gateway that checks at the same stores must run a version that checks every WRITE
+    /// at the fallback store before any of them turns this on.
+    pub fn with_unavailable_fallback(mut self, on: bool) -> Self {
+        self.unavailable_fallback = on;
+        self
+    }
+
+    /// Where the unavailable fallback confirms a WRITE on this origin, for the startup log and
+    /// `ohttp_replay_unavailable_fallback`: `local` (the local store is the one that decides; a
+    /// `failover`-mode origin with peers that acknowledge), `standby` (a read origin's hub:
+    /// confirmed at its standby stores), `local_replicas` (the hub of an origin with its own
+    /// replica wait), or None (off, or nothing to confirm at).
+    pub fn unavailable_fallback_target(&self) -> Option<&'static str> {
+        if !self.unavailable_fallback {
+            return None;
+        }
+        let peers = self.replay_peers.as_ref()?;
+        match peers.mode() {
+            ReplayPeerMode::Failover if peers.wait().is_some() && self.write_fallback.is_some() => {
+                Some("local")
+            }
+            ReplayPeerMode::AsyncReads
+                if peers.fail_closed_writes() && self.hub_fallback.is_some() =>
+            {
+                if self.confirming_standby().is_some() {
+                    Some("standby")
+                } else if self.write_wait.is_some() {
+                    Some("local_replicas")
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Whether every WRITE this gateway admits is also `SET NX` synchronously at a fallback store
+    /// (write_fallback.rs, "Check at the fallback store"): `failover` mode with the peer fallback
+    /// (peers that acknowledge, `REPLAY_WRITE_WAIT_REPLICAS`), or `async-reads` with standby
+    /// stores that acknowledge; an `async-reads` origin with its own replica wait and no standby
+    /// stores counts its own store as the fallback store (it is asked first, on every request).
+    /// `ohttp_replay_fallback_check`: the unavailable fallback is safe only once this is true on
+    /// every gateway of the network that has peers.
+    pub fn checks_writes_at_fallback_store(&self) -> bool {
+        let Some(peers) = self.replay_peers.as_ref() else {
+            return false;
+        };
+        match peers.mode() {
+            ReplayPeerMode::Failover => self.write_fallback.is_some(),
+            ReplayPeerMode::AsyncReads => {
+                self.hub_fallback.is_some()
+                    && (self.confirming_standby().is_some()
+                        || (self.write_wait.is_some() && self.standby_peers.is_none()))
+            }
+            ReplayPeerMode::Sync => false,
+        }
+    }
+
+    /// Whether a request whose local `SET NX` gave no verdict can still be decided at the peer
+    /// stores (`admit_without_local`): the fallback targets the local store and a peer is
+    /// connected right now (else the request fails closed at once, as before).
+    fn local_unavailable_fallback_ready(&self) -> bool {
+        self.unavailable_fallback_target() == Some("local")
+            && self
+                .replay_peers
+                .as_ref()
+                .is_some_and(|p| p.any_connected())
+    }
+
+    /// The local store gave no verdict on this request's nonce (`LocalReplayCheck::Unavailable`):
+    /// decide it at the peer stores alone, which then are the single point of confirmation.
+    ///
+    /// - READ: `SET NX` at every peer; new everywhere = runs, held anywhere = replay, a peer that
+    ///   does not answer = fail-closed.
+    /// - WRITE: the same, then the peers' own replica wait (`REPLAY_PEER_WAIT_REPLICAS`); only a
+    ///   nonce that every peer took as new and acknowledged runs, and it is written back to the
+    ///   local store until the local replicas have it.
+    ///
+    /// `Err` = fail-closed (inner 503 / grpc-status 14).
+    pub async fn admit_without_local(
+        &self,
+        body_hash: &[u8],
+        class: RouteClass,
+    ) -> anyhow::Result<WriteAdmission> {
+        let key = format!("replay:{}:{}", self.network, hex::encode(body_hash));
+        let (Some(peers), Some(fb), true) = (
+            self.replay_peers.as_ref().filter(|p| p.wait().is_some()),
+            self.write_fallback.as_ref(),
+            self.unavailable_fallback,
+        ) else {
+            anyhow::bail!("Replay protection unavailable: no verdict from the local store and no peer store to decide at (fail-closed)");
+        };
+        fb.open_window();
+        if class == RouteClass::Read {
+            let outcomes = peers.write_nonce(&key, REPLAY_TTL_SECS).await;
+            let verdict = combine_peer_outcomes(&outcomes);
+            crate::health::record_replay_read_fallback(
+                &self.network,
+                match verdict {
+                    PeerVerdict::Fresh => "accepted",
+                    PeerVerdict::Replay => "replay",
+                    PeerVerdict::Unavailable => "unavailable",
+                },
+            );
+            return match verdict {
+                PeerVerdict::Fresh => Ok(WriteAdmission::Run),
+                PeerVerdict::Replay => Ok(WriteAdmission::Replay),
+                PeerVerdict::Unavailable => anyhow::bail!(
+                    "Replay protection unavailable: no verdict from the local store or the peer stores (fail-closed): {outcomes:?}"
+                ),
+            };
+        }
+        let record = |result: &str| {
+            crate::health::record_replay_write_fallback(&self.network, "local_unavailable", result)
+        };
+        if !fb.has_room() {
+            record("overflow");
+            anyhow::bail!("Replay protection unavailable: no verdict from the local store, write-back queue full (fail-closed)");
+        }
+        let outcomes = peers.write_nonce(&key, REPLAY_TTL_SECS).await;
+        match combine_peer_outcomes(&outcomes) {
+            PeerVerdict::Replay => {
+                record("replay");
+                return Ok(WriteAdmission::Replay);
+            }
+            PeerVerdict::Unavailable => {
+                record("unavailable");
+                anyhow::bail!("Replay protection unavailable: no verdict from the local store or the peer stores (fail-closed): {outcomes:?}");
+            }
+            PeerVerdict::Fresh => {}
+        }
+        if let Err(e) = peers.confirm_replicated(&key, |_| true).await {
+            record("unacknowledged");
+            return Err(e.context("no verdict from the local store"));
+        }
+        if !fb.push_write_back(key) {
+            record("overflow");
+            anyhow::bail!("Replay protection unavailable: no verdict from the local store, write-back queue full (fail-closed)");
+        }
+        record("accepted");
+        warn!(network = %self.network, "WRITE replay nonce confirmed at the peer stores (no verdict from the local store); written back locally later");
         Ok(WriteAdmission::Run)
     }
 
@@ -2023,6 +2222,23 @@ impl ResponseCache {
     /// answer within REPLAY_PEER_TIMEOUT_MS is an error only with REPLAY_PEER_FAIL_CLOSED;
     /// otherwise the local verdict stands and the outcome is counted (`ohttp_replay_peer_total`).
     pub async fn check_replay(&self, body_hash: &[u8]) -> anyhow::Result<bool> {
+        match self.check_replay_detailed(body_hash).await? {
+            LocalReplayCheck::New => Ok(false),
+            LocalReplayCheck::Replay => Ok(true),
+            LocalReplayCheck::Unavailable => {
+                anyhow::bail!("Replay check: no verdict from the security store (fail-closed)")
+            }
+        }
+    }
+
+    /// `check_replay`, except that a local store that gives no verdict is
+    /// `LocalReplayCheck::Unavailable` instead of an error when the unavailable fallback can
+    /// decide the request at the peer stores (`admit_without_local`, after the inner request
+    /// is classified). Errors otherwise as `check_replay`.
+    pub async fn check_replay_detailed(
+        &self,
+        body_hash: &[u8],
+    ) -> anyhow::Result<LocalReplayCheck> {
         let key = format!("replay:{}:{}", self.network, hex::encode(body_hash));
 
         let Some(sec) = self.security_conn.as_ref() else {
@@ -2060,14 +2276,22 @@ impl ResponseCache {
 
         match local {
             Ok(Ok(Some(_))) => {}
-            Ok(Ok(None)) => return Ok(true),
+            Ok(Ok(None)) => return Ok(LocalReplayCheck::Replay),
             Ok(Err(e)) => {
+                if self.local_unavailable_fallback_ready() {
+                    debug!(network = %self.network, error = %e, "Replay check: no verdict from the security store, deciding at the peer stores");
+                    return Ok(LocalReplayCheck::Unavailable);
+                }
                 anyhow::bail!(
                     "Replay check failed on security connection (fail-closed): {}",
                     e
                 );
             }
             Err(_) => {
+                if self.local_unavailable_fallback_ready() {
+                    debug!(network = %self.network, "Replay check: security store timed out, deciding at the peer stores");
+                    return Ok(LocalReplayCheck::Unavailable);
+                }
                 anyhow::bail!(
                     "Replay check timeout on security connection (fail-closed): {}ms",
                     self.redis_timeout.as_millis()
@@ -2076,9 +2300,14 @@ impl ResponseCache {
         }
 
         let (Some(peers), Some(outcomes)) = (sync_peers, peer_outcomes) else {
-            return Ok(false);
+            return Ok(LocalReplayCheck::New);
         };
-        self.peer_verdict(&outcomes, peers.fail_closed(), "REPLAY_PEER_FAIL_CLOSED")
+        Ok(
+            match self.peer_verdict(&outcomes, peers.fail_closed(), "REPLAY_PEER_FAIL_CLOSED")? {
+                true => LocalReplayCheck::Replay,
+                false => LocalReplayCheck::New,
+            },
+        )
     }
 
     fn peer_verdict(
@@ -2181,6 +2410,18 @@ impl ResponseCache {
             }
             (ReplayPeerMode::AsyncReads, RouteClass::Write) => {
                 let outcomes = peers.write_nonce(&key, REPLAY_TTL_SECS).await;
+                // The hub gave no verdict (unreachable, a timeout or an error) where it would fail
+                // the WRITE closed: confirm at the fallback store instead
+                // (REPLAY_UNAVAILABLE_FALLBACK).
+                if peers.fail_closed_writes()
+                    && combine_peer_outcomes(&outcomes) == PeerVerdict::Unavailable
+                    && matches!(
+                        self.unavailable_fallback_target(),
+                        Some("standby" | "local_replicas")
+                    )
+                {
+                    return self.hub_unavailable_fallback(&key, &outcomes).await;
+                }
                 let replay = self.peer_verdict(
                     &outcomes,
                     peers.fail_closed_writes(),
@@ -2201,19 +2442,19 @@ impl ResponseCache {
                     }
                     match peers.confirm_replicated_kind(&key, fresh).await {
                         Ok(()) => {
-                            if all_fresh {
-                                match self.hub_window_check(&key).await {
-                                    Some(true) => {
-                                        return Ok(PeerCheck {
-                                            replay: true,
-                                            ..PeerCheck::default()
-                                        })
-                                    }
-                                    // SET NX only (no WAIT): the asynchronous hand-off
-                                    // still follows (it finds the nonce: replay_async).
-                                    Some(false) => {}
-                                    None => {}
+                            // Also when a peer did not answer and the policy tolerated it
+                            // (REPLAY_PEER_FAIL_CLOSED_WRITES=0): the WRITE then runs on the
+                            // local verdict, and the fallback store must still be asked.
+                            match self.hub_window_check(&key).await {
+                                Some(true) => {
+                                    return Ok(PeerCheck {
+                                        replay: true,
+                                        ..PeerCheck::default()
+                                    })
                                 }
+                                // Stored there synchronously: no asynchronous hand-off.
+                                Some(false) => at_standby = true,
+                                None => {}
                             }
                         }
                         Err(f) if f.only_short && all_fresh => {
@@ -2271,16 +2512,21 @@ impl ResponseCache {
             .filter(|s| s.wait().is_some() && !s.is_empty())
     }
 
-    /// Inside the hub window of a read origin: `SET NX` at the standby stores. Some(true) = a
-    /// standby store held the nonce (replay), Some(false) = every one took it, None = no window,
-    /// no standby store, or one did not answer (the hub's verdict stands, the asynchronous
-    /// hand-off follows as usual).
+    /// Every WRITE of a read origin with a confirming standby store, after the hub's verdict:
+    /// `SET NX` at the standby stores (write_fallback.rs, "Check at the fallback store").
+    /// Some(true) = a standby store held the nonce (replay), Some(false) = every one took it,
+    /// None = no standby store that confirms, or one did not answer (the hub's verdict stands,
+    /// the asynchronous hand-off follows as usual).
     async fn hub_window_check(&self, key: &str) -> Option<bool> {
         let fb = self.hub_fallback.as_ref()?;
         let standby = self.confirming_standby()?;
-        if !fb.window_open() {
-            return None;
-        }
+        // The label tells a check inside the window (after startup or a hub disruption) from
+        // the steady state; both are decided the same way.
+        let path = if fb.window_open() {
+            "hub_window"
+        } else {
+            "hub_check"
+        };
         let outcomes = standby.write_nonce(key, REPLAY_TTL_SECS).await;
         let verdict = combine_peer_outcomes(&outcomes);
         let result = match verdict {
@@ -2288,7 +2534,7 @@ impl ResponseCache {
             PeerVerdict::Replay => "replay",
             PeerVerdict::Unavailable => "unavailable",
         };
-        crate::health::record_replay_write_fallback(&self.network, "hub_window", result);
+        crate::health::record_replay_write_fallback(&self.network, path, result);
         match verdict {
             PeerVerdict::Replay => Some(true),
             PeerVerdict::Fresh => Some(false),
@@ -2348,6 +2594,71 @@ impl ResponseCache {
             return Ok(HubFallback::NeedsLocalAck);
         }
         anyhow::bail!(f.message)
+    }
+
+    /// The hub gave no verdict on a WRITE nonce (`outcomes`: none held it, at least one did not
+    /// answer) and REPLAY_UNAVAILABLE_FALLBACK is on: decide at the fallback store, with the
+    /// rules of the short-acknowledgement path. With standby stores: `SET NX` + `WAIT` there
+    /// (new and acknowledged = runs, held = replay, anything else = fail-closed). With the
+    /// local replica wait (the local store is the fallback store): the local replicas decide
+    /// (`confirm_write_nonce`). Either way the nonce is written back to the hub until the hub's
+    /// replicas have it.
+    async fn hub_unavailable_fallback(
+        &self,
+        key: &str,
+        outcomes: &[PeerOutcome],
+    ) -> anyhow::Result<PeerCheck> {
+        let Some(fb) = self.hub_fallback.as_ref() else {
+            anyhow::bail!("Replay check failed at a peer origin (REPLAY_PEER_FAIL_CLOSED_WRITES): {outcomes:?}");
+        };
+        fb.open_window();
+        let record = |result: &str| {
+            crate::health::record_replay_write_fallback(&self.network, "hub_unavailable", result)
+        };
+        if !fb.has_room() {
+            record("overflow");
+            anyhow::bail!("Replay check failed at a peer origin: {outcomes:?} (write-back queue full, no fallback)");
+        }
+        let Some(standby) = self.confirming_standby() else {
+            // The local replica wait decides (confirm_write_nonce, which also queues the
+            // write-back to the hub).
+            return Ok(PeerCheck {
+                hub_needs_local_ack: true,
+                hub_unavailable: true,
+                ..PeerCheck::default()
+            });
+        };
+        let at_standby = standby.write_nonce(key, REPLAY_TTL_SECS).await;
+        match combine_peer_outcomes(&at_standby) {
+            PeerVerdict::Replay => {
+                record("replay");
+                return Ok(PeerCheck {
+                    replay: true,
+                    ..PeerCheck::default()
+                });
+            }
+            PeerVerdict::Unavailable => {
+                record("unavailable");
+                anyhow::bail!("Replay check failed at a peer origin: {outcomes:?} (standby fallback unavailable: {at_standby:?})");
+            }
+            PeerVerdict::Fresh => {}
+        }
+        if let Err(e) = standby.confirm_replicated(key, |_| true).await {
+            record("unacknowledged");
+            anyhow::bail!(
+                "Replay check failed at a peer origin: {outcomes:?} (standby fallback: {e})"
+            );
+        }
+        if !fb.push_write_back(key.to_string()) {
+            record("overflow");
+            anyhow::bail!("Replay check failed at a peer origin: {outcomes:?} (write-back queue full, no fallback)");
+        }
+        record("accepted");
+        warn!(network = %self.network, outcomes = ?outcomes, "WRITE replay nonce confirmed at the standby stores (no verdict from the hub); written back to the hub later");
+        Ok(PeerCheck {
+            at_standby: true,
+            ..PeerCheck::default()
+        })
     }
 
     /// The shared epoch from Redis, initialised atomically (SET NX) to the current Unix time
@@ -2833,6 +3144,123 @@ impl CacheStore for ResponseCache {
             }
         })
     }
+
+    fn take_lock_if(
+        &self,
+        key: String,
+        value: String,
+        ttl_ms: u64,
+        guard_key: String,
+        guard: Bytes,
+    ) -> BoxFuture<'_, Option<bool>> {
+        Box::pin(async move {
+            let conn = self.cache_conn.load_full()?;
+            let mut conn = (*conn).clone();
+            let script = r#"
+                if redis.call('GET', KEYS[2]) == ARGV[3] then
+                    redis.call('SET', KEYS[1], ARGV[1], 'PX', ARGV[2])
+                    return 1
+                else
+                    return 0
+                end
+            "#;
+            let script = redis::Script::new(script);
+            let mut invocation = script.key(&key);
+            invocation
+                .key(&guard_key)
+                .arg(&value)
+                .arg(ttl_ms)
+                .arg(&guard[..]);
+            let fut = invocation.invoke_async::<_, i64>(&mut conn);
+            match timeout(self.redis_timeout, fut).await {
+                Ok(Ok(v)) => Some(v == 1),
+                Ok(Err(e)) => {
+                    warn!(network = %self.network, error = %e, "leader lock takeover error");
+                    crate::health::record_cache_redis_timeout(&self.network, "lock_error");
+                    None
+                }
+                Err(_) => {
+                    crate::health::record_cache_redis_timeout(&self.network, "lock_timeout");
+                    None
+                }
+            }
+        })
+    }
+
+    fn set_if_lock_held(
+        &self,
+        lock: String,
+        value: String,
+        ttl_ms: u64,
+        entries: Vec<(String, Bytes, u64)>,
+    ) -> BoxFuture<'_, Option<bool>> {
+        Box::pin(async move {
+            let conn = self.cache_conn.load_full()?;
+            let mut conn = (*conn).clone();
+            // KEYS[1] = the lock, KEYS[2..] the entries; ARGV[1] = the holder, ARGV[2] = the lock
+            // TTL (ms), then value + TTL (s) per entry: KEYS[i] -> ARGV[2i-1], ARGV[2i].
+            let script = r#"
+                local holder = redis.call('GET', KEYS[1])
+                if holder and holder ~= ARGV[1] then
+                    return 0
+                end
+                redis.call('SET', KEYS[1], ARGV[1], 'PX', ARGV[2])
+                for i = 2, #KEYS do
+                    redis.call('SET', KEYS[i], ARGV[2 * i - 1], 'EX', ARGV[2 * i])
+                end
+                return 1
+            "#;
+            let script = redis::Script::new(script);
+            let mut invocation = script.key(&lock);
+            invocation.arg(&value).arg(ttl_ms);
+            for (k, v, ttl) in &entries {
+                invocation.key(k).arg(&v[..]).arg(*ttl);
+            }
+            let fut = invocation.invoke_async::<_, i64>(&mut conn);
+            match timeout(self.redis_timeout, fut).await {
+                Ok(Ok(v)) => Some(v == 1),
+                Ok(Err(e)) => {
+                    warn!(network = %self.network, error = %e, "fenced tip write error");
+                    crate::health::record_cache_redis_timeout(&self.network, "lock_error");
+                    None
+                }
+                Err(_) => {
+                    crate::health::record_cache_redis_timeout(&self.network, "lock_timeout");
+                    None
+                }
+            }
+        })
+    }
+
+    fn release_lock(&self, key: String, value: String) -> BoxFuture<'_, Option<bool>> {
+        Box::pin(async move {
+            let conn = self.cache_conn.load_full()?;
+            let mut conn = (*conn).clone();
+            let script = r#"
+                if redis.call('GET', KEYS[1]) == ARGV[1] then
+                    return redis.call('DEL', KEYS[1])
+                else
+                    return 0
+                end
+            "#;
+            let script = redis::Script::new(script);
+            let mut invocation = script.key(&key);
+            invocation.arg(&value);
+            let fut = invocation.invoke_async::<_, i64>(&mut conn);
+            match timeout(self.redis_timeout, fut).await {
+                Ok(Ok(v)) => Some(v == 1),
+                Ok(Err(e)) => {
+                    warn!(network = %self.network, error = %e, "leader lock release error");
+                    crate::health::record_cache_redis_timeout(&self.network, "lock_error");
+                    None
+                }
+                Err(_) => {
+                    crate::health::record_cache_redis_timeout(&self.network, "lock_timeout");
+                    None
+                }
+            }
+        })
+    }
 }
 
 /// The permanent block tier on a disk-backed Redis-protocol store. Plain PING/GET/MGET/SET/MSET/DEL
@@ -2846,6 +3274,18 @@ pub struct PermanentRedis {
     conn: Arc<StoreConn>,
     timeout: Duration,
     network: String,
+    /// The store is a read-only replica (`INFO replication` says so, or a write was refused with
+    /// `READONLY`): writes are skipped, and the callers keep final data in the cache tier.
+    replica: Arc<AtomicBool>,
+}
+
+/// `role:` of an `INFO replication` answer: Some(true) for a replica (`slave`), Some(false) for
+/// a primary, None when absent.
+pub fn info_replication_is_replica(info: &str) -> Option<bool> {
+    info.lines().find_map(|l| {
+        let role = l.trim().strip_prefix("role:")?;
+        Some(matches!(role.trim(), "slave" | "replica"))
+    })
 }
 
 impl PermanentRedis {
@@ -2855,13 +3295,52 @@ impl PermanentRedis {
             conn,
             timeout: Duration::from_millis(op_timeout_ms),
             network,
+            replica: Arc::new(AtomicBool::new(false)),
         };
         // Fail startup on an unreachable store so a misconfiguration is visible; the request
         // paths stay fail-open afterwards.
         let mut c = this.conn.get();
         let pong: String = timeout(this.timeout, redis::cmd("PING").query_async(&mut c)).await??;
         anyhow::ensure!(pong == "PONG", "permanent store PING answered {pong}");
+        this.refresh_role().await;
         Ok(this)
+    }
+
+    /// Ask the store for its role (`INFO replication`) and remember it; an unanswered or
+    /// unparsable probe keeps the last known role.
+    pub async fn refresh_role(&self) {
+        let r = timeout(
+            self.timeout,
+            redis::cmd("INFO")
+                .arg("replication")
+                .query_async::<_, String>(&mut self.conn.get()),
+        )
+        .await;
+        if let Ok(Ok(info)) = r {
+            if let Some(replica) = info_replication_is_replica(&info) {
+                self.set_replica(replica);
+            }
+        }
+    }
+
+    fn set_replica(&self, replica: bool) {
+        if self.replica.swap(replica, Ordering::Relaxed) != replica {
+            if replica {
+                info!(network = %self.network, "permanent store is a read-only replica: its writes are skipped");
+            } else {
+                info!(network = %self.network, "permanent store is a primary: writes resume");
+            }
+        }
+        crate::health::record_permanent_replica(&self.network, replica);
+    }
+
+    /// Skip a write while the store is a replica (counted).
+    fn skip_write(&self, op: &str) -> bool {
+        let skip = self.replica.load(Ordering::Relaxed);
+        if skip {
+            crate::health::record_permanent_write_skipped(&self.network, op);
+        }
+        skip
     }
 
     /// `PING`, for the housekeeping gauge.
@@ -2882,6 +3361,12 @@ impl PermanentRedis {
         self.conn.observe_timed(&r);
         match r {
             Ok(Ok(v)) => Some(v),
+            Ok(Err(e)) if e.kind() == redis::ErrorKind::ReadOnly => {
+                // A replica (the role probe has not seen it yet): stop writing at once.
+                self.set_replica(true);
+                crate::health::record_permanent_write_skipped(&self.network, op);
+                None
+            }
             Ok(Err(e)) => {
                 warn!(network = %self.network, op, error = %e, "permanent store error");
                 crate::health::record_cache_redis_timeout(
@@ -2921,6 +3406,9 @@ impl PermanentStore for PermanentRedis {
 
     fn set(&self, key: String, value: Bytes) -> BoxFuture<'_, bool> {
         Box::pin(async move {
+            if self.skip_write("set") {
+                return false;
+            }
             let mut cmd = redis::cmd("SET");
             cmd.arg(&key).arg(&value[..]);
             self.run::<()>("set", cmd).await.is_some()
@@ -2930,6 +3418,9 @@ impl PermanentStore for PermanentRedis {
     /// `MSET` in chunks, flushed at 64 entries or once ~8 MiB is reached.
     fn set_many(&self, entries: Vec<(String, Bytes)>) -> BoxFuture<'_, bool> {
         Box::pin(async move {
+            if self.skip_write("mset") {
+                return false;
+            }
             let mut ok = true;
             let mut chunk: Vec<&(String, Bytes)> = Vec::new();
             let mut bytes = 0usize;
@@ -2960,7 +3451,7 @@ impl PermanentStore for PermanentRedis {
 
     fn del(&self, keys: Vec<String>) -> BoxFuture<'_, ()> {
         Box::pin(async move {
-            if keys.is_empty() {
+            if keys.is_empty() || self.skip_write("del") {
                 return;
             }
             let mut cmd = redis::cmd("DEL");
@@ -2968,15 +3459,22 @@ impl PermanentStore for PermanentRedis {
             self.run::<i64>("del", cmd).await;
         })
     }
+
+    fn writable(&self) -> bool {
+        !self.replica.load(Ordering::Relaxed)
+    }
 }
 
-/// Ping the permanent store every `HOUSEKEEPING_SECS` for `ohttp_permanent_store_connected`.
+/// Ping the permanent store every `HOUSEKEEPING_SECS` for `ohttp_permanent_store_connected`,
+/// and check its role (a replica takes no writes; a promoted one takes them again).
 pub fn spawn_permanent_housekeeping(store: PermanentRedis) {
     tokio::spawn(async move {
         loop {
             let ok = store.ping().await;
             crate::health::record_permanent_connected(&store.network, ok);
-            if !ok {
+            if ok {
+                store.refresh_role().await;
+            } else {
                 warn!(network = %store.network, "permanent store PING failed");
             }
             tokio::time::sleep(Duration::from_secs(HOUSEKEEPING_SECS)).await;
@@ -3202,6 +3700,7 @@ mod tests {
             local_aof: None,
             write_fallback: None,
             hub_fallback: None,
+            unavailable_fallback: false,
         }
     }
 
@@ -4202,6 +4701,133 @@ mod tests {
         );
         let _: () = redis::cmd("FLUSHDB").query_async(&mut a_sec).await.unwrap();
         let _: () = redis::cmd("FLUSHDB").query_async(&mut b_sec).await.unwrap();
+    }
+
+    /// A Redis-protocol store for the permanent tier role tests: answers PING, `INFO
+    /// replication` with `role`, and refuses writes with READONLY while `refuse` is set.
+    async fn fake_permanent(
+        role: &'static str,
+        refuse: Arc<AtomicBool>,
+        writes: Arc<AtomicU32>,
+    ) -> String {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((sock, _)) = listener.accept().await {
+                let (refuse, writes) = (refuse.clone(), writes.clone());
+                tokio::spawn(async move {
+                    let (r, mut w) = sock.into_split();
+                    let mut r = BufReader::new(r);
+                    loop {
+                        let mut line = String::new();
+                        if r.read_line(&mut line).await.unwrap_or(0) == 0 {
+                            return;
+                        }
+                        let Some(n) = line
+                            .trim_end()
+                            .strip_prefix('*')
+                            .and_then(|n| n.parse::<usize>().ok())
+                        else {
+                            return;
+                        };
+                        let mut args = Vec::new();
+                        for _ in 0..n {
+                            line.clear();
+                            r.read_line(&mut line).await.unwrap();
+                            let len: usize = line.trim_end()[1..].parse().unwrap();
+                            let mut data = vec![0u8; len + 2];
+                            r.read_exact(&mut data).await.unwrap();
+                            data.truncate(len);
+                            args.push(String::from_utf8_lossy(&data).to_uppercase());
+                        }
+                        let answer = match args[0].as_str() {
+                            "PING" => "+PONG\r\n".to_string(),
+                            "INFO" => {
+                                let body = format!("# Replication\r\nrole:{role}\r\n");
+                                format!("${}\r\n{body}\r\n", body.len())
+                            }
+                            "SET" | "MSET" | "DEL" => {
+                                writes.fetch_add(1, Ordering::SeqCst);
+                                if refuse.load(Ordering::SeqCst) {
+                                    "-READONLY You can't write against a read only replica.\r\n"
+                                        .to_string()
+                                } else if args[0] == "DEL" {
+                                    ":1\r\n".to_string()
+                                } else {
+                                    "+OK\r\n".to_string()
+                                }
+                            }
+                            _ => "+OK\r\n".to_string(),
+                        };
+                        if w.write_all(answer.as_bytes()).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        format!("redis://{addr}")
+    }
+
+    #[test]
+    fn test_info_replication_role() {
+        assert_eq!(
+            info_replication_is_replica("# Replication\r\nrole:slave\r\nmaster_host:x\r\n"),
+            Some(true)
+        );
+        assert_eq!(
+            info_replication_is_replica("# Replication\r\nrole:master\r\nconnected_slaves:1\r\n"),
+            Some(false)
+        );
+        assert_eq!(
+            info_replication_is_replica("# Server\r\nredis_version:7\r\n"),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn test_permanent_tier_skips_writes_on_a_replica() {
+        let refuse = Arc::new(AtomicBool::new(true));
+        let writes = Arc::new(AtomicU32::new(0));
+        let url = fake_permanent("slave", refuse.clone(), writes.clone()).await;
+        let p = PermanentRedis::connect(&url, 500, "testnet-perm-replica".to_string())
+            .await
+            .unwrap();
+        assert!(!p.writable(), "INFO replication says replica");
+        assert!(!p.set("k".to_string(), Bytes::from_static(b"v")).await);
+        assert!(
+            !p.set_many(vec![("k".to_string(), Bytes::from_static(b"v"))])
+                .await
+        );
+        p.del(vec!["k".to_string()]).await;
+        assert_eq!(
+            writes.load(Ordering::SeqCst),
+            0,
+            "nothing sent to a replica"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_permanent_tier_stops_writing_on_readonly() {
+        // The role probe says primary, but the node refuses writes (a demotion the probe has not
+        // seen yet): the first refusal stops further writes.
+        let refuse = Arc::new(AtomicBool::new(true));
+        let writes = Arc::new(AtomicU32::new(0));
+        let url = fake_permanent("master", refuse.clone(), writes.clone()).await;
+        let p = PermanentRedis::connect(&url, 500, "testnet-perm-readonly".to_string())
+            .await
+            .unwrap();
+        assert!(p.writable());
+        assert!(!p.set("k".to_string(), Bytes::from_static(b"v")).await);
+        assert!(!p.writable());
+        assert!(!p.set("k2".to_string(), Bytes::from_static(b"v")).await);
+        assert_eq!(writes.load(Ordering::SeqCst), 1);
+        // The next role probe (housekeeping) finds a primary: writes resume.
+        refuse.store(false, Ordering::SeqCst);
+        p.refresh_role().await;
+        assert!(p.writable());
+        assert!(p.set("k3".to_string(), Bytes::from_static(b"v")).await);
     }
 
     #[tokio::test]

@@ -481,9 +481,10 @@ impl BlockRangeCache {
     }
 
     /// Whether `height` is written to the permanent tier: as above, but only against a fresh
-    /// tip (never guess finality).
+    /// tip (never guess finality), and not while the tier is a read-only replica (the block then
+    /// stays in the cache tier).
     fn permanent_write(&self, height: u64, tip: Option<&Tip>) -> bool {
-        self.permanent.is_some()
+        self.permanent.as_ref().is_some_and(|p| p.writable())
             && height >= self.permanent_min_height
             && tip.is_some_and(|t| is_final(height, t))
     }
@@ -1097,6 +1098,8 @@ pub(crate) mod test_support {
         pub latest_calls: AtomicUsize,
         pub range_calls: Mutex<Vec<(u64, u64)>>,
         pub down: AtomicBool,
+        /// Milliseconds every block fetch of the chain follower's source takes.
+        pub blocks_delay_ms: AtomicU64,
     }
 
     impl FakeChain {
@@ -1107,6 +1110,7 @@ pub(crate) mod test_support {
                 latest_calls: AtomicUsize::new(0),
                 range_calls: Mutex::new(vec![]),
                 down: AtomicBool::new(false),
+                blocks_delay_ms: AtomicU64::new(0),
             }
         }
         pub fn tip(&self) -> u64 {

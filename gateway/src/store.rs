@@ -126,6 +126,11 @@ pub trait PermanentStore: Send + Sync {
         })
     }
     fn del(&self, keys: Vec<String>) -> BoxFuture<'_, ()>;
+    /// Whether writes can go to this store now (false while it is a read-only replica: the
+    /// callers keep such data in the cache tier instead).
+    fn writable(&self) -> bool {
+        true
+    }
 }
 
 /// Key-value operations the cache needs. Every method is fail-open: an error reads as a miss
@@ -162,6 +167,32 @@ pub trait CacheStore: Send + Sync {
         value: String,
         ttl_ms: u64,
     ) -> BoxFuture<'_, Option<bool>>;
+    /// `SET key value PX ttl_ms` (whoever holds it) only while `guard_key` still holds `guard`
+    /// (one atomic script): Some(true) when taken, Some(false) when the guard changed, None on
+    /// error. The chain follower takes over a leader whose tip stopped moving this way, so that
+    /// it never takes over from a leader that has just moved it.
+    fn take_lock_if(
+        &self,
+        key: String,
+        value: String,
+        ttl_ms: u64,
+        guard_key: String,
+        guard: Bytes,
+    ) -> BoxFuture<'_, Option<bool>>;
+    /// Write `entries` (key, value, TTL in seconds) unless `lock` is held by another value
+    /// (one atomic script), and hold `lock` for `ttl_ms` again: Some(true) when written,
+    /// Some(false) when another value holds the lock, None on error. A leader replaced while a
+    /// tick was in flight cannot overwrite the tip of the process that replaced it; one whose
+    /// lock merely lapsed during a long tick, with nobody taking it, still writes.
+    fn set_if_lock_held(
+        &self,
+        lock: String,
+        value: String,
+        ttl_ms: u64,
+        entries: Vec<(String, Bytes, u64)>,
+    ) -> BoxFuture<'_, Option<bool>>;
+    /// Delete `key` only if it still holds `value` (one atomic script).
+    fn release_lock(&self, key: String, value: String) -> BoxFuture<'_, Option<bool>>;
 }
 
 /// The index key of `height`.
@@ -172,6 +203,27 @@ pub fn index_key(chain_prefix: &str, height: u64) -> String {
 /// The stored tip: `height || hash`.
 pub fn tip_key(chain_prefix: &str) -> String {
     format!("{chain_prefix}tip")
+}
+
+/// When the leader last moved the stored tip: Unix milliseconds, decimal. A separate key, so
+/// that a gateway that does not know it still reads the tip as before.
+pub fn tip_at_key(chain_prefix: &str) -> String {
+    format!("{chain_prefix}tip_at")
+}
+
+pub fn encode_unix_ms(ms: u64) -> Bytes {
+    Bytes::from(ms.to_string())
+}
+
+pub fn decode_unix_ms(bytes: &[u8]) -> Option<u64> {
+    std::str::from_utf8(bytes).ok()?.trim().parse().ok()
+}
+
+/// The wall clock in Unix milliseconds (shared between processes, unlike `Instant`).
+pub fn unix_ms_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64)
 }
 
 pub fn lock_key(chain_prefix: &str) -> String {
@@ -395,6 +447,70 @@ pub(crate) mod test_support {
                 }
             })
         }
+        fn take_lock_if(
+            &self,
+            key: String,
+            value: String,
+            ttl_ms: u64,
+            guard_key: String,
+            guard: Bytes,
+        ) -> BoxFuture<'_, Option<bool>> {
+            Box::pin(async move {
+                if self.is_down() {
+                    return None;
+                }
+                let data = self.data.lock().unwrap();
+                if data.get(&guard_key).map(|(v, _)| v) != Some(&guard) {
+                    return Some(false);
+                }
+                let now = tokio::time::Instant::now();
+                self.locks
+                    .lock()
+                    .unwrap()
+                    .insert(key, (value, now + Duration::from_millis(ttl_ms)));
+                Some(true)
+            })
+        }
+        fn set_if_lock_held(
+            &self,
+            lock: String,
+            value: String,
+            ttl_ms: u64,
+            entries: Vec<(String, Bytes, u64)>,
+        ) -> BoxFuture<'_, Option<bool>> {
+            Box::pin(async move {
+                if self.is_down() {
+                    return None;
+                }
+                let now = tokio::time::Instant::now();
+                let mut locks = self.locks.lock().unwrap();
+                let other = locks
+                    .get(&lock)
+                    .is_some_and(|(v, exp)| *v != value && *exp > now);
+                if other {
+                    return Some(false);
+                }
+                locks.insert(lock, (value, now + Duration::from_millis(ttl_ms)));
+                let mut data = self.data.lock().unwrap();
+                for (k, v, ttl) in entries {
+                    data.insert(k, (v, Some(ttl)));
+                }
+                Some(true)
+            })
+        }
+        fn release_lock(&self, key: String, value: String) -> BoxFuture<'_, Option<bool>> {
+            Box::pin(async move {
+                if self.is_down() {
+                    return None;
+                }
+                let mut locks = self.locks.lock().unwrap();
+                if locks.get(&key).is_some_and(|(v, _)| *v == value) {
+                    locks.remove(&key);
+                    return Some(true);
+                }
+                Some(false)
+            })
+        }
     }
 
     /// A fake permanent tier.
@@ -403,6 +519,10 @@ pub(crate) mod test_support {
         pub data: Mutex<HashMap<String, Bytes>>,
         pub mgets: Mutex<Vec<Vec<String>>>,
         pub down: std::sync::atomic::AtomicBool,
+        /// A read-only replica: `writable()` is false and writes are refused.
+        pub replica: std::sync::atomic::AtomicBool,
+        /// Writes attempted (refused ones included).
+        pub writes: std::sync::atomic::AtomicUsize,
     }
 
     impl MemPermanent {
@@ -436,7 +556,9 @@ pub(crate) mod test_support {
         }
         fn set(&self, key: String, value: Bytes) -> BoxFuture<'_, bool> {
             Box::pin(async move {
-                if self.is_down() {
+                self.writes
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if self.is_down() || !self.writable() {
                     return false;
                 }
                 self.data.lock().unwrap().insert(key, value);
@@ -445,7 +567,9 @@ pub(crate) mod test_support {
         }
         fn del(&self, keys: Vec<String>) -> BoxFuture<'_, ()> {
             Box::pin(async move {
-                if self.is_down() {
+                self.writes
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if self.is_down() || !self.writable() {
                     return;
                 }
                 let mut data = self.data.lock().unwrap();
@@ -453,6 +577,9 @@ pub(crate) mod test_support {
                     data.remove(&k);
                 }
             })
+        }
+        fn writable(&self) -> bool {
+            !self.replica.load(std::sync::atomic::Ordering::SeqCst)
         }
     }
 

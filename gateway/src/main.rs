@@ -101,6 +101,13 @@ async fn main() -> anyhow::Result<()> {
     let padding_mode = padding::Mode::from_env()?;
     padding::init(padding_mode);
     info!(mode = %padding_mode, "Response padding");
+    let lwd_deadlines = lwd::LwdDeadlines::from_env()?;
+    lwd::init_deadlines(lwd_deadlines);
+    info!(
+        unary_secs = lwd_deadlines.unary.as_secs(),
+        stream_idle_secs = lwd_deadlines.stream_idle.as_secs(),
+        "lightwalletd call deadlines (LWD_UNARY_TIMEOUT_SECS, LWD_STREAM_IDLE_SECS; LWD_TIMEOUT_SECS bounds both)"
+    );
     info!(
         mode = %freshness_settings.mode,
         window_secs = freshness_settings.window_secs,
@@ -173,6 +180,7 @@ async fn main() -> anyhow::Result<()> {
         replay_peer_fail_closed_writes = origin.replay_peer_fail_closed_writes,
         replay_async_max_lag_ms = origin.replay_async_max_lag_ms,
         replay_async_recovery_secs = origin.replay_async_recovery_secs,
+        replay_unavailable_fallback = origin.replay_unavailable_fallback,
         redis = %sanitized_redis,
         "Starting OHTTP Gateway"
     );
@@ -461,6 +469,32 @@ async fn main() -> anyhow::Result<()> {
                     c
                 };
 
+                // REPLAY_UNAVAILABLE_FALLBACK: decide at the fallback store when the deciding
+                // store gives no verdict (write_fallback.rs, "Unavailable store").
+                let c = c.with_unavailable_fallback(origin.replay_unavailable_fallback);
+                let target = c.unavailable_fallback_target();
+                health::record_replay_unavailable_fallback(&network, target);
+                let checks = c.checks_writes_at_fallback_store();
+                health::record_replay_fallback_check(&network, checks);
+                if c.replay_peers().is_some() && !checks {
+                    warn!(
+                        network = %network,
+                        "WRITEs admitted here reach the fallback store only asynchronously: REPLAY_UNAVAILABLE_FALLBACK on another origin of these stores could admit one of them again"
+                    );
+                }
+                match (origin.replay_unavailable_fallback, target) {
+                    (true, Some(target)) => info!(
+                        network = %network,
+                        target,
+                        "A store that gives no replay verdict is replaced by the fallback store (REPLAY_UNAVAILABLE_FALLBACK)"
+                    ),
+                    (true, None) => warn!(
+                        network = %network,
+                        "REPLAY_UNAVAILABLE_FALLBACK has no effect here: no fallback store that acknowledges on its replicas"
+                    ),
+                    _ => {}
+                }
+
                 Some(c)
             }
             Err(e) => {
@@ -637,6 +671,15 @@ async fn main() -> anyhow::Result<()> {
         }
         Arc::new(sc)
     });
+    // CHAIN_TIP_STALE_SECS: a stored tip unmoved for longer makes the followers compare it with
+    // their own lightwalletd (chain.rs, "Stale leader").
+    let chain_tip_stale_after = match std::env::var("CHAIN_TIP_STALE_SECS") {
+        Ok(v) if !v.trim().is_empty() => match v.trim().parse::<u64>() {
+            Ok(n) if n > 0 => Duration::from_secs(n),
+            _ => anyhow::bail!("CHAIN_TIP_STALE_SECS must be a positive integer, got '{v}'"),
+        },
+        _ => chain::DEFAULT_TIP_STALE_AFTER,
+    };
     let follower = cache_state.as_ref().map(|c| {
         let mut f = chain::ChainFollower::new(
             Arc::new(c.clone()),
@@ -648,6 +691,7 @@ async fn main() -> anyhow::Result<()> {
         if let Some(p) = &permanent_store {
             f = f.with_permanent(p.clone(), permanent_min_height);
         }
+        f = f.with_stale_after(chain_tip_stale_after);
         let f = Arc::new(f);
         f.add_listener(mempool_fanout.clone());
         tokio::spawn(f.clone().run());
@@ -1603,9 +1647,12 @@ async fn gateway_handler(
         hasher.update(&body);
         hasher.finalize()
     };
+    // The local store gave no verdict and the unavailable fallback decides at the peer stores
+    // once the inner request is classified (GW-REPLAY-INNER below).
+    let mut local_unavailable = false;
     if let Some(ref cache) = state.cache {
-        match cache.check_replay(&body_hash).await {
-            Ok(true) => {
+        match cache.check_replay_detailed(&body_hash).await {
+            Ok(cache::LocalReplayCheck::Replay) => {
                 warn!(
                     request_id = %request_id,
                     network = %network,
@@ -1626,9 +1673,10 @@ async fn gateway_handler(
                 )
                     .into_response();
             }
-            Ok(false) => {
+            Ok(cache::LocalReplayCheck::New) => {
                 // Not a replay, continue
             }
+            Ok(cache::LocalReplayCheck::Unavailable) => local_unavailable = true,
             Err(e) => {
                 warn!(
                     request_id = %request_id,
@@ -1865,8 +1913,13 @@ async fn gateway_handler(
     // store; a WRITE (anything not on REPLAY_READ_ROUTES) is checked at the peers synchronously
     // and a nonce a peer holds is refused like a local replay.
     // Returns inner responses so the relay learns nothing about side effects.
+    // With `local_unavailable` the peer stores decide alone (admit_without_local).
     let mut peer_check = cache::PeerCheck::default();
-    if let Some(cache) = state.cache.as_ref().filter(|c| c.replay_peers().is_some()) {
+    if let Some(cache) = state
+        .cache
+        .as_ref()
+        .filter(|c| local_unavailable || c.replay_peers().is_some())
+    {
         let class = state.origin.replay_read_routes.classify(
             cache_allowed,
             &inner_request.authority,
@@ -1874,7 +1927,22 @@ async fn gateway_handler(
             &inner_request.path,
         );
         health::record_replay_class(&network, class.as_str());
-        match cache.replicate_nonce_checked(&body_hash, class).await {
+        let verdict = if local_unavailable {
+            match cache.admit_without_local(&body_hash, class).await {
+                Ok(cache::WriteAdmission::Run) => Ok(cache::PeerCheck {
+                    local_bypassed: true,
+                    ..cache::PeerCheck::default()
+                }),
+                Ok(cache::WriteAdmission::Replay) => Ok(cache::PeerCheck {
+                    replay: true,
+                    ..cache::PeerCheck::default()
+                }),
+                Err(e) => Err(e),
+            }
+        } else {
+            cache.replicate_nonce_checked(&body_hash, class).await
+        };
+        match verdict {
             Ok(check) if !check.replay => peer_check = check,
             Ok(_) => {
                 warn!(
@@ -1964,7 +2032,11 @@ async fn gateway_handler(
     // READs skip this: a replayed READ changes no state. Decided before
     // anything is executed or served from the cache; fail-closed like the replay check.
     // Returns inner responses so the relay learns nothing about side effects.
-    if let Some(cache) = state.cache.as_ref().filter(|c| c.write_wait().is_some()) {
+    if let Some(cache) = state
+        .cache
+        .as_ref()
+        .filter(|c| c.write_wait().is_some() && !peer_check.local_bypassed)
+    {
         let class = state.origin.replay_read_routes.classify(
             cache_allowed,
             &inner_request.authority,

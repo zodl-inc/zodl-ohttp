@@ -542,22 +542,27 @@ async fn peers_without_replica_acknowledgement_get_no_fallback() {
 }
 
 #[tokio::test]
-async fn failover_mode_outside_the_window_replicates_after_the_local_ack() {
+async fn failover_mode_outside_the_window_checks_at_the_peer_after_the_local_ack() {
     let net = "testnet-wfb-normal";
     let w = world(net, ReplayPeerMode::Failover, true).await;
     // The startup window is over.
     w.origin.write_fallback().unwrap().close_window();
     let write = request("normal write");
     assert!(admit(&w.origin, &write, RouteClass::Write).await.unwrap());
-    // Asynchronously, after the local verdict (never before: the peer must not hold a nonce
-    // of a request still being decided).
-    until("replicated to the peer", Duration::from_secs(2), || {
-        w.peer.has(&key(net, &write))
-    })
-    .await;
+    // At the peer synchronously, after the local verdict (never before: the peer must not hold
+    // a nonce of a request still being decided).
+    assert!(w.peer.has(&key(net, &write)));
     assert!(!w.origin.write_fallback().unwrap().window_open());
+    assert_eq!(fallback(net, "check", "accepted"), 1.0);
     assert_eq!(fallback(net, "window", "accepted"), 0.0);
     assert_eq!(fallback(net, "short_ack", "accepted"), 0.0);
+    // A nonce only the peer holds is refused outside the window too.
+    let elsewhere = request("admitted at the peer store only");
+    w.peer.put(&key(net, &elsewhere));
+    assert!(!admit(&w.origin, &elsewhere, RouteClass::Write)
+        .await
+        .unwrap());
+    assert_eq!(fallback(net, "check", "replay"), 1.0);
 }
 
 #[tokio::test]

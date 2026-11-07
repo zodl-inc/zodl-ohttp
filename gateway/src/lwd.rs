@@ -41,34 +41,172 @@ const GRPC_CONTENT_TYPE: &str = "application/grpc";
 /// connect retry of [`request`] covers an address that is joining or leaving).
 ///
 /// `LWD_CONNECTION_POOL=1` shares one pooled client instead (idle connections kept 60 s, HTTP/2
-/// PINGs every 20 s), which saves the TCP handshake, one round trip, per call. For a gateway far
-/// from lightwalletd that is one long round trip per cache miss and per SendTransaction. The
-/// trade-off: a pooled connection stays on one instance until it closes, so a call in flight
-/// when that instance exits fails.
+/// PINGs every 20 s, a connection whose PING is not answered within 5 s is closed), which saves
+/// the TCP handshake, one round trip, per call. For a gateway far from lightwalletd that is one
+/// long round trip per cache miss and per SendTransaction. The trade-off: a pooled connection
+/// stays on one instance until it closes, so a call in flight when that instance exits fails,
+/// and an instance that hangs keeps getting calls until the PING closes the connection; a call
+/// that runs into its deadline therefore replaces the pooled client ([`reset_pool`]).
 pub(crate) fn lwd_client() -> Client<HttpConnector, Full<axum::body::Bytes>> {
-    static POOLED: OnceLock<Option<Client<HttpConnector, Full<axum::body::Bytes>>>> =
-        OnceLock::new();
-    let pooled = POOLED.get_or_init(|| {
-        let on = std::env::var("LWD_CONNECTION_POOL")
-            .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "on"))
-            .unwrap_or(false);
-        on.then(|| {
-            Client::builder(TokioExecutor::new())
-                .http2_only(true)
-                .pool_timer(TokioTimer::new())
-                .pool_idle_timeout(Duration::from_secs(60))
-                .timer(TokioTimer::new())
-                .http2_keep_alive_interval(Duration::from_secs(20))
-                .http2_keep_alive_while_idle(true)
-                .build_http()
-        })
-    });
-    match pooled {
-        Some(client) => client.clone(),
+    match pooled() {
+        Some(client) => (**client.load()).clone(),
         None => Client::builder(TokioExecutor::new())
             .http2_only(true)
             .build_http(),
     }
+}
+
+type LwdClient = Client<HttpConnector, Full<axum::body::Bytes>>;
+
+fn pooled() -> &'static Option<arc_swap::ArcSwap<LwdClient>> {
+    static POOLED: OnceLock<Option<arc_swap::ArcSwap<LwdClient>>> = OnceLock::new();
+    POOLED.get_or_init(|| {
+        let on = std::env::var("LWD_CONNECTION_POOL")
+            .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "on"))
+            .unwrap_or(false);
+        on.then(|| arc_swap::ArcSwap::from_pointee(new_pooled_client()))
+    })
+}
+
+fn new_pooled_client() -> LwdClient {
+    Client::builder(TokioExecutor::new())
+        .http2_only(true)
+        .pool_timer(TokioTimer::new())
+        .pool_idle_timeout(Duration::from_secs(60))
+        .timer(TokioTimer::new())
+        .http2_keep_alive_interval(Duration::from_secs(20))
+        .http2_keep_alive_timeout(Duration::from_secs(5))
+        .http2_keep_alive_while_idle(true)
+        .build_http()
+}
+
+/// Shortest time between two replacements of the pooled client.
+const POOL_RESET_MIN_INTERVAL: Duration = Duration::from_secs(5);
+
+/// A call ran into its deadline: replace the pooled client (no-op without the pool), so that
+/// new calls open new connections instead of queueing on one to an instance that may hang.
+/// Calls in flight keep their connection. At most once per [`POOL_RESET_MIN_INTERVAL`].
+fn reset_pool(network: &str) {
+    static LAST: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
+    let Some(pool) = pooled() else { return };
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    if last.is_some_and(|t| t.elapsed() < POOL_RESET_MIN_INTERVAL) {
+        return;
+    }
+    *last = Some(Instant::now());
+    pool.store(std::sync::Arc::new(new_pooled_client()));
+    crate::health::record_lwd_pool_reset(network);
+    tracing::warn!(
+        network,
+        "lightwalletd call ran into its deadline: pooled connections replaced"
+    );
+}
+
+/// Per-class deadlines of a lightwalletd call, below the overall `LWD_TIMEOUT_SECS`.
+///
+/// - `LWD_UNARY_TIMEOUT_SECS` (default 10): the whole call of an RPC with one answer
+///   (`GetLatestBlock`, `GetTreeState`, `GetTransaction`, `SendTransaction`, ...).
+/// - `LWD_STREAM_IDLE_SECS` (default 20): for a server-streaming RPC (`GetBlockRange`,
+///   `GetSubtreeRoots`, ...) the wait for the response head and for each next frame; a stream
+///   that keeps sending runs up to `LWD_TIMEOUT_SECS`. The mempool long poll keeps its own rules.
+/// - Transparent-address RPCs ([`LWD_ADDRESS_RPCS`]) keep `LWD_TIMEOUT_SECS` for their first
+///   answer (a node's address query can be slow), streams of them get the idle bound after it.
+///
+/// A lightwalletd that accepts connections but does not answer (a hung process) thus costs a
+/// read at most these bounds instead of `LWD_TIMEOUT_SECS`, and the client's retry (a fresh
+/// request) can land on another instance. Calls cut by them are counted in
+/// `ohttp_lwd_timeouts_total`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LwdDeadlines {
+    pub unary: Duration,
+    pub stream_idle: Duration,
+}
+
+pub const DEFAULT_LWD_UNARY_TIMEOUT: Duration = Duration::from_secs(10);
+pub const DEFAULT_LWD_STREAM_IDLE: Duration = Duration::from_secs(20);
+
+impl Default for LwdDeadlines {
+    fn default() -> Self {
+        Self {
+            unary: DEFAULT_LWD_UNARY_TIMEOUT,
+            stream_idle: DEFAULT_LWD_STREAM_IDLE,
+        }
+    }
+}
+
+impl LwdDeadlines {
+    pub fn parse(unary: Option<&str>, stream_idle: Option<&str>) -> Result<Self> {
+        let secs = |name: &str, v: Option<&str>, default: Duration| -> Result<Duration> {
+            match v.map(str::trim).filter(|v| !v.is_empty()) {
+                None => Ok(default),
+                Some(v) => match v.parse::<u64>() {
+                    Ok(n) if n > 0 => Ok(Duration::from_secs(n)),
+                    _ => Err(anyhow!("{name} must be a positive integer, got '{v}'")),
+                },
+            }
+        };
+        Ok(Self {
+            unary: secs("LWD_UNARY_TIMEOUT_SECS", unary, DEFAULT_LWD_UNARY_TIMEOUT)?,
+            stream_idle: secs("LWD_STREAM_IDLE_SECS", stream_idle, DEFAULT_LWD_STREAM_IDLE)?,
+        })
+    }
+
+    pub fn from_env() -> Result<Self> {
+        Self::parse(
+            std::env::var("LWD_UNARY_TIMEOUT_SECS").ok().as_deref(),
+            std::env::var("LWD_STREAM_IDLE_SECS").ok().as_deref(),
+        )
+    }
+}
+
+static DEADLINES: OnceLock<LwdDeadlines> = OnceLock::new();
+
+/// Set the deadlines once at startup (main); later calls are ignored.
+pub fn init_deadlines(d: LwdDeadlines) {
+    let _ = DEADLINES.set(d);
+}
+
+/// The deadlines in force (the defaults when `init_deadlines` was not called, as in tests).
+pub fn deadlines() -> LwdDeadlines {
+    DEADLINES.get().copied().unwrap_or_default()
+}
+
+/// The server-streaming RPCs of lightwalletd's `CompactTxStreamer` (service.proto); every other
+/// RPC has one answer.
+pub const LWD_STREAMING_RPCS: &[&str] = &[
+    "GetBlockRange",
+    "GetBlockRangeNullifiers",
+    "GetTaddressTxids",
+    "GetTaddressTransactions",
+    "GetMempoolTx",
+    "GetMempoolStream",
+    "GetSubtreeRoots",
+    "GetAddressUtxosStream",
+];
+
+/// Whether `path` (`/<service>/<method>`) is a server-streaming RPC.
+pub fn is_streaming_rpc(path: &str) -> bool {
+    path.rsplit('/')
+        .next()
+        .is_some_and(|m| LWD_STREAMING_RPCS.contains(&m))
+}
+
+/// RPCs whose first answer waits for a transparent-address index query of the node, which can
+/// take long for a busy address: their head (or, for one answer, the whole call) keeps
+/// `LWD_TIMEOUT_SECS`; a stream of them still gets the idle bound between frames.
+pub const LWD_ADDRESS_RPCS: &[&str] = &[
+    "GetTaddressTxids",
+    "GetTaddressTransactions",
+    "GetTaddressBalance",
+    "GetTaddressBalanceStream",
+    "GetAddressUtxos",
+    "GetAddressUtxosStream",
+];
+
+fn is_address_rpc(path: &str) -> bool {
+    path.rsplit('/')
+        .next()
+        .is_some_and(|m| LWD_ADDRESS_RPCS.contains(&m))
 }
 
 /// Pause before the one retry of [`request`].
@@ -137,13 +275,18 @@ async fn call_lwd(config: &Config, path: &str, body: Vec<u8>) -> Result<InnerRes
         .body(Full::new(Bytes::from(body)))
         .map_err(|e| anyhow!("request build: {e}"))?;
 
-    let overall = Duration::from_secs(config.lwd_timeout_secs);
+    // One answer: the unary deadline bounds the whole call.
+    let overall = Duration::from_secs(config.lwd_timeout_secs).min(deadlines().unary);
     let deadline = Instant::now() + overall;
 
-    let resp = timeout(overall, request(&client, req))
-        .await
-        .map_err(|_| anyhow!("LWD timeout"))?
-        .map_err(|e| anyhow!("HTTP: {e}"))?;
+    let resp = match timeout(overall, request(&client, req)).await {
+        Ok(r) => r.map_err(|e| anyhow!("HTTP: {e}"))?,
+        Err(_) => {
+            crate::health::record_lwd_timeout(&config.network, "unary", "head");
+            reset_pool(&config.network);
+            return Err(anyhow!("LWD timeout"));
+        }
+    };
 
     let status = resp.status().as_u16();
     let mut headers: Vec<(String, String)> = resp
@@ -161,6 +304,7 @@ async fn call_lwd(config: &Config, path: &str, body: Vec<u8>) -> Result<InnerRes
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
+            crate::health::record_lwd_timeout(&config.network, "unary", "body");
             return Err(anyhow!("LWD response deadline"));
         }
         match timeout(remaining, body_out.frame()).await {
@@ -177,7 +321,11 @@ async fn call_lwd(config: &Config, path: &str, body: Vec<u8>) -> Result<InnerRes
             Ok(Some(Err(e))) => return Err(anyhow!("body error: {e}")),
             Ok(None) => break,
             // The deadline passed mid-body: what arrived so far is not the answer.
-            Err(_) => return Err(anyhow!("LWD response deadline")),
+            Err(_) => {
+                crate::health::record_lwd_timeout(&config.network, "unary", "body");
+                reset_pool(&config.network);
+                return Err(anyhow!("LWD response deadline"));
+            }
         }
     }
 
@@ -613,6 +761,244 @@ mod tests {
         );
     }
 
+    /// A lightwalletd that accepts connections and never answers (a stopped process: the
+    /// kernel still completes the handshake).
+    async fn hung_lwd() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                held.push(stream);
+            }
+        });
+        addr.to_string()
+    }
+
+    /// A lightwalletd (h2) that answers with `frames` data frames, one every `every`, then a
+    /// clean grpc-status 0.
+    async fn trickling_lwd(frames: u8, every: std::time::Duration) -> String {
+        use hyper::body::Frame;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let service = hyper::service::service_fn(
+                    move |_req: hyper::Request<hyper::body::Incoming>| async move {
+                        let body = futures_util::stream::unfold(0u8, move |n| async move {
+                            if n > frames {
+                                return None;
+                            }
+                            tokio::time::sleep(every).await;
+                            let frame = if n == frames {
+                                let mut t = hyper::HeaderMap::new();
+                                t.insert("grpc-status", "0".parse().unwrap());
+                                Frame::trailers(t)
+                            } else {
+                                Frame::data(axum::body::Bytes::from_static(&[0, 0, 0, 0, 1, 7]))
+                            };
+                            Some((Ok::<_, std::convert::Infallible>(frame), n + 1))
+                        });
+                        Ok::<_, std::convert::Infallible>(
+                            hyper::Response::builder()
+                                .status(200)
+                                .header("content-type", "application/grpc")
+                                .body(http_body_util::StreamBody::new(body))
+                                .unwrap(),
+                        )
+                    },
+                );
+                tokio::spawn(async move {
+                    let _ = hyper_util::server::conn::auto::Builder::new(
+                        hyper_util::rt::TokioExecutor::new(),
+                    )
+                    .serve_connection(hyper_util::rt::TokioIo::new(stream), service)
+                    .await;
+                });
+            }
+        });
+        addr.to_string()
+    }
+
+    const TREE_STATE: &str = "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetTreeState";
+    const BLOCK_RANGE: &str = "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetBlockRange";
+    const SHORT: super::LwdDeadlines = super::LwdDeadlines {
+        unary: std::time::Duration::from_secs(1),
+        stream_idle: std::time::Duration::from_secs(1),
+    };
+
+    fn opts_for(path: &str) -> super::StreamOpts {
+        super::StreamOpts::for_path(
+            path,
+            std::time::Duration::from_secs(80),
+            std::time::Duration::from_secs(3),
+            SHORT,
+        )
+    }
+
+    /// What `call_lwd_stream_with` returns.
+    type Streamed<S> = anyhow::Result<(u16, Vec<(String, String)>, S)>;
+
+    /// Drain a streamed call: Ok(frames) when it ended cleanly, Err at the first error.
+    async fn drain<S>(r: Streamed<S>) -> anyhow::Result<usize>
+    where
+        S: futures_util::Stream<Item = anyhow::Result<crate::chunked_stream::UpFrame>>,
+    {
+        use futures_util::StreamExt;
+        let (_, _, body) = r?;
+        let mut body = std::pin::pin!(body);
+        let mut n = 0;
+        while let Some(f) = body.next().await {
+            f?;
+            n += 1;
+        }
+        Ok(n)
+    }
+
+    #[test]
+    fn rpc_classes_and_their_deadlines() {
+        assert!(super::is_streaming_rpc(BLOCK_RANGE));
+        assert!(super::is_streaming_rpc(
+            "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetSubtreeRoots"
+        ));
+        assert!(!super::is_streaming_rpc(TREE_STATE));
+        assert!(!super::is_streaming_rpc(
+            "/cash.z.wallet.sdk.rpc.CompactTxStreamer/SendTransaction"
+        ));
+        assert!(!super::is_streaming_rpc(
+            "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetTaddressBalanceStream"
+        ));
+        let unary = opts_for(TREE_STATE);
+        assert_eq!(unary.overall, Some(SHORT.unary));
+        assert_eq!(unary.head, Some(SHORT.unary));
+        assert_eq!((unary.gap, unary.idle), (None, None));
+        let stream = opts_for(BLOCK_RANGE);
+        assert_eq!(stream.overall, Some(std::time::Duration::from_secs(80)));
+        assert_eq!(stream.head, Some(SHORT.stream_idle));
+        assert_eq!(stream.gap, Some(SHORT.stream_idle));
+        // Transparent-address queries keep the overall timeout for their first answer.
+        let balance = opts_for("/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetTaddressBalance");
+        assert_eq!(balance.overall, Some(std::time::Duration::from_secs(80)));
+        assert_eq!(balance.head, None);
+        let txids = opts_for("/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetTaddressTxids");
+        assert_eq!(txids.head, Some(std::time::Duration::from_secs(80)));
+        assert_eq!(txids.gap, Some(SHORT.stream_idle));
+        let poll = opts_for("/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetMempoolStream");
+        assert_eq!(poll.idle, Some(std::time::Duration::from_secs(3)));
+        assert_eq!((poll.head, poll.gap, poll.class), (None, None, None));
+        // LWD_TIMEOUT_SECS stays the upper bound.
+        let tight = super::StreamOpts::for_path(
+            TREE_STATE,
+            std::time::Duration::from_millis(500),
+            std::time::Duration::from_secs(3),
+            SHORT,
+        );
+        assert_eq!(tight.overall, Some(std::time::Duration::from_millis(500)));
+    }
+
+    #[test]
+    fn deadlines_parse() {
+        assert_eq!(
+            super::LwdDeadlines::parse(None, None).unwrap(),
+            super::LwdDeadlines::default()
+        );
+        let d = super::LwdDeadlines::parse(Some("4"), Some(" 9 ")).unwrap();
+        assert_eq!(d.unary, std::time::Duration::from_secs(4));
+        assert_eq!(d.stream_idle, std::time::Duration::from_secs(9));
+        assert!(super::LwdDeadlines::parse(Some("0"), None).is_err());
+        assert!(super::LwdDeadlines::parse(None, Some("x")).is_err());
+    }
+
+    #[tokio::test]
+    async fn a_hung_lightwalletd_costs_a_unary_call_its_deadline_only() {
+        let mut config = test_config();
+        config.lwd_addr = hung_lwd().await;
+        let start = std::time::Instant::now();
+        let r = super::call_lwd_stream_with(
+            &config,
+            TREE_STATE,
+            super::grpc_wrap(&[]),
+            None,
+            Vec::new(),
+            opts_for(TREE_STATE),
+        )
+        .await;
+        assert!(r.is_err());
+        let took = start.elapsed();
+        assert!(
+            took >= std::time::Duration::from_millis(900)
+                && took < std::time::Duration::from_secs(3),
+            "{took:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_hung_lightwalletd_costs_a_stream_its_idle_bound_only() {
+        let mut config = test_config();
+        config.lwd_addr = hung_lwd().await;
+        let start = std::time::Instant::now();
+        let r = super::call_lwd_stream_with(
+            &config,
+            BLOCK_RANGE,
+            super::grpc_wrap(&[]),
+            None,
+            Vec::new(),
+            opts_for(BLOCK_RANGE),
+        )
+        .await;
+        assert!(r.is_err());
+        assert!(start.elapsed() < std::time::Duration::from_secs(3));
+    }
+
+    #[tokio::test]
+    async fn a_stream_that_goes_silent_ends_after_the_idle_bound() {
+        let mut config = test_config();
+        // One frame, then silence for 30 s.
+        config.lwd_addr = stalling_lwd().await;
+        let start = std::time::Instant::now();
+        let r = drain(
+            super::call_lwd_stream_with(
+                &config,
+                BLOCK_RANGE,
+                super::grpc_wrap(&[]),
+                None,
+                Vec::new(),
+                opts_for(BLOCK_RANGE),
+            )
+            .await,
+        )
+        .await;
+        assert!(
+            r.is_err(),
+            "a silent stream is an error, not a short answer"
+        );
+        assert!(start.elapsed() < std::time::Duration::from_secs(3));
+    }
+
+    #[tokio::test]
+    async fn a_stream_that_keeps_sending_runs_past_the_idle_bound() {
+        let mut config = test_config();
+        // 12 frames 250 ms apart: 3 s in total, three times the 1 s idle bound.
+        config.lwd_addr = trickling_lwd(12, std::time::Duration::from_millis(250)).await;
+        let start = std::time::Instant::now();
+        let n = drain(
+            super::call_lwd_stream_with(
+                &config,
+                BLOCK_RANGE,
+                super::grpc_wrap(&[]),
+                None,
+                Vec::new(),
+                opts_for(BLOCK_RANGE),
+            )
+            .await,
+        )
+        .await
+        .unwrap();
+        assert_eq!(n, 13, "12 data frames + the trailers");
+        assert!(start.elapsed() >= std::time::Duration::from_millis(2900));
+    }
+
     fn test_config() -> crate::config::Config {
         crate::config::Config {
             port: 8080,
@@ -662,11 +1048,63 @@ mod tests {
 }
 
 /// How long a streamed call may run. `overall` None = no deadline;
-/// `idle` Some = a long poll closed cleanly (grpc-status 0) after that much silence.
-#[derive(Clone, Copy, Debug)]
+/// `idle` Some = a long poll closed cleanly (grpc-status 0) after that much silence;
+/// `head` Some = the response head must arrive within this (else `LWD_TIMEOUT_SECS`);
+/// `gap` Some = no frame for this long ends the call with an error (a stream that went silent).
+/// `class` labels the deadlines in `ohttp_lwd_timeouts_total` (None = not counted).
+#[derive(Clone, Copy, Debug, Default)]
 pub struct StreamOpts {
     pub overall: Option<Duration>,
     pub idle: Option<Duration>,
+    pub head: Option<Duration>,
+    pub gap: Option<Duration>,
+    pub class: Option<&'static str>,
+}
+
+impl StreamOpts {
+    /// The deadlines of a call to `path` (see [`LwdDeadlines`]): a unary RPC is bounded as a
+    /// whole by the unary deadline; a server-streaming one waits at most the stream idle bound
+    /// for its head and for each frame, and runs up to `lwd_timeout`; the mempool long poll is
+    /// closed cleanly after `long_poll_idle` of silence, as before.
+    pub fn for_path(
+        path: &str,
+        lwd_timeout: Duration,
+        long_poll_idle: Duration,
+        d: LwdDeadlines,
+    ) -> Self {
+        if path.ends_with("/GetMempoolStream") {
+            return Self {
+                overall: Some(lwd_timeout),
+                idle: Some(long_poll_idle),
+                ..Self::default()
+            };
+        }
+        let address = is_address_rpc(path);
+        if is_streaming_rpc(path) {
+            let idle = d.stream_idle.min(lwd_timeout);
+            return Self {
+                overall: Some(lwd_timeout),
+                head: Some(if address { lwd_timeout } else { idle }),
+                gap: Some(idle),
+                class: Some("stream"),
+                ..Self::default()
+            };
+        }
+        if address {
+            return Self {
+                overall: Some(lwd_timeout),
+                class: Some("unary"),
+                ..Self::default()
+            };
+        }
+        let unary = d.unary.min(lwd_timeout);
+        Self {
+            overall: Some(unary),
+            head: Some(unary),
+            class: Some("unary"),
+            ..Self::default()
+        }
+    }
 }
 
 /// The error a source returns when the lightwalletd concurrency limit is reached.
@@ -721,12 +1159,26 @@ pub async fn call_lwd_stream_with(
     }
     let req = builder.body(Full::new(Bytes::from(body)))?;
 
-    // Connecting and getting the head never waits longer than the configured timeout.
+    // Connecting and getting the head never waits longer than the configured timeout, or the
+    // call's own head deadline.
     let connect = Duration::from_secs(config.lwd_timeout_secs);
+    let connect = opts.head.map_or(connect, |h| h.min(connect));
     let deadline = opts.overall.map(|d| Instant::now() + d);
     let idle = opts.idle;
+    let gap = opts.gap;
+    let class = opts.class;
+    let network = config.network.clone();
 
-    let resp = timeout(connect, request(&client, req)).await??;
+    let resp = match timeout(connect, request(&client, req)).await {
+        Ok(r) => r?,
+        Err(e) => {
+            if let Some(class) = class {
+                crate::health::record_lwd_timeout(&network, class, "head");
+            }
+            reset_pool(&network);
+            return Err(e.into());
+        }
+    };
     let status = resp.status().as_u16();
     let headers: Vec<(String, String)> = resp
         .headers()
@@ -751,6 +1203,9 @@ pub async fn call_lwd_stream_with(
                 Some(d) => {
                     let r = d.saturating_duration_since(Instant::now());
                     if r.is_zero() {
+                        if let Some(class) = class {
+                            crate::health::record_lwd_timeout(&network, class, "body");
+                        }
                         yield Err(anyhow!("LWD response deadline"));
                         break;
                     }
@@ -761,6 +1216,10 @@ pub async fn call_lwd_stream_with(
             let wait = match idle {
                 Some(i) => remaining.min(i),
                 None => remaining,
+            };
+            let wait = match gap {
+                Some(g) => wait.min(g),
+                None => wait,
             };
             match timeout(wait, body_out.frame()).await {
                 Ok(Some(Ok(frame))) => {
@@ -791,6 +1250,11 @@ pub async fn call_lwd_stream_with(
                         // A long poll: close it with what arrived, as a success.
                         yield Ok(UpFrame::Trailers(vec![("grpc-status".to_string(), "0".to_string())]));
                         break;
+                    }
+                    if let Some(class) = class {
+                        let phase = if gap.is_some_and(|g| wait == g) { "gap" } else { "body" };
+                        crate::health::record_lwd_timeout(&network, class, phase);
+                        reset_pool(&network);
                     }
                     yield Err(anyhow!("frame timeout"));
                     break;
@@ -1024,12 +1488,12 @@ impl LwdSources {
     }
 
     fn default_opts(&self, path: &str) -> StreamOpts {
-        StreamOpts {
-            overall: Some(Duration::from_secs(self.config.lwd_timeout_secs)),
-            idle: path
-                .ends_with("/GetMempoolStream")
-                .then(|| Duration::from_secs(self.config.long_poll_idle_secs)),
-        }
+        StreamOpts::for_path(
+            path,
+            Duration::from_secs(self.config.lwd_timeout_secs),
+            Duration::from_secs(self.config.long_poll_idle_secs),
+            deadlines(),
+        )
     }
 }
 
@@ -1170,7 +1634,7 @@ impl crate::mempool::MempoolSource for LwdSources {
             Vec::new(),
             StreamOpts {
                 overall: Some(MEMPOOL_STREAM_MAX),
-                idle: None,
+                ..StreamOpts::default()
             },
         )
     }

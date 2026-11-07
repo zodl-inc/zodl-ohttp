@@ -17,7 +17,7 @@
 //! The peer fallback of the WRITE replica wait (`REPLAY_WRITE_WAIT_REPLICAS`).
 //!
 //! A managed Redis that promotes a replica resynchronises every other replica from the new
-//! primary at once, so for a while (minutes on ElastiCache) the new primary has no replica and
+//! primary at once, so for a while (minutes on a managed Redis) the new primary has no replica and
 //! every `WAIT 1` of a WRITE nonce comes back short. Before this, every WRITE failed closed for
 //! that whole time although READs were back after the endpoint switch.
 //!
@@ -43,15 +43,50 @@
 //!   acknowledgements in a row (a reconnect resolves the endpoint again). The queue is in memory:
 //!   a gateway that stops before it is written back leaves the nonce at the peers only, which is
 //!   what the window below covers for the gateways that consult the peers.
-//! - **Window** (`failover` mode only, where WRITEs are otherwise never checked at the peers):
-//!   for `REPLAY_TTL_SECS` after this gateway process started, saw a short acknowledgement, or
-//!   had a security-store connection replaced (watched in the background, not only on WRITEs),
-//!   every WRITE whose local wait succeeded is also `SET NX` at the peers synchronously, and a
-//!   peer that holds the nonce refuses it. A replay of a WRITE admitted through the peers (here
-//!   or at another gateway of the same store) is then refused even if the local store lost its
-//!   copy before the write-back. An unreachable peer there keeps the local verdict, as outside
-//!   the window (the window never fails a request closed). The window is per process, in
-//!   memory; a gateway that only checks at another origin's store (a read origin) has none.
+//! - **Window** (`failover` mode only): for `REPLAY_TTL_SECS` after this gateway process started,
+//!   saw a short acknowledgement, or had a security-store connection replaced (watched in the
+//!   background, not only on WRITEs). Since the check below runs on every WRITE, the window
+//!   only labels those checks (`path="window"` instead of `"check"`).
+//!
+//! **Check at the fallback store.** Every WRITE whose local wait succeeded is also `SET NX` at
+//! the fallback store synchronously (the peers in `failover` mode, the confirming standby stores
+//! of a read origin), and a store that holds the nonce refuses it. An unreachable fallback store
+//! there keeps the first verdict (the check never fails a request closed); the nonce then
+//! reaches it asynchronously. A replay of a WRITE admitted through the fallback store (here, at
+//! another gateway of the same store, or at an origin that could not reach the primary store)
+//! is then refused even if the primary store never got or lost its copy. This used to happen
+//! only inside the window; it runs on every WRITE because an origin may admit WRITEs at the
+//! fallback store alone while the others still reach the primary store (below, and an origin
+//! with `REPLAY_PEER_FAIL_CLOSED_WRITES=0`), and nothing tells the others when that starts.
+//!
+//! **Unavailable store** (`REPLAY_UNAVAILABLE_FALLBACK`, off by default). When the store that
+//! decides gives no verdict at all (no connection, a timeout, an error), the request is decided
+//! at the fallback store instead of failing closed, with the rules above: new and acknowledged
+//! there = runs, held there = replay, anything else = fail-closed; the nonce is written back to
+//! the store that gave no verdict once it answers.
+//!
+//! - `failover` mode, the local store: the outer check cannot tell READ from WRITE, so the
+//!   request is decapsulated and classified first (`LocalReplayCheck::Unavailable`), then
+//!   decided at the peers alone (`ResponseCache::admit_without_local`): a READ by `SET NX`, a
+//!   WRITE by `SET NX` + the peers' `WAIT`. A WRITE whose local `SET NX` succeeded but whose
+//!   local `WAIT` got no answer takes the short-acknowledgement path (`path="local_unavailable"`).
+//! - `async-reads`, the hub: a WRITE confirmed at the standby stores, or by the local replicas
+//!   where the local store is the fallback store (`path="hub_unavailable"`).
+//!
+//! Safety (two gateways never both run the same WRITE): a WRITE runs only after a `SET NX`
+//! that found its nonce new at the primary store, at the fallback store, or at both, and every
+//! store reached is asked. With both reachable both are asked (the check above); without the
+//! primary only the fallback store; without the fallback store only the primary store (as
+//! before). `SET NX` on one store is decided once per key, so two admissions of one nonce need
+//! two disjoint sets of stores: one gateway that reached only the primary store and another that
+//! reached only the fallback store at the same time. That needs two failures at once (and is
+//! the case an origin with `REPLAY_PEER_FAIL_CLOSED_WRITES=0` already had). A nonce admitted at
+//! one store only is copied to the other (write-back, asynchronous hand-off) as soon as it is
+//! reachable. The guarantee needs the check above on every gateway that asks the primary store
+//! (`ResponseCache::checks_writes_at_fallback_store`, gauge `ohttp_replay_fallback_check`):
+//! turn the fallback on only once all of them report it. READ nonces decided at the fallback
+//! store are not written back (a replayed READ changes nothing). A nonce stored by a request
+//! that then failed closed stays held for those exact bytes; clients seal every attempt afresh.
 //!
 //! **Hub path** (`async-reads`, the WRITE check at another origin's store, the hub): when the
 //! hub took the nonce as new but its replica acknowledgement is short (the hub resyncs after a
@@ -65,8 +100,11 @@
 //! written back to the hub until the hub's replicas have it.
 //!
 //! Metrics: `ohttp_replay_write_fallback_total{network,path,result}` (path `short_ack` |
-//! `window` | `hub_short_ack` | `hub_window`; result `accepted` | `replay` | `unavailable` | `unacknowledged` | `overflow`) and
-//! `ohttp_replay_write_back_total{network,result}` (`written` | `expired`).
+//! `local_unavailable` | `window` | `check` | `hub_short_ack` | `hub_unavailable` | `hub_window` |
+//! `hub_check`; result `accepted` | `replay` | `unavailable` | `unacknowledged` | `overflow`),
+//! `ohttp_replay_read_fallback_total{network,result}`,
+//! `ohttp_replay_write_back_total{network,result}` (`written` | `expired`) and
+//! `ohttp_replay_unavailable_fallback{network,target}`.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};

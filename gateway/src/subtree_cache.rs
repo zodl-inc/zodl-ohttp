@@ -296,9 +296,11 @@ impl SubtreeRootsCache {
     }
 
     /// The tier an entry completing at `height` is written to: permanent only when final
-    /// against a fresh tip (never guess finality).
+    /// against a fresh tip (never guess finality) and the tier takes writes (not a replica).
     fn tier_for(&self, height: u64, tip: Option<&Tip>) -> Tier {
-        if self.permanent.is_some() && tip.is_some_and(|t| is_final(height, t)) {
+        if self.permanent.as_ref().is_some_and(|p| p.writable())
+            && tip.is_some_and(|t| is_final(height, t))
+        {
             Tier::Permanent
         } else {
             Tier::Cache
@@ -402,7 +404,7 @@ impl SubtreeRootsCache {
     /// Move entries that became final from the cache tier to the permanent tier, off the
     /// request path.
     fn promote(&self, prefix: &str, protocol: u32, entries: Vec<(u32, u64, Bytes)>) {
-        let Some(perm) = self.permanent.clone() else {
+        let Some(perm) = self.permanent.clone().filter(|p| p.writable()) else {
             return;
         };
         if entries.is_empty() {
