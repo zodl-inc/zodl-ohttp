@@ -61,8 +61,13 @@
 //!   takes WRITEs only while the shared store of the peers is unreachable (it checks its own
 //!   store then). Every WRITE this gateway admits is also replicated there, asynchronously, off
 //!   the request path (the `failover` mechanism: per-store queue, pipelined batches, retried
-//!   until the nonce TTL). A standby store never refuses or delays a request here; it only keeps
-//!   the standby from admitting the same WRITE once more after a switch-over. Needed where the
+//!   until the nonce TTL). That hand-off never refuses or delays a request; it keeps the
+//!   standby from admitting the same WRITE once more after a switch-over. With
+//!   `REPLAY_PEER_WAIT_REPLICAS` >= 1 the standby stores also take part in the request path of
+//!   an `async-reads` WRITE, in the hub path of the WRITE fallback (`write_fallback.rs`): while
+//!   the peers' store cannot acknowledge on its replicas, or for one nonce TTL after startup or a
+//!   disruption of it, a WRITE is also `SET NX` there synchronously and a nonce held there is a
+//!   replay. Needed where the
 //!   WRITE check goes to a shared store whose owner replicates only its own requests to the
 //!   standby (a read origin in `async-reads` checking WRITEs at the primary origin's store):
 //!   without it, a WRITE admitted there within the nonce TTL before the primary origin is lost

@@ -53,8 +53,19 @@
 //!   the window (the window never fails a request closed). The window is per process, in
 //!   memory; a gateway that only checks at another origin's store (a read origin) has none.
 //!
+//! **Hub path** (`async-reads`, the WRITE check at another origin's store, the hub): when the
+//! hub took the nonce as new but its replica acknowledgement is short (the hub resyncs after a
+//! failover), the WRITE is confirmed at a second store instead. A read origin uses its standby
+//! stores (`REPLAY_STANDBY_URLS`, with `REPLAY_PEER_WAIT_REPLICAS`): `SET NX` + `WAIT` there,
+//! with the same rules (new + acknowledged = runs, held = replay, anything else fails closed),
+//! and a window after startup or a hub disruption in which every WRITE is also `SET NX` at the
+//! standby stores. An origin with its own replica wait (`REPLAY_WRITE_WAIT_REPLICAS`, the
+//! standby origin and its spoke) uses its own store: the WRITE runs only once the local replicas
+//! acknowledge it (no window: these origins always check both stores). Either way the nonce is
+//! written back to the hub until the hub's replicas have it.
+//!
 //! Metrics: `ohttp_replay_write_fallback_total{network,path,result}` (path `short_ack` |
-//! `window`; result `accepted` | `replay` | `unavailable` | `unacknowledged` | `overflow`) and
+//! `window` | `hub_short_ack` | `hub_window`; result `accepted` | `replay` | `unavailable` | `unacknowledged` | `overflow`) and
 //! `ohttp_replay_write_back_total{network,result}` (`written` | `expired`).
 
 use std::collections::VecDeque;
@@ -62,6 +73,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures_util::future::BoxFuture;
 use parking_lot::Mutex;
 use tokio::sync::Notify;
 use tokio::time::{timeout, Instant};
@@ -218,14 +230,73 @@ pub fn spawn_window_watch(fb: Arc<WriteFallback>, conn: Arc<StoreConn>) {
     });
 }
 
-/// The write-back task: rewrite pending nonces to the local store until its replicas have them.
-/// `conn` is its own connection to the local store.
-pub fn spawn_write_back(
-    fb: Arc<WriteFallback>,
-    conn: Arc<StoreConn>,
-    wait: WriteWaitConfig,
-    redis_timeout: Duration,
-) {
+/// The outcome of one write-back attempt (a pipelined `SET ... EX` per nonce + `WAIT`).
+pub enum WriteBackResult {
+    Acked,
+    /// Fewer replicas than required acknowledged.
+    Short(String),
+    Failed(String),
+}
+
+/// Where a write-back goes: the local store (`LocalWriteBack`) or the replay peers
+/// (`cache::ReplayPeers`, for the hub of a read origin).
+pub trait WriteBackSink: Send + Sync + 'static {
+    /// `SET key 1 EX ttl` for every (key, ttl), then `WAIT`.
+    fn write(&self, batch: Vec<(String, u64)>) -> BoxFuture<'static, WriteBackResult>;
+    /// Replace the connection (re-resolve the endpoint): after many short acknowledgements.
+    fn reconnect(&self);
+}
+
+/// The local store, on a connection of its own.
+pub struct LocalWriteBack {
+    pub conn: Arc<StoreConn>,
+    pub wait: WriteWaitConfig,
+    pub redis_timeout: Duration,
+}
+
+impl WriteBackSink for LocalWriteBack {
+    fn write(&self, batch: Vec<(String, u64)>) -> BoxFuture<'static, WriteBackResult> {
+        let conn = self.conn.clone();
+        let wait = self.wait;
+        let budget = Duration::from_millis(wait.timeout_ms) + self.redis_timeout * 4;
+        Box::pin(async move {
+            let mut pipe = redis::pipe();
+            for (key, ttl) in &batch {
+                pipe.cmd("SET")
+                    .arg(key)
+                    .arg("1")
+                    .arg("EX")
+                    .arg(*ttl)
+                    .ignore();
+            }
+            pipe.cmd("WAIT").arg(wait.replicas).arg(wait.timeout_ms);
+            let mut c = conn.get();
+            let r = timeout(budget, pipe.query_async::<_, (i64,)>(&mut c)).await;
+            conn.observe_timed(&r);
+            match r {
+                Ok(Ok((acked,))) if acked >= wait.replicas as i64 => WriteBackResult::Acked,
+                Ok(Ok((acked,))) => {
+                    conn.observe_short_ack();
+                    WriteBackResult::Short(format!(
+                        "acknowledged by {acked} of {} replica(s)",
+                        wait.replicas
+                    ))
+                }
+                Ok(Err(e)) => WriteBackResult::Failed(e.to_string()),
+                Err(_) => {
+                    WriteBackResult::Failed(format!("timed out after {}ms", budget.as_millis()))
+                }
+            }
+        })
+    }
+
+    fn reconnect(&self) {
+        self.conn.force_reconnect("short_ack");
+    }
+}
+
+/// The write-back task: rewrite pending nonces to `sink` until its replicas have them.
+pub fn spawn_write_back(fb: Arc<WriteFallback>, sink: Arc<dyn WriteBackSink>) {
     tokio::spawn(async move {
         let mut short_in_a_row = 0u32;
         let mut failed_in_a_row = 0u32;
@@ -243,46 +314,33 @@ pub fn spawn_write_back(
                 continue;
             }
             let now = Instant::now();
-            let mut pipe = redis::pipe();
-            for (key, deadline) in &batch {
-                let ttl = deadline.saturating_duration_since(now).as_secs().max(1);
-                pipe.cmd("SET")
-                    .arg(key)
-                    .arg("1")
-                    .arg("EX")
-                    .arg(ttl)
-                    .ignore();
-            }
-            pipe.cmd("WAIT").arg(wait.replicas).arg(wait.timeout_ms);
-            let mut c = conn.get();
-            let budget = Duration::from_millis(wait.timeout_ms) + redis_timeout * 4;
-            let r = timeout(budget, pipe.query_async::<_, (i64,)>(&mut c)).await;
-            conn.observe_timed(&r);
-            let failure = match r {
-                Ok(Ok((acked,))) if acked >= wait.replicas as i64 => {
-                    debug!(network = %fb.network, n = batch.len(), "Replay nonces admitted through the peers written back to the local store");
+            let items: Vec<(String, u64)> = batch
+                .iter()
+                .map(|(k, d)| (k.clone(), d.saturating_duration_since(now).as_secs().max(1)))
+                .collect();
+            let failure = match sink.write(items).await {
+                WriteBackResult::Acked => {
+                    debug!(network = %fb.network, n = batch.len(), "Replay nonces admitted through another store written back");
                     fb.done(batch.len());
                     short_in_a_row = 0;
                     failed_in_a_row = 0;
                     continue;
                 }
-                Ok(Ok((acked,))) => {
-                    conn.observe_short_ack();
+                WriteBackResult::Short(m) => {
                     short_in_a_row += 1;
                     if short_in_a_row >= WRITE_BACK_SHORT_RECONNECT {
                         short_in_a_row = 0;
-                        conn.force_reconnect("short_ack");
+                        sink.reconnect();
                     }
-                    format!("acknowledged by {acked} of {} replica(s)", wait.replicas)
+                    m
                 }
-                Ok(Err(e)) => e.to_string(),
-                Err(_) => format!("timed out after {}ms", budget.as_millis()),
+                WriteBackResult::Failed(m) => m,
             };
             failed_in_a_row += 1;
             if failed_in_a_row % WRITE_BACK_WARN_EVERY == 0 {
-                warn!(network = %fb.network, attempts = failed_in_a_row, pending = fb.pending_len(), error = %failure, "Write-back of replay nonces admitted through the peers still failing");
+                warn!(network = %fb.network, attempts = failed_in_a_row, pending = fb.pending_len(), error = %failure, "Write-back of replay nonces admitted through another store still failing");
             } else {
-                debug!(network = %fb.network, pending = fb.pending_len(), error = %failure, "Write-back to the local store not done, retrying");
+                debug!(network = %fb.network, pending = fb.pending_len(), error = %failure, "Write-back not done, retrying");
             }
         }
     });

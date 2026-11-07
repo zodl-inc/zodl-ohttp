@@ -56,7 +56,7 @@ use crate::replication::{AsyncReplicator, Effective, PeerSink, ReplicationConfig
 use crate::rpc_cache::{self, grpc_message, BlockId, TreeStateHead};
 use crate::store::{CacheStore, PermanentStore, TipCell};
 use crate::store_conn::{is_failover_signal, Role, StoreConn};
-use crate::write_fallback::WriteFallback;
+use crate::write_fallback::{LocalWriteBack, WriteBackResult, WriteBackSink, WriteFallback};
 
 pub use crate::rpc_cache::{grpc_block_id, height_key, CacheLookup, CacheMiss, MAX_CACHEABLE_SIZE};
 
@@ -128,6 +128,9 @@ pub struct ResponseCache {
     local_aof: Option<Arc<LocalAof>>,
     /// The peer fallback of the WRITE replica wait (write_fallback.rs); with `write_wait`.
     write_fallback: Option<Arc<WriteFallback>>,
+    /// The hub path of the fallback (write_fallback.rs): async-reads with peers that wait;
+    /// its queue writes back to the peers.
+    hub_fallback: Option<Arc<WriteFallback>>,
 }
 
 /// What the peers said about a WRITE nonce in `replicate_nonce_checked`, for the replica wait
@@ -143,6 +146,12 @@ pub struct PeerCheck {
     /// to the peers is left to `confirm_write_nonce`, after the local verdict, so that a
     /// synchronous check at the peers there never meets this request's own nonce.
     pub deferred: bool,
+    /// The WRITE was also confirmed at the standby stores synchronously (the hub fallback or
+    /// window): no asynchronous hand-off to them is needed.
+    pub at_standby: bool,
+    /// The hub took the nonce but its replicas did not acknowledge it: the WRITE runs only if
+    /// the local replicas do (`confirm_write_nonce`).
+    pub hub_needs_local_ack: bool,
 }
 
 /// The decision of `confirm_write_nonce` for a WRITE whose nonce is new locally.
@@ -151,6 +160,13 @@ pub enum WriteAdmission {
     Run,
     /// A peer store already held the nonce.
     Replay,
+}
+
+/// What the hub path of the fallback decided (`hub_short_ack_fallback`).
+enum HubFallback {
+    Replay,
+    AtStandby,
+    NeedsLocalAck,
 }
 
 /// The outcome of the local replica wait of a WRITE nonce.
@@ -298,6 +314,9 @@ struct ReplayPeer {
     /// The dedicated connection for `WAIT` (see `WriteWait`), opened in the background by
     /// `with_wait`, else on first use.
     wait_conn: Arc<ArcSwapOption<ConnectionManager>>,
+    /// The write-back's own connection (`rewrite_replicated`): its `WAIT`s must not delay the
+    /// requests' on `wait_conn`. Opened on first use.
+    write_back_conn: Arc<ArcSwapOption<ConnectionManager>>,
     /// Consecutive failed housekeeping PINGs (see PEER_PING_FAILURES_RECONNECT).
     ping_failures: AtomicU32,
     /// A standby store (REPLAY_STANDBY_URLS): its connectivity is `ohttp_replay_standby_connected`,
@@ -320,6 +339,9 @@ pub struct ReplayPeers {
     fail_closed_writes: bool,
     /// REPLAY_PEER_WAIT_REPLICAS: replica acknowledgement of a WRITE nonce at each peer that took it.
     wait: Option<WriteWaitConfig>,
+    /// Peer errors, timeouts, disconnects and failed PINGs so far: a change opens the hub
+    /// window of a read origin (write_fallback.rs).
+    disruptions: AtomicU64,
 }
 
 /// The outcome of one nonce write at one peer.
@@ -386,8 +408,9 @@ impl ReplayPeers {
     }
 
     /// The standby stores (REPLAY_STANDBY_URLS): labelled from `first_label` on (the number of
-    /// REPLAY_PEER_URLS), so their metrics never share a `peer` value with a peer. Only the
-    /// asynchronous replicator uses them; nothing on the request path waits for them.
+    /// REPLAY_PEER_URLS), so their metrics never share a `peer` value with a peer. The
+    /// asynchronous replicator uses them, and, with `with_wait`, the hub path of the WRITE
+    /// fallback (write_fallback.rs) on the request path.
     pub async fn connect_standby(
         urls: &[String],
         network: String,
@@ -434,6 +457,7 @@ impl ReplayPeers {
                 url: url.clone(),
                 conn,
                 wait_conn: Arc::new(ArcSwapOption::empty()),
+                write_back_conn: Arc::new(ArcSwapOption::empty()),
                 ping_failures: AtomicU32::new(0),
                 standby,
             });
@@ -446,6 +470,7 @@ impl ReplayPeers {
             mode: ReplayPeerMode::Sync,
             fail_closed_writes: true,
             wait: None,
+            disruptions: AtomicU64::new(0),
         };
         for p in &this.peers {
             if p.conn.load().is_none() {
@@ -544,6 +569,23 @@ impl ReplayPeers {
         key: &str,
         confirm: impl Fn(usize) -> bool,
     ) -> anyhow::Result<()> {
+        self.confirm_replicated_kind(key, confirm)
+            .await
+            .map_err(|f| anyhow::anyhow!(f.message))
+    }
+
+    /// Times a peer failed (error, timeout, disconnected, failed PING).
+    pub fn disruptions(&self) -> u64 {
+        self.disruptions.load(Ordering::Relaxed)
+    }
+
+    /// `confirm_replicated`, telling apart the case where every failing peer still held the
+    /// nonce and only its replica acknowledgement was short (`ConfirmFailure::only_short`).
+    pub async fn confirm_replicated_kind(
+        &self,
+        key: &str,
+        confirm: impl Fn(usize) -> bool,
+    ) -> Result<(), ConfirmFailure> {
         let Some(WriteWaitConfig {
             replicas,
             timeout_ms,
@@ -555,6 +597,7 @@ impl ReplayPeers {
         let futures = self.peers.iter().filter(|p| confirm(p.index)).map(|p| async move {
             let verdict = async {
                 let mut last = String::new();
+                let mut short = false;
                 for attempt in 0..PEER_WAIT_ATTEMPTS {
                     if attempt > 0 {
                         warn!(network = %self.network, peer = p.index, error = %last, "Replay peer WAIT failed, retrying once");
@@ -571,6 +614,7 @@ impl ReplayPeers {
                             }
                             Ok(Err(e)) => {
                                 last = format!("connect: {e}");
+                                short = false;
                                 continue;
                             }
                             Err(_) => {
@@ -578,6 +622,7 @@ impl ReplayPeers {
                                     "connect timed out after {}ms",
                                     PEER_WAIT_CONNECT_TIMEOUT.as_millis()
                                 );
+                                short = false;
                                 continue;
                             }
                         },
@@ -598,12 +643,15 @@ impl ReplayPeers {
                             .await
                     })
                     .await;
+                    short = matches!(result, Ok(Ok((Some(_), _))));
                     last = match result {
                         Ok(Ok((Some(_), acked))) if acked >= replicas as i64 => return Ok(()),
                         Ok(Ok((Some(_), acked))) => format!(
                             "acknowledged by {acked} of {replicas} replica(s) within {timeout_ms}ms"
                         ),
-                        Ok(Ok((None, _))) => return Err("nonce no longer at the peer".to_string()),
+                        Ok(Ok((None, _))) => {
+                            return Err((false, "nonce no longer at the peer".to_string()))
+                        }
                         // A broken or stuck connection: the retry opens a fresh one (on the
                         // primary). A failover signal also replaces the peer's main connection.
                         Ok(Err(e)) => {
@@ -619,7 +667,7 @@ impl ReplayPeers {
                         }
                     };
                 }
-                Err(last)
+                Err((short, last))
             }
             .await;
             crate::health::record_replay_peer(
@@ -627,9 +675,9 @@ impl ReplayPeers {
                 p.index,
                 if verdict.is_ok() { "acknowledged" } else { "unacknowledged" },
             );
-            verdict.map_err(|e| format!("peer {}: {e}", p.index))
+            verdict.map_err(|(short, e)| (short, format!("peer {}: {e}", p.index)))
         });
-        let failures: Vec<String> = futures_util::future::join_all(futures)
+        let failures: Vec<(bool, String)> = futures_util::future::join_all(futures)
             .await
             .into_iter()
             .filter_map(Result::err)
@@ -637,13 +685,116 @@ impl ReplayPeers {
         if failures.is_empty() {
             Ok(())
         } else {
-            anyhow::bail!(
-                "WRITE replay nonce not acknowledged by the peer replicas (fail-closed): {}",
-                failures.join("; ")
-            )
+            Err(ConfirmFailure {
+                only_short: failures.iter().all(|(short, _)| *short),
+                message: format!(
+                    "WRITE replay nonce not acknowledged by the peer replicas (fail-closed): {}",
+                    failures
+                        .iter()
+                        .map(|(_, m)| m.as_str())
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                ),
+            })
         }
     }
 
+    /// Write-back to every peer: `SET key 1 EX ttl` per entry on the `WAIT` connection, then
+    /// `WAIT`; acknowledged only when every peer acknowledged.
+    async fn rewrite_replicated(&self, batch: &[(String, u64)]) -> WriteBackResult {
+        let Some(WriteWaitConfig {
+            replicas,
+            timeout_ms,
+        }) = self.wait
+        else {
+            return WriteBackResult::Acked;
+        };
+        let budget = self.timeout + Duration::from_millis(timeout_ms);
+        let futures = self.peers.iter().map(|p| async move {
+            let conn = match p.write_back_conn.load_full() {
+                Some(c) => c,
+                None => match timeout(PEER_WAIT_CONNECT_TIMEOUT, ReplayPeer::open(&p.url)).await {
+                    Ok(Ok(c)) => {
+                        let c = Arc::new(c);
+                        p.write_back_conn.store(Some(c.clone()));
+                        c
+                    }
+                    Ok(Err(e)) => return WriteBackResult::Failed(format!("connect: {e}")),
+                    Err(_) => return WriteBackResult::Failed("connect timed out".to_string()),
+                },
+            };
+            let mut conn = (*conn).clone();
+            let mut pipe = redis::pipe();
+            for (key, ttl) in batch {
+                pipe.cmd("SET")
+                    .arg(key)
+                    .arg("1")
+                    .arg("EX")
+                    .arg(*ttl)
+                    .ignore();
+            }
+            pipe.cmd("WAIT").arg(replicas).arg(timeout_ms);
+            match timeout(budget, pipe.query_async::<_, (i64,)>(&mut conn)).await {
+                Ok(Ok((acked,))) if acked >= replicas as i64 => WriteBackResult::Acked,
+                Ok(Ok((acked,))) => WriteBackResult::Short(format!(
+                    "peer {}: acknowledged by {acked} of {replicas} replica(s)",
+                    p.index
+                )),
+                Ok(Err(e)) => {
+                    p.write_back_conn.store(None);
+                    WriteBackResult::Failed(format!("peer {}: {e}", p.index))
+                }
+                Err(_) => {
+                    p.write_back_conn.store(None);
+                    WriteBackResult::Failed(format!("peer {}: timed out", p.index))
+                }
+            }
+        });
+        let mut short = None;
+        for r in futures_util::future::join_all(futures).await {
+            match r {
+                WriteBackResult::Acked => {}
+                WriteBackResult::Failed(m) => return WriteBackResult::Failed(m),
+                WriteBackResult::Short(m) => short = Some(m),
+            }
+        }
+        match short {
+            Some(m) => WriteBackResult::Short(m),
+            None => WriteBackResult::Acked,
+        }
+    }
+
+    /// Drop the write-back connections, so the next attempt resolves the endpoints again.
+    fn reset_write_back_conns(&self) {
+        for p in &self.peers {
+            p.write_back_conn.store(None);
+        }
+    }
+}
+
+/// `ReplayPeers` as a write-back target (the hub of a read origin).
+struct PeerWriteBack(Arc<ReplayPeers>);
+
+impl WriteBackSink for PeerWriteBack {
+    fn write(&self, batch: Vec<(String, u64)>) -> BoxFuture<'static, WriteBackResult> {
+        let peers = self.0.clone();
+        Box::pin(async move { peers.rewrite_replicated(&batch).await })
+    }
+
+    fn reconnect(&self) {
+        self.0.reset_write_back_conns();
+    }
+}
+
+/// Why `confirm_replicated_kind` failed.
+#[derive(Debug)]
+pub struct ConfirmFailure {
+    /// Every failing peer still held the nonce; only its replicas did not acknowledge in time.
+    pub only_short: bool,
+    pub message: String,
+}
+
+impl ReplayPeers {
     /// Whether peer `index` has a connection (it may still fail a command).
     fn connected(&self, index: usize) -> bool {
         self.peers
@@ -682,6 +833,9 @@ impl ReplayPeers {
                 }
             };
             crate::health::record_replay_peer(&self.network, p.index, outcome.as_str());
+            if !matches!(outcome, PeerOutcome::Fresh | PeerOutcome::Replay) {
+                self.disruptions.fetch_add(1, Ordering::Relaxed);
+            }
             outcome
         });
         futures_util::future::join_all(futures).await
@@ -725,6 +879,9 @@ impl ReplayPeers {
                     ok
                 }
             };
+            if !ok {
+                self.disruptions.fetch_add(1, Ordering::Relaxed);
+            }
             record_peer_connected(&self.network, p.index, p.standby, ok);
         }
     }
@@ -1013,6 +1170,7 @@ impl ResponseCache {
             write_wait: None,
             local_aof: None,
             write_fallback: None,
+            hub_fallback: None,
         };
 
         if cache.cache_conn.load().is_none() {
@@ -1092,9 +1250,11 @@ impl ResponseCache {
             .await?;
             crate::write_fallback::spawn_write_back(
                 fb.clone(),
-                write_back,
-                config,
-                self.redis_timeout,
+                Arc::new(LocalWriteBack {
+                    conn: write_back,
+                    wait: config,
+                    redis_timeout: self.redis_timeout,
+                }),
             );
             crate::write_fallback::spawn_window_watch(fb.clone(), conn.clone());
             if let Some(sec) = &self.security_conn {
@@ -1243,6 +1403,34 @@ impl ResponseCache {
         );
         if let Some(fb) = &self.write_fallback {
             fb.note_generation(self.store_generation_of(&ww.conn));
+        }
+        if check.hub_needs_local_ack {
+            let record = |result: &str| {
+                crate::health::record_replay_write_fallback(&self.network, "hub_short_ack", result)
+            };
+            return match local {
+                LocalWait::Acked => match self.hub_fallback.as_ref() {
+                    Some(fb) if fb.push_write_back(key.clone()) => {
+                        record("accepted");
+                        warn!(network = %self.network, "WRITE replay nonce confirmed by the local replicas (hub replica acknowledgement short); written back to the hub later");
+                        Ok(self.after_local_ack(&key, check).await)
+                    }
+                    Some(_) => {
+                        record("overflow");
+                        anyhow::bail!("WRITE replay nonce not acknowledged by the hub replicas, write-back queue full (fail-closed)")
+                    }
+                    None => anyhow::bail!(
+                        "WRITE replay nonce not acknowledged by the hub replicas (fail-closed)"
+                    ),
+                },
+                LocalWait::Short(e) | LocalWait::Failed(e) => {
+                    if let Some(fb) = &self.write_fallback {
+                        fb.open_window();
+                    }
+                    record("unacknowledged");
+                    Err(e.context("hub replicas did not acknowledge either"))
+                }
+            };
         }
         match local {
             LocalWait::Acked => Ok(self.after_local_ack(&key, check).await),
@@ -1480,8 +1668,24 @@ impl ResponseCache {
     }
 
     pub fn with_replay_peers(mut self, peers: ReplayPeers) -> Self {
-        self.replay_peers = Some(Arc::new(peers));
+        let peers = Arc::new(peers);
+        if peers.mode() == ReplayPeerMode::AsyncReads
+            && peers.wait().is_some()
+            && tokio::runtime::Handle::try_current().is_ok()
+        {
+            let fb = Arc::new(WriteFallback::new(&self.network, peers.disruptions()));
+            crate::write_fallback::spawn_write_back(
+                fb.clone(),
+                Arc::new(PeerWriteBack(peers.clone())),
+            );
+            self.hub_fallback = Some(fb);
+        }
+        self.replay_peers = Some(peers);
         self
+    }
+
+    pub fn hub_fallback(&self) -> Option<&WriteFallback> {
+        self.hub_fallback.as_deref()
     }
 
     /// Start the asynchronous nonce replication for REPLAY_PEER_MODE=async-reads|failover (a
@@ -1986,9 +2190,46 @@ impl ResponseCache {
                 // it on their replicas before the WRITE runs. A peer that did not answer was
                 // tolerated by the verdict above (REPLAY_PEER_FAIL_CLOSED_WRITES=0 while the peers
                 // are down).
+                let mut at_standby = false;
+                let mut hub_needs_local_ack = false;
                 if !replay {
                     let fresh = |i: usize| outcomes.get(i) == Some(&PeerOutcome::Fresh);
-                    peers.confirm_replicated(&key, fresh).await?;
+                    let all_fresh =
+                        !outcomes.is_empty() && outcomes.iter().all(|o| *o == PeerOutcome::Fresh);
+                    if let Some(fb) = &self.hub_fallback {
+                        fb.note_generation(peers.disruptions());
+                    }
+                    match peers.confirm_replicated_kind(&key, fresh).await {
+                        Ok(()) => {
+                            if all_fresh {
+                                match self.hub_window_check(&key).await {
+                                    Some(true) => {
+                                        return Ok(PeerCheck {
+                                            replay: true,
+                                            ..PeerCheck::default()
+                                        })
+                                    }
+                                    // SET NX only (no WAIT): the asynchronous hand-off
+                                    // still follows (it finds the nonce: replay_async).
+                                    Some(false) => {}
+                                    None => {}
+                                }
+                            }
+                        }
+                        Err(f) if f.only_short && all_fresh => {
+                            match self.hub_short_ack_fallback(&key, f).await? {
+                                HubFallback::Replay => {
+                                    return Ok(PeerCheck {
+                                        replay: true,
+                                        ..PeerCheck::default()
+                                    })
+                                }
+                                HubFallback::AtStandby => at_standby = true,
+                                HubFallback::NeedsLocalAck => hub_needs_local_ack = true,
+                            }
+                        }
+                        Err(f) => anyhow::bail!(f.message),
+                    }
                     // No peer took it (tolerated): only the local store holds the nonce, so it
                     // must survive a crash of this host (REPLAY_LOCAL_WAITAOF_MS).
                     if !outcomes.contains(&PeerOutcome::Fresh) {
@@ -2007,16 +2248,106 @@ impl ResponseCache {
                 // Every peer took the nonce and (confirm_replicated above, with a wait) has it
                 // on its replicas: the local replica wait may fall back on that.
                 let durable_at_peers = !replay
+                    && !hub_needs_local_ack
                     && peers.wait().is_some()
                     && !outcomes.is_empty()
                     && outcomes.iter().all(|o| *o == PeerOutcome::Fresh);
                 Ok(PeerCheck {
                     replay,
                     durable_at_peers,
-                    deferred: false,
+                    at_standby,
+                    hub_needs_local_ack,
+                    ..PeerCheck::default()
                 })
             }
         }
+    }
+
+    /// The standby stores that can confirm a WRITE synchronously (REPLAY_STANDBY_URLS with
+    /// REPLAY_PEER_WAIT_REPLICAS >= 1).
+    fn confirming_standby(&self) -> Option<&ReplayPeers> {
+        self.standby_peers
+            .as_deref()
+            .filter(|s| s.wait().is_some() && !s.is_empty())
+    }
+
+    /// Inside the hub window of a read origin: `SET NX` at the standby stores. Some(true) = a
+    /// standby store held the nonce (replay), Some(false) = every one took it, None = no window,
+    /// no standby store, or one did not answer (the hub's verdict stands, the asynchronous
+    /// hand-off follows as usual).
+    async fn hub_window_check(&self, key: &str) -> Option<bool> {
+        let fb = self.hub_fallback.as_ref()?;
+        let standby = self.confirming_standby()?;
+        if !fb.window_open() {
+            return None;
+        }
+        let outcomes = standby.write_nonce(key, REPLAY_TTL_SECS).await;
+        let verdict = combine_peer_outcomes(&outcomes);
+        let result = match verdict {
+            PeerVerdict::Fresh => "accepted",
+            PeerVerdict::Replay => "replay",
+            PeerVerdict::Unavailable => "unavailable",
+        };
+        crate::health::record_replay_write_fallback(&self.network, "hub_window", result);
+        match verdict {
+            PeerVerdict::Replay => Some(true),
+            PeerVerdict::Fresh => Some(false),
+            PeerVerdict::Unavailable => None,
+        }
+    }
+
+    /// The hub took the nonce as new but its replicas did not acknowledge it (`f`). With
+    /// standby stores: confirm there (`SET NX` + `WAIT`). With the local replica wait: leave it
+    /// to the local replicas. Otherwise, or on any other outcome: fail closed with `f`.
+    async fn hub_short_ack_fallback(
+        &self,
+        key: &str,
+        f: ConfirmFailure,
+    ) -> anyhow::Result<HubFallback> {
+        let Some(fb) = self.hub_fallback.as_ref() else {
+            anyhow::bail!(f.message);
+        };
+        if self.confirming_standby().is_none() && self.write_wait.is_none() {
+            anyhow::bail!(f.message);
+        }
+        fb.open_window();
+        let record = |result: &str| {
+            crate::health::record_replay_write_fallback(&self.network, "hub_short_ack", result)
+        };
+        if !fb.has_room() {
+            record("overflow");
+            anyhow::bail!("{} (write-back queue full, no fallback)", f.message);
+        }
+        if let Some(standby) = self.confirming_standby() {
+            let outcomes = standby.write_nonce(key, REPLAY_TTL_SECS).await;
+            match combine_peer_outcomes(&outcomes) {
+                PeerVerdict::Replay => {
+                    record("replay");
+                    return Ok(HubFallback::Replay);
+                }
+                PeerVerdict::Unavailable => {
+                    record("unavailable");
+                    anyhow::bail!("{} (standby fallback unavailable: {outcomes:?})", f.message);
+                }
+                PeerVerdict::Fresh => {}
+            }
+            if let Err(e) = standby.confirm_replicated(key, |_| true).await {
+                record("unacknowledged");
+                anyhow::bail!("{} (standby fallback: {e})", f.message);
+            }
+            if !fb.push_write_back(key.to_string()) {
+                record("overflow");
+                anyhow::bail!("{} (write-back queue full, no fallback)", f.message);
+            }
+            record("accepted");
+            warn!(network = %self.network, reason = %f.message, "WRITE replay nonce confirmed at the standby stores (hub replica acknowledgement short); written back to the hub later");
+            return Ok(HubFallback::AtStandby);
+        }
+        if self.write_wait.is_some() {
+            // Decided by the local replica wait (confirm_write_nonce).
+            return Ok(HubFallback::NeedsLocalAck);
+        }
+        anyhow::bail!(f.message)
     }
 
     /// The shared epoch from Redis, initialised atomically (SET NX) to the current Unix time
@@ -2870,6 +3201,7 @@ mod tests {
             write_wait: None,
             local_aof: None,
             write_fallback: None,
+            hub_fallback: None,
         }
     }
 

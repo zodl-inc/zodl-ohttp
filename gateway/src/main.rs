@@ -392,18 +392,21 @@ async fn main() -> anyhow::Result<()> {
                 let c = if origin.replay_standby_urls.is_empty() {
                     c
                 } else {
+                    // REPLAY_PEER_WAIT_REPLICAS also applies to the standby stores: the hub
+                    // fallback (write_fallback.rs) confirms a WRITE there synchronously.
                     let standby = cache::ReplayPeers::connect_standby(
                         &origin.replay_standby_urls,
                         network.clone(),
                         origin.replay_peer_timeout_ms,
                         origin.replay_peer_urls.len(),
                     )
-                    .await;
+                    .await
+                    .with_wait(cache::WriteWaitConfig::peer_from_env()?);
                     info!(
                         network = %network,
                         stores = standby.len(),
                         first_peer_label = standby.first_label(),
-                        "WRITE replay nonces are also replicated to the standby stores (asynchronous, never refusing a request)"
+                        "WRITE replay nonces are also replicated to the standby stores (asynchronously; synchronously in the hub path of the WRITE fallback)"
                     );
                     c.with_standby_replication(
                         standby,
@@ -2063,7 +2066,8 @@ async fn gateway_handler(
             &inner_request.method,
             &inner_request.path,
         );
-        if class == origin::RouteClass::Write {
+        // Already confirmed there synchronously (the hub fallback or window).
+        if class == origin::RouteClass::Write && !peer_check.at_standby {
             cache.replicate_write_to_standby(&body_hash);
         }
     }
