@@ -181,6 +181,12 @@ before the write-back (for example because the gateway that admitted it stopped)
 per process and in memory; a gateway that checks WRITEs only at another origin's store has no such
 window. Without peers that acknowledge on their replicas nothing changes.
 
+The same applies to an `async-reads` origin's WRITE check at the hub (its peer store): a short
+acknowledgement there is covered by the standby stores (`REPLAY_STANDBY_URLS`, `SET NX` + `WAIT`)
+or by the origin's own replica wait, the nonce is written back to the hub, and a read origin with
+standby stores checks every WRITE there as well for one nonce TTL after startup or a hub
+disruption.
+
 ## Response framing: chunks and padding
 
 Every response is a chunked OHTTP message: a response nonce, then non-final chunks of

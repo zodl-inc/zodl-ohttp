@@ -117,7 +117,7 @@ only, and `REPLAY_STANDBY_URLS`). See `docs/architecture.md`, "Multiple origins"
 | `REPLAY_ASYNC_RECOVERY_SECS` | `30` | How long replication must be healthy again before READs return to the background path. |
 | `REPLAY_ASYNC_FAILURES_BEFORE_STRICT` | `3` | Consecutive peer failures that degrade background replication. |
 | `REPLAY_PEER_WAIT_REPLICAS` | `1` | A WRITE nonce stored synchronously at a peer must reach this many replicas of that peer's store (`WAIT`) before the request runs; `0` turns it off (a peer store without replicas). |
-| `REPLAY_PEER_WAIT_MS` | `100` | `WAIT` timeout at the peer; a failed attempt is retried once. |
+| `REPLAY_PEER_WAIT_MS` | `100` | `WAIT` timeout at the peer; a failed attempt is retried once. Both settings also apply to the standby stores (`REPLAY_STANDBY_URLS`) when the hub fallback confirms a WRITE there. |
 | `REPLAY_LOCAL_WAITAOF_MS` | auto (`2000`) | Only in `async-reads` with `REPLAY_PEER_FAIL_CLOSED_WRITES=0`: a WRITE whose nonce no peer took runs only after the local security Redis has fsynced it (`WAITAOF 1 0`). Unset: on if the store answers a `WAITAOF` probe at startup, off otherwise. `0`: off. A positive value: required (startup fails without AOF), with that timeout. |
 
 ## Caches
