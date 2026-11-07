@@ -128,7 +128,10 @@ chain state:
 
 - A chain follower (one leader per network, elected through a Redis lock) polls the tip and
   keeps a height-to-hash index of recent blocks. On a reorg it walks back to the fork point and
-  deletes the affected index entries and cached blocks, nullifiers and tree states.
+  deletes the affected index entries and cached blocks, nullifiers and tree states. A
+  lightwalletd answering with a lower tip on the indexed chain is behind, not a reorg. A leader
+  whose stored tip stops moving while another process's lightwalletd is ahead is replaced by
+  that process (`CHAIN_TIP_STALE_SECS`).
 - Blocks (`GetBlockRange` per block, `GetBlock`, `GetBlockNullifiers`) are served only while
   their hash matches the index; final blocks can live in the permanent tier
   (`PERMANENT_REDIS_URL`). `GetTreeState`, mined `GetTransaction` and `GetSubtreeRoots` entries
@@ -147,7 +150,9 @@ A relay typically closes a response that stays silent for too long between bytes
 keeps long answers moving: `GetMempoolStream` ends cleanly after `LONG_POLL_MAX_INITIAL_SILENCE_SECS`
 without a first message and `LONG_POLL_IDLE_SECS` after the last one; `text/event-stream`
 answers get keep-alive comments every `SSE_KEEPALIVE_SECS`; partial data is flushed as a short
-chunk after `CHUNK_FLUSH_MS`. Every upstream call is bounded by `LWD_TIMEOUT_SECS` in total. An
+chunk after `CHUNK_FLUSH_MS`. Every upstream call is bounded by `LWD_TIMEOUT_SECS` in total, and
+a lightwalletd call by its class: an RPC with one answer by `LWD_UNARY_TIMEOUT_SECS`, a
+server-streaming RPC by `LWD_STREAM_IDLE_SECS` of silence (for the head and between frames). An
 upstream that sends no response head at all (an unresponsive backend) can still exceed a relay's
 silence limit; the client then sees the relay's error.
 
@@ -179,6 +184,8 @@ trace ids are never labels. `network` is `NETWORK`.
 | `ohttp_lwd_connect_retries_total` | - | lightwalletd calls retried after a failed connection attempt. |
 | `ohttp_lwd_reachable` | `network` | 1 while lightwalletd is reachable. |
 | `ohttp_lwd_shed_total` | `network, class` | lightwalletd calls refused because their class was at its cap. |
+| `ohttp_lwd_timeouts_total` | `network, class, phase` | lightwalletd calls cut by their deadline. `class`: `unary`, `stream`; `phase`: `head` (no response head in time), `body` (the call's overall deadline: the unary deadline, or `LWD_TIMEOUT_SECS` for a stream), `gap` (a stream silent too long). |
+| `ohttp_lwd_pool_resets_total` | `network` | Pooled lightwalletd clients replaced after a call ran into its deadline (`LWD_CONNECTION_POOL`). |
 | `ohttp_lwd_permit_waited_total` | `network, class` | Calls that waited for a permit. |
 | `ohttp_lwd_permit_wait_seconds` | `network, class` | Permit wait time (histogram). |
 | `ohttp_third_party_cache_total` | `network, authority, result` | Third-party cache `hit` / `miss`. |
@@ -195,8 +202,12 @@ trace ids are never labels. `network` is `NETWORK`.
 | `ohttp_block_cache_unvalidated_total` | `network` | Cached blocks inside the index window without an index entry (not served). |
 | `ohttp_block_cache_continuity_mismatch_total` | `network` | Cached blocks dropped because they did not chain to their neighbour. |
 | `ohttp_permanent_store_connected` | `network` | Permanent tier PING. |
+| `ohttp_permanent_store_replica` | `network` | 1 while the permanent tier store is a read-only replica (`INFO replication`, or a write refused with `READONLY`): its writes are skipped and final blocks stay in the cache tier. |
+| `ohttp_permanent_writes_skipped_total` | `network, op` | Permanent tier writes not sent to a replica. |
 | `ohttp_block_permanent_total` | `network, result` | Permanent tier `hit`, `miss`, `stored`, `promoted`, `backfilled`. |
 | `ohttp_chain_leader` | `network` | 1 while this process leads the chain follower. |
+| `ohttp_chain_tip_age_seconds` | `network` | Seconds since the leader last moved the stored tip, as this process sees it (`-1`: unknown). |
+| `ohttp_chain_stale_leader_total` | `network, action` | Times this process found the stored tip unmoved past `CHAIN_TIP_STALE_SECS` with its own lightwalletd ahead: `local_tip` (served its own tip), `takeover` (took the leader lock). |
 | `ohttp_chain_reorgs_total` | `network` | Reorgs detected. |
 | `ohttp_chain_reorg_depth` | - | Blocks invalidated per reorg (histogram). |
 | `ohttp_mempool_subscribers` | `network` | Clients subscribed to the mempool fan-out. |
@@ -204,7 +215,10 @@ trace ids are never labels. `network` is `NETWORK`.
 | `ohttp_replay_rejected_total` | `network` | Requests refused as replays. |
 | `ohttp_replay_write_wait_total` | `network, result` | WRITE nonces checked for replica acknowledgement (`REPLAY_WRITE_WAIT_REPLICAS`). |
 | `ohttp_replay_write_wait_seconds` | `network` | Time to that acknowledgement (histogram). |
-| `ohttp_replay_write_fallback_total` | `network, path, result` | WRITE nonces confirmed at the peer stores. `path`: `short_ack` (the local acknowledgement was short), `window` (`failover` mode, one nonce TTL after startup or a local store failover), `hub_short_ack` (`async-reads`: the hub's acknowledgement was short) or `hub_window` (`async-reads` with standby stores, one nonce TTL after startup or a hub disruption). `result`: `accepted`, `replay`, `unavailable`, `unacknowledged`, `overflow`. |
+| `ohttp_replay_write_fallback_total` | `network, path, result` | WRITE nonces decided at a second store. `path`: `short_ack` (the local acknowledgement was short), `local_unavailable` (the local store gave no verdict, `REPLAY_UNAVAILABLE_FALLBACK`), `hub_short_ack` / `hub_unavailable` (the same for the hub of an `async-reads` origin), `check` / `window` (`failover` mode: the check of every WRITE at the peers, `window` within one nonce TTL after startup or a local store failover), `hub_check` / `hub_window` (the same at the standby stores of an `async-reads` origin). `result`: `accepted`, `replay`, `unavailable`, `unacknowledged`, `overflow`. |
+| `ohttp_replay_read_fallback_total` | `network, result` | READ nonces decided at the peers because the local store gave no verdict (`REPLAY_UNAVAILABLE_FALLBACK`). |
+| `ohttp_replay_fallback_check` | `network` | 1 when every WRITE this gateway admits is also checked at a fallback store synchronously; `REPLAY_UNAVAILABLE_FALLBACK` is safe only while every gateway with peers reports 1. |
+| `ohttp_replay_unavailable_fallback` | `network, target` | 1 for the store the unavailable fallback replaces on this gateway (`local`, `standby`, `local_replicas`); all 0 when off. |
 | `ohttp_replay_write_back_total` | `network, result` | Nonces admitted through the peers rewritten to the local store: `written` (acknowledged by its replicas) or `expired`. |
 | `ohttp_replay_write_back_pending` | `network` | Such nonces still waiting for the local replicas. |
 | `ohttp_key_config_info` | `network, fingerprint, signing_key_id` | Always 1: first 16 hex of SHA-256 of `/ohttp-configs` and the signing key id. |

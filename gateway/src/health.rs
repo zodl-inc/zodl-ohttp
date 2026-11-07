@@ -500,8 +500,21 @@ pub fn init_metrics() {
         &*OHTTP_STORE_RECONNECT_TOTAL,
         &*OHTTP_REPLAY_WRITE_FALLBACK_TOTAL,
         &*OHTTP_REPLAY_WRITE_BACK_TOTAL,
+        &*OHTTP_REPLAY_READ_FALLBACK_TOTAL,
+        &*OHTTP_CHAIN_STALE_LEADER_TOTAL,
+        &*OHTTP_PERMANENT_WRITES_SKIPPED_TOTAL,
+        &*OHTTP_LWD_TIMEOUTS_TOTAL,
+        &*OHTTP_LWD_POOL_RESETS_TOTAL,
     ] {
         REGISTRY.register(Box::new(c.clone())).ok();
+    }
+    for g in [
+        &*OHTTP_REPLAY_UNAVAILABLE_FALLBACK,
+        &*OHTTP_REPLAY_FALLBACK_CHECK,
+        &*OHTTP_CHAIN_TIP_AGE_SECONDS,
+        &*OHTTP_PERMANENT_STORE_REPLICA,
+    ] {
+        REGISTRY.register(Box::new(g.clone())).ok();
     }
     for g in [
         &*OHTTP_PERMANENT_STORE_CONNECTED,
@@ -1038,7 +1051,7 @@ lazy_static::lazy_static! {
     )
     .unwrap();
     static ref OHTTP_REPLAY_WRITE_FALLBACK_TOTAL: IntCounterVec = IntCounterVec::new(
-        Opts::new("ohttp_replay_write_fallback_total", "WRITE replay nonces confirmed at the peer stores (write_fallback.rs). path: short_ack (the local replica acknowledgement was short, e.g. a resync after a failover of the local store) or window (failover mode, after a local store failover). result: accepted (the WRITE runs), replay (a peer held the nonce: refused), unavailable (a peer did not answer: short_ack fails closed, window keeps the local verdict), unacknowledged (the peer's own replicas did not confirm: fail-closed), overflow (write-back queue full: fail-closed)"),
+        Opts::new("ohttp_replay_write_fallback_total", "WRITE replay nonces decided at a second store (write_fallback.rs). path: short_ack (the local replica acknowledgement was short, e.g. a resync after a failover of the local store), local_unavailable (the local store gave no verdict, REPLAY_UNAVAILABLE_FALLBACK), hub_short_ack / hub_unavailable (the same for the hub of an async-reads origin), window / hub_window (the check of every WRITE at the fallback store, inside the window after startup or a disruption), check / hub_check (the same check outside the window). result: accepted (the WRITE runs), replay (a store held the nonce: refused), unavailable (a store did not answer: the fallbacks fail closed, the checks keep the first verdict), unacknowledged (the store's own replicas did not confirm: fail-closed), overflow (write-back queue full: fail-closed)"),
         &["network", "path", "result"]
     )
     .unwrap();
@@ -1054,7 +1067,118 @@ lazy_static::lazy_static! {
     .unwrap();
 }
 
-/// `path`: short_ack | window; `result`: accepted | replay | unavailable | unacknowledged | overflow.
+lazy_static::lazy_static! {
+    static ref OHTTP_REPLAY_READ_FALLBACK_TOTAL: IntCounterVec = IntCounterVec::new(
+        Opts::new("ohttp_replay_read_fallback_total", "READ replay nonces decided at the peer stores because the local store gave no verdict (REPLAY_UNAVAILABLE_FALLBACK). result: accepted | replay | unavailable (fail-closed)"),
+        &["network", "result"]
+    )
+    .unwrap();
+    static ref OHTTP_REPLAY_UNAVAILABLE_FALLBACK: IntGaugeVec = IntGaugeVec::new(
+        Opts::new("ohttp_replay_unavailable_fallback", "1 when REPLAY_UNAVAILABLE_FALLBACK is in effect on this gateway; target: local (the local store's verdict), standby (the hub's verdict, confirmed at the standby stores) or local_replicas (the hub's verdict, confirmed by the local replicas)"),
+        &["network", "target"]
+    )
+    .unwrap();
+    static ref OHTTP_REPLAY_FALLBACK_CHECK: IntGaugeVec = IntGaugeVec::new(
+        Opts::new("ohttp_replay_fallback_check", "1 when every WRITE this gateway admits is also checked at a fallback store synchronously (write_fallback.rs); REPLAY_UNAVAILABLE_FALLBACK is safe only while every gateway of the network with peers reports 1"),
+        &["network"]
+    )
+    .unwrap();
+    static ref OHTTP_CHAIN_TIP_AGE_SECONDS: IntGaugeVec = IntGaugeVec::new(
+        Opts::new("ohttp_chain_tip_age_seconds", "Seconds since the chain follower's leader last moved the stored tip, as this process sees it (-1 = unknown)"),
+        &["network"]
+    )
+    .unwrap();
+    static ref OHTTP_CHAIN_STALE_LEADER_TOTAL: IntCounterVec = IntCounterVec::new(
+        Opts::new("ohttp_chain_stale_leader_total", "Times this process found the stored tip older than CHAIN_TIP_STALE_SECS while its own lightwalletd was ahead. action: local_tip (served its own lightwalletd's tip), takeover (took the leader lock)"),
+        &["network", "action"]
+    )
+    .unwrap();
+    static ref OHTTP_PERMANENT_STORE_REPLICA: IntGaugeVec = IntGaugeVec::new(
+        Opts::new("ohttp_permanent_store_replica", "1 while the permanent tier store is a read-only replica: its writes are skipped"),
+        &["network"]
+    )
+    .unwrap();
+    static ref OHTTP_PERMANENT_WRITES_SKIPPED_TOTAL: IntCounterVec = IntCounterVec::new(
+        Opts::new("ohttp_permanent_writes_skipped_total", "Permanent tier writes not sent because the store is a read-only replica"),
+        &["network", "op"]
+    )
+    .unwrap();
+    static ref OHTTP_LWD_TIMEOUTS_TOTAL: IntCounterVec = IntCounterVec::new(
+        Opts::new("ohttp_lwd_timeouts_total", "lightwalletd calls ended by a per-class deadline. class: unary | stream; phase: head (no response head in time), body (unary: the whole call), gap (stream: no frame in time)"),
+        &["network", "class", "phase"]
+    )
+    .unwrap();
+    static ref OHTTP_LWD_POOL_RESETS_TOTAL: IntCounterVec = IntCounterVec::new(
+        Opts::new("ohttp_lwd_pool_resets_total", "Times the pooled lightwalletd client (LWD_CONNECTION_POOL=1) was replaced after a call ran into its deadline, so that new calls open new connections"),
+        &["network"]
+    )
+    .unwrap();
+}
+
+/// `result`: accepted | replay | unavailable.
+pub fn record_replay_read_fallback(network: &str, result: &str) {
+    OHTTP_REPLAY_READ_FALLBACK_TOTAL
+        .with_label_values(&[network, result])
+        .inc();
+}
+
+/// The unavailable fallback's target on this gateway (None = off).
+pub fn record_replay_unavailable_fallback(network: &str, target: Option<&str>) {
+    for t in ["local", "standby", "local_replicas"] {
+        OHTTP_REPLAY_UNAVAILABLE_FALLBACK
+            .with_label_values(&[network, t])
+            .set(i64::from(target == Some(t)));
+    }
+}
+
+pub fn record_replay_fallback_check(network: &str, on: bool) {
+    OHTTP_REPLAY_FALLBACK_CHECK
+        .with_label_values(&[network])
+        .set(i64::from(on));
+}
+
+/// `age`: None = no advance time stored (an older leader, or no tip yet).
+pub fn record_chain_tip_age(network: &str, age: Option<std::time::Duration>) {
+    OHTTP_CHAIN_TIP_AGE_SECONDS
+        .with_label_values(&[network])
+        .set(age.map_or(-1, |a| a.as_secs() as i64));
+}
+
+/// `action`: local_tip | takeover.
+pub fn record_chain_stale_leader(network: &str, action: &str) {
+    OHTTP_CHAIN_STALE_LEADER_TOTAL
+        .with_label_values(&[network, action])
+        .inc();
+}
+
+pub fn record_permanent_replica(network: &str, replica: bool) {
+    OHTTP_PERMANENT_STORE_REPLICA
+        .with_label_values(&[network])
+        .set(i64::from(replica));
+}
+
+/// `op`: set | mset | del.
+pub fn record_permanent_write_skipped(network: &str, op: &str) {
+    OHTTP_PERMANENT_WRITES_SKIPPED_TOTAL
+        .with_label_values(&[network, op])
+        .inc();
+}
+
+/// `class`: unary | stream; `phase`: head | body | gap.
+pub fn record_lwd_timeout(network: &str, class: &str, phase: &str) {
+    OHTTP_LWD_TIMEOUTS_TOTAL
+        .with_label_values(&[network, class, phase])
+        .inc();
+}
+
+pub fn record_lwd_pool_reset(network: &str) {
+    OHTTP_LWD_POOL_RESETS_TOTAL
+        .with_label_values(&[network])
+        .inc();
+}
+
+/// `path`: short_ack | local_unavailable | hub_short_ack | hub_unavailable | window | check |
+/// hub_window | hub_check; `result`: accepted | replay | unavailable | unacknowledged | overflow.
 pub fn record_replay_write_fallback(network: &str, path: &str, result: &str) {
     OHTTP_REPLAY_WRITE_FALLBACK_TOTAL
         .with_label_values(&[network, path, result])

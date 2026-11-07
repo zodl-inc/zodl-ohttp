@@ -174,18 +174,33 @@ nonce the local primary took as new but whose acknowledgement came back short is
 the peer stores instead: the nonce must be new there too and acknowledged by the peer's own
 replicas (`REPLAY_PEER_WAIT_REPLICAS`), else the WRITE fails closed as before; a peer holding the
 nonce makes it a replay. The nonce is then written back to the local store until its replicas
-have it. In `failover` mode, where WRITEs are not otherwise checked at the peers, a gateway also
-checks every WRITE at the peers for one nonce TTL after it started, saw a short acknowledgement or
-had a store connection replaced, so a replay is refused even if the local store lost the nonce
-before the write-back (for example because the gateway that admitted it stopped). This state is
-per process and in memory; a gateway that checks WRITEs only at another origin's store has no such
-window. Without peers that acknowledge on their replicas nothing changes.
+have it. A replay is refused even if the local store lost the nonce before the write-back (for
+example because the gateway that admitted it stopped), because every WRITE is also checked at the
+peers (below). Without peers that acknowledge on their replicas nothing changes.
 
 The same applies to an `async-reads` origin's WRITE check at the hub (its peer store): a short
 acknowledgement there is covered by the standby stores (`REPLAY_STANDBY_URLS`, `SET NX` + `WAIT`)
-or by the origin's own replica wait, the nonce is written back to the hub, and a read origin with
-standby stores checks every WRITE there as well for one nonce TTL after startup or a hub
-disruption.
+or by the origin's own replica wait, and the nonce is written back to the hub.
+
+Every WRITE that the deciding store (the local store in `failover` mode, the hub in
+`async-reads`) admitted is also `SET NX` synchronously at the fallback store (the peers, or a read
+origin's standby stores), and a nonce held there is a replay; an unreachable fallback store keeps
+the first verdict. With `REPLAY_UNAVAILABLE_FALLBACK` a deciding store that gives no verdict at
+all (unreachable, a timeout, an error) is replaced by the fallback store, under the same rules:
+new and acknowledged there runs, held there is a replay, anything else fails closed, and a WRITE
+nonce is written back. A `failover`-mode gateway decides READs that way too (`SET NX` at the
+peers, not written back: a replayed READ changes nothing), after decapsulating the request to
+classify it. A request refused or failed closed after its nonce was stored stays refused for
+those exact bytes; a client seals every attempt afresh, so its retry is a new nonce.
+
+Why the check of every WRITE: two gateways run the same WRITE only if each found its nonce new at
+a store the other did not ask. Every gateway asks every store it reaches, the deciding store is
+replaced only by the fallback store, and `SET NX` on one store admits a key once, so that takes a
+gateway that reached only the deciding store and another that reached only the fallback store at
+the same time: two failures at once. A nonce admitted at one store only reaches the other by the
+write-back or the background hand-off as soon as it is reachable. The guarantee needs the check on
+every gateway that asks the deciding store (gauge `ohttp_replay_fallback_check`, with the settings
+of the WRITE fallback), so the fallback stays off until all of them report it.
 
 ## Response framing: chunks and padding
 

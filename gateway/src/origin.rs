@@ -72,6 +72,15 @@
 //!   standby (a read origin in `async-reads` checking WRITEs at the primary origin's store):
 //!   without it, a WRITE admitted there within the nonce TTL before the primary origin is lost
 //!   is unknown to the standby.
+//! - `REPLAY_UNAVAILABLE_FALLBACK` (default false): when the store that normally decides a
+//!   request gives no verdict at all (unreachable, a timeout, an error), decide it at the
+//!   fallback store instead of failing closed (`write_fallback.rs`, "Unavailable store"): a
+//!   `failover`-mode origin whose own store is down decides at its peers (READs `SET NX`,
+//!   WRITEs `SET NX` + the peers' `WAIT`); an `async-reads` origin whose hub is down confirms
+//!   WRITEs at its standby stores, or by its own replicas when its own store is the fallback
+//!   store. Every gateway that checks at the same stores must run a version that checks every
+//!   WRITE at the fallback store (`write_fallback.rs`, "Check at the fallback store") before
+//!   any of them turns this on.
 //! - `REPLAY_READ_ROUTES`: the READ allowlist for `async-reads`, in the `BACKENDS_POLICY`
 //!   syntax (`authority=METHOD /path,...;authority2=...`; `/*` suffix = segment-bounded prefix,
 //!   `*` method = any). The pseudo-authority `lwd` stands for the gateway's own lightwalletd (any
@@ -349,6 +358,8 @@ pub struct OriginSettings {
     pub replay_async_failures_before_strict: usize,
     /// `REPLAY_READ_ROUTES` (parsed; the default list when unset).
     pub replay_read_routes: ReadRoutes,
+    /// `REPLAY_UNAVAILABLE_FALLBACK` (default false).
+    pub replay_unavailable_fallback: bool,
 }
 
 /// The raw environment of `OriginSettings::parse_env`, so tests can build it without `set_var`.
@@ -365,6 +376,7 @@ pub struct RawOriginEnv<'a> {
     pub async_recovery_secs: Option<&'a str>,
     pub async_failures_before_strict: Option<&'a str>,
     pub read_routes: Option<&'a str>,
+    pub unavailable_fallback: Option<&'a str>,
 }
 
 impl OriginSettings {
@@ -382,6 +394,7 @@ impl OriginSettings {
             async_recovery_secs,
             async_failures_before_strict,
             read_routes,
+            unavailable_fallback,
         ) = (
             get("ORIGIN_ID"),
             get("REPLAY_PEER_URLS"),
@@ -394,6 +407,7 @@ impl OriginSettings {
             get("REPLAY_ASYNC_RECOVERY_SECS"),
             get("REPLAY_ASYNC_FAILURES_BEFORE_STRICT"),
             get("REPLAY_READ_ROUTES"),
+            get("REPLAY_UNAVAILABLE_FALLBACK"),
         );
         Self::parse_env(RawOriginEnv {
             origin_id: origin_id.as_deref(),
@@ -407,6 +421,7 @@ impl OriginSettings {
             async_recovery_secs: async_recovery_secs.as_deref(),
             async_failures_before_strict: async_failures_before_strict.as_deref(),
             read_routes: read_routes.as_deref(),
+            unavailable_fallback: unavailable_fallback.as_deref(),
         })
     }
 
@@ -474,6 +489,7 @@ impl OriginSettings {
         let replay_peer_fail_closed_writes = parse_flag(raw.peer_fail_closed_writes, true);
         let replay_peer_mode = ReplayPeerMode::parse(raw.peer_mode.unwrap_or_default())?;
         let replay_read_routes = ReadRoutes::parse(raw.read_routes.unwrap_or_default())?;
+        let replay_unavailable_fallback = parse_flag(raw.unavailable_fallback, false);
 
         Ok(Self {
             origin_id,
@@ -487,6 +503,7 @@ impl OriginSettings {
             replay_async_recovery_secs,
             replay_async_failures_before_strict,
             replay_read_routes,
+            replay_unavailable_fallback,
         })
     }
 
@@ -1028,6 +1045,7 @@ pay.example=GET /*";
                 replay_async_recovery_secs: DEFAULT_REPLAY_ASYNC_RECOVERY_SECS,
                 replay_async_failures_before_strict: DEFAULT_REPLAY_ASYNC_FAILURES_BEFORE_STRICT,
                 replay_read_routes: ReadRoutes::default_list(),
+                replay_unavailable_fallback: false,
             }
         }
     }
