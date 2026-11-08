@@ -856,6 +856,7 @@ async fn primary_origin_stays_healthy_while_the_peer_decides_for_its_unreachable
             is_security_redis_connected(net),
             is_replay_serving_via_fallback(net),
             true,
+            true,
         )
     };
     primary.ping_redis().await;
@@ -934,6 +935,7 @@ async fn without_the_setting_an_unreachable_store_still_fails_healthz() {
     assert!(!healthz_ok(
         is_security_redis_connected(net),
         is_replay_serving_via_fallback(net),
+        true,
         true
     ));
 }

@@ -56,6 +56,7 @@ mod health;
 mod hpke;
 mod local;
 mod lwd;
+mod lwd_endpoints;
 mod mempool;
 mod ohttp;
 mod ohttp_chunked;
@@ -103,6 +104,21 @@ async fn main() -> anyhow::Result<()> {
     info!(mode = %padding_mode, "Response padding");
     let lwd_deadlines = lwd::LwdDeadlines::from_env()?;
     lwd::init_deadlines(lwd_deadlines);
+    let lwd_transport = lwd_endpoints::Settings::from_env(&config.lwd_addr)?;
+    info!(
+        endpoints = lwd_transport.endpoints.as_deref().unwrap_or("-"),
+        connect_timeout_ms = lwd_transport.connect_timeout.as_millis() as u64,
+        "lightwalletd instances (LWD_ENDPOINTS, LWD_CONNECT_TIMEOUT_MS)"
+    );
+    lwd_endpoints::init(lwd_transport);
+    let lwd_error_policy = health::LwdErrorPolicy::from_env()?;
+    info!(
+        ratio = lwd_error_policy.ratio,
+        window_secs = lwd_error_policy.window.as_secs(),
+        min_errors = lwd_error_policy.min_errors,
+        "/healthz lightwalletd error window (HEALTHZ_LWD_ERROR_RATIO, HEALTHZ_LWD_ERROR_WINDOW_SECS, HEALTHZ_LWD_MIN_ERRORS)"
+    );
+    health::init_lwd_error_policy(lwd_error_policy);
     info!(
         unary_secs = lwd_deadlines.unary.as_secs(),
         stream_idle_secs = lwd_deadlines.stream_idle.as_secs(),
@@ -811,13 +827,15 @@ async fn main() -> anyhow::Result<()> {
     /// GET /healthz — the public, unauthenticated probe for a load balancer in front of several
     /// origins (load balancer health monitor). 200 "ok" while this origin can answer OHTTP requests:
     /// replay protection works (the security Redis answered the last PING, or it did not and the
-    /// peer stores decide in its place: `ohttp_replay_serving_via_fallback`) and lightwalletd is
-    /// reachable; else 503 "unavailable". Reads gauges, no I/O, no mode/network/origin in the body.
+    /// peer stores decide in its place: `ohttp_replay_serving_via_fallback`), lightwalletd is
+    /// reachable and recent lightwalletd calls did not fail too often (`health::LwdErrorPolicy`);
+    /// else 503 "unavailable". Reads gauges, no I/O, no mode/network/origin in the body.
     async fn healthz_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         let ok = health::healthz_ok(
             health::is_security_redis_connected(&state.config.network),
             health::is_replay_serving_via_fallback(&state.config.network),
             health::is_lwd_healthy(&state.config.network),
+            health::lwd_errors_ok(&state.config.network),
         );
         let status = if ok {
             StatusCode::OK

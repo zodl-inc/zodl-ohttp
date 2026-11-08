@@ -27,10 +27,7 @@ use axum::{body::Bytes, extract::State, http::StatusCode, response::IntoResponse
 use http_body_util::{BodyExt, Full};
 use hyper::Request;
 use hyper_tls::HttpsConnector;
-use hyper_util::{
-    client::legacy::{connect::HttpConnector, Client},
-    rt::TokioExecutor,
-};
+use hyper_util::{client::legacy::Client, rt::TokioExecutor};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -1098,13 +1095,19 @@ async fn forward_to_backend_internal(
             .map_err(|_| anyhow!("Backend did not respond within {:?}", overall))?
             .map_err(|e| anyhow!("HTTPS request failed: {:?}", e))?
     } else {
-        let client: Client<HttpConnector, Full<Bytes>> = Client::builder(TokioExecutor::new())
-            .http2_only(true)
-            .build_http();
-        timeout(overall, crate::lwd::request(&client, http_request))
-            .await
-            .map_err(|_| anyhow!("LWD did not respond within {:?}", overall))?
-            .map_err(|e| anyhow!("HTTP request failed: {:?}", e))?
+        let call = crate::lwd_endpoints::CallOpts {
+            network: &config.network,
+            head: overall,
+            class: None,
+            pooled: false,
+        };
+        match crate::lwd_endpoints::request(http_request, call).await {
+            Ok(r) => r,
+            Err(crate::lwd_endpoints::RequestError::Timeout) => {
+                return Err(anyhow!("LWD did not respond within {:?}", overall))
+            }
+            Err(e) => return Err(anyhow!("HTTP request failed: {:?}", e)),
+        }
     };
 
     let mut status = http_response.status().as_u16();
@@ -1661,13 +1664,19 @@ pub async fn forward_to_backend_stream(
             .map_err(|_| anyhow!("Backend did not respond within {:?}", overall))?
             .map_err(|e| anyhow!("HTTPS request failed: {:?}", e))?
     } else {
-        let client: Client<HttpConnector, Full<Bytes>> = Client::builder(TokioExecutor::new())
-            .http2_only(true)
-            .build_http();
-        timeout(overall, crate::lwd::request(&client, http_request))
-            .await
-            .map_err(|_| anyhow!("LWD did not respond within {:?}", overall))?
-            .map_err(|e| anyhow!("HTTP request failed: {:?}", e))?
+        let call = crate::lwd_endpoints::CallOpts {
+            network: &config.network,
+            head: overall,
+            class: None,
+            pooled: false,
+        };
+        match crate::lwd_endpoints::request(http_request, call).await {
+            Ok(r) => r,
+            Err(crate::lwd_endpoints::RequestError::Timeout) => {
+                return Err(anyhow!("LWD did not respond within {:?}", overall))
+            }
+            Err(e) => return Err(anyhow!("HTTP request failed: {:?}", e)),
+        }
     };
 
     let status = http_response.status().as_u16();
