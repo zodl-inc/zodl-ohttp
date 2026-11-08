@@ -7,6 +7,15 @@ keeps its own log in [client/CHANGELOG.md](client/CHANGELOG.md).
 
 ### Gateway
 
+- `REPLAY_UNAVAILABLE_FALLBACK` on an `async-reads` origin whose own store is the fallback store
+  (no standby stores, `REPLAY_WRITE_WAIT_REPLICAS`, peers with `REPLAY_PEER_WAIT_REPLICAS` >= 1):
+  while its own store gives no verdict (a promotion, a cut), requests are decided at the hub
+  instead of failing closed, as a `failover`-mode gateway does at its peers: READs by `SET NX`,
+  WRITEs by `SET NX` + the hub's `WAIT`, a nonce held there is a replay, anything else fails
+  closed, and a WRITE nonce is written back to the own store once it answers. `/healthz` stays up
+  meanwhile while the hub answers (`ohttp_replay_serving_via_fallback`). This also holds with
+  `REPLAY_PEER_FAIL_CLOSED_WRITES=0`: an unreachable hub is tolerated there, an unreachable own
+  store is not. New gauge `ohttp_replay_local_fallback`.
 - lightwalletd calls: a connection must be established within `LWD_CONNECT_TIMEOUT_MS` (default
   2000), so an instance whose network is cut costs a connect error instead of the call's whole
   deadline. A read (every lightwalletd RPC except `SendTransaction`) that got a transport error or
