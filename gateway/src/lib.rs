@@ -24,6 +24,7 @@ pub mod freshness;
 pub mod health;
 pub mod hpke;
 pub mod lwd;
+pub mod lwd_endpoints;
 pub mod ohttp;
 pub mod padding;
 pub mod proxy;

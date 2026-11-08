@@ -505,6 +505,7 @@ pub fn init_metrics() {
         &*OHTTP_PERMANENT_WRITES_SKIPPED_TOTAL,
         &*OHTTP_LWD_TIMEOUTS_TOTAL,
         &*OHTTP_LWD_POOL_RESETS_TOTAL,
+        &*OHTTP_LWD_READ_RETRIES_TOTAL,
     ] {
         REGISTRY.register(Box::new(c.clone())).ok();
     }
@@ -517,6 +518,9 @@ pub fn init_metrics() {
     ] {
         REGISTRY.register(Box::new(g.clone())).ok();
     }
+    REGISTRY
+        .register(Box::new(OHTTP_HEALTHZ_LWD_ERROR_RATIO.clone()))
+        .ok();
     for g in [
         &*OHTTP_PERMANENT_STORE_CONNECTED,
         &*OHTTP_ORIGIN_INFO,
@@ -1042,8 +1046,197 @@ pub fn record_replay_class(network: &str, class: &str) {
 /// is a 503) and lightwalletd (else every uncached RPC is a 502). Replay protection is the
 /// security Redis, or, while that does not answer, the peer stores that decide in its place
 /// (`via_fallback`, `ohttp_replay_serving_via_fallback`). Pure so that it is testable.
-pub fn healthz_ok(security_redis_ok: bool, via_fallback: bool, lwd_ok: bool) -> bool {
-    (security_redis_ok || via_fallback) && lwd_ok
+pub fn healthz_ok(
+    security_redis_ok: bool,
+    via_fallback: bool,
+    lwd_ok: bool,
+    lwd_errors_ok: bool,
+) -> bool {
+    (security_redis_ok || via_fallback) && lwd_ok && lwd_errors_ok
+}
+
+/// When the outcome of recent lightwalletd calls fails `/healthz` (`HEALTHZ_LWD_ERROR_RATIO`,
+/// `HEALTHZ_LWD_ERROR_WINDOW_SECS`, `HEALTHZ_LWD_MIN_ERRORS`): over the last `window`, at least
+/// `min_errors` calls failed and failed calls are at least `ratio` of all calls. A call failed
+/// when it got no response head after its retry (connect error, transport error, deadline);
+/// gRPC errors that lightwalletd answers do not count.
+///
+/// `ohttp_lwd_reachable` only follows the chain follower's probe, so a lightwalletd that answers
+/// some connections and not others (one of several instances unreachable from here) kept
+/// `/healthz` up while a share of the calls failed; this sends a load balancer to another origin
+/// in that case. `ratio` 0 turns it off.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LwdErrorPolicy {
+    pub ratio: f64,
+    pub window: std::time::Duration,
+    pub min_errors: u64,
+}
+
+pub const DEFAULT_HEALTHZ_LWD_ERROR_RATIO: f64 = 0.2;
+pub const DEFAULT_HEALTHZ_LWD_ERROR_WINDOW_SECS: u64 = 30;
+pub const DEFAULT_HEALTHZ_LWD_MIN_ERRORS: u64 = 5;
+
+impl Default for LwdErrorPolicy {
+    fn default() -> Self {
+        Self {
+            ratio: DEFAULT_HEALTHZ_LWD_ERROR_RATIO,
+            window: std::time::Duration::from_secs(DEFAULT_HEALTHZ_LWD_ERROR_WINDOW_SECS),
+            min_errors: DEFAULT_HEALTHZ_LWD_MIN_ERRORS,
+        }
+    }
+}
+
+impl LwdErrorPolicy {
+    pub fn parse(
+        ratio: Option<&str>,
+        window_secs: Option<&str>,
+        min_errors: Option<&str>,
+    ) -> anyhow::Result<Self> {
+        fn set(v: Option<&str>) -> Option<&str> {
+            v.map(str::trim).filter(|v| !v.is_empty())
+        }
+        let ratio = match set(ratio) {
+            None => DEFAULT_HEALTHZ_LWD_ERROR_RATIO,
+            Some(v) => match v.parse::<f64>() {
+                Ok(r) if (0.0..=1.0).contains(&r) => r,
+                _ => anyhow::bail!("HEALTHZ_LWD_ERROR_RATIO must be between 0 and 1, got '{v}'"),
+            },
+        };
+        let window = match set(window_secs) {
+            None => DEFAULT_HEALTHZ_LWD_ERROR_WINDOW_SECS,
+            Some(v) => match v.parse::<u64>() {
+                Ok(n) if (1..=600).contains(&n) => n,
+                _ => anyhow::bail!(
+                    "HEALTHZ_LWD_ERROR_WINDOW_SECS must be an integer from 1 to 600, got '{v}'"
+                ),
+            },
+        };
+        let min_errors = match set(min_errors) {
+            None => DEFAULT_HEALTHZ_LWD_MIN_ERRORS,
+            Some(v) => match v.parse::<u64>() {
+                Ok(n) if n > 0 => n,
+                _ => anyhow::bail!("HEALTHZ_LWD_MIN_ERRORS must be a positive integer, got '{v}'"),
+            },
+        };
+        Ok(Self {
+            ratio,
+            window: std::time::Duration::from_secs(window),
+            min_errors,
+        })
+    }
+
+    pub fn from_env() -> anyhow::Result<Self> {
+        Self::parse(
+            std::env::var("HEALTHZ_LWD_ERROR_RATIO").ok().as_deref(),
+            std::env::var("HEALTHZ_LWD_ERROR_WINDOW_SECS")
+                .ok()
+                .as_deref(),
+            std::env::var("HEALTHZ_LWD_MIN_ERRORS").ok().as_deref(),
+        )
+    }
+
+    /// The verdict for `ok` and `failed` calls in the window (pure, for tests).
+    pub fn healthy(&self, ok: u64, failed: u64) -> bool {
+        if self.ratio <= 0.0 || failed < self.min_errors {
+            return true;
+        }
+        (failed as f64) / ((ok + failed) as f64) < self.ratio
+    }
+}
+
+static LWD_ERROR_POLICY: std::sync::OnceLock<LwdErrorPolicy> = std::sync::OnceLock::new();
+
+/// Set once at startup (main); later calls are ignored (the defaults apply without it).
+pub fn init_lwd_error_policy(p: LwdErrorPolicy) {
+    let _ = LWD_ERROR_POLICY.set(p);
+}
+
+fn lwd_error_policy() -> LwdErrorPolicy {
+    LWD_ERROR_POLICY.get().copied().unwrap_or_default()
+}
+
+/// Per-second counts of lightwalletd call outcomes, the last 600 s at most.
+#[derive(Default)]
+pub struct CallWindow {
+    /// (second, ok, failed), oldest first.
+    buckets: std::collections::VecDeque<(u64, u64, u64)>,
+}
+
+impl CallWindow {
+    pub fn record(&mut self, now_sec: u64, ok: bool) {
+        match self.buckets.back_mut() {
+            Some((sec, o, f)) if *sec == now_sec => {
+                if ok {
+                    *o += 1
+                } else {
+                    *f += 1
+                }
+            }
+            _ => self
+                .buckets
+                .push_back((now_sec, u64::from(ok), u64::from(!ok))),
+        }
+        while self
+            .buckets
+            .front()
+            .is_some_and(|(sec, _, _)| now_sec.saturating_sub(*sec) >= 600)
+        {
+            self.buckets.pop_front();
+        }
+    }
+
+    /// (ok, failed) over the `window_secs` seconds up to `now_sec`.
+    pub fn totals(&self, now_sec: u64, window_secs: u64) -> (u64, u64) {
+        self.buckets
+            .iter()
+            .filter(|(sec, _, _)| now_sec.saturating_sub(*sec) < window_secs)
+            .fold((0, 0), |(o, f), (_, bo, bf)| (o + bo, f + bf))
+    }
+}
+
+static LWD_CALLS: std::sync::LazyLock<
+    parking_lot::Mutex<std::collections::HashMap<String, CallWindow>>,
+> = std::sync::LazyLock::new(Default::default);
+static LWD_CALLS_EPOCH: std::sync::LazyLock<std::time::Instant> =
+    std::sync::LazyLock::new(std::time::Instant::now);
+
+fn lwd_calls_now() -> u64 {
+    LWD_CALLS_EPOCH.elapsed().as_secs()
+}
+
+/// The outcome of one call to the own lightwalletd, after its retry (lwd_endpoints::request).
+pub fn record_lwd_call(network: &str, ok: bool) {
+    let now = lwd_calls_now();
+    LWD_CALLS
+        .lock()
+        .entry(network.to_string())
+        .or_default()
+        .record(now, ok);
+}
+
+/// Whether recent lightwalletd calls allow `/healthz` to be healthy ([`LwdErrorPolicy`]);
+/// sets `ohttp_healthz_lwd_error_ratio`.
+pub fn lwd_errors_ok(network: &str) -> bool {
+    let policy = lwd_error_policy();
+    let (ok, failed) = LWD_CALLS.lock().get(network).map_or((0, 0), |w| {
+        w.totals(lwd_calls_now(), policy.window.as_secs())
+    });
+    let ratio = if failed < policy.min_errors {
+        -1.0
+    } else {
+        failed as f64 / (ok + failed) as f64
+    };
+    OHTTP_HEALTHZ_LWD_ERROR_RATIO
+        .with_label_values(&[network])
+        .set(ratio);
+    policy.healthy(ok, failed)
+}
+
+/// `reason`: timeout | error.
+pub fn record_lwd_read_retry(network: &str, reason: &str) {
+    OHTTP_LWD_READ_RETRIES_TOTAL
+        .with_label_values(&[network, reason])
+        .inc();
 }
 
 lazy_static::lazy_static! {
@@ -1112,8 +1305,18 @@ lazy_static::lazy_static! {
     )
     .unwrap();
     static ref OHTTP_LWD_TIMEOUTS_TOTAL: IntCounterVec = IntCounterVec::new(
-        Opts::new("ohttp_lwd_timeouts_total", "lightwalletd calls ended by a per-class deadline. class: unary | stream; phase: head (no response head in time), body (unary: the whole call), gap (stream: no frame in time)"),
+        Opts::new("ohttp_lwd_timeouts_total", "lightwalletd call attempts ended by a per-class deadline (a read retried on another attempt counts each attempt). class: unary | stream; phase: head (no response head in time), body (unary: the whole call), gap (stream: no frame in time)"),
         &["network", "class", "phase"]
+    )
+    .unwrap();
+    static ref OHTTP_LWD_READ_RETRIES_TOTAL: IntCounterVec = IntCounterVec::new(
+        Opts::new("ohttp_lwd_read_retries_total", "Idempotent lightwalletd calls sent a second time (to another instance when LWD_ENDPOINTS has one) because the first attempt got no response head. reason: timeout (half of the head deadline passed) | error (transport error)"),
+        &["network", "reason"]
+    )
+    .unwrap();
+    static ref OHTTP_HEALTHZ_LWD_ERROR_RATIO: prometheus::GaugeVec = prometheus::GaugeVec::new(
+        Opts::new("ohttp_healthz_lwd_error_ratio", "Share of calls to lightwalletd that failed (no answer after the retry) in the /healthz error window, at the last /healthz; -1 below HEALTHZ_LWD_MIN_ERRORS failures"),
+        &["network"]
     )
     .unwrap();
     static ref OHTTP_LWD_POOL_RESETS_TOTAL: IntCounterVec = IntCounterVec::new(
@@ -1691,24 +1894,83 @@ mod multi_origin_tests {
 
     #[test]
     fn healthz_needs_replay_store_and_lightwalletd() {
-        assert!(healthz_ok(true, false, true));
+        assert!(healthz_ok(true, false, true, true));
         assert!(
-            !healthz_ok(false, false, true),
+            !healthz_ok(false, false, true, true),
             "no replay store: every request is a 503"
         );
         assert!(
-            !healthz_ok(true, false, false),
+            !healthz_ok(true, false, false, true),
             "no lightwalletd: every uncached RPC is a 502"
         );
-        assert!(!healthz_ok(false, false, false));
+        assert!(!healthz_ok(false, false, false, true));
         assert!(
-            healthz_ok(false, true, true),
+            healthz_ok(false, true, true, true),
             "replay store down, peer stores decide: still serving"
         );
         assert!(
-            !healthz_ok(false, true, false),
+            !healthz_ok(false, true, false, true),
             "the fallback does not replace lightwalletd"
         );
+        assert!(
+            !healthz_ok(false, true, true, false),
+            "too many failed lightwalletd calls fail it also while the fallback works"
+        );
+        assert!(!healthz_ok(true, false, true, false));
+    }
+
+    #[test]
+    fn lwd_error_policy_parse_and_verdict() {
+        let d = LwdErrorPolicy::parse(None, None, None).unwrap();
+        assert_eq!(d, LwdErrorPolicy::default());
+        let p = LwdErrorPolicy::parse(Some("0.5"), Some("10"), Some("3")).unwrap();
+        assert_eq!(p.window, std::time::Duration::from_secs(10));
+        assert_eq!(p.min_errors, 3);
+        assert!(LwdErrorPolicy::parse(Some("1.5"), None, None).is_err());
+        assert!(LwdErrorPolicy::parse(Some("x"), None, None).is_err());
+        assert!(LwdErrorPolicy::parse(None, Some("0"), None).is_err());
+        assert!(LwdErrorPolicy::parse(None, Some("601"), None).is_err());
+        assert!(LwdErrorPolicy::parse(None, None, Some("0")).is_err());
+
+        // Default: 20 % of the calls, at least 5 failures.
+        assert!(d.healthy(0, 0));
+        assert!(d.healthy(0, 4), "below the minimum number of failures");
+        assert!(!d.healthy(0, 5));
+        assert!(!d.healthy(20, 5), "5 of 25 = 20 %");
+        assert!(d.healthy(21, 5));
+        // Ratio 0: off.
+        let off = LwdErrorPolicy::parse(Some("0"), None, None).unwrap();
+        assert!(off.healthy(0, 1000));
+    }
+
+    #[test]
+    fn call_window_counts_only_the_window() {
+        let mut w = CallWindow::default();
+        for sec in 0..10 {
+            w.record(sec, true);
+            w.record(sec, sec % 2 == 0);
+        }
+        assert_eq!(w.totals(9, 30), (15, 5));
+        assert_eq!(w.totals(9, 2), (3, 1), "seconds 8 and 9");
+        assert_eq!(w.totals(100, 30), (0, 0), "all older than the window");
+        // Old buckets are dropped after 600 s.
+        w.record(700, false);
+        assert_eq!(w.totals(700, 600), (0, 1));
+    }
+
+    #[test]
+    fn failed_calls_fail_healthz_until_they_age_out() {
+        let net = "test-lwd-errors";
+        assert!(lwd_errors_ok(net));
+        for _ in 0..5 {
+            record_lwd_call(net, false);
+        }
+        record_lwd_call(net, true);
+        assert!(!lwd_errors_ok(net), "5 of 6 calls failed");
+        for _ in 0..30 {
+            record_lwd_call(net, true);
+        }
+        assert!(lwd_errors_ok(net), "5 of 36 is below 20 %");
     }
 
     #[test]

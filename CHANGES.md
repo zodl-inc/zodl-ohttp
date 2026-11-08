@@ -7,6 +7,18 @@ keeps its own log in [client/CHANGELOG.md](client/CHANGELOG.md).
 
 ### Gateway
 
+- lightwalletd calls: a connection must be established within `LWD_CONNECT_TIMEOUT_MS` (default
+  2000), so an instance whose network is cut costs a connect error instead of the call's whole
+  deadline. A read (every lightwalletd RPC except `SendTransaction`) that got a transport error or
+  no response head within half of its head deadline (not `GetMempoolStream` and the
+  transparent-address RPCs) is sent once more; a `SendTransaction` is
+  retried only after a connect error, as before. Optional `LWD_ENDPOINTS` (a name that resolves to
+  one address per instance) lets the gateway pick the instance itself: random among those that
+  did not fail in the last 30 s, the retry on another one. New series
+  `ohttp_lwd_read_retries_total`.
+- `/healthz` also fails while too many lightwalletd calls fail (`HEALTHZ_LWD_ERROR_RATIO`, default
+  0.2 of the calls in `HEALTHZ_LWD_ERROR_WINDOW_SECS` 30, at least `HEALTHZ_LWD_MIN_ERRORS` 5), also
+  while the replay fallback keeps it up otherwise. New series `ohttp_healthz_lwd_error_ratio`.
 - Every WRITE is checked at the fallback store. Where the WRITE fallback exists (`failover` mode
   with peers that acknowledge on their replicas; `async-reads` with standby stores that do), the
   nonce of every WRITE admitted by the deciding store is also `SET NX` at the fallback store

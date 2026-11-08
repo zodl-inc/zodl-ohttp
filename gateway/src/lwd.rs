@@ -38,7 +38,7 @@ const GRPC_CONTENT_TYPE: &str = "application/grpc";
 /// opens its own connection: behind a load-balanced service address that spreads connections over
 /// several lightwalletd instances, a new call does not reuse a connection to an instance that has
 /// already been taken out of service, which keeps failed calls during rolling restarts rare (the
-/// connect retry of [`request`] covers an address that is joining or leaving).
+/// connect retry of [`crate::lwd_endpoints::request`] covers an address that is joining or leaving).
 ///
 /// `LWD_CONNECTION_POOL=1` shares one pooled client instead (idle connections kept 60 s, HTTP/2
 /// PINGs every 20 s, a connection whose PING is not answered within 5 s is closed), which saves
@@ -50,9 +50,7 @@ const GRPC_CONTENT_TYPE: &str = "application/grpc";
 pub(crate) fn lwd_client() -> Client<HttpConnector, Full<axum::body::Bytes>> {
     match pooled() {
         Some(client) => (**client.load()).clone(),
-        None => Client::builder(TokioExecutor::new())
-            .http2_only(true)
-            .build_http(),
+        None => crate::lwd_endpoints::fresh_client(),
     }
 }
 
@@ -77,7 +75,7 @@ fn new_pooled_client() -> LwdClient {
         .http2_keep_alive_interval(Duration::from_secs(20))
         .http2_keep_alive_timeout(Duration::from_secs(5))
         .http2_keep_alive_while_idle(true)
-        .build_http()
+        .build(crate::lwd_endpoints::connector())
 }
 
 /// Shortest time between two replacements of the pooled client.
@@ -86,7 +84,7 @@ const POOL_RESET_MIN_INTERVAL: Duration = Duration::from_secs(5);
 /// A call ran into its deadline: replace the pooled client (no-op without the pool), so that
 /// new calls open new connections instead of queueing on one to an instance that may hang.
 /// Calls in flight keep their connection. At most once per [`POOL_RESET_MIN_INTERVAL`].
-fn reset_pool(network: &str) {
+pub(crate) fn reset_pool(network: &str) {
     static LAST: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
     let Some(pool) = pooled() else { return };
     let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
@@ -209,34 +207,6 @@ fn is_address_rpc(path: &str) -> bool {
         .is_some_and(|m| LWD_ADDRESS_RPCS.contains(&m))
 }
 
-/// Pause before the one retry of [`request`].
-const CONNECT_RETRY_DELAY: Duration = Duration::from_millis(50);
-
-/// Send `req` to lightwalletd, once more if the connection could not be established. A connect
-/// error means no byte of the request reached lightwalletd, so the retry cannot execute anything
-/// twice (WRITE requests included). It covers the moment a lightwalletd instance joins or leaves
-/// a load-balanced service address during a rollout, when a connection can land on an address that
-/// does not accept yet or any more.
-pub(crate) async fn request(
-    client: &Client<HttpConnector, Full<axum::body::Bytes>>,
-    req: Request<Full<axum::body::Bytes>>,
-) -> Result<hyper::Response<hyper::body::Incoming>, hyper_util::client::legacy::Error> {
-    let mut again = Request::new(req.body().clone());
-    *again.method_mut() = req.method().clone();
-    *again.uri_mut() = req.uri().clone();
-    *again.version_mut() = req.version();
-    *again.headers_mut() = req.headers().clone();
-    match client.request(req).await {
-        Err(e) if e.is_connect() => {
-            tracing::warn!(error = %e, "lightwalletd connect failed, retrying once");
-            crate::health::record_lwd_connect_retry();
-            tokio::time::sleep(CONNECT_RETRY_DELAY).await;
-            client.request(again).await
-        }
-        other => other,
-    }
-}
-
 fn grpc_wrap(body: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(5 + body.len());
     out.push(0u8);
@@ -261,8 +231,6 @@ pub fn lwd_uri(addr: &str, path: &str) -> Result<hyper::Uri> {
 
 async fn call_lwd(config: &Config, path: &str, body: Vec<u8>) -> Result<InnerResponse> {
     use axum::body::Bytes;
-    let client: Client<HttpConnector, Full<Bytes>> = lwd_client();
-
     // The gateway's own call: a fresh request id for lightwalletd's logs.
     let request_id = uuid::Uuid::new_v4().to_string();
     let req = Request::builder()
@@ -279,13 +247,16 @@ async fn call_lwd(config: &Config, path: &str, body: Vec<u8>) -> Result<InnerRes
     let overall = Duration::from_secs(config.lwd_timeout_secs).min(deadlines().unary);
     let deadline = Instant::now() + overall;
 
-    let resp = match timeout(overall, request(&client, req)).await {
-        Ok(r) => r.map_err(|e| anyhow!("HTTP: {e}"))?,
-        Err(_) => {
-            crate::health::record_lwd_timeout(&config.network, "unary", "head");
-            reset_pool(&config.network);
-            return Err(anyhow!("LWD timeout"));
-        }
+    let opts = crate::lwd_endpoints::CallOpts {
+        network: &config.network,
+        head: overall,
+        class: Some("unary"),
+        pooled: pooled().is_some(),
+    };
+    let resp = match crate::lwd_endpoints::request(req, opts).await {
+        Ok(r) => r,
+        Err(crate::lwd_endpoints::RequestError::Timeout) => return Err(anyhow!("LWD timeout")),
+        Err(e) => return Err(anyhow!("HTTP: {e}")),
     };
 
     let status = resp.status().as_u16();
@@ -1135,8 +1106,6 @@ pub async fn call_lwd_stream_with(
     use axum::body::Bytes;
     use http_body_util::BodyExt;
 
-    let client: Client<HttpConnector, Full<Bytes>> = lwd_client();
-
     let content_type = client_headers
         .iter()
         .find(|(name, _)| name == "content-type")
@@ -1169,16 +1138,13 @@ pub async fn call_lwd_stream_with(
     let class = opts.class;
     let network = config.network.clone();
 
-    let resp = match timeout(connect, request(&client, req)).await {
-        Ok(r) => r?,
-        Err(e) => {
-            if let Some(class) = class {
-                crate::health::record_lwd_timeout(&network, class, "head");
-            }
-            reset_pool(&network);
-            return Err(e.into());
-        }
+    let call = crate::lwd_endpoints::CallOpts {
+        network: &network,
+        head: connect,
+        class,
+        pooled: pooled().is_some(),
     };
+    let resp = crate::lwd_endpoints::request(req, call).await?;
     let status = resp.status().as_u16();
     let headers: Vec<(String, String)> = resp
         .headers()

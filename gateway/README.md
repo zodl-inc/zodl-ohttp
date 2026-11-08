@@ -19,7 +19,7 @@ Public listener (`PORT`, default 8080):
 | `/gateway` | POST | An Encapsulated Request, `Content-Type: message/ohttp-chunked-req`, with `X-Relay-Secret`. Answers `message/ohttp-chunked-res`. |
 | `/ohttp-configs` | GET | The key configuration, `application/ohttp-keys` (RFC 9458 §3), `Cache-Control: max-age=300`. |
 | `/ohttp-configs/signed` | GET | The signed key configuration envelope (JSON, below), `Cache-Control: max-age=300`. 503 without `CONFIGS_SIGNING_SEED_HEX`. |
-| `/healthz` | GET | `200 ok` while replay protection works and lightwalletd is reachable, else `503 unavailable`. Replay protection works while the security Redis answers, or, with `REPLAY_UNAVAILABLE_FALLBACK` in `failover` mode, while it does not but every peer store answers and decides in its place (`ohttp_replay_serving_via_fallback`). Unauthenticated, no I/O, no details in the body: a monitor path for a load balancer. |
+| `/healthz` | GET | `200 ok` while replay protection works, lightwalletd is reachable and recent lightwalletd calls did not fail too often (`HEALTHZ_LWD_ERROR_RATIO`), else `503 unavailable`. Replay protection works while the security Redis answers, or, with `REPLAY_UNAVAILABLE_FALLBACK` in `failover` mode, while it does not but every peer store answers and decides in its place (`ohttp_replay_serving_via_fallback`). Unauthenticated, no I/O, no details in the body: a monitor path for a load balancer. |
 | `/health/startup` | GET | `200` once the process is listening. Does not depend on lightwalletd. |
 
 Any other method on these paths, and any other path in `ohttp` mode, answers `426`. With
@@ -156,6 +156,14 @@ server-streaming RPC by `LWD_STREAM_IDLE_SECS` of silence (for the head and betw
 upstream that sends no response head at all (an unresponsive backend) can still exceed a relay's
 silence limit; the client then sees the relay's error.
 
+A lightwalletd connection must be established within `LWD_CONNECT_TIMEOUT_MS`. A call that could
+not connect is sent once more; a read (every lightwalletd RPC except `SendTransaction`) is also
+sent once more when it got a transport error or no response head within half of its head
+deadline (`GetMempoolStream` and the transparent-address RPCs keep their whole head deadline). With `LWD_ENDPOINTS` the second attempt goes to another lightwalletd instance, and an
+instance that failed is skipped for 30 s. A `SendTransaction` that reached lightwalletd is never
+sent a second time by the gateway, and a call that fails after its response head arrived is not
+retried.
+
 ## Metrics
 
 All metrics are registered in `src/health.rs` and served on `:9090/metrics`. Request ids and
@@ -182,9 +190,11 @@ trace ids are never labels. `network` is `NETWORK`.
 | `ohttp_singleflight_joins_total` | `network, rpc` | Calls that joined an identical call in flight. |
 | `ohttp_lwd_errors_total` | - | lightwalletd forwarding errors. |
 | `ohttp_lwd_connect_retries_total` | - | lightwalletd calls retried after a failed connection attempt. |
+| `ohttp_lwd_read_retries_total` | `network, reason` | lightwalletd reads sent a second time because the first attempt got no response head. `reason`: `timeout` (half of the head deadline passed), `error` (transport error). |
+| `ohttp_healthz_lwd_error_ratio` | `network` | Share of failed lightwalletd calls in the `/healthz` error window at the last `/healthz`; `-1` while fewer than `HEALTHZ_LWD_MIN_ERRORS` failed. |
 | `ohttp_lwd_reachable` | `network` | 1 while lightwalletd is reachable. |
 | `ohttp_lwd_shed_total` | `network, class` | lightwalletd calls refused because their class was at its cap. |
-| `ohttp_lwd_timeouts_total` | `network, class, phase` | lightwalletd calls cut by their deadline. `class`: `unary`, `stream`; `phase`: `head` (no response head in time), `body` (the call's overall deadline: the unary deadline, or `LWD_TIMEOUT_SECS` for a stream), `gap` (a stream silent too long). |
+| `ohttp_lwd_timeouts_total` | `network, class, phase` | lightwalletd call attempts cut by their deadline (a read whose first attempt was cut and whose retry answered counts once). `class`: `unary`, `stream`; `phase`: `head` (no response head in time), `body` (the call's overall deadline: the unary deadline, or `LWD_TIMEOUT_SECS` for a stream), `gap` (a stream silent too long). |
 | `ohttp_lwd_pool_resets_total` | `network` | Pooled lightwalletd clients replaced after a call ran into its deadline (`LWD_CONNECTION_POOL`). |
 | `ohttp_lwd_permit_waited_total` | `network, class` | Calls that waited for a permit. |
 | `ohttp_lwd_permit_wait_seconds` | `network, class` | Permit wait time (histogram). |
