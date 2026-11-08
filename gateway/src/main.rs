@@ -810,11 +810,13 @@ async fn main() -> anyhow::Result<()> {
 
     /// GET /healthz — the public, unauthenticated probe for a load balancer in front of several
     /// origins (load balancer health monitor). 200 "ok" while this origin can answer OHTTP requests:
-    /// the security Redis (replay store) answered the last PING and lightwalletd is reachable;
-    /// else 503 "unavailable". Reads two gauges, no I/O, no mode/network/origin in the body.
+    /// replay protection works (the security Redis answered the last PING, or it did not and the
+    /// peer stores decide in its place: `ohttp_replay_serving_via_fallback`) and lightwalletd is
+    /// reachable; else 503 "unavailable". Reads gauges, no I/O, no mode/network/origin in the body.
     async fn healthz_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         let ok = health::healthz_ok(
             health::is_security_redis_connected(&state.config.network),
+            health::is_replay_serving_via_fallback(&state.config.network),
             health::is_lwd_healthy(&state.config.network),
         );
         let status = if ok {

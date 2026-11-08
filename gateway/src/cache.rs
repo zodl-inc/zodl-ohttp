@@ -344,6 +344,8 @@ struct ReplayPeer {
     write_back_conn: Arc<ArcSwapOption<ConnectionManager>>,
     /// Consecutive failed housekeeping PINGs (see PEER_PING_FAILURES_RECONNECT).
     ping_failures: AtomicU32,
+    /// Whether the last housekeeping PING was answered (false until the first one).
+    answered: AtomicBool,
     /// A standby store (REPLAY_STANDBY_URLS): its connectivity is `ohttp_replay_standby_connected`,
     /// never `ohttp_replay_peer_connected` (which watchdogs read as "the peers are reachable").
     standby: bool,
@@ -484,6 +486,7 @@ impl ReplayPeers {
                 wait_conn: Arc::new(ArcSwapOption::empty()),
                 write_back_conn: Arc::new(ArcSwapOption::empty()),
                 ping_failures: AtomicU32::new(0),
+                answered: AtomicBool::new(false),
                 standby,
             });
         }
@@ -825,6 +828,16 @@ impl ReplayPeers {
         self.peers.iter().any(|p| p.conn.load().is_some())
     }
 
+    /// Whether every peer answered its last housekeeping PING: a request that the local store
+    /// cannot decide needs all of them (`admit_without_local`).
+    pub fn all_answering(&self) -> bool {
+        !self.peers.is_empty()
+            && self
+                .peers
+                .iter()
+                .all(|p| p.answered.load(Ordering::Relaxed))
+    }
+
     /// Whether peer `index` has a connection (it may still fail a command).
     fn connected(&self, index: usize) -> bool {
         self.peers
@@ -912,6 +925,7 @@ impl ReplayPeers {
             if !ok {
                 self.disruptions.fetch_add(1, Ordering::Relaxed);
             }
+            p.answered.store(ok, Ordering::Relaxed);
             record_peer_connected(&self.network, p.index, p.standby, ok);
         }
     }
@@ -1671,6 +1685,20 @@ impl ResponseCache {
                 .is_some_and(|p| p.any_connected())
     }
 
+    /// Whether this origin can serve while its local store does not answer: the unavailable
+    /// fallback decides at the local store's peers (`local`), every WRITE is also checked at
+    /// them, and every peer answered its last housekeeping PING. `/healthz` stays healthy on
+    /// this alone (`ohttp_replay_serving_via_fallback`); with no peer answering it fails, as
+    /// before.
+    pub fn serves_without_local_store(&self) -> bool {
+        self.unavailable_fallback_target() == Some("local")
+            && self.checks_writes_at_fallback_store()
+            && self
+                .replay_peers
+                .as_ref()
+                .is_some_and(|p| p.all_answering())
+    }
+
     /// The local store gave no verdict on this request's nonce (`LocalReplayCheck::Unavailable`):
     /// decide it at the peer stores alone, which then are the single point of confirmation.
     ///
@@ -2100,8 +2128,10 @@ impl ResponseCache {
     }
 
     /// Actual Redis PING check (cache, and security when configured). Updates
-    /// `ohttp_cache_redis_connected`.
-    async fn ping_redis(&self) -> bool {
+    /// `ohttp_cache_redis_connected`, the store and peer connectivity gauges and
+    /// `ohttp_replay_serving_via_fallback`. Run by the housekeeping task every
+    /// `HOUSEKEEPING_SECS`; public so tests can run one round.
+    pub async fn ping_redis(&self) -> bool {
         let cache_ok = if let Some(cache_conn) = self.cache_conn.load_full() {
             let mut cache_conn = (*cache_conn).clone();
             match timeout(
@@ -2201,6 +2231,18 @@ impl ResponseCache {
                 }
             };
             crate::health::record_security_redis_connected(&self.network, sec_ok);
+            // The peers were PINGed just before (ping_redis), so their state is current.
+            let via_fallback = !sec_ok && self.serves_without_local_store();
+            if via_fallback != crate::health::is_replay_serving_via_fallback(&self.network) {
+                if via_fallback {
+                    warn!(network = %self.network, "Security Redis unreachable: serving through the peer stores (REPLAY_UNAVAILABLE_FALLBACK)");
+                } else if !sec_ok {
+                    warn!(network = %self.network, "Security Redis unreachable and the peer stores cannot decide: not serving");
+                } else {
+                    info!(network = %self.network, "Security Redis answers again: requests decided locally");
+                }
+            }
+            crate::health::record_replay_serving_via_fallback(&self.network, via_fallback);
             cache_ok && sec_ok
         } else {
             // No dedicated security Redis: replay checks fail closed, so the origin cannot serve.
@@ -3662,6 +3704,13 @@ mod pinned_tests {
 mod tests {
     use super::*;
 
+    /// Operation budget of the local test Redis in `test_cache`, and of the peers that are
+    /// databases of that Redis. It is shared by every test running in parallel, and some of
+    /// them make it slow on purpose for a moment (`appendfsync always`), so a production-sized
+    /// timeout (250 ms) turned correct verdicts into fail-closed errors at random. Tests of a
+    /// store that does not answer in time set their own short timeout.
+    const LOCAL_TEST_OP_TIMEOUT: Duration = Duration::from_secs(5);
+
     /// A cache on `conn` (and optionally a security connection) for the Redis-gated tests.
     fn test_cache(
         conn: ConnectionManager,
@@ -3687,7 +3736,7 @@ mod tests {
             network: network.to_string(),
             backend_host: "lwd.example.com:9067".to_string(),
             last_epoch_sync: Arc::new(AtomicU64::new(0)),
-            redis_timeout: Duration::from_millis(250),
+            redis_timeout: LOCAL_TEST_OP_TIMEOUT,
             policy_hash: "test".to_string(),
             pinned_conn: None,
             pinned_range: None,
@@ -3944,14 +3993,14 @@ mod tests {
         let peers_of_a = ReplayPeers::connect(
             &["redis://127.0.0.1:6379/13".to_string()],
             net.to_string(),
-            250,
+            LOCAL_TEST_OP_TIMEOUT.as_millis() as u64,
             false,
         )
         .await;
         let peers_of_b = ReplayPeers::connect(
             &["redis://127.0.0.1:6379/12".to_string()],
             net.to_string(),
-            250,
+            LOCAL_TEST_OP_TIMEOUT.as_millis() as u64,
             false,
         )
         .await;
@@ -4056,7 +4105,7 @@ mod tests {
         let peers_of_a = ReplayPeers::connect(
             &[format!("redis://127.0.0.1:6379/{b}")],
             net.to_string(),
-            250,
+            LOCAL_TEST_OP_TIMEOUT.as_millis() as u64,
             false,
         )
         .await
@@ -4064,7 +4113,7 @@ mod tests {
         let peers_of_b = ReplayPeers::connect(
             &[format!("redis://127.0.0.1:6379/{a}")],
             net.to_string(),
-            250,
+            LOCAL_TEST_OP_TIMEOUT.as_millis() as u64,
             false,
         )
         .await
@@ -4106,8 +4155,9 @@ mod tests {
 
         // READ at A: the local check is synchronous, the peer write asynchronous.
         let h1 = sha2::Sha256::digest(b"read one");
-        let t = std::time::Instant::now();
         assert!(!a.check_replay(&h1).await.unwrap());
+        // Timed: the peer step alone (the local check runs on the shared test Redis).
+        let t = std::time::Instant::now();
         assert!(!a.replicate_nonce(&h1, READ).await.unwrap());
         assert!(t.elapsed() < Duration::from_millis(200));
         // check_replay did NOT touch the peer store in this mode (only sync mode does).
@@ -4217,7 +4267,7 @@ mod tests {
                 let peers = ReplayPeers::connect(
                     &["redis://127.0.0.1:6379/3".to_string()],
                     net.to_string(),
-                    250,
+                    LOCAL_TEST_OP_TIMEOUT.as_millis() as u64,
                     false,
                 )
                 .await
@@ -4421,14 +4471,16 @@ mod tests {
         assert!(err.to_string().contains("local AOF"), "{err}");
 
         // One peer took the nonce, another is down: the nonce is not only local, no WAITAOF
-        // (the local copy is gone here, so a WAITAOF would fail).
+        // (the local copy is gone here, so a WAITAOF would fail). The peer that takes it is the
+        // shared test Redis with `appendfsync always` on (the local test budget); the other one
+        // refuses at once.
         let mixed_peers = ReplayPeers::connect(
             &[
                 "redis://127.0.0.1:6379/5".to_string(),
                 "redis://127.0.0.1:1".to_string(),
             ],
             net.to_string(),
-            100,
+            LOCAL_TEST_OP_TIMEOUT.as_millis() as u64,
             false,
         )
         .await
@@ -4627,8 +4679,10 @@ mod tests {
             ));
         for (i, class) in [READ, WRITE, READ, WRITE].into_iter().enumerate() {
             let h = sha2::Sha256::digest(unique(&format!("failover {i}")));
-            let t = std::time::Instant::now();
             assert!(!c.check_replay(&h).await.unwrap());
+            // Timed: the peer step alone (the local check above runs on the shared test Redis,
+            // whose latency is not what this test is about).
+            let t = std::time::Instant::now();
             assert!(!c.replicate_nonce(&h, class).await.unwrap(), "{class:?}");
             assert!(
                 t.elapsed() < Duration::from_millis(100),
@@ -4859,7 +4913,9 @@ mod tests {
         .await
         .ok()
         .and_then(|r| r.ok());
-        let cache = test_cache(cache_conn, security_conn, "testnet-failclosed");
+        let mut cache = test_cache(cache_conn, security_conn, "testnet-failclosed");
+        // The store never answers: the production-sized timeout keeps the test short.
+        cache.redis_timeout = Duration::from_millis(250);
 
         let body_hash = {
             let mut h = sha2::Sha256::new();

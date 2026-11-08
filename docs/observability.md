@@ -79,7 +79,7 @@ For the ids above to mean anything, a relay in front of the gateway:
 
 | Signal | Meaning |
 |---|---|
-| `GET /healthz` (public port) | `200` while `ohttp_security_redis_connected` and `ohttp_lwd_reachable` are both 1, else `503`. |
+| `GET /healthz` (public port) | `200` while `ohttp_lwd_reachable` is 1 and either `ohttp_security_redis_connected` or `ohttp_replay_serving_via_fallback` is 1, else `503`. |
 | `ohttp_key_config_info{fingerprint,signing_key_id}` | `count by (network) (count by (network, fingerprint) (ohttp_key_config_info)) > 1` across origins means two origins publish different keys. |
 | `ohttp_origin_info{origin}` | Which origin a scrape came from. |
 | `ohttp_replay_peer_total{peer,result}` | Nonce writes to peer origins; `replay` is a cross-origin replay refused, `error`/`timeout`/`disconnected` a peer problem. |
