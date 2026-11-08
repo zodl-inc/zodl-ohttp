@@ -511,6 +511,7 @@ pub fn init_metrics() {
     for g in [
         &*OHTTP_REPLAY_UNAVAILABLE_FALLBACK,
         &*OHTTP_REPLAY_FALLBACK_CHECK,
+        &*OHTTP_REPLAY_SERVING_VIA_FALLBACK,
         &*OHTTP_CHAIN_TIP_AGE_SECONDS,
         &*OHTTP_PERMANENT_STORE_REPLICA,
     ] {
@@ -1037,10 +1038,12 @@ pub fn record_replay_class(network: &str, class: &str) {
 }
 
 /// The verdict of the public `/healthz` route for a load-balancer monitor: 200 only while this
-/// origin can actually answer OHTTP requests, which needs the replay store (else every request
-/// is a 503) and lightwalletd (else every uncached RPC is a 502). Pure so that it is testable.
-pub fn healthz_ok(security_redis_ok: bool, lwd_ok: bool) -> bool {
-    security_redis_ok && lwd_ok
+/// origin can actually answer OHTTP requests, which needs replay protection (else every request
+/// is a 503) and lightwalletd (else every uncached RPC is a 502). Replay protection is the
+/// security Redis, or, while that does not answer, the peer stores that decide in its place
+/// (`via_fallback`, `ohttp_replay_serving_via_fallback`). Pure so that it is testable.
+pub fn healthz_ok(security_redis_ok: bool, via_fallback: bool, lwd_ok: bool) -> bool {
+    (security_redis_ok || via_fallback) && lwd_ok
 }
 
 lazy_static::lazy_static! {
@@ -1080,6 +1083,11 @@ lazy_static::lazy_static! {
     .unwrap();
     static ref OHTTP_REPLAY_FALLBACK_CHECK: IntGaugeVec = IntGaugeVec::new(
         Opts::new("ohttp_replay_fallback_check", "1 when every WRITE this gateway admits is also checked at a fallback store synchronously (write_fallback.rs); REPLAY_UNAVAILABLE_FALLBACK is safe only while every gateway of the network with peers reports 1"),
+        &["network"]
+    )
+    .unwrap();
+    static ref OHTTP_REPLAY_SERVING_VIA_FALLBACK: IntGaugeVec = IntGaugeVec::new(
+        Opts::new("ohttp_replay_serving_via_fallback", "1 while the security Redis does not answer and this gateway keeps serving (and /healthz healthy) because its requests are decided at the peer stores (REPLAY_UNAVAILABLE_FALLBACK, every peer answering)"),
         &["network"]
     )
     .unwrap();
@@ -1129,6 +1137,21 @@ pub fn record_replay_unavailable_fallback(network: &str, target: Option<&str>) {
             .with_label_values(&[network, t])
             .set(i64::from(target == Some(t)));
     }
+}
+
+pub fn record_replay_serving_via_fallback(network: &str, on: bool) {
+    OHTTP_REPLAY_SERVING_VIA_FALLBACK
+        .with_label_values(&[network])
+        .set(i64::from(on));
+}
+
+/// Whether the last housekeeping round found the security Redis unreachable and the peer
+/// stores able to decide this gateway's requests (`ResponseCache::serves_without_local_store`).
+pub fn is_replay_serving_via_fallback(network: &str) -> bool {
+    OHTTP_REPLAY_SERVING_VIA_FALLBACK
+        .with_label_values(&[network])
+        .get()
+        == 1
 }
 
 pub fn record_replay_fallback_check(network: &str, on: bool) {
@@ -1668,16 +1691,24 @@ mod multi_origin_tests {
 
     #[test]
     fn healthz_needs_replay_store_and_lightwalletd() {
-        assert!(healthz_ok(true, true));
+        assert!(healthz_ok(true, false, true));
         assert!(
-            !healthz_ok(false, true),
+            !healthz_ok(false, false, true),
             "no replay store: every request is a 503"
         );
         assert!(
-            !healthz_ok(true, false),
+            !healthz_ok(true, false, false),
             "no lightwalletd: every uncached RPC is a 502"
         );
-        assert!(!healthz_ok(false, false));
+        assert!(!healthz_ok(false, false, false));
+        assert!(
+            healthz_ok(false, true, true),
+            "replay store down, peer stores decide: still serving"
+        );
+        assert!(
+            !healthz_ok(false, true, false),
+            "the fallback does not replace lightwalletd"
+        );
     }
 
     #[test]

@@ -344,6 +344,8 @@ struct ReplayPeer {
     write_back_conn: Arc<ArcSwapOption<ConnectionManager>>,
     /// Consecutive failed housekeeping PINGs (see PEER_PING_FAILURES_RECONNECT).
     ping_failures: AtomicU32,
+    /// Whether the last housekeeping PING was answered (false until the first one).
+    answered: AtomicBool,
     /// A standby store (REPLAY_STANDBY_URLS): its connectivity is `ohttp_replay_standby_connected`,
     /// never `ohttp_replay_peer_connected` (which watchdogs read as "the peers are reachable").
     standby: bool,
@@ -484,6 +486,7 @@ impl ReplayPeers {
                 wait_conn: Arc::new(ArcSwapOption::empty()),
                 write_back_conn: Arc::new(ArcSwapOption::empty()),
                 ping_failures: AtomicU32::new(0),
+                answered: AtomicBool::new(false),
                 standby,
             });
         }
@@ -825,6 +828,16 @@ impl ReplayPeers {
         self.peers.iter().any(|p| p.conn.load().is_some())
     }
 
+    /// Whether every peer answered its last housekeeping PING: a request that the local store
+    /// cannot decide needs all of them (`admit_without_local`).
+    pub fn all_answering(&self) -> bool {
+        !self.peers.is_empty()
+            && self
+                .peers
+                .iter()
+                .all(|p| p.answered.load(Ordering::Relaxed))
+    }
+
     /// Whether peer `index` has a connection (it may still fail a command).
     fn connected(&self, index: usize) -> bool {
         self.peers
@@ -912,6 +925,7 @@ impl ReplayPeers {
             if !ok {
                 self.disruptions.fetch_add(1, Ordering::Relaxed);
             }
+            p.answered.store(ok, Ordering::Relaxed);
             record_peer_connected(&self.network, p.index, p.standby, ok);
         }
     }
@@ -1671,6 +1685,20 @@ impl ResponseCache {
                 .is_some_and(|p| p.any_connected())
     }
 
+    /// Whether this origin can serve while its local store does not answer: the unavailable
+    /// fallback decides at the local store's peers (`local`), every WRITE is also checked at
+    /// them, and every peer answered its last housekeeping PING. `/healthz` stays healthy on
+    /// this alone (`ohttp_replay_serving_via_fallback`); with no peer answering it fails, as
+    /// before.
+    pub fn serves_without_local_store(&self) -> bool {
+        self.unavailable_fallback_target() == Some("local")
+            && self.checks_writes_at_fallback_store()
+            && self
+                .replay_peers
+                .as_ref()
+                .is_some_and(|p| p.all_answering())
+    }
+
     /// The local store gave no verdict on this request's nonce (`LocalReplayCheck::Unavailable`):
     /// decide it at the peer stores alone, which then are the single point of confirmation.
     ///
@@ -2100,8 +2128,10 @@ impl ResponseCache {
     }
 
     /// Actual Redis PING check (cache, and security when configured). Updates
-    /// `ohttp_cache_redis_connected`.
-    async fn ping_redis(&self) -> bool {
+    /// `ohttp_cache_redis_connected`, the store and peer connectivity gauges and
+    /// `ohttp_replay_serving_via_fallback`. Run by the housekeeping task every
+    /// `HOUSEKEEPING_SECS`; public so tests can run one round.
+    pub async fn ping_redis(&self) -> bool {
         let cache_ok = if let Some(cache_conn) = self.cache_conn.load_full() {
             let mut cache_conn = (*cache_conn).clone();
             match timeout(
@@ -2201,6 +2231,18 @@ impl ResponseCache {
                 }
             };
             crate::health::record_security_redis_connected(&self.network, sec_ok);
+            // The peers were PINGed just before (ping_redis), so their state is current.
+            let via_fallback = !sec_ok && self.serves_without_local_store();
+            if via_fallback != crate::health::is_replay_serving_via_fallback(&self.network) {
+                if via_fallback {
+                    warn!(network = %self.network, "Security Redis unreachable: serving through the peer stores (REPLAY_UNAVAILABLE_FALLBACK)");
+                } else if !sec_ok {
+                    warn!(network = %self.network, "Security Redis unreachable and the peer stores cannot decide: not serving");
+                } else {
+                    info!(network = %self.network, "Security Redis answers again: requests decided locally");
+                }
+            }
+            crate::health::record_replay_serving_via_fallback(&self.network, via_fallback);
             cache_ok && sec_ok
         } else {
             // No dedicated security Redis: replay checks fail closed, so the origin cannot serve.

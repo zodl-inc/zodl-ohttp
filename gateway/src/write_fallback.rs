@@ -72,6 +72,11 @@
 //!   local `WAIT` got no answer takes the short-acknowledgement path (`path="local_unavailable"`).
 //! - `async-reads`, the hub: a WRITE confirmed at the standby stores, or by the local replicas
 //!   where the local store is the fallback store (`path="hub_unavailable"`).
+//! - Health: a `failover`-mode gateway whose local store does not answer keeps `/healthz`
+//!   healthy while every peer answered its last housekeeping PING
+//!   (`ResponseCache::serves_without_local_store`, gauge `ohttp_replay_serving_via_fallback`),
+//!   so a load balancer keeps sending it the requests the peers can decide. With no peer
+//!   answering it fails, as before.
 //!
 //! Safety (two gateways never both run the same WRITE): a WRITE runs only after a `SET NX`
 //! that found its nonce new at the primary store, at the fallback store, or at both, and every

@@ -840,3 +840,100 @@ async fn an_origin_that_tolerates_an_unreachable_hub_still_asks_the_fallback_sto
         assert_eq!(runs, 1, "request {i}");
     }
 }
+
+#[tokio::test]
+async fn primary_origin_stays_healthy_while_the_peer_decides_for_its_unreachable_store() {
+    use ohttp_gateway::health::{
+        healthz_ok, is_replay_serving_via_fallback, is_security_redis_connected,
+    };
+    let net = "testnet-ufb-healthz";
+    let w = World::new().await;
+    let (p_link, p_url) = w.to_p().await;
+    let (f_link, f_url) = w.to_f().await;
+    let primary = primary_origin(net, &p_url, &f_url, true).await;
+    let healthz = || {
+        healthz_ok(
+            is_security_redis_connected(net),
+            is_replay_serving_via_fallback(net),
+            true,
+        )
+    };
+    primary.ping_redis().await;
+    assert!(is_security_redis_connected(net));
+    assert!(!is_replay_serving_via_fallback(net));
+    assert!(healthz());
+
+    // The own store stops answering, the peer answers: healthy, serving through the peer.
+    p_link.hang();
+    primary.ping_redis().await;
+    assert!(!is_security_redis_connected(net));
+    assert!(primary.serves_without_local_store());
+    assert!(is_replay_serving_via_fallback(net));
+    assert!(healthz());
+    let write = request("write while healthy through the peer");
+    assert!(admit(&primary, &write, RouteClass::Write).await.unwrap());
+
+    // Neither store answers: unhealthy, and requests fail closed.
+    f_link.hang();
+    primary.ping_redis().await;
+    assert!(!primary.serves_without_local_store());
+    assert!(!is_replay_serving_via_fallback(net));
+    assert!(!healthz());
+    assert!(
+        admit(&primary, &request("no store answers"), RouteClass::Write)
+            .await
+            .is_err()
+    );
+
+    // The peer is back: healthy through it again. Each round with the own store hung also waits
+    // for that store's checks, so the bound is generous.
+    f_link.restore();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        primary.ping_redis().await;
+        if is_replay_serving_via_fallback(net) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "not healthy through the peer again"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(healthz());
+
+    // The own store is back: healthy on its own, the fallback gauge clears.
+    p_link.restore();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        primary.ping_redis().await;
+        if is_security_redis_connected(net) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "own store not back");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(!is_replay_serving_via_fallback(net));
+    assert!(healthz());
+}
+
+#[tokio::test]
+async fn without_the_setting_an_unreachable_store_still_fails_healthz() {
+    use ohttp_gateway::health::{
+        healthz_ok, is_replay_serving_via_fallback, is_security_redis_connected,
+    };
+    let net = "testnet-ufb-healthz-off";
+    let w = World::new().await;
+    let (p_link, p_url) = w.to_p().await;
+    let (_f_link, f_url) = w.to_f().await;
+    let primary = primary_origin(net, &p_url, &f_url, false).await;
+    p_link.hang();
+    primary.ping_redis().await;
+    assert!(!primary.serves_without_local_store());
+    assert!(!is_replay_serving_via_fallback(net));
+    assert!(!healthz_ok(
+        is_security_redis_connected(net),
+        is_replay_serving_via_fallback(net),
+        true
+    ));
+}

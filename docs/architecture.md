@@ -193,6 +193,13 @@ peers, not written back: a replayed READ changes nothing), after decapsulating t
 classify it. A request refused or failed closed after its nonce was stored stays refused for
 those exact bytes; a client seals every attempt afresh, so its retry is a new nonce.
 
+Such a `failover`-mode gateway also stays healthy for a load balancer: `/healthz` answers 200
+while its own store does not answer but every peer answered the last housekeeping PING (every
+10 s), and 503 once no store can decide. The state can lag by one round (up to 10 s plus the peer
+timeout) in either direction. WRITEs decided this way are queued for write-back to the local
+store; if that queue is full, further WRITEs fail closed (`result="overflow"`) while READs keep
+being served.
+
 Why the check of every WRITE: two gateways run the same WRITE only if each found its nonce new at
 a store the other did not ask. Every gateway asks every store it reaches, the deciding store is
 replaced only by the fallback store, and `SET NX` on one store admits a key once, so that takes a
