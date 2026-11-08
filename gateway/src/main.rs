@@ -498,17 +498,28 @@ async fn main() -> anyhow::Result<()> {
                         "WRITEs admitted here reach the fallback store only asynchronously: REPLAY_UNAVAILABLE_FALLBACK on another origin of these stores could admit one of them again"
                     );
                 }
+                let local_fallback = c.decides_at_peers_without_local();
+                health::record_replay_local_fallback(&network, local_fallback);
                 match (origin.replay_unavailable_fallback, target) {
                     (true, Some(target)) => info!(
                         network = %network,
                         target,
                         "A store that gives no replay verdict is replaced by the fallback store (REPLAY_UNAVAILABLE_FALLBACK)"
                     ),
-                    (true, None) => warn!(
+                    // An origin that tolerates an unreachable hub has no deciding store to replace,
+                    // but its own store still is (below).
+                    (true, None) if !local_fallback => warn!(
                         network = %network,
                         "REPLAY_UNAVAILABLE_FALLBACK has no effect here: no fallback store that acknowledges on its replicas"
                     ),
                     _ => {}
+                }
+                if local_fallback {
+                    info!(
+                        network = %network,
+                        mode = c.replay_peer_mode().as_str(),
+                        "A security store that gives no replay verdict is replaced by the peer stores (REPLAY_UNAVAILABLE_FALLBACK); WRITE nonces are written back once it answers"
+                    );
                 }
 
                 Some(c)

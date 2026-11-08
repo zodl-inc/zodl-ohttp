@@ -513,6 +513,7 @@ pub fn init_metrics() {
         &*OHTTP_REPLAY_UNAVAILABLE_FALLBACK,
         &*OHTTP_REPLAY_FALLBACK_CHECK,
         &*OHTTP_REPLAY_SERVING_VIA_FALLBACK,
+        &*OHTTP_REPLAY_LOCAL_FALLBACK,
         &*OHTTP_CHAIN_TIP_AGE_SECONDS,
         &*OHTTP_PERMANENT_STORE_REPLICA,
     ] {
@@ -1284,6 +1285,11 @@ lazy_static::lazy_static! {
         &["network"]
     )
     .unwrap();
+    static ref OHTTP_REPLAY_LOCAL_FALLBACK: IntGaugeVec = IntGaugeVec::new(
+        Opts::new("ohttp_replay_local_fallback", "1 when a request the security Redis gives no verdict on is decided at the peer stores instead of failing closed (REPLAY_UNAVAILABLE_FALLBACK; failover mode, or async-reads whose own store is the fallback store)"),
+        &["network"]
+    )
+    .unwrap();
     static ref OHTTP_CHAIN_TIP_AGE_SECONDS: IntGaugeVec = IntGaugeVec::new(
         Opts::new("ohttp_chain_tip_age_seconds", "Seconds since the chain follower's leader last moved the stored tip, as this process sees it (-1 = unknown)"),
         &["network"]
@@ -1340,6 +1346,12 @@ pub fn record_replay_unavailable_fallback(network: &str, target: Option<&str>) {
             .with_label_values(&[network, t])
             .set(i64::from(target == Some(t)));
     }
+}
+
+pub fn record_replay_local_fallback(network: &str, on: bool) {
+    OHTTP_REPLAY_LOCAL_FALLBACK
+        .with_label_values(&[network])
+        .set(i64::from(on));
 }
 
 pub fn record_replay_serving_via_fallback(network: &str, on: bool) {

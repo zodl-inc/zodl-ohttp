@@ -359,9 +359,49 @@ async fn read_origin_with(
     c
 }
 
+/// `read_origin`, with its local store at `local` (a link the test can cut).
+async fn read_origin_at(network: &str, local: &str, hub: &str, fallback: &str) -> ResponseCache {
+    ohttp_gateway::health::init_metrics();
+    let c = ResponseCache::connect(
+        &cache_store().await,
+        Some(local),
+        network.to_string(),
+        "lwd.example.com:9067".to_string(),
+        250,
+        100,
+        &HashMap::new(),
+    )
+    .await
+    .unwrap();
+    let peers = ReplayPeers::connect(&[hub.to_string()], network.to_string(), 250, false)
+        .await
+        .with_mode(ReplayPeerMode::AsyncReads, true)
+        .with_wait(Some(WAIT));
+    let standby =
+        ReplayPeers::connect_standby(&[fallback.to_string()], network.to_string(), 250, 1)
+            .await
+            .with_wait(Some(WAIT));
+    c.with_replay_peers(peers)
+        .with_async_replication(replication(network, ReplayPeerMode::AsyncReads))
+        .with_standby_replication(standby, replication(network, ReplayPeerMode::Failover))
+        .with_unavailable_fallback(true)
+}
+
 /// The origin whose own store is the fallback store (with the replica wait), WRITEs checked
 /// at the hub, refused while the hub is unreachable (`REPLAY_PEER_FAIL_CLOSED_WRITES` default).
 async fn spoke_origin(network: &str, own: &str, hub: &str, on: bool) -> ResponseCache {
+    spoke_origin_with(network, own, hub, on, true).await
+}
+
+/// `spoke_origin`; `fail_closed_writes` false = the standby origin, which admits WRITEs on its
+/// own store while the hub is unreachable (`REPLAY_PEER_FAIL_CLOSED_WRITES=0`).
+async fn spoke_origin_with(
+    network: &str,
+    own: &str,
+    hub: &str,
+    on: bool,
+    fail_closed_writes: bool,
+) -> ResponseCache {
     ohttp_gateway::health::init_metrics();
     let c = ResponseCache::connect(
         &cache_store().await,
@@ -376,7 +416,7 @@ async fn spoke_origin(network: &str, own: &str, hub: &str, on: bool) -> Response
     .unwrap();
     let peers = ReplayPeers::connect(&[hub.to_string()], network.to_string(), 250, false)
         .await
-        .with_mode(ReplayPeerMode::AsyncReads, true)
+        .with_mode(ReplayPeerMode::AsyncReads, fail_closed_writes)
         .with_wait(Some(WAIT));
     c.with_replay_peers(peers)
         .with_async_replication(replication(network, ReplayPeerMode::AsyncReads))
@@ -938,4 +978,251 @@ async fn without_the_setting_an_unreachable_store_still_fails_healthz() {
         true,
         true
     ));
+}
+
+// ---------------------------------------------------------------------------------------------
+// An origin whose own store is the fallback store (the spoke, the standby origin) while that
+// store gives no verdict: decided at the hub (`admit_without_local`).
+
+#[tokio::test]
+async fn spoke_decides_at_the_hub_while_its_own_store_is_unreachable() {
+    use ohttp_gateway::health::{
+        healthz_ok, is_replay_serving_via_fallback, is_security_redis_connected,
+    };
+    let net = "testnet-ufb-spoke-own";
+    let w = World::new().await;
+    let (_hub, hub_url) = w.to_p().await;
+    let (own_link, own_url) = w.to_f().await;
+    let spoke = spoke_origin(net, &own_url, &hub_url, true).await;
+    assert!(spoke.decides_at_peers_without_local());
+    // A primary-region gateway that reaches both stores.
+    let (_pp, pp_url) = w.to_p().await;
+    let (_pf, pf_url) = w.to_f().await;
+    let primary = primary_origin(net, &pp_url, &pf_url, true).await;
+
+    // The own store stops answering (a promotion): healthy, serving through the hub.
+    own_link.hang();
+    spoke.ping_redis().await;
+    assert!(!is_security_redis_connected(net));
+    assert!(spoke.serves_without_local_store());
+    assert!(is_replay_serving_via_fallback(net));
+    assert!(healthz_ok(
+        is_security_redis_connected(net),
+        is_replay_serving_via_fallback(net),
+        true,
+        true
+    ));
+
+    let read = request("spoke read, own store unreachable");
+    assert!(admit(&spoke, &read, RouteClass::Read).await.unwrap());
+    assert!(w.p.has(&key(net, &read)), "READ decided at the hub");
+    assert_eq!(read_fallback(net, "accepted"), 1.0);
+    let write = request("spoke write, own store unreachable");
+    assert!(admit(&spoke, &write, RouteClass::Write).await.unwrap());
+    assert!(w.p.has(&key(net, &write)), "WRITE decided at the hub");
+    assert!(!w.f.has(&key(net, &write)));
+    assert_eq!(fallback(net, "local_unavailable", "accepted"), 1.0);
+
+    // Replays: refused at the hub, by the spoke and by a gateway that reaches both stores.
+    assert!(!admit(&spoke, &write, RouteClass::Write).await.unwrap());
+    assert!(!admit(&spoke, &read, RouteClass::Read).await.unwrap());
+    assert!(!admit(&primary, &write, RouteClass::Write).await.unwrap());
+    assert_eq!(fallback(net, "local_unavailable", "replay"), 1.0);
+
+    // The hub's replicas do not acknowledge: the WRITE fails closed; READs still run.
+    w.p.set_acks(0);
+    let short = request("spoke write, own store unreachable, hub without replica");
+    assert!(admit(&spoke, &short, RouteClass::Write).await.is_err());
+    assert_eq!(fallback(net, "local_unavailable", "unacknowledged"), 1.0);
+    assert!(admit(
+        &spoke,
+        &request("spoke read, hub without replica"),
+        RouteClass::Read
+    )
+    .await
+    .unwrap());
+    w.p.set_acks(1);
+
+    // The own store answers again: the WRITE nonce is written back there (not the READ), and
+    // requests are decided locally again.
+    own_link.restore();
+    until(
+        "written back to the own store",
+        Duration::from_secs(20),
+        || spoke.write_fallback().unwrap().pending_len() == 0,
+    )
+    .await;
+    assert!(w.f.has(&key(net, &write)));
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        spoke.ping_redis().await;
+        if is_security_redis_connected(net) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "own store not back");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(!is_replay_serving_via_fallback(net));
+    let before = fallback(net, "local_unavailable", "accepted");
+    let after = request("spoke write after the promotion");
+    assert!(admit(&spoke, &after, RouteClass::Write).await.unwrap());
+    assert!(w.f.has(&key(net, &after)) && w.p.has(&key(net, &after)));
+    assert_eq!(fallback(net, "local_unavailable", "accepted"), before);
+}
+
+#[tokio::test]
+async fn spoke_fails_closed_when_neither_its_own_store_nor_the_hub_answers() {
+    use ohttp_gateway::health::is_replay_serving_via_fallback;
+    let net = "testnet-ufb-spoke-nothing";
+    let w = World::new().await;
+    let (hub_link, hub_url) = w.to_p().await;
+    let (own_link, own_url) = w.to_f().await;
+    for tolerant in [false, true] {
+        let spoke = spoke_origin_with(net, &own_url, &hub_url, true, !tolerant).await;
+        own_link.hang();
+        hub_link.lose();
+        spoke.ping_redis().await;
+        assert!(!spoke.serves_without_local_store());
+        assert!(!is_replay_serving_via_fallback(net));
+        for class in [RouteClass::Read, RouteClass::Write] {
+            let r = request(&format!("nothing answers {tolerant} {}", class.as_str()));
+            assert!(
+                admit(&spoke, &r, class).await.is_err(),
+                "tolerant {tolerant}"
+            );
+            assert!(!w.p.has(&key(net, &r)) && !w.f.has(&key(net, &r)));
+        }
+        own_link.restore();
+        hub_link.restore();
+    }
+}
+
+/// The standby origin (`REPLAY_PEER_FAIL_CLOSED_WRITES=0`) tolerates an unreachable hub, not an
+/// unreachable own store: without it the hub decides, with the same rules as for the spoke.
+#[tokio::test]
+async fn standby_origin_decides_at_the_hub_while_its_own_store_is_unreachable() {
+    let net = "testnet-ufb-standby-own";
+    let w = World::new().await;
+    let (_hub, hub_url) = w.to_p().await;
+    let (own_link, own_url) = w.to_f().await;
+    let standby = spoke_origin_with(net, &own_url, &hub_url, true, false).await;
+    assert!(standby.decides_at_peers_without_local());
+    own_link.hang();
+    standby.ping_redis().await;
+    assert!(standby.serves_without_local_store());
+    let write = request("standby write, own store unreachable");
+    assert!(admit(&standby, &write, RouteClass::Write).await.unwrap());
+    assert!(w.p.has(&key(net, &write)));
+    assert!(!admit(&standby, &write, RouteClass::Write).await.unwrap());
+    own_link.restore();
+    until(
+        "written back to the own store",
+        Duration::from_secs(20),
+        || standby.write_fallback().unwrap().pending_len() == 0,
+    )
+    .await;
+    assert!(w.f.has(&key(net, &write)));
+}
+
+/// Only an origin whose own store is the fallback store: a read origin (standby stores, no
+/// replica wait), the setting off, or no replica wait at all leave a local store without a
+/// verdict failing closed, as before.
+#[tokio::test]
+async fn other_async_reads_origins_still_fail_closed_without_their_own_store() {
+    let net = "testnet-ufb-spoke-unchanged";
+    let w = World::new().await;
+    let (_rp, rp_url) = w.to_p().await;
+    let (_rf, rf_url) = w.to_f().await;
+    let (local, local_addr) = Store::start().await;
+    let (local_link, local_port) = Link::start(local_addr).await;
+    let reader = read_origin_at(net, &url(local_port), &rp_url, &rf_url).await;
+    assert!(!reader.decides_at_peers_without_local());
+    local_link.hang();
+    reader.ping_redis().await;
+    assert!(!reader.serves_without_local_store());
+    let r = request("read origin, local store unreachable");
+    assert!(admit(&reader, &r, RouteClass::Write).await.is_err());
+    assert!(!w.p.has(&key(net, &r)) && !w.f.has(&key(net, &r)));
+    local_link.restore();
+    drop(local);
+    let (_hub, hub_url) = w.to_p().await;
+    let (own_link, own_url) = w.to_f().await;
+    let off = spoke_origin(net, &own_url, &hub_url, false).await;
+    assert!(!off.decides_at_peers_without_local());
+    own_link.hang();
+    off.ping_redis().await;
+    assert!(!off.serves_without_local_store());
+    let r = request("setting off, own store unreachable");
+    assert!(admit(&off, &r, RouteClass::Write).await.is_err());
+    assert!(!w.p.has(&key(net, &r)));
+}
+
+/// The split-brain case for the spoke: it has lost its own store (the fallback store) and
+/// decides at the hub, while the other origins reach both stores; the same request at all of
+/// them at once never runs twice.
+#[tokio::test]
+async fn a_nonce_never_runs_twice_while_the_spoke_decides_at_the_hub() {
+    let net = "testnet-ufb-spoke-split";
+    let w = World::new().await;
+    let (_sp, sp_url) = w.to_p().await;
+    let (own_link, own_url) = w.to_f().await;
+    let spoke = spoke_origin(net, &own_url, &sp_url, true).await;
+    let (_tp, tp_url) = w.to_p().await;
+    let (_tf, tf_url) = w.to_f().await;
+    let standby = spoke_origin_with(net, &tf_url, &tp_url, true, false).await;
+    let (_pp, pp_url) = w.to_p().await;
+    let (_pf, pf_url) = w.to_f().await;
+    let primary = primary_origin(net, &pp_url, &pf_url, true).await;
+    let (_rp, rp_url) = w.to_p().await;
+    let (_rf, rf_url) = w.to_f().await;
+    let reader = read_origin(net, &rp_url, &rf_url, true).await;
+    own_link.hang();
+    for i in 0..20 {
+        let write = request(&format!("spoke split {i}"));
+        let (a, b, c, d) = tokio::join!(
+            admit(&spoke, &write, RouteClass::Write),
+            admit(&standby, &write, RouteClass::Write),
+            admit(&primary, &write, RouteClass::Write),
+            admit(&reader, &write, RouteClass::Write),
+        );
+        // At most once. (Zero is possible here: the same bytes at four origins at once can be
+        // held at each store by another of them first; a client sends one request to one origin.)
+        let runs = [a, b, c, d].map(|r| matches!(r, Ok(true)));
+        assert!(
+            runs.iter().filter(|r| **r).count() <= 1,
+            "request {i} ran at more than one origin: {runs:?}"
+        );
+        for c in [&spoke, &standby, &primary, &reader] {
+            assert!(!matches!(
+                admit(c, &write, RouteClass::Write).await,
+                Ok(true)
+            ));
+        }
+    }
+}
+
+/// A refused connection (not a silent one): the own store gets the WRITE nonce only through the
+/// write-back, never from a buffered request.
+#[tokio::test]
+async fn spoke_writes_back_a_nonce_its_refusing_store_never_saw() {
+    let net = "testnet-ufb-spoke-refused";
+    let w = World::new().await;
+    let (_hub, hub_url) = w.to_p().await;
+    let (own_link, own_url) = w.to_f().await;
+    let spoke = spoke_origin(net, &own_url, &hub_url, true).await;
+    own_link.lose();
+    let write = request("spoke write, own store refusing");
+    assert!(admit(&spoke, &write, RouteClass::Write).await.unwrap());
+    assert!(w.p.has(&key(net, &write)));
+    assert!(!w.f.has(&key(net, &write)));
+    assert_eq!(spoke.write_fallback().unwrap().pending_len(), 1);
+    assert!(!admit(&spoke, &write, RouteClass::Write).await.unwrap());
+    own_link.restore();
+    until(
+        "written back to the own store",
+        Duration::from_secs(30),
+        || spoke.write_fallback().unwrap().pending_len() == 0,
+    )
+    .await;
+    assert!(w.f.has(&key(net, &write)));
 }

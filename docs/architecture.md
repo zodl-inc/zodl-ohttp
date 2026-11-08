@@ -193,7 +193,17 @@ peers, not written back: a replayed READ changes nothing), after decapsulating t
 classify it. A request refused or failed closed after its nonce was stored stays refused for
 those exact bytes; a client seals every attempt afresh, so its retry is a new nonce.
 
-Such a `failover`-mode gateway also stays healthy for a load balancer: `/healthz` answers 200
+An `async-reads` origin whose own store is the fallback store (no standby stores, its own replica
+wait: the standby origin and its read spoke) does the same when its own store gives no verdict:
+the hub, which decides its WRITEs anyway, decides the request alone (READ: `SET NX`; WRITE: `SET
+NX` + the hub's `WAIT`), and a WRITE nonce is written back to the own store. That holds with
+`REPLAY_PEER_FAIL_CLOSED_WRITES=0` too (an unreachable hub is tolerated there, an unreachable own
+store is not). Every other origin keeps the hub's verdict while the fallback store is silent and
+asks both while it answers, so this adds no new way to admit a nonce twice: two admissions still
+need one gateway that reached only the hub and another that reached only the fallback store at
+the same time.
+
+Such a gateway also stays healthy for a load balancer: `/healthz` answers 200
 while its own store does not answer but every peer answered the last housekeeping PING (every
 10 s), and 503 once no store can decide. The state can lag by one round (up to 10 s plus the peer
 timeout) in either direction. WRITEs decided this way are queued for write-back to the local

@@ -72,7 +72,14 @@
 //!   local `WAIT` got no answer takes the short-acknowledgement path (`path="local_unavailable"`).
 //! - `async-reads`, the hub: a WRITE confirmed at the standby stores, or by the local replicas
 //!   where the local store is the fallback store (`path="hub_unavailable"`).
-//! - Health: a `failover`-mode gateway whose local store does not answer keeps `/healthz`
+//! - `async-reads`, the local store, where it is the fallback store (no standby stores, the local
+//!   replica wait: `ResponseCache::decides_at_peers_without_local`): as in `failover` mode, the
+//!   request is classified and decided at the hub alone (`admit_without_local`: a READ by `SET
+//!   NX`, a WRITE by `SET NX` + the hub's `WAIT`, written back to the local store). Also with
+//!   `REPLAY_PEER_FAIL_CLOSED_WRITES=0`: an unreachable hub is tolerated there, an unreachable
+//!   local store is not.
+//! - Health: a gateway whose local store does not answer and whose peers decide in its place
+//!   (`failover` mode, or the `async-reads` case above) keeps `/healthz`
 //!   healthy while every peer answered its last housekeeping PING
 //!   (`ResponseCache::serves_without_local_store`, gauge `ohttp_replay_serving_via_fallback`),
 //!   so a load balancer keeps sending it the requests the peers can decide. With no peer
@@ -85,7 +92,10 @@
 //! before). `SET NX` on one store is decided once per key, so two admissions of one nonce need
 //! two disjoint sets of stores: one gateway that reached only the primary store and another that
 //! reached only the fallback store at the same time. That needs two failures at once (and is
-//! the case an origin with `REPLAY_PEER_FAIL_CLOSED_WRITES=0` already had). A nonce admitted at
+//! the case an origin with `REPLAY_PEER_FAIL_CLOSED_WRITES=0` already had). An `async-reads`
+//! origin whose own store is the fallback store and gives no verdict reaches only the primary
+//! store; every other origin keeps the primary store's verdict while the fallback store is silent
+//! and asks both while it answers, so this is the same residual class, not a new one. A nonce admitted at
 //! one store only is copied to the other (write-back, asynchronous hand-off) as soon as it is
 //! reachable. The guarantee needs the check above on every gateway that asks the primary store
 //! (`ResponseCache::checks_writes_at_fallback_store`, gauge `ohttp_replay_fallback_check`):

@@ -1674,24 +1674,48 @@ impl ResponseCache {
         }
     }
 
+    /// Whether the peer stores can decide a request the local store gives no verdict on
+    /// (`admit_without_local`), with REPLAY_UNAVAILABLE_FALLBACK, peers that acknowledge on their
+    /// replicas and the local write-back queue (`REPLAY_WRITE_WAIT_REPLICAS`):
+    ///
+    /// - `failover` (the fallback target `local`): the peers are the fallback store.
+    /// - `async-reads` without standby stores (the standby origin and its spoke): the local store
+    ///   is the fallback store and the peer is the hub, which already decides every WRITE here.
+    ///   With standby stores (a read origin) the local store is neither, and nothing changes.
+    pub fn decides_at_peers_without_local(&self) -> bool {
+        if !self.unavailable_fallback || self.write_fallback.is_none() {
+            return false;
+        }
+        let Some(peers) = self.replay_peers.as_ref().filter(|p| p.wait().is_some()) else {
+            return false;
+        };
+        match peers.mode() {
+            ReplayPeerMode::Failover => true,
+            ReplayPeerMode::AsyncReads => {
+                self.standby_peers.is_none() && self.hub_fallback.is_some()
+            }
+            ReplayPeerMode::Sync => false,
+        }
+    }
+
     /// Whether a request whose local `SET NX` gave no verdict can still be decided at the peer
-    /// stores (`admit_without_local`): the fallback targets the local store and a peer is
-    /// connected right now (else the request fails closed at once, as before).
+    /// stores (`admit_without_local`): `decides_at_peers_without_local` and a peer is connected
+    /// right now (else the request fails closed at once, as before).
     fn local_unavailable_fallback_ready(&self) -> bool {
-        self.unavailable_fallback_target() == Some("local")
+        self.decides_at_peers_without_local()
             && self
                 .replay_peers
                 .as_ref()
                 .is_some_and(|p| p.any_connected())
     }
 
-    /// Whether this origin can serve while its local store does not answer: the unavailable
-    /// fallback decides at the local store's peers (`local`), every WRITE is also checked at
-    /// them, and every peer answered its last housekeeping PING. `/healthz` stays healthy on
-    /// this alone (`ohttp_replay_serving_via_fallback`); with no peer answering it fails, as
-    /// before.
+    /// Whether this origin can serve while its local store does not answer: the peer stores
+    /// decide in its place (`decides_at_peers_without_local`), every WRITE is also checked at
+    /// the fallback store while the local store answers, and every peer answered its last
+    /// housekeeping PING. `/healthz` stays healthy on this alone
+    /// (`ohttp_replay_serving_via_fallback`); with no peer answering it fails, as before.
     pub fn serves_without_local_store(&self) -> bool {
-        self.unavailable_fallback_target() == Some("local")
+        self.decides_at_peers_without_local()
             && self.checks_writes_at_fallback_store()
             && self
                 .replay_peers
@@ -1700,7 +1724,9 @@ impl ResponseCache {
     }
 
     /// The local store gave no verdict on this request's nonce (`LocalReplayCheck::Unavailable`):
-    /// decide it at the peer stores alone, which then are the single point of confirmation.
+    /// decide it at the peer stores alone, which then are the single point of confirmation. In
+    /// `failover` mode these are the fallback store; in `async-reads` (an origin whose own store
+    /// is the fallback store) the hub, the store every WRITE here is decided at anyway.
     ///
     /// - READ: `SET NX` at every peer; new everywhere = runs, held anywhere = replay, a peer that
     ///   does not answer = fail-closed.
@@ -1718,7 +1744,7 @@ impl ResponseCache {
         let (Some(peers), Some(fb), true) = (
             self.replay_peers.as_ref().filter(|p| p.wait().is_some()),
             self.write_fallback.as_ref(),
-            self.unavailable_fallback,
+            self.decides_at_peers_without_local(),
         ) else {
             anyhow::bail!("Replay protection unavailable: no verdict from the local store and no peer store to decide at (fail-closed)");
         };
