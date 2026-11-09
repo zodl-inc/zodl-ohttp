@@ -2,6 +2,56 @@
 
 [Keep a Changelog](https://keepachangelog.com).
 
+## 1.0.0
+
+The crate carries no OHTTP endpoints or keys any more, not even from its build: the application
+passes the configuration of each network in at runtime. A breaking change for every caller.
+
+### Added
+
+- `OhttpConfig`: the configuration of one network (gateway host, relay URL, keys DNS name,
+  signing key), built by `OhttpConfig::new(OhttpConfigParams { gateway_host, relay_url,
+  keys_dns_name, signing_pubkey })`; the named fields keep two values of the same form from being
+  swapped by position. `OhttpConfig::new` requires all four values and checks them: the gateway host
+  and the keys DNS name are lower-case bare DNS host names, the relay URL is `https://` with a
+  valid host, an optional numeric port and an optional path, and without userinfo, query,
+  fragment, backslash, whitespace or control characters, the signing key is a raw Ed25519
+  public key as 64 hex digits, a valid point not of small order. Accessors `gateway_host`,
+  `relay_url`, `keys_dns_name`, `signing_pubkey`.
+- `OhttpNetworks`: the configurations of mainnet and testnet, either or both `None` (OHTTP off
+  for that network; `OhttpNetworks::default()` has both off). `OhttpNetworks::new` refuses two
+  configurations that share a gateway host, relay URL or keys DNS name (compared ignoring ASCII
+  case) or a signing key. `get`, `network_of_host` and `relay_for` (exact host match, as before).
+- `ConfigError` (`Empty`, `Invalid`, `SharedAcrossNetworks`) and `ConfigField`: a refused
+  configuration names the field and the rule, never the value. The `Debug` output of
+  `OhttpConfigParams`, `OhttpConfig` and `OhttpNetworks` shows only which fields and networks are
+  set.
+
+### Changed
+
+- Requests are padded to fixed size buckets: `encode_bhttp_request` (and so `encode_request` and
+  `Client`) appends zero padding after the trailer section (RFC 9292 §3.8) up to 16 KiB for a
+  lightwalletd `SendTransaction` (32 KiB if larger, then the next multiple of 32 KiB) and up to
+  the next multiple of 4 KiB for every other request, never past what fits under the 10 MiB
+  sealed-request cap. The relay and the network then see a few
+  request sizes only. No API change; a gateway accepts the padding (this release's gateway also
+  refuses non-zero bytes there).
+- `verify_signed_config`, `doh_query_url` and `envelope_from_doh_json` take the
+  `&OhttpNetworks` as their first argument, and `NetworkRule::network_for` takes it before the
+  host; they read the signing key, the keys DNS name and the gateway hosts from it. For a network
+  without a configuration they behave as an unconfigured build did: `Error::KeyConfig`, `None`,
+  or no network for the host.
+- The `Error::KeyConfig` of `NetworkRule::KnownHosts` for an unknown host no longer contains the
+  host, nor does that of `signed_config_url` contain the relay URL.
+
+### Removed
+
+- The build-time configuration: `build.rs`, the `ZODL_OHTTP_*` build variables and
+  `ZODL_OHTTP_REQUIRE`. Setting them has no effect.
+- `relay_for` (now `OhttpNetworks::relay_for`), `GATEWAY_HOST_MAINNET`, `GATEWAY_HOST_TESTNET`,
+  `MAINNET_SIGNING_KEY_HEX`, `TESTNET_SIGNING_KEY_HEX`, `Network::pinned_signing_key` (now
+  `OhttpConfig::signing_pubkey`) and `key_config_dns_name` (now `OhttpConfig::keys_dns_name`).
+
 ## 0.1.2
 
 ### Changed

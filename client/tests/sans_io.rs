@@ -176,16 +176,21 @@ fn rfc_9458_bhttp_request_is_ours_up_to_the_sections_it_leaves_out() {
     let ours = encode_bhttp_request(&request, &EncodeOptions::LOWERCASE).unwrap();
     let mut expected = hex(RFC9458_BHTTP_REQUEST);
     expected.extend_from_slice(&[0, 0, 0]);
-    assert_eq!(ours, expected);
+    // Followed by zero padding (RFC 9292 §3.8) to 4 KiB.
+    let padded = |message: &[u8]| {
+        let mut padded = message.to_vec();
+        padded.resize(4096, 0);
+        padded
+    };
+    assert_eq!(ours, padded(&expected));
     // The library's `Request` maps to the same bytes; `encode_request` itself also appends the
     // freshness field real requests need.
     let request = Request::new("GET", "example.com", "/");
     assert_eq!(
         encode_bhttp_request(&BhttpRequest::from(&request), &EncodeOptions::PRESERVE).unwrap(),
-        expected
+        padded(&expected)
     );
     let stamped = encode_request(&request).unwrap();
-    assert!(stamped.len() > expected.len());
     assert!(stamped
         .windows(b"ohttp-freshness".len())
         .any(|w| w == b"ohttp-freshness"));
@@ -571,20 +576,34 @@ fn bytes_after_the_suite_list_are_tolerated_or_refused_as_the_profile_says() {
 // ---- Signed envelopes --------------------------------------------------------------------
 
 #[test]
-fn the_pinned_keys_are_what_the_build_set() {
+fn the_pinned_keys_are_the_configured_ones() {
     use sha2::Digest;
-    for (network, configured) in [
-        (Network::Mainnet, zodl_ohttp_client::MAINNET_SIGNING_KEY_HEX),
-        (Network::Testnet, zodl_ohttp_client::TESTNET_SIGNING_KEY_HEX),
-    ] {
-        match configured {
-            Some(hex_key) => {
-                let key = network.pinned_signing_key().unwrap();
-                assert_eq!(hex_of(key.as_bytes()), hex_key.to_ascii_lowercase());
-                assert_eq!(hex_of(&Sha256::digest(key.as_bytes())[..4]).len(), 8);
-            }
-            None => assert!(network.pinned_signing_key().is_err()),
-        }
+    use zodl_ohttp_client::{OhttpConfig, OhttpConfigParams, OhttpNetworks};
+    let key_hex = |seed: u8| {
+        hex_of(
+            ed25519_dalek::SigningKey::from_bytes(&[seed; 32])
+                .verifying_key()
+                .as_bytes(),
+        )
+    };
+    let config = |host: &str, seed: u8| {
+        OhttpConfig::new(OhttpConfigParams {
+            gateway_host: host,
+            relay_url: &format!("https://{host}/relay"),
+            keys_dns_name: &format!("keys.{host}"),
+            signing_pubkey: &key_hex(seed).to_ascii_uppercase(),
+        })
+        .unwrap()
+    };
+    let networks = OhttpNetworks::new(
+        Some(config("ohttp-gateway.example", 4)),
+        Some(config("ohttp-gateway-testnet.example", 5)),
+    )
+    .unwrap();
+    for (network, seed) in [(Network::Mainnet, 4), (Network::Testnet, 5)] {
+        let key = networks.get(network).unwrap().signing_pubkey();
+        assert_eq!(hex_of(key.as_bytes()), key_hex(seed));
+        assert_eq!(hex_of(&Sha256::digest(key.as_bytes())[..4]).len(), 8);
     }
     assert_eq!(Network::from_name("mainnet"), Some(Network::Mainnet));
     assert_eq!(Network::from_name("regtest"), None);
@@ -715,13 +734,21 @@ fn the_sealed_request_cap_is_exact_for_every_preset() {
     let request =
         |len: usize| BhttpRequest::new("POST", "a.example", "/upload").body(vec![0u8; len]);
     // The sealed size is 39 (hdr || enc) + varint + the Binary HTTP message + 16 (tag) + the
-    // final chunk (1 + 16); find the body length that makes it exactly CAP.
+    // final chunk (1 + 16); find the body length that makes it exactly CAP. Near the cap the
+    // message is not padded any further (padding stops at 80 bytes below the cap, a few bytes
+    // short of the largest message that still fits), so the sealed size grows by one per body
+    // byte there.
     // Every preset adds the same `ohttp-freshness` field (a 10-digit timestamp), so measure with
     // a preset's own options.
     let profile = ClientProfile::IOS;
     let sealed_len = |len: usize| seal(&profile, &request(len)).0.len();
-    let probe = CAP - 1000;
-    let exact = probe + (CAP - sealed_len(probe));
+    let probe = CAP - 60;
+    let exact = (probe as i64 + CAP as i64 - sealed_len(probe) as i64) as usize;
+    assert_eq!(sealed_len(exact - 1), CAP - 1);
+    // A request further below the cap is padded, but never past it.
+    for len in [CAP - 5000, CAP - 4096 - 200, CAP - 150] {
+        assert!(sealed_len(len) <= CAP, "{len}");
+    }
     for profile in [
         ClientProfile::LIBRARY,
         ClientProfile::ANDROID,

@@ -16,12 +16,12 @@
 
 //! DNS-over-HTTPS as a last-resort source for the signed Key Configuration.
 //!
-//! The TXT record names are build-time configuration (`ZODL_OHTTP_KEYS_DNS_NAME_MAINNET`,
-//! `ZODL_OHTTP_KEYS_DNS_NAME_TESTNET`, see `relays.rs`). When the build did not set the
-//! name of a network, the DNS source is off for it: [`key_config_dns_name`] and
-//! [`doh_query_url`] return `None` and [`envelope_from_doh_json`] refuses every response.
+//! The TXT record name of a network is [`crate::OhttpConfig::keys_dns_name`]. For a network
+//! without a configuration the DNS source is off: [`doh_query_url`] returns `None` and
+//! [`envelope_from_doh_json`] refuses every response.
 
-use crate::{Error, MAX_KEY_CONFIG_BYTES};
+use crate::signed::Network;
+use crate::{Error, OhttpNetworks, MAX_KEY_CONFIG_BYTES};
 use base64::Engine as _;
 
 /// Public DNS-over-HTTPS resolvers (JSON API), tried in order.
@@ -30,18 +30,12 @@ pub const DOH_RESOLVERS: &[&str] = &[
     "https://dns.google/resolve",
 ];
 
-/// The DNS name of the signed Key Configuration TXT record for `network`, as the build set it
-/// (`ZODL_OHTTP_KEYS_DNS_NAME_*`); `None` when unset (no DNS source for that network).
-pub fn key_config_dns_name(network: crate::signed::Network) -> Option<&'static str> {
-    crate::relays::Endpoints::BUILT_IN
-        .network(network)
-        .keys_dns_name
-}
-
-/// The DoH query URL for `resolver` and `network` (JSON API, TXT record); `None` when the build
-/// did not set the network's DNS name.
-pub fn doh_query_url(resolver: &str, network: crate::signed::Network) -> Option<String> {
-    key_config_dns_name(network).map(|name| doh_query_url_for(resolver, name))
+/// The DoH query URL for `resolver` and the TXT record of `network`'s keys DNS name (JSON API);
+/// `None` when OHTTP is off for `network`.
+pub fn doh_query_url(networks: &OhttpNetworks, resolver: &str, network: Network) -> Option<String> {
+    networks
+        .get(network)
+        .map(|config| doh_query_url_for(resolver, config.keys_dns_name()))
 }
 
 /// The DoH query URL for `resolver` and the TXT record `name`.
@@ -60,17 +54,13 @@ fn doh_query_url_for(resolver: &str, name: &str) -> String {
 /// response must have `Status` 0, one or more TXT answers for the queried name (`type` 16), whose
 /// presentation-format `data` fields (one or more quoted strings, `\"` / `\\` / `\DDD` escapes)
 /// are concatenated and base64-decoded. Enforces the 64 KiB envelope limit. Errors on 0 or >1
-/// distinct TXT values, and always when the build did not set the network's DNS name.
+/// distinct TXT values, and always when OHTTP is off for `network`.
 pub fn envelope_from_doh_json(
+    networks: &OhttpNetworks,
     body: &[u8],
-    network: crate::signed::Network,
+    network: Network,
 ) -> Result<Vec<u8>, Error> {
-    let name = key_config_dns_name(network).ok_or_else(|| {
-        Error::KeyConfig(format!(
-            "DoH response: no key-configuration DNS name configured for {}",
-            network.as_str()
-        ))
-    })?;
+    let name = networks.require(network)?.keys_dns_name();
     envelope_from_doh_json_for(body, name)
 }
 
@@ -225,30 +215,32 @@ struct DohAnswer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::signed::Network;
 
     /// The example DNS names of the tests (RFC 2606).
     const MAINNET_NAME: &str = "mainnet.ohttp-keys.example";
     const TESTNET_NAME: &str = "testnet.ohttp-keys.example";
 
     #[test]
-    fn dns_names_are_what_the_build_set() {
+    fn the_dns_source_follows_the_configuration() {
+        let networks = crate::config::tests::example();
+        assert_eq!(
+            doh_query_url(&networks, DOH_RESOLVERS[0], Network::Mainnet),
+            Some(doh_query_url_for(DOH_RESOLVERS[0], MAINNET_NAME))
+        );
+        let json = format!(
+            r#"{{"Status":0,"Answer":[{{"name":"{TESTNET_NAME}","type":16,"data":"aGVsbG8gd29ybGQ="}}]}}"#
+        );
+        assert_eq!(
+            envelope_from_doh_json(&networks, json.as_bytes(), Network::Testnet).unwrap(),
+            b"hello world"
+        );
+        // The mainnet name does not answer for the testnet record.
+        assert!(envelope_from_doh_json(&networks, json.as_bytes(), Network::Mainnet).is_err());
+        // No configuration: the DNS source is off and refuses every response.
+        let off = OhttpNetworks::default();
         for network in [Network::Mainnet, Network::Testnet] {
-            let name = crate::relays::Endpoints::BUILT_IN
-                .network(network)
-                .keys_dns_name;
-            assert_eq!(key_config_dns_name(network), name);
-            assert_eq!(
-                doh_query_url(DOH_RESOLVERS[0], network).is_some(),
-                name.is_some()
-            );
-            if name.is_none() {
-                // No DNS name: the DNS source is off and refuses every response.
-                let json = format!(
-                    r#"{{"Status":0,"Answer":[{{"name":"{MAINNET_NAME}","type":16,"data":"aGVsbG8gd29ybGQ="}}]}}"#
-                );
-                assert!(envelope_from_doh_json(json.as_bytes(), network).is_err());
-            }
+            assert_eq!(doh_query_url(&off, DOH_RESOLVERS[0], network), None);
+            assert!(envelope_from_doh_json(&off, json.as_bytes(), network).is_err());
         }
     }
 

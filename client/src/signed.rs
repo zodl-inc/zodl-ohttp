@@ -25,7 +25,7 @@ use serde::de::{IgnoredAny, MapAccess, Visitor};
 use serde::{Deserialize, Deserializer as _};
 use sha2::{Digest, Sha256};
 
-use crate::{Error, MAX_KEY_CONFIG_BYTES};
+use crate::{Error, OhttpNetworks, MAX_KEY_CONFIG_BYTES};
 
 /// The envelope's domain separator.
 const DOMAIN: &[u8] = b"zodl-ohttp-configs-v1";
@@ -58,15 +58,6 @@ const LENIENT_BASE64: GeneralPurpose = GeneralPurpose::new(
         .with_decode_allow_trailing_bits(true),
 );
 
-/// The gateway's configuration-signing key for mainnet, raw Ed25519, hex, as the build set it
-/// (`ZODL_OHTTP_SIGNING_PUBKEY_MAINNET`). `None` when unset: no mainnet envelope verifies
-/// against a built-in key and the built-in mainnet configuration is off.
-pub const MAINNET_SIGNING_KEY_HEX: Option<&str> = crate::relays::SIGNING_PUBKEY_MAINNET;
-/// The gateway's configuration-signing key for testnet, raw Ed25519, hex, as the build set it
-/// (`ZODL_OHTTP_SIGNING_PUBKEY_TESTNET`). `None` when unset: no testnet envelope verifies
-/// against a built-in key and the built-in testnet configuration is off.
-pub const TESTNET_SIGNING_KEY_HEX: Option<&str> = crate::relays::SIGNING_PUBKEY_TESTNET;
-
 /// The network a gateway serves, which picks the signing key an envelope is checked against.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Network {
@@ -93,46 +84,16 @@ impl Network {
             _ => None,
         }
     }
-
-    /// The pinned key of the gateway's envelope signer for this network, as the build set it
-    /// (`ZODL_OHTTP_SIGNING_PUBKEY_*`). An error when the build did not set one (OHTTP off for
-    /// this network) or the value is not an Ed25519 point.
-    pub fn pinned_signing_key(self) -> Result<VerifyingKey, Error> {
-        signing_key_from_hex(
-            self,
-            crate::relays::Endpoints::BUILT_IN
-                .network(self)
-                .signing_key_hex,
-        )
-    }
-}
-
-/// The verifying key in `hex_key`, the configured key of `network`.
-fn signing_key_from_hex(network: Network, hex_key: Option<&str>) -> Result<VerifyingKey, Error> {
-    let refused = |why: &str| {
-        Error::KeyConfig(format!(
-            "{why} signing key for {} (ZODL_OHTTP_SIGNING_PUBKEY_{})",
-            network.as_str(),
-            network.as_str().to_ascii_uppercase()
-        ))
-    };
-    let hex_key = hex_key.ok_or_else(|| refused("no OHTTP"))?;
-    let bytes: [u8; 32] = hex::decode(hex_key)
-        .ok()
-        .and_then(|bytes| bytes.try_into().ok())
-        .ok_or_else(|| refused("malformed"))?;
-    VerifyingKey::from_bytes(&bytes).map_err(|_| refused("invalid"))
 }
 
 /// How a gateway host name picks its [`Network`]. The clients differ here, and the choice
 /// decides which signing key an envelope is trusted under, so it is explicit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NetworkRule {
-    /// Exactly the build's mainnet gateway host (`ZODL_OHTTP_GATEWAY_HOST_MAINNET`) is mainnet
-    /// and exactly its testnet gateway host (`ZODL_OHTTP_GATEWAY_HOST_TESTNET`) testnet; any
-    /// other host, and every host of a network whose gateway host the build left unset, is
-    /// refused. Every preset uses it (the network comes from the static configuration, never
-    /// the host name).
+    /// Exactly the configured mainnet gateway host ([`crate::OhttpConfig::gateway_host`]) is
+    /// mainnet and exactly the configured testnet gateway host testnet; any other host, and
+    /// every host of a network without a configuration, is refused. Every preset uses it (the
+    /// network comes from the application's configuration, never the host name).
     KnownHosts,
     /// A host containing `-testnet` (after lower-casing) is testnet, every other host
     /// mainnet (what iOS did before the ZIP required the static network binding). Not used
@@ -144,22 +105,16 @@ pub enum NetworkRule {
 }
 
 impl NetworkRule {
-    /// The network of `gateway_host` under this rule.
-    pub fn network_for(self, gateway_host: &str) -> Result<Network, Error> {
-        self.network_in(&crate::relays::Endpoints::BUILT_IN, gateway_host)
-    }
-
-    /// [`NetworkRule::network_for`] against the endpoint configuration `endpoints`.
-    fn network_in(
+    /// The network of `gateway_host` under this rule; [`NetworkRule::KnownHosts`] looks it up
+    /// in `networks`. The error does not repeat the host.
+    pub fn network_for(
         self,
-        endpoints: &crate::relays::Endpoints,
+        networks: &OhttpNetworks,
         gateway_host: &str,
     ) -> Result<Network, Error> {
         match self {
-            NetworkRule::KnownHosts => endpoints.network_of_host(gateway_host).ok_or_else(|| {
-                Error::KeyConfig(format!(
-                    "no OHTTP network configured for gateway host {gateway_host}"
-                ))
+            NetworkRule::KnownHosts => networks.network_of_host(gateway_host).ok_or_else(|| {
+                Error::KeyConfig("no OHTTP network configured for this gateway host".into())
             }),
             NetworkRule::ContainsDashTestnetElseMainnet => {
                 Ok(if gateway_host.to_lowercase().contains("-testnet") {
@@ -322,20 +277,18 @@ pub fn open_signed_config(
 }
 
 /// The key configurations in the envelope `json`, once it is checked under `policy`: signed
-/// for `network` by the key pinned for it ([`Network::pinned_signing_key`]).
+/// for `network` by the signing key `networks` configures for it
+/// ([`crate::OhttpConfig::signing_pubkey`]). [`Error::KeyConfig`] when OHTTP is off for
+/// `network`.
 pub fn verify_signed_config(
+    networks: &OhttpNetworks,
     json: &[u8],
     network: Network,
     now: u64,
     policy: &SignedConfigPolicy,
 ) -> Result<SignedKeys, Error> {
-    verify_signed_config_with(
-        json,
-        network.as_str(),
-        &network.pinned_signing_key()?,
-        now,
-        policy,
-    )
+    let signer = networks.require(network)?.signing_pubkey();
+    verify_signed_config_with(json, network.as_str(), signer, now, policy)
 }
 
 /// [`verify_signed_config`] against a `signer` of the caller's choosing, for tests that sign
@@ -576,14 +529,15 @@ mod tests {
 
     #[test]
     fn known_hosts_take_the_network_from_the_configuration() {
-        use crate::relays::tests::EXAMPLE;
+        let networks = crate::config::tests::example();
         let rule = NetworkRule::KnownHosts;
         assert_eq!(
-            rule.network_in(&EXAMPLE, "ohttp-gateway.example").unwrap(),
+            rule.network_for(&networks, "ohttp-gateway.example")
+                .unwrap(),
             Network::Mainnet
         );
         assert_eq!(
-            rule.network_in(&EXAMPLE, "ohttp-gateway-testnet.example")
+            rule.network_for(&networks, "ohttp-gateway-testnet.example")
                 .unwrap(),
             Network::Testnet
         );
@@ -593,34 +547,46 @@ mod tests {
             "testnet.example",
             "",
         ] {
-            assert!(rule.network_in(&EXAMPLE, host).is_err(), "{host}");
+            let Err(Error::KeyConfig(message)) = rule.network_for(&networks, host) else {
+                panic!("{host} has a network");
+            };
+            assert!(host.is_empty() || !message.contains(host), "{message}");
         }
-        let mut unset = EXAMPLE;
-        unset.testnet.gateway_host = None;
+        let mainnet_only =
+            OhttpNetworks::new(networks.get(Network::Mainnet).cloned(), None).unwrap();
         assert!(rule
-            .network_in(&unset, "ohttp-gateway-testnet.example")
+            .network_for(&mainnet_only, "ohttp-gateway-testnet.example")
+            .is_err());
+        assert!(rule
+            .network_for(&OhttpNetworks::default(), "ohttp-gateway.example")
             .is_err());
     }
 
     #[test]
-    fn a_missing_or_malformed_signing_key_is_an_error() {
+    fn the_configured_key_verifies_and_an_unconfigured_network_refuses() {
         let v = vector();
-        let key = signing_key_from_hex(Network::Testnet, Some(v.public_key_hex.as_str())).unwrap();
-        assert_eq!(key, signer(&v));
-        for bad in [None, Some(""), Some("00"), Some("zz")] {
-            let Err(Error::KeyConfig(_)) = signing_key_from_hex(Network::Mainnet, bad) else {
-                panic!("{bad:?} gave a key");
+        let good = envelope(&v, &v.network, &v.signature_base64);
+        let now = v.not_before + 60;
+        let network = Network::from_name(&v.network).unwrap();
+        let config = crate::OhttpConfig::new(crate::OhttpConfigParams {
+            gateway_host: "ohttp-gateway-testnet.example",
+            relay_url: "https://relay-testnet.example/relay",
+            keys_dns_name: "testnet.ohttp-keys.example",
+            signing_pubkey: &v.public_key_hex,
+        })
+        .unwrap();
+        let networks = OhttpNetworks::new(None, Some(config)).unwrap();
+        let keys =
+            verify_signed_config(&networks, &good, network, now, &SignedConfigPolicy::LIBRARY)
+                .unwrap();
+        assert_eq!(keys.not_after, v.not_after);
+        // Another configured key, or no configuration at all: refused.
+        for networks in [crate::config::tests::example(), OhttpNetworks::default()] {
+            let Err(Error::KeyConfig(_)) =
+                verify_signed_config(&networks, &good, network, now, &SignedConfigPolicy::LIBRARY)
+            else {
+                panic!("an envelope opened under a key not configured for it");
             };
-        }
-        // The library's own key is whatever the build set, or an error.
-        for network in [Network::Mainnet, Network::Testnet] {
-            assert_eq!(
-                network.pinned_signing_key().is_ok(),
-                crate::relays::Endpoints::BUILT_IN
-                    .network(network)
-                    .signing_key_hex
-                    .is_some()
-            );
         }
     }
 }

@@ -107,35 +107,35 @@ trusts a key configuration only through that envelope.
 
 ## Key configuration discovery
 
-A network is OHTTP-capable in a wallet build only when its gateway host
-(`ZODL_OHTTP_GATEWAY_HOST_MAINNET` / `_TESTNET`), relay URL (`ZODL_OHTTP_RELAY_URL_*`, `https://`
-only), signing key (`ZODL_OHTTP_SIGNING_PUBKEY_*`, 64 hex digits) and keys DNS name
-(`ZODL_OHTTP_KEYS_DNS_NAME_*`) are all set at build time (`client/src/relays.rs`, validated by
-`client/build.rs`). There is no built-in value and no runtime override. With none of a network's
-four values set, OHTTP is off for that network; a partial set, a malformed value or a value
-shared by mainnet and testnet fails the build.
+A network is OHTTP-capable in a wallet only when the application passes in its configuration
+at runtime: gateway host, relay URL (`https://` only), keys DNS name and signing key (raw
+Ed25519, 64 hex digits), as an `OhttpConfig` per network held by an `OhttpNetworks`
+(`client/src/config.rs`, `client/INTEGRATION.md` section 1). The crate carries no value of its
+own. A network without a configuration has OHTTP off; an incomplete or malformed configuration,
+or one sharing a value between mainnet and testnet, is refused when it is built.
 
 1. **Through the relay.** The client fetches `GET /ohttp-configs/signed` through its relay (the
    URL is derived from the relay URL, `signed_config_url`). The relay forwards the GET to the
    gateway and returns the answer unchanged, so the gateway never sees the client's address here
    either.
-2. **DNS, last resort.** If that fails and the build set `ZODL_OHTTP_KEYS_DNS_NAME_MAINNET` /
-   `_TESTNET`, the client may read the envelope from a DNS TXT record of that name over
+2. **DNS, last resort.** If that fails, the client may read the envelope from a DNS TXT record
+   named by the network's configured keys DNS name over
    DNS-over-HTTPS, JSON API, using the public resolvers in `client/src/dns.rs` (`DOH_RESOLVERS`,
    tried in order; `doh_query_url` builds the query and disables EDNS Client Subnet where the
    resolver supports the parameter). `envelope_from_doh_json` accepts only a `Status` 0 answer
    with TXT records (type 16) for exactly the queried name, concatenates the character-strings
    of the record in order (presentation format, `\"`, `\\` and `\DDD` decimal escapes), requires
    exactly one distinct TXT value, and base64-decodes it into the envelope, refusing anything
-   over 64 KiB (`MAX_KEY_CONFIG_BYTES`). Without a DNS name for the network this source is off.
+   over 64 KiB (`MAX_KEY_CONFIG_BYTES`). Without a configuration for the network this source is
+   off.
    The library supplies the parsing; the wallet SDK performs the HTTPS fetch over its own
    transport.
 
 Either way the envelope is then verified the same way (`verify_signed_config`, `client/src/signed.rs`):
 
-- version 1, `network` equal to the network the build bound to the gateway host, `key_id`
-  equal to the first four bytes of SHA-256 of the pinned key, a valid Ed25519 signature by the
-  network's pinned key (`ZODL_OHTTP_SIGNING_PUBKEY_*`) over the exact signed message;
+- version 1, `network` equal to the network the configuration binds to the gateway host,
+  `key_id` equal to the first four bytes of SHA-256 of the pinned key, a valid Ed25519 signature
+  by the network's pinned key (its configured signing key) over the exact signed message;
 - `not_before < not_after`, `not_after - not_before` at most 86400 s, `not_after` at most
   86400 s ahead of the device clock, and the device clock within the window widened by
   `CLOCK_SKEW_SECS` (60 s) on each side;
@@ -229,6 +229,19 @@ keeps moving. With `RESPONSE_PADDING=on` (default) the final chunk is zero-padde
 `CHUNK_SIZE`, so a response that does not stall is a whole number of chunks and its size says
 little about which blocks or transactions were fetched. `sensitive` leaves a
 few small, uninformative answers unpadded.
+
+## Request padding
+
+The client pads every request to a fixed size class with zero bytes after the trailer section
+of its Binary HTTP message (RFC 9292 §3.8), before sealing it: a `SendTransaction` to 16 KiB
+(32 KiB if larger, then the next multiple of 32 KiB), every other request to the next multiple
+of 4 KiB, never past what fits under the 10 MiB sealed-request cap. The relay and the network see
+only these sizes: not which of the small calls was made, nor how large a transaction is (a send
+is still told apart from the other calls by its size class). The padding is part of the encoding (`encode_bhttp_request`), so every client
+sharing the crate has the same size classes. The gateway skips zero padding and refuses any
+non-zero byte after the message. Measured cost: none measurable for 4 and 8 KiB requests, a few
+milliseconds (up to about 20 ms at the median over long paths) for 16 KiB, where the request
+needs a second network round of packets.
 
 ## Multiple origins
 

@@ -22,7 +22,7 @@ use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
 use sha2::{Digest, Sha256};
 use zodl_ohttp_client::{
     open_signed_config, verify_signed_config, verify_signed_config_with, ClientProfile, Error,
-    Network, NetworkRule, SignedConfigPolicy, GATEWAY_HOST_MAINNET, GATEWAY_HOST_TESTNET,
+    Network, NetworkRule, OhttpConfig, OhttpConfigParams, OhttpNetworks, SignedConfigPolicy,
 };
 
 const NOW: u64 = 1_800_000_000;
@@ -32,6 +32,26 @@ const PROFILES: [(&str, SignedConfigPolicy); 4] = [
     ("ios", SignedConfigPolicy::IOS),
     ("slipstream", SignedConfigPolicy::SLIPSTREAM),
 ];
+
+/// Both networks configured with example values (RFC 2606); the testnet signing key is
+/// [`signer`]'s.
+fn example_networks() -> OhttpNetworks {
+    let mainnet = OhttpConfig::new(OhttpConfigParams {
+        gateway_host: "ohttp-gateway.example",
+        relay_url: "https://relay-mainnet.example/relay",
+        keys_dns_name: "mainnet.ohttp-keys.example",
+        signing_pubkey: &hex::encode(SigningKey::from_bytes(&[9; 32]).verifying_key().as_bytes()),
+    })
+    .unwrap();
+    let testnet = OhttpConfig::new(OhttpConfigParams {
+        gateway_host: "ohttp-gateway-testnet.example",
+        relay_url: "https://relay-testnet.example/relay",
+        keys_dns_name: "testnet.ohttp-keys.example",
+        signing_pubkey: &hex::encode(signer().verifying_key().as_bytes()),
+    })
+    .unwrap();
+    OhttpNetworks::new(Some(mainnet), Some(testnet)).unwrap()
+}
 
 struct Spec {
     not_before: u64,
@@ -290,9 +310,27 @@ fn the_wrong_network_key_or_signature_is_refused_by_all() {
             verify_signed_config_with(&json, "testnet", &other, NOW, &policy),
             Err(Error::KeyConfig(_))
         ));
-        // Signed by the test key, so not by the pinned testnet key.
+        // Under the configured testnet key (the test key) it verifies; not under the mainnet
+        // key, not as mainnet, and not without a configuration.
+        let networks = example_networks();
+        assert!(verify_signed_config(&networks, &json, Network::Testnet, NOW, &policy).is_ok());
         assert!(matches!(
-            verify_signed_config(&json, Network::Testnet, NOW, &policy),
+            verify_signed_config(&networks, &json, Network::Mainnet, NOW, &policy),
+            Err(Error::KeyConfig(_))
+        ));
+        let swapped = OhttpNetworks::new(None, networks.get(Network::Mainnet).cloned()).unwrap();
+        assert!(matches!(
+            verify_signed_config(&swapped, &json, Network::Testnet, NOW, &policy),
+            Err(Error::KeyConfig(_))
+        ));
+        assert!(matches!(
+            verify_signed_config(
+                &OhttpNetworks::default(),
+                &json,
+                Network::Testnet,
+                NOW,
+                &policy
+            ),
             Err(Error::KeyConfig(_))
         ));
     }
@@ -314,18 +352,19 @@ fn every_preset_takes_the_network_from_the_known_hosts_only() {
         ("library", ClientProfile::LIBRARY),
     ] {
         assert_eq!(profile.network_rule, NetworkRule::KnownHosts, "{name}");
-        assert!(
+        let networks = example_networks();
+        for host in ["ohttp.example.org", "evil-testnet.example"] {
+            assert!(
+                profile.network_rule.network_for(&networks, host).is_err(),
+                "{name} {host}"
+            );
+        }
+        assert_eq!(
             profile
                 .network_rule
-                .network_for("ohttp.example.org")
-                .is_err(),
-            "{name}"
-        );
-        assert!(
-            profile
-                .network_rule
-                .network_for("evil-testnet.example")
-                .is_err(),
+                .network_for(&networks, "ohttp-gateway-testnet.example")
+                .unwrap(),
+            Network::Testnet,
             "{name}"
         );
     }
@@ -334,41 +373,34 @@ fn every_preset_takes_the_network_from_the_known_hosts_only() {
 #[test]
 fn the_gateway_host_picks_the_network_as_each_client_does() {
     use Network::{Mainnet, Testnet};
+    let networks = example_networks();
     let rules = |host| {
         [
             NetworkRule::KnownHosts,
             NetworkRule::ContainsDashTestnetElseMainnet,
             NetworkRule::ContainsTestnetElseMainnet,
         ]
-        .map(|rule| rule.network_for(host).ok())
+        .map(|rule| rule.network_for(&networks, host).ok())
     };
-    // KnownHosts knows only the hosts the build configured (`ZODL_OHTTP_GATEWAY_HOST_*`).
-    let known = |host: &str| {
-        if GATEWAY_HOST_MAINNET == Some(host) {
-            Some(Mainnet)
-        } else if GATEWAY_HOST_TESTNET == Some(host) {
-            Some(Testnet)
-        } else {
-            None
-        }
-    };
-    if let Some(host) = GATEWAY_HOST_MAINNET {
-        assert_eq!(rules(host)[0], Some(Mainnet));
-    }
-    if let Some(host) = GATEWAY_HOST_TESTNET {
-        assert_eq!(rules(host)[0], Some(Testnet));
-    }
+    // KnownHosts knows only the configured hosts.
     assert_eq!(
         rules("ohttp-gateway.example"),
-        [known("ohttp-gateway.example"), Some(Mainnet), Some(Mainnet)]
+        [Some(Mainnet), Some(Mainnet), Some(Mainnet)]
     );
     assert_eq!(
         rules("ohttp-gateway-testnet.example"),
-        [
-            known("ohttp-gateway-testnet.example"),
-            Some(Testnet),
-            Some(Testnet)
-        ]
+        [Some(Testnet), Some(Testnet), Some(Testnet)]
+    );
+    // Without a configuration KnownHosts refuses every host; the legacy rules do not look at it.
+    let off = OhttpNetworks::default();
+    assert!(NetworkRule::KnownHosts
+        .network_for(&off, "ohttp-gateway.example")
+        .is_err());
+    assert_eq!(
+        NetworkRule::ContainsTestnetElseMainnet
+            .network_for(&off, "ohttp-gateway-testnet.example")
+            .unwrap(),
+        Testnet
     );
     // Another host: KnownHosts refuses, both legacy host-name rules take mainnet.
     assert_eq!(

@@ -126,6 +126,55 @@ mod tests {
     }
 
     #[test]
+    fn the_gateway_reads_a_padded_request_as_the_unpadded_one() {
+        for (path, body) in [
+            (
+                "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetLatestBlock",
+                vec![0; 5],
+            ),
+            (crate::bhttp_codec::SEND_TRANSACTION_PATH, vec![7; 20_000]),
+        ] {
+            let request = Request::new("POST", "gw.example", path)
+                .header("content-type", "application/grpc")
+                .body(body);
+            let padded = encode_request(&request).unwrap();
+            // The length of the same message without its padding.
+            let end = crate::bhttp_codec::encode_unpadded_into(
+                &mut Vec::new(),
+                &BhttpRequest::from(&request),
+                &EncodeOptions::PRESERVE_FRESH,
+                |len| len,
+            )
+            .unwrap();
+            assert!(padded.len() > end);
+            assert!(padded[end..].iter().all(|&b| b == 0));
+            let with = ohttp_gateway::ohttp::parse_inner_request(&padded).unwrap();
+            let without = ohttp_gateway::ohttp::parse_inner_request(&padded[..end]).unwrap();
+            assert_eq!(
+                (
+                    &with.method,
+                    &with.authority,
+                    &with.path,
+                    &with.headers,
+                    &with.body
+                ),
+                (
+                    &without.method,
+                    &without.authority,
+                    &without.path,
+                    &without.headers,
+                    &without.body
+                )
+            );
+            assert_eq!(with.body, request.body);
+            // Non-zero bytes after the message are refused.
+            let mut junk = padded.clone();
+            *junk.last_mut().unwrap() = 1;
+            assert!(ohttp_gateway::ohttp::parse_inner_request(&junk).is_err());
+        }
+    }
+
+    #[test]
     fn an_indeterminate_length_response_decodes() {
         // Framing 3: status 201, one header field, content in one chunk, end of content,
         // empty trailer section.

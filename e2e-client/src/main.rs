@@ -21,23 +21,91 @@ use anyhow::{bail, Result};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use zodl_ohttp_client::{
     decode_bhttp_response, doh_query_url, encapsulate_chunked_request, encode_request,
-    envelope_from_doh_json, key_config_dns_name, open_signed_config, verify_signed_config,
-    DecodeOptions, KeyConfig, Network, Request, SignedConfigPolicy, VerifyingKey,
-    CONTENT_TYPE_CHUNKED_REQ, CONTENT_TYPE_CHUNKED_RES, DOH_RESOLVERS,
+    envelope_from_doh_json, open_signed_config, verify_signed_config, DecodeOptions, KeyConfig,
+    Network, OhttpConfig, OhttpConfigParams, OhttpNetworks, Request, SignedConfigPolicy,
+    VerifyingKey, CONTENT_TYPE_CHUNKED_REQ, CONTENT_TYPE_CHUNKED_RES, DOH_RESOLVERS,
 };
 
-/// The signing key of `network`, as this build of the client crate pinned it
-/// (`ZODL_OHTTP_SIGNING_PUBKEY_MAINNET` / `_TESTNET` at build time).
-fn signer(network: &str) -> Result<VerifyingKey> {
-    let network = Network::from_name(network)
-        .ok_or_else(|| anyhow::anyhow!("Unknown network: {}", network))?;
-    Ok(network.pinned_signing_key()?)
+/// The runtime OHTTP configuration of each network, from the environment: the four variables
+/// `OHTTP_E2E_GATEWAY_HOST_<NET>`, `OHTTP_E2E_RELAY_URL_<NET>`, `OHTTP_E2E_KEYS_DNS_NAME_<NET>`
+/// and `OHTTP_E2E_SIGNING_PUBKEY_<NET>`, `<NET>` being `MAINNET` or `TESTNET`.
+const CONFIG_VARS: [&str; 4] = [
+    "OHTTP_E2E_GATEWAY_HOST",
+    "OHTTP_E2E_RELAY_URL",
+    "OHTTP_E2E_KEYS_DNS_NAME",
+    "OHTTP_E2E_SIGNING_PUBKEY",
+];
+
+/// The OHTTP configuration of both networks, read through `var` (the process environment, or a
+/// map in tests). A network is configured with all four of its variables or none (an empty
+/// variable counts as unset); none leaves it off. Errors name variables and rules, never values.
+fn networks_from(var: impl Fn(&str) -> Option<String>) -> Result<OhttpNetworks> {
+    let network = |network: Network| -> Result<Option<OhttpConfig>> {
+        let names =
+            CONFIG_VARS.map(|prefix| format!("{prefix}_{}", network.as_str().to_ascii_uppercase()));
+        let values = names
+            .clone()
+            .map(|name| var(&name).filter(|value| !value.is_empty()));
+        if values.iter().all(Option::is_none) {
+            return Ok(None);
+        }
+        let missing: Vec<&str> = names
+            .iter()
+            .zip(&values)
+            .filter(|(_, value)| value.is_none())
+            .map(|(name, _)| name.as_str())
+            .collect();
+        if !missing.is_empty() {
+            bail!(
+                "{} OHTTP configuration is incomplete: set all four variables or none; missing {}",
+                network.as_str(),
+                missing.join(", ")
+            );
+        }
+        let [host, relay, dns, key] = values.map(Option::unwrap_or_default);
+        OhttpConfig::new(OhttpConfigParams {
+            gateway_host: &host,
+            relay_url: &relay,
+            keys_dns_name: &dns,
+            signing_pubkey: &key,
+        })
+        .map(Some)
+        .map_err(|e| anyhow::anyhow!("{}: {e}", network.as_str()))
+    };
+    Ok(OhttpNetworks::new(
+        network(Network::Mainnet)?,
+        network(Network::Testnet)?,
+    )?)
+}
+
+/// [`networks_from`] the process environment.
+fn networks() -> Result<OhttpNetworks> {
+    networks_from(|name| std::env::var(name).ok())
+}
+
+/// The network named `name`.
+fn network_named(name: &str) -> Result<Network> {
+    Network::from_name(name).ok_or_else(|| anyhow::anyhow!("network must be mainnet or testnet"))
+}
+
+/// The signing key configured for `network`.
+fn signer(networks: &OhttpNetworks, network: Network) -> Result<VerifyingKey> {
+    match networks.get(network) {
+        Some(config) => Ok(*config.signing_pubkey()),
+        None => bail!(
+            "no OHTTP configuration for {0}: set the OHTTP_E2E_*_{1} variables",
+            network.as_str(),
+            network.as_str().to_ascii_uppercase()
+        ),
+    }
 }
 
 fn usage() -> ! {
     eprintln!("usage: ohttp-e2e <config_url> <relay_url> <authority> <method> <path> [trace_id] [grpc|http] [body_hex]");
     eprintln!("       ohttp-e2e --key-config-source dns <network>");
     eprintln!("  env: NETWORK=mainnet|testnet (for signed config verification)");
+    eprintln!("  env: OHTTP_E2E_{{GATEWAY_HOST,RELAY_URL,KEYS_DNS_NAME,SIGNING_PUBKEY}}_{{MAINNET,TESTNET}}:");
+    eprintln!("       the OHTTP configuration of each network, needed for signed configs and DNS");
     eprintln!("  --key-config-source dns: fetch and verify envelope from DNS-over-HTTPS");
     std::process::exit(2)
 }
@@ -100,7 +168,8 @@ fn main() -> Result<()> {
             network
         );
         let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
-        let keys = open_signed_config(&kc_raw, &network, &signer(&network)?, now)?;
+        let signer = signer(&networks()?, network_named(&network)?)?;
+        let keys = open_signed_config(&kc_raw, &network, &signer, now)?;
         println!("signed-configs: OK not_after={}", keys.not_after);
         keys.document
     } else {
@@ -300,30 +369,21 @@ fn main() -> Result<()> {
 }
 
 fn dns_key_config_test(network_str: &str) -> Result<()> {
-    let network = match network_str {
-        "mainnet" => Network::Mainnet,
-        "testnet" => Network::Testnet,
-        _ => bail!("network must be mainnet or testnet"),
-    };
+    let network = network_named(network_str)?;
+    let networks = networks()?;
 
     let http = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()?;
 
     println!("DNS key config test for {}", network.as_str());
-    let Some(name) = key_config_dns_name(network) else {
-        bail!(
-            "no key-configuration DNS name for {} in this build (ZODL_OHTTP_KEYS_DNS_NAME_{})",
-            network.as_str(),
-            network.as_str().to_ascii_uppercase()
-        );
-    };
-    println!("DNS name: {}", name);
+    // Fails without a configuration for the network.
+    signer(&networks, network)?;
     println!("Resolvers: {:?}", DOH_RESOLVERS);
 
     for (i, resolver) in DOH_RESOLVERS.iter().enumerate() {
         println!("\n[{}] Trying resolver: {}", i + 1, resolver);
-        let Some(url) = doh_query_url(resolver, network) else {
+        let Some(url) = doh_query_url(&networks, resolver, network) else {
             bail!("no key-configuration DNS name for {}", network.as_str());
         };
         println!("    URL: {}", url);
@@ -355,12 +415,18 @@ fn dns_key_config_test(network_str: &str) -> Result<()> {
         };
         println!("    Response: {} bytes in {:?}", body.len(), t.elapsed());
 
-        match envelope_from_doh_json(&body, network) {
+        match envelope_from_doh_json(&networks, &body, network) {
             Ok(envelope) => {
                 println!("    Envelope: {} bytes", envelope.len());
 
                 let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
-                match verify_signed_config(&envelope, network, now, &SignedConfigPolicy::LIBRARY) {
+                match verify_signed_config(
+                    &networks,
+                    &envelope,
+                    network,
+                    now,
+                    &SignedConfigPolicy::LIBRARY,
+                ) {
                     Ok(keys) => {
                         println!("    Signature: OK");
                         println!("    not_after: {}", keys.not_after);
@@ -398,4 +464,110 @@ fn extra_headers() -> Vec<(String, String)> {
         .filter_map(|kv| kv.split_once(':'))
         .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    /// Valid example signing keys: the Ed25519 base point (`1`) and its double (`2`).
+    fn key_hex(which: u8) -> String {
+        match which {
+            1 => "5866666666666666666666666666666666666666666666666666666666666666".into(),
+            _ => "c9a3f86aae465f0e56513864510f3997561fa2c9e85ea21dc2292309f3cd6022".into(),
+        }
+    }
+
+    fn env(pairs: &[(&str, String)]) -> impl Fn(&str) -> Option<String> {
+        let map: HashMap<String, String> = pairs
+            .iter()
+            .map(|(name, value)| (name.to_string(), value.clone()))
+            .collect();
+        move |name| map.get(name).cloned()
+    }
+
+    fn testnet() -> Vec<(&'static str, String)> {
+        vec![
+            (
+                "OHTTP_E2E_GATEWAY_HOST_TESTNET",
+                "ohttp-gateway-testnet.example".into(),
+            ),
+            (
+                "OHTTP_E2E_RELAY_URL_TESTNET",
+                "https://relay-testnet.example/relay".into(),
+            ),
+            (
+                "OHTTP_E2E_KEYS_DNS_NAME_TESTNET",
+                "testnet.ohttp-keys.example".into(),
+            ),
+            ("OHTTP_E2E_SIGNING_PUBKEY_TESTNET", key_hex(1)),
+        ]
+    }
+
+    #[test]
+    fn no_variables_means_ohttp_off() {
+        let networks = networks_from(env(&[])).unwrap();
+        assert_eq!(networks, OhttpNetworks::default());
+        assert!(signer(&networks, Network::Mainnet).is_err());
+    }
+
+    #[test]
+    fn one_complete_network_is_configured() {
+        let networks = networks_from(env(&testnet())).unwrap();
+        let config = networks.get(Network::Testnet).unwrap();
+        assert_eq!(config.gateway_host(), "ohttp-gateway-testnet.example");
+        assert_eq!(
+            networks.relay_for("ohttp-gateway-testnet.example"),
+            Some("https://relay-testnet.example/relay")
+        );
+        assert!(networks.get(Network::Mainnet).is_none());
+        assert!(signer(&networks, Network::Testnet).is_ok());
+    }
+
+    #[test]
+    fn a_partial_or_invalid_network_is_an_error_without_values() {
+        let mut partial = testnet();
+        partial.remove(1);
+        let error = networks_from(env(&partial)).unwrap_err().to_string();
+        assert!(
+            error.contains("missing OHTTP_E2E_RELAY_URL_TESTNET"),
+            "{error}"
+        );
+        assert!(!error.contains("example"), "{error}");
+
+        let mut invalid = testnet();
+        invalid[1].1 = "http://relay-testnet.example/relay".into();
+        let error = networks_from(env(&invalid)).unwrap_err().to_string();
+        assert_eq!(
+            error,
+            "testnet: OHTTP configuration: relay_url must be an https:// URL"
+        );
+
+        // Mainnet with testnet's signing key.
+        let mut shared = testnet();
+        shared.extend([
+            (
+                "OHTTP_E2E_GATEWAY_HOST_MAINNET",
+                "ohttp-gateway.example".into(),
+            ),
+            (
+                "OHTTP_E2E_RELAY_URL_MAINNET",
+                "https://relay-mainnet.example/relay".into(),
+            ),
+            (
+                "OHTTP_E2E_KEYS_DNS_NAME_MAINNET",
+                "mainnet.ohttp-keys.example".into(),
+            ),
+            ("OHTTP_E2E_SIGNING_PUBKEY_MAINNET", key_hex(1)),
+        ]);
+        let error = networks_from(env(&shared)).unwrap_err().to_string();
+        assert!(error.contains("signing_pubkey"), "{error}");
+        shared.last_mut().unwrap().1 = key_hex(2);
+        let networks = networks_from(env(&shared)).unwrap();
+        assert_eq!(
+            networks.network_of_host("ohttp-gateway.example"),
+            Some(Network::Mainnet)
+        );
+    }
 }

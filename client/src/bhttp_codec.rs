@@ -273,8 +273,20 @@ fn fields_latin1(fields: &[Field]) -> Vec<(String, String)> {
 
 /// `request` as a known-length Binary HTTP message (RFC 9292 §3.1, framing indicator 0):
 /// control data, header section, content and trailer section (always empty), each
-/// length-prefixed; no padding. Fails for a field of 2^62 bytes or more, which cannot be
-/// framed, or when the message does not fit in memory.
+/// length-prefixed, then zero padding (RFC 9292 §3.8) up to a fixed size, so that the relay and
+/// the network see only a few request sizes:
+///
+/// - a lightwalletd `SendTransaction` (path
+///   `/cash.z.wallet.sdk.rpc.CompactTxStreamer/SendTransaction`) is padded to 16 KiB, a larger
+///   one to 32 KiB, and one larger still to the next multiple of 32 KiB;
+/// - every other request is padded to the next multiple of 4 KiB (at least 4 KiB);
+/// - never past what still fits under the gateway's 10 MiB sealed-request cap
+///   ([`crate::GATEWAY_MAX_ENCAPSULATED_REQUEST_BYTES`]): a message close to it is padded only
+///   up to that limit, and a longer one not at all.
+///
+/// Padding is part of the encoding and not an option: every client then has the same size
+/// classes. Fails for a field of 2^62 bytes or more, which cannot be framed, or when the
+/// message does not fit in memory.
 pub fn encode_bhttp_request(
     request: &BhttpRequest,
     options: &EncodeOptions,
@@ -284,12 +296,66 @@ pub fn encode_bhttp_request(
     Ok(out)
 }
 
-/// [`encode_bhttp_request`] appending to `out`, which is grown once, to the exact size.
+/// The path of lightwalletd's `SendTransaction`, the one request padded to the larger size
+/// classes (a transaction is a few KiB to tens of KiB).
+pub(crate) const SEND_TRANSACTION_PATH: &str =
+    "/cash.z.wallet.sdk.rpc.CompactTxStreamer/SendTransaction";
+
+/// The size class of every other request.
+const REQUEST_PAD_STEP: usize = 4 << 10;
+/// The smallest size class of a `SendTransaction`.
+const SEND_PAD_MIN: usize = 16 << 10;
+/// The size step of a `SendTransaction` above [`SEND_PAD_MIN`].
+const SEND_PAD_STEP: usize = 32 << 10;
+/// The longest message padding produces: sealed as a chunked request (39 bytes of header and
+/// encapsulated key, a length varint of at most 8 bytes, the 16-byte tag and the 17-byte final
+/// chunk) it stays within [`crate::GATEWAY_MAX_ENCAPSULATED_REQUEST_BYTES`], so padding never
+/// makes a request the gateway would accept too large to send.
+const MAX_PADDED_LEN: usize = crate::GATEWAY_MAX_ENCAPSULATED_REQUEST_BYTES - 80;
+
+/// The length a request message of `len` bytes to `path` is padded to: see
+/// [`encode_bhttp_request`]. Never more than [`MAX_PADDED_LEN`] unless `len` itself is, and
+/// never less than `len`.
+pub(crate) fn padded_request_len(path: &[u8], len: usize) -> usize {
+    let round_up = |step: usize| len.checked_next_multiple_of(step).unwrap_or(len);
+    let class = if path == SEND_TRANSACTION_PATH.as_bytes() {
+        if len <= SEND_PAD_MIN {
+            SEND_PAD_MIN
+        } else {
+            round_up(SEND_PAD_STEP)
+        }
+    } else {
+        round_up(REQUEST_PAD_STEP).max(REQUEST_PAD_STEP)
+    };
+    class.min(MAX_PADDED_LEN).max(len)
+}
+
+/// [`encode_bhttp_request`] appending to `out`, which is grown once, to the exact size. The
+/// whole request is in memory here (the clients send known-length requests only, sealed in one
+/// piece), so its padding follows from its full length.
 pub(crate) fn encode_bhttp_request_into(
     out: &mut Vec<u8>,
     request: &BhttpRequest,
     options: &EncodeOptions,
 ) -> Result<(), Error> {
+    let start = out.len();
+    let written = encode_unpadded_into(out, request, options, |len| {
+        padded_request_len(&request.path, len)
+    })?;
+    // RFC 9292 §3.8: zero bytes after the trailer section, sized by what was written.
+    out.resize(start + padded_request_len(&request.path, written), 0);
+    Ok(())
+}
+
+/// The message without padding, appended to `out` with room reserved for `reserve(len)` bytes
+/// in all, `len` being the message's computed length; returns the length written.
+pub(crate) fn encode_unpadded_into(
+    out: &mut Vec<u8>,
+    request: &BhttpRequest,
+    options: &EncodeOptions,
+    reserve: impl Fn(usize) -> usize,
+) -> Result<usize, Error> {
+    let start = out.len();
     let stamp: Option<(Vec<u8>, Vec<u8>)> = (options.freshness
         && !request.headers.iter().any(|(name, _)| {
             name.eq_ignore_ascii_case(crate::freshness::REQUEST_HEADER.as_bytes())
@@ -320,7 +386,7 @@ pub(crate) fn encode_bhttp_request_into(
     ]
     .into_iter()
     .fold(0, usize::saturating_add);
-    out.try_reserve_exact(total)
+    out.try_reserve_exact(reserve(total).max(total))
         .map_err(|_| format_error("the request does not fit in memory"))?;
     write_varint(out, 0)?;
     write_vec(out, &request.method)?;
@@ -338,7 +404,10 @@ pub(crate) fn encode_bhttp_request_into(
         write_vec(out, value)?;
     }
     write_vec(out, &request.body)?;
-    write_varint(out, 0)
+    write_varint(out, 0)?;
+    let written = out.len() - start;
+    debug_assert_eq!(written, total, "the computed length is what is written");
+    Ok(written)
 }
 
 /// The bytes a length-prefixed field of `len` bytes takes.
@@ -542,6 +611,94 @@ fn write_vec(out: &mut Vec<u8>, bytes: &[u8]) -> Result<(), Error> {
 mod tests {
     use super::*;
 
+    /// `request` encoded without its padding.
+    fn unpadded(request: &BhttpRequest, options: &EncodeOptions) -> Vec<u8> {
+        let mut out = Vec::new();
+        encode_unpadded_into(&mut out, request, options, |len| len).unwrap();
+        out
+    }
+
+    #[test]
+    fn requests_are_padded_to_their_size_class() {
+        let send = SEND_TRANSACTION_PATH.as_bytes();
+        let other = b"/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetLatestBlock";
+        for (len, expected) in [
+            (1, 4096),
+            (300, 4096),
+            (4095, 4096),
+            (4096, 4096),
+            (4097, 8192),
+            (8192, 8192),
+            (8193, 12288),
+            (40_000, 40_960),
+        ] {
+            assert_eq!(padded_request_len(other, len), expected, "{len}");
+        }
+        for (len, expected) in [
+            (1, 16384),
+            (5000, 16384),
+            (16384, 16384),
+            (16385, 32768),
+            (32768, 32768),
+            (32769, 65536),
+            (65536, 65536),
+            (65537, 98304),
+        ] {
+            assert_eq!(padded_request_len(send, len), expected, "{len}");
+        }
+        // Only the exact path is a send.
+        assert_eq!(padded_request_len(b"/x/SendTransaction", 10), 4096);
+        // Never padded past what still fits under the gateway's sealed-request cap, and never
+        // shortened; no overflow near the top.
+        let cap = crate::GATEWAY_MAX_ENCAPSULATED_REQUEST_BYTES;
+        for path in [other.as_slice(), send] {
+            assert_eq!(
+                padded_request_len(path, MAX_PADDED_LEN - 10),
+                MAX_PADDED_LEN
+            );
+            assert_eq!(padded_request_len(path, MAX_PADDED_LEN), MAX_PADDED_LEN);
+            assert_eq!(
+                padded_request_len(path, MAX_PADDED_LEN + 1),
+                MAX_PADDED_LEN + 1
+            );
+            assert_eq!(padded_request_len(path, cap), cap);
+        }
+        assert_eq!(padded_request_len(other, usize::MAX), usize::MAX);
+        assert_eq!(padded_request_len(send, usize::MAX - 1), usize::MAX - 1);
+    }
+
+    #[test]
+    fn the_padding_is_zeros_after_the_complete_message() {
+        for (path, body, size) in [
+            (
+                "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetLatestBlock",
+                5,
+                4096,
+            ),
+            ("/v1/info", 5000, 8192),
+            (SEND_TRANSACTION_PATH, 3000, 16384),
+            (SEND_TRANSACTION_PATH, 20_000, 32768),
+            (SEND_TRANSACTION_PATH, 40_000, 65536),
+        ] {
+            // An explicit freshness field, so that the `_FRESH` options add none and both
+            // encodings are deterministic.
+            let request = BhttpRequest::new("POST", "gw.example", path)
+                .header("ohttp-freshness", "1800000000")
+                .body(vec![7; body]);
+            for options in [EncodeOptions::LOWERCASE, EncodeOptions::PRESERVE_FRESH] {
+                let message = unpadded(&request, &options);
+                let mut out = vec![9, 9];
+                encode_bhttp_request_into(&mut out, &request, &options).unwrap();
+                assert_eq!(&out[..2], &[9, 9], "the prefix is kept");
+                let padded = &out[2..];
+                assert_eq!(padded.len(), size, "{path} {body}");
+                assert_eq!(&padded[..message.len()], &message[..]);
+                assert!(padded[message.len()..].iter().all(|&b| b == 0));
+                assert_eq!(out.len(), out.capacity(), "the reserve was exact");
+            }
+        }
+    }
+
     fn hex(s: &str) -> Vec<u8> {
         let digits: Vec<u8> = s.bytes().filter(u8::is_ascii_hexdigit).collect();
         digits
@@ -553,8 +710,8 @@ mod tests {
     #[test]
     fn freshness_option_stamps_the_header_once() {
         let request = BhttpRequest::new("POST", "gw.example", "/p");
-        let plain = encode_bhttp_request(&request, &EncodeOptions::LOWERCASE).unwrap();
-        let fresh = encode_bhttp_request(&request, &EncodeOptions::LOWERCASE_FRESH).unwrap();
+        let plain = unpadded(&request, &EncodeOptions::LOWERCASE);
+        let fresh = unpadded(&request, &EncodeOptions::LOWERCASE_FRESH);
         assert!(fresh.len() > plain.len());
         let text = String::from_utf8_lossy(&fresh);
         assert!(text.contains(crate::freshness::REQUEST_HEADER), "{text}");
@@ -584,10 +741,12 @@ mod tests {
             )
             .header("Host", "www.example.com")
             .header("Accept-Language", "en, mi");
-        assert_eq!(
-            encode_bhttp_request(&request, &EncodeOptions::LOWERCASE).unwrap(),
-            expected
-        );
+        assert_eq!(unpadded(&request, &EncodeOptions::LOWERCASE), expected);
+        // On the wire it is followed by zero padding to 4 KiB.
+        let padded = encode_bhttp_request(&request, &EncodeOptions::LOWERCASE).unwrap();
+        assert_eq!(padded.len(), 4096);
+        assert_eq!(&padded[..expected.len()], &expected[..]);
+        assert!(padded[expected.len()..].iter().all(|&b| b == 0));
     }
 
     #[test]

@@ -20,17 +20,30 @@ One Oblivious HTTP exchange against a real relay, on the encapsulation of `zodl-
 cargo run --release -- <config_url> <relay_url> <authority> <method> <path> [trace_id] [grpc|http] [body_hex]
 ```
 
-Signed key configurations (`.../ohttp-configs/signed`) are verified against the signing key the
-client crate was built with (`ZODL_OHTTP_SIGNING_PUBKEY_MAINNET` / `_TESTNET`, see
-`../client/src/relays.rs`); `--key-config-source dns` uses `ZODL_OHTTP_KEYS_DNS_NAME_*`. A
-network is configured with all four of its variables (gateway host, relay URL, signing key, keys
-DNS name) or none; without them the binary still builds and refuses signed configurations for
-that network.
+The binary carries no OHTTP configuration; it reads it at runtime from its environment, four
+variables per network (`<NET>` is `MAINNET` or `TESTNET`):
+
+| Variable | Value |
+|---|---|
+| `OHTTP_E2E_GATEWAY_HOST_<NET>` | the gateway host name |
+| `OHTTP_E2E_RELAY_URL_<NET>` | the relay URL, `https://` |
+| `OHTTP_E2E_KEYS_DNS_NAME_<NET>` | the DNS TXT name of the signed key configuration |
+| `OHTTP_E2E_SIGNING_PUBKEY_<NET>` | the key-configuration signing key, 64 hex digits |
+
+A network is configured with all four or none (an empty variable counts as unset); the values
+are checked as `zodl_ohttp_client::OhttpConfig::new` checks them, and mainnet and testnet must
+not share one. Errors name the variable or field, never the value. Signed key configurations
+(`.../ohttp-configs/signed`) are verified against the configured signing key of `NETWORK`, and
+`--key-config-source dns <network>` reads the configured keys DNS name; without a configuration
+for that network both fail. Unsigned key configurations need none. The URLs and the authority
+of an exchange are always the command-line arguments.
 
 ```
-ZODL_OHTTP_GATEWAY_HOST_TESTNET=<host> ZODL_OHTTP_RELAY_URL_TESTNET=<https URL> \
-ZODL_OHTTP_SIGNING_PUBKEY_TESTNET=<64 hex digits> ZODL_OHTTP_KEYS_DNS_NAME_TESTNET=<DNS name> \
-  cargo build --release
+OHTTP_E2E_GATEWAY_HOST_TESTNET=ohttp-gateway-testnet.example \
+OHTTP_E2E_RELAY_URL_TESTNET=https://relay-testnet.example/relay \
+OHTTP_E2E_KEYS_DNS_NAME_TESTNET=testnet.ohttp-keys.example \
+OHTTP_E2E_SIGNING_PUBKEY_TESTNET=<64 hex digits> \
+  ohttp-e2e --key-config-source dns testnet
 ```
 
 Examples (placeholder hosts, RFC 2606):

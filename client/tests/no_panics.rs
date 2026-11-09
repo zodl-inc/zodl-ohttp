@@ -23,7 +23,8 @@ use zodl_ohttp_client::{
     classify_outer_response, decode_bhttp_response, decode_response, encapsulate_chunked_request,
     encode_bhttp_request, signed_config_url, verify_signed_config, verify_signed_config_with,
     BhttpRequest, ChunkedResponseDecoder, ClientProfile, DecodeOptions, EncodeOptions, KeyConfig,
-    KeySelection, Network, OuterResponse, SignedConfigPolicy, SignedConfigUrlRule,
+    KeySelection, Network, OhttpConfig, OhttpConfigParams, OhttpNetworks, OuterResponse,
+    SignedConfigPolicy, SignedConfigUrlRule,
 };
 
 /// xorshift64*: good enough to make bytes, and the same on every machine.
@@ -148,6 +149,19 @@ fn signed_envelopes_never_panic() {
     let mut rng = Rng(0x5eed_5eed_5eed_5eed);
     let base = br#"{"v":1,"network":"testnet","configs":"AAAA","not_before":10,"not_after":20,"key_id":"abcd1234","sig":"AAAA"}"#;
     let key = ed25519_dalek::SigningKey::from_bytes(&[9; 32]).verifying_key();
+    let networks = OhttpNetworks::new(
+        None,
+        Some(
+            OhttpConfig::new(OhttpConfigParams {
+                gateway_host: "ohttp-gateway-testnet.example",
+                relay_url: "https://relay-testnet.example/relay",
+                keys_dns_name: "testnet.ohttp-keys.example",
+                signing_pubkey: &hex::encode(key.as_bytes()),
+            })
+            .unwrap(),
+        ),
+    )
+    .unwrap();
     for i in 0..ROUNDS {
         let input = if i % 3 == 0 {
             rng.bytes(300)
@@ -160,7 +174,8 @@ fn signed_envelopes_never_panic() {
             SignedConfigPolicy::IOS,
             SignedConfigPolicy::SLIPSTREAM,
         ] {
-            let _ = verify_signed_config(&input, Network::Testnet, 15, &policy);
+            let _ = verify_signed_config(&networks, &input, Network::Testnet, 15, &policy);
+            let _ = verify_signed_config(&networks, &input, Network::Mainnet, 15, &policy);
             let _ = verify_signed_config_with(&input, "testnet", &key, 15, &policy);
         }
     }
@@ -232,7 +247,47 @@ fn outer_answers_and_urls_never_panic() {
                 let _ = signed_config_url(&url, rule);
             }
             let host = String::from_utf8_lossy(&rng.bytes(30)).into_owned();
-            let _ = profile.network_rule.network_for(&host);
+            let _ = profile
+                .network_rule
+                .network_for(&OhttpNetworks::default(), &host);
+        }
+    }
+}
+
+#[test]
+fn configuration_values_never_panic() {
+    let mut rng = Rng(0x0c0f_1600_d00d_5eed);
+    let valid = [
+        "ohttp-gateway.example",
+        "https://relay.example/relay",
+        "keys.ohttp-gateway.example",
+        "5866666666666666666666666666666666666666666666666666666666666666",
+    ];
+    // A configuration that shares no value with `valid`, so `OhttpNetworks::new` compares
+    // every field of the mutated one.
+    let distinct = OhttpConfig::new(OhttpConfigParams {
+        gateway_host: "ohttp-gateway-testnet.example",
+        relay_url: "https://relay-testnet.example/relay",
+        keys_dns_name: "keys.ohttp-gateway-testnet.example",
+        signing_pubkey: "c9a3f86aae465f0e56513864510f3997561fa2c9e85ea21dc2292309f3cd6022",
+    })
+    .unwrap();
+    for _ in 0..ROUNDS {
+        let mut values = valid.map(String::from);
+        let field = rng.below(4);
+        values[field] = if rng.below(2) == 0 {
+            String::from_utf8_lossy(&rng.bytes(80)).into_owned()
+        } else {
+            String::from_utf8_lossy(&rng.mutate(valid[field].as_bytes())).into_owned()
+        };
+        if let Ok(config) = OhttpConfig::new(OhttpConfigParams {
+            gateway_host: &values[0],
+            relay_url: &values[1],
+            keys_dns_name: &values[2],
+            signing_pubkey: &values[3],
+        }) {
+            let _ = OhttpNetworks::new(Some(config.clone()), Some(config.clone()));
+            let _ = OhttpNetworks::new(Some(config), Some(distinct.clone()));
         }
     }
 }
