@@ -2,6 +2,16 @@
 
 [Keep a Changelog](https://keepachangelog.com).
 
+## 1.0.0
+
+The first release published to crates.io. The API and behaviour are those of 0.1.2.
+
+### Changed
+
+- The crate is published: `publish = false` is gone, and the manifest names the repository.
+- The package carries the licence texts (`LICENSE`, `LICENSE-EXCEPTIONS.md`,
+  `COMMERCIAL-LICENSE.md`) that the source file headers refer to.
+
 ## 0.1.2
 
 ### Changed
