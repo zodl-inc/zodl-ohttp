@@ -571,20 +571,34 @@ fn bytes_after_the_suite_list_are_tolerated_or_refused_as_the_profile_says() {
 // ---- Signed envelopes --------------------------------------------------------------------
 
 #[test]
-fn the_pinned_keys_are_what_the_build_set() {
+fn the_pinned_keys_are_the_configured_ones() {
     use sha2::Digest;
-    for (network, configured) in [
-        (Network::Mainnet, zodl_ohttp_client::MAINNET_SIGNING_KEY_HEX),
-        (Network::Testnet, zodl_ohttp_client::TESTNET_SIGNING_KEY_HEX),
-    ] {
-        match configured {
-            Some(hex_key) => {
-                let key = network.pinned_signing_key().unwrap();
-                assert_eq!(hex_of(key.as_bytes()), hex_key.to_ascii_lowercase());
-                assert_eq!(hex_of(&Sha256::digest(key.as_bytes())[..4]).len(), 8);
-            }
-            None => assert!(network.pinned_signing_key().is_err()),
-        }
+    use zodl_ohttp_client::{OhttpConfig, OhttpConfigParams, OhttpNetworks};
+    let key_hex = |seed: u8| {
+        hex_of(
+            ed25519_dalek::SigningKey::from_bytes(&[seed; 32])
+                .verifying_key()
+                .as_bytes(),
+        )
+    };
+    let config = |host: &str, seed: u8| {
+        OhttpConfig::new(OhttpConfigParams {
+            gateway_host: host,
+            relay_url: &format!("https://{host}/relay"),
+            keys_dns_name: &format!("keys.{host}"),
+            signing_pubkey: &key_hex(seed).to_ascii_uppercase(),
+        })
+        .unwrap()
+    };
+    let networks = OhttpNetworks::new(
+        Some(config("ohttp-gateway.example", 4)),
+        Some(config("ohttp-gateway-testnet.example", 5)),
+    )
+    .unwrap();
+    for (network, seed) in [(Network::Mainnet, 4), (Network::Testnet, 5)] {
+        let key = networks.get(network).unwrap().signing_pubkey();
+        assert_eq!(hex_of(key.as_bytes()), key_hex(seed));
+        assert_eq!(hex_of(&Sha256::digest(key.as_bytes())[..4]).len(), 8);
     }
     assert_eq!(Network::from_name("mainnet"), Some(Network::Mainnet));
     assert_eq!(Network::from_name("regtest"), None);

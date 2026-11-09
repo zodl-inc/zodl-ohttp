@@ -7,6 +7,8 @@
 # GATEWAY_HOST (the gateway's inner authority) and RELAY_URL are required; there are no built-in
 # endpoints. NETWORK defaults to testnet. Exits non-zero if GetLatestBlock does not come back
 # with inner status 200 / grpc-status 0, or if an unknown :authority is not rejected with inner 403.
+# With CONFIGS_URL pointing at a signed configuration (.../ohttp-configs/signed) the e2e client
+# also needs the network's OHTTP configuration, OHTTP_E2E_*_<NET> (e2e-client/README.md).
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

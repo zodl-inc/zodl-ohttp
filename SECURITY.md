@@ -39,7 +39,7 @@ ineligible for any compensation.
   they are provided to the gateway through its environment. A report that one of them is exposed
   by this code is in scope.
 - The repository carries no deployment key. The key-configuration signing **public** keys a
-  wallet trusts are build-time variables (`ZODL_OHTTP_SIGNING_PUBKEY_MAINNET` / `_TESTNET`, see
+  wallet trusts are passed in by the application at runtime (`OhttpConfig`, see
   `client/INTEGRATION.md`) and are public by design; so are the test seeds and keys in
   `docs/signed-configs-test-vector.json` and in the tests.
 - Operational findings about a specific deployment (rate limits, edge configuration) are welcome

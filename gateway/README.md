@@ -93,8 +93,8 @@ u64be(not_after) || configs` (the decoded document). Envelopes are issued per on
 `not_before` is the slot start minus 300 s and `not_after` the slot start plus 21300 s, so every
 envelope is valid for 21600 s (`MAX_ISSUED_VALIDITY_SECS`) and overlaps the next one by five
 hours. Ed25519 is deterministic, so every gateway with the same seed, network and keys serves the
-identical envelope within a slot. Clients pin the public key of `CONFIGS_SIGNING_SEED_HEX` at
-build time; `../docs/signed-configs-test-vector.json` is a test vector with a test key.
+identical envelope within a slot. Clients pin the public key of `CONFIGS_SIGNING_SEED_HEX` in
+their OHTTP configuration; `../docs/signed-configs-test-vector.json` is a test vector with a test key.
 
 ## HPKE key rotation
 

@@ -548,12 +548,10 @@ pub fn signed_config_url(relay_url: &str, rule: SignedConfigUrlRule) -> Result<S
         SignedConfigUrlRule::RelayHostRoot => {
             let rest = relay_url
                 .strip_prefix("https://")
-                .ok_or_else(|| Error::KeyConfig(format!("relay URL must be https: {relay_url}")))?;
+                .ok_or_else(|| Error::KeyConfig("relay URL must be https".into()))?;
             let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
             if authority.is_empty() {
-                return Err(Error::KeyConfig(format!(
-                    "relay URL without host: {relay_url}"
-                )));
+                return Err(Error::KeyConfig("relay URL without host".into()));
             }
             Ok(format!("https://{authority}{SIGNED}"))
         }

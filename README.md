@@ -57,7 +57,23 @@ Rust client library, crate `zodl-ohttp-client`:
 - Chunked OHTTP request encapsulation and response decapsulation, Binary HTTP (RFC 9292) framing
 - `Client` (feature `client`): relay posting, key refetch and one retry after an outer `400`/`422`
 
-Endpoints and keys are build-time configuration only. Tested against the gateway's own code
+The crate carries no endpoint or key: the application passes the configuration of each network
+in at runtime (placeholder values):
+
+```rust
+use zodl_ohttp_client::{OhttpConfig, OhttpConfigParams, OhttpNetworks};
+
+let testnet = OhttpConfig::new(OhttpConfigParams {
+    gateway_host: "ohttp-gateway-testnet.example",
+    relay_url: "https://relay-testnet.example/relay",
+    keys_dns_name: "testnet.ohttp-keys.example",
+    signing_pubkey: signing_pubkey_hex, // 64 hex digits
+})?;
+let networks = OhttpNetworks::new(None, Some(testnet))?; // mainnet: OHTTP off
+let relay = networks.relay_for("ohttp-gateway-testnet.example");
+```
+
+Tested against the gateway's own code
 (`client/tests/`). `e2e-client/` is built on it. [client/INTEGRATION.md](client/INTEGRATION.md)
 explains configuration and use; [client/CHANGELOG.md](client/CHANGELOG.md) lists its changes.
 

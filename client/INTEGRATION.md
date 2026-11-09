@@ -13,42 +13,82 @@ The crate has two layers:
   classification of the relay's answer and streaming decryption. `cargo build
   --no-default-features` builds the core alone, without reqwest or tokio.
 
-## 1. Build-time configuration
+## 1. Configuration
 
-The crate carries no endpoint, host name or key. Everything a network needs is read from the
-environment of the build (`option_env!`), validated by `build.rs`:
+The crate carries no endpoint, host name or key. The application passes the OHTTP
+configuration of each network in at runtime, and every function that needs one takes it:
 
-| Variable | Value |
+```rust
+#[derive(Clone, Copy)]
+pub struct OhttpConfigParams<'a> {
+    pub gateway_host: &'a str,
+    pub relay_url: &'a str,
+    pub keys_dns_name: &'a str,
+    pub signing_pubkey: &'a str,
+}
+
+pub struct OhttpConfig { /* private */ }
+impl OhttpConfig {
+    pub fn new(params: OhttpConfigParams<'_>) -> Result<OhttpConfig, ConfigError>;
+    pub fn gateway_host(&self) -> &str;
+    pub fn relay_url(&self) -> &str;
+    pub fn keys_dns_name(&self) -> &str;
+    pub fn signing_pubkey(&self) -> &VerifyingKey;
+}
+
+pub struct OhttpNetworks { /* private */ }        // Default: both networks off
+impl OhttpNetworks {
+    pub fn new(mainnet: Option<OhttpConfig>, testnet: Option<OhttpConfig>)
+        -> Result<OhttpNetworks, ConfigError>;
+    pub fn get(&self, network: Network) -> Option<&OhttpConfig>;
+    pub fn network_of_host(&self, gateway_host: &str) -> Option<Network>;
+    pub fn relay_for(&self, gateway_host: &str) -> Option<&str>;
+}
+```
+
+| Value | Rule |
 |---|---|
-| `ZODL_OHTTP_GATEWAY_HOST_MAINNET`, `ZODL_OHTTP_GATEWAY_HOST_TESTNET` | the gateway host name, which is also the inner `:authority` of light client server requests; a bare DNS name |
-| `ZODL_OHTTP_RELAY_URL_MAINNET`, `ZODL_OHTTP_RELAY_URL_TESTNET` | the relay URL sealed requests are posted to; `https://` with a host, no whitespace |
-| `ZODL_OHTTP_SIGNING_PUBKEY_MAINNET`, `ZODL_OHTTP_SIGNING_PUBKEY_TESTNET` | the gateway's key-configuration signing key, raw Ed25519, 64 hex digits |
-| `ZODL_OHTTP_KEYS_DNS_NAME_MAINNET`, `ZODL_OHTTP_KEYS_DNS_NAME_TESTNET` | the DNS TXT name of the signed key configuration, a last-resort source (section 2) |
+| `gateway_host` | the gateway host name, which is also the inner `:authority` of light client server requests; a lower-case bare DNS host name (no scheme, port, path or trailing dot) |
+| `relay_url` | the relay URL sealed requests are posted to; `https://`, a host (DNS name or IP literal), an optional numeric port and an optional path; no userinfo, query, fragment, backslash, whitespace or control characters |
+| `keys_dns_name` | the DNS TXT name of the signed key configuration, a last-resort source (section 2); a lower-case bare DNS host name |
+| `signing_pubkey` | the gateway's key-configuration signing key, raw Ed25519 as 64 hex digits, a valid point not of small order |
 
-A network is configured with all four of its variables or with none: setting some and leaving
-another unset or empty fails the build with a message naming the network and the missing
-variables. With none set, OHTTP is off for that network; there is no fallback value and no
-runtime override. Then `relay_for(host)` returns `None`, `NetworkRule::KnownHosts` refuses the
-host, and `Network::pinned_signing_key()` / `verify_signed_config` return `Error::KeyConfig`.
-With nothing set at all the build succeeds with OHTTP off for both networks. `ZODL_OHTTP_REQUIRE=1`
-(opt-in, for release builds) fails the build unless all eight variables are set. When both
-networks are configured they must not share a gateway host, relay URL, keys DNS name or signing
-key. A set value that fails the build script's checks (an `https://` URL with a non-empty
-authority and no whitespace, a bare DNS host name, 64 hex digits) fails the build. Messages name
-variables and rules, never values; a value that is not valid Unicode counts as unset. Changing a
-variable triggers a rebuild.
+The values are named fields of `OhttpConfigParams`, so two of the same form (the gateway host
+and the keys DNS name) cannot be swapped by position. `OhttpConfig::new` requires all four
+values and checks each, copying them; `OhttpNetworks::new` also requires
+that mainnet and testnet share no gateway host, relay URL or keys DNS name (compared ignoring
+ASCII case) and no signing key. Values are taken as given: surrounding whitespace, such as a
+trailing newline from a secret store, is refused, not trimmed. A refusal is a `ConfigError`
+(`Empty`, `Invalid` or `SharedAcrossNetworks`) that names the field (`ConfigField`) and the
+rule, never the value, and the `Debug` output of a configuration shows only which fields are
+set (for `OhttpConfigParams`, which are set and which empty); both can be logged.
 
-What the build set is visible as `GATEWAY_HOST_MAINNET`, `GATEWAY_HOST_TESTNET`,
-`MAINNET_SIGNING_KEY_HEX`, `TESTNET_SIGNING_KEY_HEX` (all `Option<&str>`), `key_config_dns_name`
-and `relay_for(gateway_host) -> Option<&'static str>`, which maps exactly the configured host of
-a network that is on to its relay URL (no prefix or suffix matching).
+A network without a configuration has OHTTP off, and so does every network of
+`OhttpNetworks::default()`: `relay_for(host)` returns `None`, `NetworkRule::KnownHosts` refuses
+the host, `verify_signed_config` and `envelope_from_doh_json` return `Error::KeyConfig` and
+`doh_query_url` returns `None`. The crate keeps no global configuration: build one
+`OhttpNetworks` at startup and pass it where it is needed.
 
-```bash
-ZODL_OHTTP_GATEWAY_HOST_TESTNET=ohttp-gateway-testnet.example \
-ZODL_OHTTP_RELAY_URL_TESTNET=https://relay-testnet.example/relay \
-ZODL_OHTTP_SIGNING_PUBKEY_TESTNET="$SIGNING_PUBKEY_HEX" \
-ZODL_OHTTP_KEYS_DNS_NAME_TESTNET=testnet.ohttp-keys.example \
-  cargo build --release
+`relay_for(gateway_host)` maps exactly the configured gateway host of a network to its relay
+URL (no case folding, no prefix or suffix matching); `relay_for(host).is_some()` tells whether a
+light client server endpoint is an OHTTP gateway.
+
+```rust
+use zodl_ohttp_client::{Network, OhttpConfig, OhttpConfigParams, OhttpNetworks};
+
+let testnet = OhttpConfig::new(OhttpConfigParams {
+    gateway_host: "ohttp-gateway-testnet.example",
+    relay_url: "https://relay-testnet.example/relay",
+    keys_dns_name: "testnet.ohttp-keys.example",
+    signing_pubkey: signing_pubkey_hex, // 64 hex digits, from the application's settings or resources
+})?;
+let networks = OhttpNetworks::new(None, Some(testnet))?; // mainnet: OHTTP off
+assert_eq!(
+    networks.relay_for("ohttp-gateway-testnet.example"),
+    Some("https://relay-testnet.example/relay")
+);
+assert_eq!(networks.relay_for("lightwalletd.example"), None);
+assert!(networks.get(Network::Mainnet).is_none());
 ```
 
 ## 2. Obtaining the key configuration
@@ -57,41 +97,43 @@ ZODL_OHTTP_KEYS_DNS_NAME_TESTNET=testnet.ohttp-keys.example \
    URL from the relay URL (`.../relay` becomes `.../ohttp-configs/signed` under the default
    rules). Do not follow redirects. Read at most `MAX_KEY_CONFIG_BYTES` (64 KiB, enforce it while
    reading with `Limits::key_config_guard()`).
-2. Only if that fails, and only if the build set a DNS name for the network, read the envelope
-   from DNS over HTTPS: for each resolver in `DOH_RESOLVERS`, in order, `GET
-   doh_query_url(resolver, network)` with `accept: application/dns-json`, and pass the body to
-   `envelope_from_doh_json(body, network)`. It requires `Status` 0 and TXT answers for exactly
+2. Only if that fails, read the envelope from DNS over HTTPS: for each resolver in
+   `DOH_RESOLVERS`, in order, `GET doh_query_url(&networks, resolver, network)` (the network's
+   `keys_dns_name`) with `accept: application/dns-json`, and pass the body to
+   `envelope_from_doh_json(&networks, body, network)`. It requires `Status` 0 and TXT answers for exactly
    the queried name, concatenates the record's character-strings (presentation format, `\"`,
    `\\` and `\DDD` decimal escapes), requires exactly one distinct TXT value, base64-decodes it
    (standard alphabet, padded) and refuses an envelope over 64 KiB. The TXT value is the base64
    of the exact bytes `GET /ohttp-configs/signed` returns. Use the same transport as for the
    relay (over Tor when the wallet is in Tor mode).
-3. Either way, verify the envelope with `verify_signed_config(json, network, now,
+3. Either way, verify the envelope with `verify_signed_config(&networks, json, network, now,
    &profile.signed_config)` (or `open_signed_config(json, network, &key, now)` for the library
    policy). It checks version 1, the network, the key id and Ed25519 signature against the
-   network's pinned key, `not_before < not_after`, a validity of at most 86400 s ending at most
+   network's configured `signing_pubkey`, `not_before < not_after`, a validity of at most 86400 s ending at most
    86400 s from now, `now` inside the window widened by `CLOCK_SKEW_SECS` (60 s) on each side,
    and the size limits. DNS is only a transport: an envelope from DNS gets no other treatment.
 4. Pick the key with `KeyConfig::select_with(&keys.document, &profile.key_selection)` (the first
    configuration offering the suite) and cache it until `keys.not_after`
    (`CachePolicy::is_fresh`).
 
-The network of a gateway host comes from the build configuration
-(`NetworkRule::KnownHosts`), never from the host name.
+The network of a gateway host comes from the configuration
+(`NetworkRule::KnownHosts.network_for(&networks, host)`), never from the host name.
 
 ## 3. Using `Client`
 
 ```rust
 use std::time::Duration;
-use zodl_ohttp_client::{Client, KeyConfigSource, Network, Request};
+use zodl_ohttp_client::{signed_config_url, Client, KeyConfigSource, Network, Request, SignedConfigUrlRule};
 
-let relay = zodl_ohttp_client::relay_for(host).expect("OHTTP is on for this host");
+// `networks` as in section 1; `host` is the light client server host.
+let network = zodl_ohttp_client::NetworkRule::KnownHosts.network_for(&networks, host)?;
+let config = networks.get(network).expect("a known host has a configuration");
 let client = Client::new(
-    relay,
+    config.relay_url(),
     KeyConfigSource::Signed {
-        url: zodl_ohttp_client::signed_config_url(relay, zodl_ohttp_client::SignedConfigUrlRule::ReplaceRelaySuffix)?,
-        network: "testnet".into(),
-        signer: Network::Testnet.pinned_signing_key()?,
+        url: signed_config_url(config.relay_url(), SignedConfigUrlRule::ReplaceRelaySuffix)?,
+        network: network.as_str().into(),
+        signer: *config.signing_pubkey(),
     },
 );
 let request = Request::new("POST", host, "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetLatestBlock")
@@ -169,5 +211,6 @@ a pause.
 ## 6. Testing an integration
 
 The crate's own tests run against the gateway's code (`tests/gateway.rs`,
-`tests/gateway_core.rs`) and need no network. Against a running deployment, `e2e-client/` and
+`tests/gateway_core.rs`) and need no network; they use example configurations (`*.example`
+names, RFC 2606) of their own. Against a running deployment, `e2e-client/` and
 `scripts/test-e2e.sh` perform real exchanges (`../docs/testing.md`).

@@ -39,6 +39,11 @@
 //! those options as one client passes them. `client/INTEGRATION.md` describes how to use
 //! either layer.
 //!
+//! The crate carries no endpoint, host name or key. The application passes the configuration
+//! of each network in at runtime: an [`OhttpConfig`] (gateway host, relay URL, keys DNS name,
+//! signing key) per network, both held by an [`OhttpNetworks`]. A network without one has
+//! OHTTP off.
+//!
 //! The gateway speaks chunked OHTTP (draft-ietf-ohai-chunked-ohttp-08) only, and so does this
 //! crate: a request is posted as `message/ohttp-chunked-req` ([`encapsulate_chunked_request`])
 //! and the `message/ohttp-chunked-res` answer is opened as it streams
@@ -78,13 +83,13 @@ mod bhttp_codec;
 pub mod chunked;
 #[cfg(feature = "client")]
 mod client;
+mod config;
 mod dns;
 pub mod encapsulation;
 pub mod freshness;
 mod message;
 mod outer;
 mod profile;
-mod relays;
 mod signed;
 mod trace;
 
@@ -99,7 +104,8 @@ pub use chunked::{
 };
 #[cfg(feature = "client")]
 pub use client::{Client, KeyConfigSource, ResponseStream};
-pub use dns::{doh_query_url, envelope_from_doh_json, key_config_dns_name, DOH_RESOLVERS};
+pub use config::{ConfigError, ConfigField, OhttpConfig, OhttpConfigParams, OhttpNetworks};
+pub use dns::{doh_query_url, envelope_from_doh_json, DOH_RESOLVERS};
 /// The key type of [`open_signed_config`]'s signer, so callers need not pin `ed25519-dalek`.
 pub use ed25519_dalek::VerifyingKey;
 pub use encapsulation::{EntryLayout, KeyConfig, KeySelection, UnsupportedKem, KEY_BYTES};
@@ -112,11 +118,10 @@ pub use outer::{
     MAX_RETRY_AFTER, UNSIGNED_DEFAULT_CACHE_SECS,
 };
 pub use profile::ClientProfile;
-pub use relays::{relay_for, GATEWAY_HOST_MAINNET, GATEWAY_HOST_TESTNET};
 pub use signed::{
     open_signed_config, verify_signed_config, verify_signed_config_with, Base64Decoding,
     DuplicateKeys, Network, NetworkRule, SignatureCheck, SignedConfigPolicy, SignedKeys,
-    UnknownFields, CLOCK_SKEW_SECS, MAINNET_SIGNING_KEY_HEX, TESTNET_SIGNING_KEY_HEX,
+    UnknownFields, CLOCK_SKEW_SECS,
 };
 pub use trace::{ClientTrace, PrefixSanitization, TraceIdFormat, TracePolicy};
 

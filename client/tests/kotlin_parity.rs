@@ -24,7 +24,8 @@ use base64::Engine as _;
 use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
 use sha2::{Digest, Sha256};
 use zodl_ohttp_client::{
-    verify_signed_config_with, Error, Network, SignedConfigPolicy, MAINNET_SIGNING_KEY_HEX,
+    verify_signed_config, verify_signed_config_with, Error, Network, OhttpConfig,
+    OhttpConfigParams, OhttpNetworks, SignedConfigPolicy,
 };
 
 const NOW: u64 = 1_800_000_000;
@@ -122,24 +123,34 @@ fn key_id_mismatch_is_rejected_by_all() {
     }
 }
 
-/// The embedded signing public key is the one the build set, and a valid Ed25519
-/// point. The Kotlin SDK hardcoded its key; this crate takes it from the build
-/// (`ZODL_OHTTP_SIGNING_PUBKEY_MAINNET`), and without one no mainnet envelope verifies.
+/// The pinned signing key is the one the application configured. The Kotlin SDK hardcoded its
+/// key; this crate takes it from the [`OhttpConfig`], and without one no mainnet envelope
+/// verifies.
 #[test]
-fn embedded_mainnet_key_is_the_configured_one() {
-    let Some(hex_key) = MAINNET_SIGNING_KEY_HEX else {
-        assert!(Network::Mainnet.pinned_signing_key().is_err());
-        return;
-    };
-    let bytes = hex::decode(hex_key).expect("mainnet key is valid hex");
-    assert_eq!(bytes.len(), 32, "Ed25519 public key is 32 bytes");
-    let configured = VerifyingKey::from_bytes(&bytes.try_into().expect("mainnet key is 32 bytes"))
-        .expect("mainnet key is a valid Ed25519 point");
-    let key = Network::Mainnet
-        .pinned_signing_key()
-        .expect("the configured key is pinned");
-    assert_eq!(key, configured);
-    assert_eq!(key_id(&key).len(), 8);
+fn the_pinned_mainnet_key_is_the_configured_one() {
+    let key = test_signer().verifying_key();
+    let config = OhttpConfig::new(OhttpConfigParams {
+        gateway_host: "ohttp-gateway.example",
+        relay_url: "https://relay-mainnet.example/relay",
+        keys_dns_name: "mainnet.ohttp-keys.example",
+        signing_pubkey: &hex::encode(key.as_bytes()),
+    })
+    .unwrap();
+    let networks = OhttpNetworks::new(Some(config), None).unwrap();
+    let pinned = networks.get(Network::Mainnet).unwrap().signing_pubkey();
+    assert_eq!(*pinned, key);
+    assert_eq!(key_id(pinned).len(), 8);
+    // Nothing configured: a mainnet envelope never verifies.
+    assert!(matches!(
+        verify_signed_config(
+            &OhttpNetworks::default(),
+            b"{}",
+            Network::Mainnet,
+            NOW,
+            &SignedConfigPolicy::ANDROID
+        ),
+        Err(Error::KeyConfig(_))
+    ));
 }
 
 // ---- RFC 9180 test vectors ----

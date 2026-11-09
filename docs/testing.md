@@ -46,14 +46,15 @@ Besides the unit tests in `src/`:
 | `tests/gateway_core.rs` | The sans-IO core against the gateway's own key configuration, decapsulation, streaming encoder and signed envelope, under the client profiles. |
 | `tests/gateway.rs` | `Client` against the gateway's code served in-process (relay and gateway in one) in front of an echo backend; needs the default `client` feature. |
 | `tests/chunked.rs` | Chunked round trips: the gateway's streaming encoder produces what `ChunkedResponseDecoder` opens, chunk by chunk. |
+| `tests/config.rs` | The runtime configuration: every field required and checked, mainnet and testnet distinct, OHTTP off without a configuration, and no value in an error or a `Debug` output. |
 | `tests/signed_policy.rs` | Every `SignedConfigPolicy` option, one assertion per difference between the client profiles. |
 | `tests/no_panics.rs` | A deterministic pseudo-random sweep over the byte parsers: random bytes and valid inputs flipped, cut and extended may give errors, never panics. |
 | `tests/kotlin_parity.rs` | The scenarios of a former platform implementation, kept so the crate covers them. |
 
 The envelope test vector is `docs/signed-configs-test-vector.json`.
 
-The tests build the crate without endpoint configuration; they use example values (RFC 2606
-names) of their own and never need `ZODL_OHTTP_*` variables.
+The crate carries no endpoint configuration; the tests build their own with example values
+(RFC 2606 `*.example` names and test keys).
 
 ### Relay simulator (`relay-simulator/`)
 
@@ -67,7 +68,8 @@ response header allowlists.
 
 ### e2e client (`e2e-client/`)
 
-CI builds it (`cargo build --locked`); it has no tests of its own.
+CI builds it and runs its tests (`cargo build --locked`, `cargo test --locked`): reading the
+OHTTP configuration from its environment.
 
 ## Fuzzing (`fuzz/`)
 
@@ -117,7 +119,9 @@ the relay when `RELAY_URL` points at a relay simulator, else `https://$GATEWAY_H
 The e2e client can also be run directly (`e2e-client/README.md`): signed or unsigned key
 configurations, gRPC or plain HTTP inner requests, the DNS key-configuration source
 (`--key-config-source dns <network>`), and options that add outer headers or replay a request
-to check how a relay and the gateway treat them.
+to check how a relay and the gateway treat them. Signed configurations and the DNS source need
+the OHTTP configuration of the network in its environment (`OHTTP_E2E_*_MAINNET` /
+`_TESTNET`).
 
 ### Locally, with the relay simulator
 
