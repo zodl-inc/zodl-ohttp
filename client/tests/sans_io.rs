@@ -176,16 +176,21 @@ fn rfc_9458_bhttp_request_is_ours_up_to_the_sections_it_leaves_out() {
     let ours = encode_bhttp_request(&request, &EncodeOptions::LOWERCASE).unwrap();
     let mut expected = hex(RFC9458_BHTTP_REQUEST);
     expected.extend_from_slice(&[0, 0, 0]);
-    assert_eq!(ours, expected);
+    // Followed by zero padding (RFC 9292 §3.8) to 4 KiB.
+    let padded = |message: &[u8]| {
+        let mut padded = message.to_vec();
+        padded.resize(4096, 0);
+        padded
+    };
+    assert_eq!(ours, padded(&expected));
     // The library's `Request` maps to the same bytes; `encode_request` itself also appends the
     // freshness field real requests need.
     let request = Request::new("GET", "example.com", "/");
     assert_eq!(
         encode_bhttp_request(&BhttpRequest::from(&request), &EncodeOptions::PRESERVE).unwrap(),
-        expected
+        padded(&expected)
     );
     let stamped = encode_request(&request).unwrap();
-    assert!(stamped.len() > expected.len());
     assert!(stamped
         .windows(b"ohttp-freshness".len())
         .any(|w| w == b"ohttp-freshness"));
@@ -729,13 +734,21 @@ fn the_sealed_request_cap_is_exact_for_every_preset() {
     let request =
         |len: usize| BhttpRequest::new("POST", "a.example", "/upload").body(vec![0u8; len]);
     // The sealed size is 39 (hdr || enc) + varint + the Binary HTTP message + 16 (tag) + the
-    // final chunk (1 + 16); find the body length that makes it exactly CAP.
+    // final chunk (1 + 16); find the body length that makes it exactly CAP. Near the cap the
+    // message is not padded any further (padding stops at 80 bytes below the cap, a few bytes
+    // short of the largest message that still fits), so the sealed size grows by one per body
+    // byte there.
     // Every preset adds the same `ohttp-freshness` field (a 10-digit timestamp), so measure with
     // a preset's own options.
     let profile = ClientProfile::IOS;
     let sealed_len = |len: usize| seal(&profile, &request(len)).0.len();
-    let probe = CAP - 1000;
-    let exact = probe + (CAP - sealed_len(probe));
+    let probe = CAP - 60;
+    let exact = (probe as i64 + CAP as i64 - sealed_len(probe) as i64) as usize;
+    assert_eq!(sealed_len(exact - 1), CAP - 1);
+    // A request further below the cap is padded, but never past it.
+    for len in [CAP - 5000, CAP - 4096 - 200, CAP - 150] {
+        assert!(sealed_len(len) <= CAP, "{len}");
+    }
     for profile in [
         ClientProfile::LIBRARY,
         ClientProfile::ANDROID,

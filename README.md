@@ -54,7 +54,9 @@ Rust client library, crate `zodl-ohttp-client`:
 
 - Key configuration: `application/ohttp-keys` selection, signed envelope (`/ohttp-configs/signed`)
   verification
-- Chunked OHTTP request encapsulation and response decapsulation, Binary HTTP (RFC 9292) framing
+- Chunked OHTTP request encapsulation and response decapsulation, Binary HTTP (RFC 9292) framing;
+  requests are padded to fixed size buckets (4 KiB steps, `SendTransaction` 16 / 32 KiB), never
+  past the 10 MiB sealed-request cap
 - `Client` (feature `client`): relay posting, key refetch and one retry after an outer `400`/`422`
 
 The crate carries no endpoint or key: the application passes the configuration of each network

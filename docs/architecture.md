@@ -230,6 +230,19 @@ keeps moving. With `RESPONSE_PADDING=on` (default) the final chunk is zero-padde
 little about which blocks or transactions were fetched. `sensitive` leaves a
 few small, uninformative answers unpadded.
 
+## Request padding
+
+The client pads every request to a fixed size class with zero bytes after the trailer section
+of its Binary HTTP message (RFC 9292 §3.8), before sealing it: a `SendTransaction` to 16 KiB
+(32 KiB if larger, then the next multiple of 32 KiB), every other request to the next multiple
+of 4 KiB, never past what fits under the 10 MiB sealed-request cap. The relay and the network see
+only these sizes: not which of the small calls was made, nor how large a transaction is (a send
+is still told apart from the other calls by its size class). The padding is part of the encoding (`encode_bhttp_request`), so every client
+sharing the crate has the same size classes. The gateway skips zero padding and refuses any
+non-zero byte after the message. Measured cost: none measurable for 4 and 8 KiB requests, a few
+milliseconds (up to about 20 ms at the median over long paths) for 16 KiB, where the request
+needs a second network round of packets.
+
 ## Multiple origins
 
 Several gateways can serve one gateway host name, for example behind a load balancer that

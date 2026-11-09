@@ -60,10 +60,19 @@ impl InnerResponse {
 }
 
 /// Parse Binary HTTP request (RFC 9292) from plaintext.
+///
+/// The message may be followed by zero padding (RFC 9292 §3.8), which clients add to hide the
+/// request size; any non-zero byte after the trailer section refuses the request.
 pub fn parse_inner_request(plaintext: &[u8]) -> Result<InnerRequest> {
-    let mut cursor = Cursor::new(plaintext.to_vec());
+    let mut cursor = Cursor::new(plaintext);
     let msg = Message::read_bhttp(&mut cursor)
         .map_err(|e| anyhow!("Binary HTTP parse error: {:?}", e))?;
+    let end = usize::try_from(cursor.position())?;
+    if plaintext[end..].iter().any(|&b| b != 0) {
+        return Err(anyhow!(
+            "Binary HTTP parse error: non-zero bytes after the message"
+        ));
+    }
 
     let control = msg.control();
     let method_bytes = control.method().ok_or_else(|| anyhow!("Missing method"))?;
@@ -106,4 +115,58 @@ pub fn parse_inner_request(plaintext: &[u8]) -> Result<InnerRequest> {
         headers,
         body: msg.content().to_vec(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A known-length Binary HTTP request (RFC 9292 §3.1): `POST https://gw.example/p`, one
+    /// header field, a body, an empty trailer section.
+    fn message() -> Vec<u8> {
+        let mut m = vec![0];
+        for field in [&b"POST"[..], b"https", b"gw.example", b"/p"] {
+            m.push(field.len() as u8);
+            m.extend_from_slice(field);
+        }
+        let header = [&[2u8][..], b"te", &[8], b"trailers"].concat();
+        m.push(header.len() as u8);
+        m.extend_from_slice(&header);
+        m.extend_from_slice(&[3, 1, 2, 3]);
+        m.push(0);
+        m
+    }
+
+    fn summary(r: &InnerRequest) -> (String, String, String, Vec<(String, String)>, Vec<u8>) {
+        (
+            r.method.clone(),
+            r.authority.clone(),
+            r.path.clone(),
+            r.headers.clone(),
+            r.body.clone(),
+        )
+    }
+
+    #[test]
+    fn zero_padding_after_the_message_is_accepted_and_changes_nothing() {
+        let plain = parse_inner_request(&message()).unwrap();
+        assert_eq!(plain.method, "POST");
+        assert_eq!(plain.authority, "gw.example");
+        assert_eq!(plain.body, [1, 2, 3]);
+        for pad in [1, 100, 4096 - message().len(), 32 << 10] {
+            let mut padded = message();
+            padded.resize(padded.len() + pad, 0);
+            let parsed = parse_inner_request(&padded).unwrap();
+            assert_eq!(summary(&parsed), summary(&plain), "{pad}");
+        }
+    }
+
+    #[test]
+    fn non_zero_bytes_after_the_message_are_refused() {
+        for junk in [&[1u8][..], &[0, 0, 0x80], &[0xff; 16]] {
+            let mut bytes = message();
+            bytes.extend_from_slice(junk);
+            assert!(parse_inner_request(&bytes).is_err(), "{junk:?}");
+        }
+    }
 }

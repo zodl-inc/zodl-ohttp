@@ -183,6 +183,11 @@ loop {
 
 Rules that matter for privacy and correctness:
 
+- **Requests are padded to fixed buckets.** `encode_bhttp_request` (and `encode_request`) append
+  zero padding after the trailer section (RFC 9292 §3.8): a `SendTransaction` to 16 KiB, 32 KiB
+  if larger and then the next multiple of 32 KiB; every other request to the next multiple of
+  4 KiB; never past what fits under the 10 MiB sealed-request cap. Seal the encoded bytes as they
+  are; do not trim them.
 - **Seal every attempt afresh.** Never resend a sealed body: the gateway refuses a repeated
   ciphertext as a replay (409). Each sealing returns its own `ChunkedResponseOpener` (neither
   `Clone` nor `Copy`); keep one sealing per post, the type does not enforce it. A transport error before an answer is just another iteration.

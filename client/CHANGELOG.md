@@ -29,6 +29,13 @@ passes the configuration of each network in at runtime. A breaking change for ev
 
 ### Changed
 
+- Requests are padded to fixed size buckets: `encode_bhttp_request` (and so `encode_request` and
+  `Client`) appends zero padding after the trailer section (RFC 9292 §3.8) up to 16 KiB for a
+  lightwalletd `SendTransaction` (32 KiB if larger, then the next multiple of 32 KiB) and up to
+  the next multiple of 4 KiB for every other request, never past what fits under the 10 MiB
+  sealed-request cap. The relay and the network then see a few
+  request sizes only. No API change; a gateway accepts the padding (this release's gateway also
+  refuses non-zero bytes there).
 - `verify_signed_config`, `doh_query_url` and `envelope_from_doh_json` take the
   `&OhttpNetworks` as their first argument, and `NetworkRule::network_for` takes it before the
   host; they read the signing key, the keys DNS name and the gateway hosts from it. For a network

@@ -8,8 +8,8 @@ keeps its own log in [client/CHANGELOG.md](client/CHANGELOG.md).
 The first stable release of the gateway, the relay simulator, the e2e client and the client
 library (`zodl-ohttp-client` 1.0.0, all at version 1.0.0). Since the initial release: multi-origin
 replay protection that survives a failover of its store, lightwalletd calls with deadlines,
-retries and health accounting, a self-correcting chain follower, and an OHTTP configuration that
-clients take at runtime instead of from their build.
+retries and health accounting, a self-correcting chain follower, an OHTTP configuration that
+clients take at runtime instead of from their build, and requests padded to fixed size buckets.
 
 ### Client library
 
@@ -18,6 +18,9 @@ clients take at runtime instead of from their build.
   / `OhttpNetworks`, validated when it is built, instead
   of being compiled in; a network without one has OHTTP off. The build-time variables are gone.
   Details in [client/CHANGELOG.md](client/CHANGELOG.md).
+- Requests are padded to fixed size buckets with zero bytes after the Binary HTTP message:
+  `SendTransaction` to 16 KiB (32 KiB if larger, then multiples of 32 KiB), every other request
+  to multiples of 4 KiB, never past the 10 MiB sealed-request cap.
 
 ### e2e client
 
@@ -27,6 +30,10 @@ clients take at runtime instead of from their build.
   and the DNS source. The image carries no configuration and is built without secrets.
 
 ### Gateway
+
+- A request's Binary HTTP message may be followed by zero padding only: a non-zero byte after
+  its trailer section refuses the request as a parse error (inner 400). Zero padding was already
+  skipped.
 
 - `REPLAY_UNAVAILABLE_FALLBACK` on an `async-reads` origin whose own store is the fallback store
   (no standby stores, `REPLAY_WRITE_WAIT_REPLICAS`, peers with `REPLAY_PEER_WAIT_REPLICAS` >= 1):
