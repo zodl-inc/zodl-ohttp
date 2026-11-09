@@ -3,7 +3,28 @@
 Behaviour changes of the gateway, the relay simulator and the e2e client. The client library
 keeps its own log in [client/CHANGELOG.md](client/CHANGELOG.md).
 
-## Unreleased
+## 1.0.0
+
+The first stable release of the gateway, the relay simulator, the e2e client and the client
+library (`zodl-ohttp-client` 1.0.0, all at version 1.0.0). Since the initial release: multi-origin
+replay protection that survives a failover of its store, lightwalletd calls with deadlines,
+retries and health accounting, a self-correcting chain follower, and an OHTTP configuration that
+clients take at runtime instead of from their build.
+
+### Client library
+
+- The OHTTP configuration of each network (gateway host, relay URL, keys DNS name, signing key)
+  is passed in at runtime as `OhttpConfig` (built from the named fields of `OhttpConfigParams`)
+  / `OhttpNetworks`, validated when it is built, instead
+  of being compiled in; a network without one has OHTTP off. The build-time variables are gone.
+  Details in [client/CHANGELOG.md](client/CHANGELOG.md).
+
+### e2e client
+
+- Reads the OHTTP configuration at runtime from `OHTTP_E2E_GATEWAY_HOST_<NET>`,
+  `OHTTP_E2E_RELAY_URL_<NET>`, `OHTTP_E2E_KEYS_DNS_NAME_<NET>` and `OHTTP_E2E_SIGNING_PUBKEY_<NET>`
+  (`<NET>` = `MAINNET` or `TESTNET`), all four or none per network, for signed key configurations
+  and the DNS source. The image carries no configuration and is built without secrets.
 
 ### Gateway
 
