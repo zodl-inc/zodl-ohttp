@@ -19,6 +19,10 @@ env:
   # placeholder registry name.
   AWS_REGION: ${{ secrets.AWS_REGION }}
   ECR_REGISTRY: ${{ secrets.ECR_REGISTRY || 'registry.invalid' }}
+  # The build summary and the build record artifact of build-push-action carry the full image
+  # names, outside the log masking.
+  DOCKER_BUILD_SUMMARY: "false"
+  DOCKER_BUILD_RECORD_UPLOAD: "false"
 
 jobs:
   test:
@@ -126,9 +130,15 @@ jobs:
       - name: Generate SBOM
         if: github.event_name != 'pull_request'
         uses: anchore/sbom-action@251a468eed47e5082b105c3ba6ee500c0e65a764 # v0.17.6
+        env:
+          # The SBOM names the image by this name, not by its registry reference; the action's
+          # own artifact is off, the next step uploads the file.
+          SYFT_SOURCE_NAME: ohttp-gateway
         with:
           image: ${{ env.ECR_REGISTRY }}/ohttp-gateway@${{ steps.build.outputs.digest }}
           format: spdx-json
+          artifact-name: gateway-sbom.spdx.json
+          upload-artifact: false
           output-file: gateway-sbom.spdx.json
 
       - name: Upload SBOM artifact
@@ -195,9 +205,15 @@ jobs:
       - name: Generate SBOM
         if: github.event_name != 'pull_request'
         uses: anchore/sbom-action@251a468eed47e5082b105c3ba6ee500c0e65a764 # v0.17.6
+        env:
+          # The SBOM names the image by this name, not by its registry reference; the action's
+          # own artifact is off, the next step uploads the file.
+          SYFT_SOURCE_NAME: ohttp-relay-simulator
         with:
           image: ${{ env.ECR_REGISTRY }}/ohttp-relay-simulator@${{ steps.build.outputs.digest }}
           format: spdx-json
+          artifact-name: relay-simulator-sbom.spdx.json
+          upload-artifact: false
           output-file: relay-simulator-sbom.spdx.json
 
       - name: Upload SBOM artifact
@@ -280,9 +296,15 @@ jobs:
       - name: Generate SBOM
         if: github.event_name != 'pull_request'
         uses: anchore/sbom-action@251a468eed47e5082b105c3ba6ee500c0e65a764 # v0.17.6
+        env:
+          # The SBOM names the image by this name, not by its registry reference; the action's
+          # own artifact is off, the next step uploads the file.
+          SYFT_SOURCE_NAME: ohttp-e2e
         with:
           image: ${{ env.ECR_REGISTRY }}/ohttp-e2e@${{ steps.build.outputs.digest }}
           format: spdx-json
+          artifact-name: e2e-sbom.spdx.json
+          upload-artifact: false
           output-file: e2e-sbom.spdx.json
 
       - name: Upload SBOM artifact
