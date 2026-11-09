@@ -14,8 +14,11 @@ permissions:
   contents: read
 
 env:
-  AWS_REGION: us-east-1
-  ECR_REGISTRY: ${{ vars.ECR_REGISTRY }}  # repository variable
+  # Repository secrets, so that the registry, the push role and the region stay out of the logs.
+  # Pull requests from forks get no secrets: their images are built but never pushed, under a
+  # placeholder registry name.
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+  ECR_REGISTRY: ${{ secrets.ECR_REGISTRY || 'registry.invalid' }}
 
 jobs:
   test:
@@ -86,7 +89,7 @@ jobs:
         if: github.event_name != 'pull_request'
         uses: aws-actions/configure-aws-credentials@5579c002bb4778aa43395ef1df492868a9a1c83f # v4.0.2
         with:
-          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Login to ECR
@@ -155,7 +158,7 @@ jobs:
         if: github.event_name != 'pull_request'
         uses: aws-actions/configure-aws-credentials@5579c002bb4778aa43395ef1df492868a9a1c83f # v4.0.2
         with:
-          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Login to ECR
@@ -224,7 +227,7 @@ jobs:
         if: github.event_name != 'pull_request'
         uses: aws-actions/configure-aws-credentials@5579c002bb4778aa43395ef1df492868a9a1c83f # v4.0.2
         with:
-          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Login to ECR
@@ -274,6 +277,21 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      - name: Generate SBOM
+        if: github.event_name != 'pull_request'
+        uses: anchore/sbom-action@251a468eed47e5082b105c3ba6ee500c0e65a764 # v0.17.6
+        with:
+          image: ${{ env.ECR_REGISTRY }}/ohttp-e2e@${{ steps.build.outputs.digest }}
+          format: spdx-json
+          output-file: e2e-sbom.spdx.json
+
+      - name: Upload SBOM artifact
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
+        with:
+          name: e2e-sbom
+          path: e2e-sbom.spdx.json
+
   sign-attest-gateway:
     name: Sign & Attest Gateway
     runs-on: ubuntu-24.04
@@ -287,7 +305,7 @@ jobs:
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@5579c002bb4778aa43395ef1df492868a9a1c83f # v4.0.2
         with:
-          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Login to ECR
@@ -354,7 +372,7 @@ jobs:
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@5579c002bb4778aa43395ef1df492868a9a1c83f # v4.0.2
         with:
-          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Login to ECR
@@ -421,7 +439,7 @@ jobs:
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@5579c002bb4778aa43395ef1df492868a9a1c83f # v4.0.2
         with:
-          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Login to ECR
