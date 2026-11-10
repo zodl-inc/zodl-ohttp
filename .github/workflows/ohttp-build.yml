@@ -110,6 +110,8 @@ jobs:
         # immutable repository refuses once it exists).
         with:
           images: ${{ env.ECR_REGISTRY }}/ohttp-gateway
+          flavor: |
+            latest=false
           tags: |
             type=ref,event=pr,prefix=pr-
             type=semver,pattern={{version}}
@@ -187,6 +189,8 @@ jobs:
         # immutable repository refuses once it exists).
         with:
           images: ${{ env.ECR_REGISTRY }}/ohttp-relay-simulator
+          flavor: |
+            latest=false
           tags: |
             type=ref,event=pr,prefix=pr-
             type=semver,pattern={{version}}
@@ -264,6 +268,8 @@ jobs:
         # immutable repository refuses once it exists).
         with:
           images: ${{ env.ECR_REGISTRY }}/ohttp-e2e
+          flavor: |
+            latest=false
           tags: |
             type=ref,event=pr,prefix=pr-
             type=semver,pattern={{version}}
