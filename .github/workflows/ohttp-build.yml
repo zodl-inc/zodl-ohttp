@@ -105,13 +105,15 @@ jobs:
       - name: Docker meta
         id: meta
         uses: docker/metadata-action@369eb591f429131d6889c46b94e711f089e6ca96 # v5.6.1
+        # ECR tags are immutable and the main build of the same commit already pushed sha-<short>:
+        # a release tag build pushes only its version tags.
         with:
           images: ${{ env.ECR_REGISTRY }}/ohttp-gateway
           tags: |
             type=ref,event=pr,prefix=pr-
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
-            type=sha,format=short
+            type=sha,format=short,enable=${{ !startsWith(github.ref, 'refs/tags/') }}
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@c47758b77c9736f4b2ef4073d4d51994fabfe349 # v3.7.1
@@ -180,13 +182,15 @@ jobs:
       - name: Docker meta
         id: meta
         uses: docker/metadata-action@369eb591f429131d6889c46b94e711f089e6ca96 # v5.6.1
+        # ECR tags are immutable and the main build of the same commit already pushed sha-<short>:
+        # a release tag build pushes only its version tags.
         with:
           images: ${{ env.ECR_REGISTRY }}/ohttp-relay-simulator
           tags: |
             type=ref,event=pr,prefix=pr-
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
-            type=sha,format=short
+            type=sha,format=short,enable=${{ !startsWith(github.ref, 'refs/tags/') }}
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@c47758b77c9736f4b2ef4073d4d51994fabfe349 # v3.7.1
@@ -255,13 +259,15 @@ jobs:
       - name: Docker meta
         id: meta
         uses: docker/metadata-action@369eb591f429131d6889c46b94e711f089e6ca96 # v5.6.1
+        # ECR tags are immutable and the main build of the same commit already pushed sha-<short>:
+        # a release tag build pushes only its version tags.
         with:
           images: ${{ env.ECR_REGISTRY }}/ohttp-e2e
           tags: |
             type=ref,event=pr,prefix=pr-
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
-            type=sha,format=short
+            type=sha,format=short,enable=${{ !startsWith(github.ref, 'refs/tags/') }}
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@c47758b77c9736f4b2ef4073d4d51994fabfe349 # v3.7.1
