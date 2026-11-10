@@ -1,12 +1,17 @@
 [package]
 name = "zodl-ohttp-client"
-version = "1.0.0"
+version = "1.0.1"
 license = "AGPL-3.0-only"
 edition = "2021"
 # reqwest's dependency tree (url, idna, icu) needs 1.88.
 rust-version = "1.88"
 description = "Oblivious HTTP (RFC 9458) client for the ZODL gateway"
-publish = false
+repository = "https://github.com/zodl-inc/zodl-ohttp"
+homepage = "https://github.com/zodl-inc/zodl-ohttp"
+documentation = "https://docs.rs/zodl-ohttp-client"
+readme = "README.md"
+keywords = ["ohttp", "rfc9458", "privacy", "zcash", "hpke"]
+categories = ["cryptography", "network-programming"]
 
 [lib]
 name = "zodl_ohttp_client"

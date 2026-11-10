@@ -106,13 +106,13 @@ jobs:
         id: meta
         uses: docker/metadata-action@369eb591f429131d6889c46b94e711f089e6ca96 # v5.6.1
         # ECR tags are immutable and the main build of the same commit already pushed sha-<short>:
-        # a release tag build pushes only its version tags.
+        # a release tag build pushes only its version tag (no moving `major.minor` tag, which an
+        # immutable repository refuses once it exists).
         with:
           images: ${{ env.ECR_REGISTRY }}/ohttp-gateway
           tags: |
             type=ref,event=pr,prefix=pr-
             type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
             type=sha,format=short,enable=${{ !startsWith(github.ref, 'refs/tags/') }}
 
       - name: Set up Docker Buildx
@@ -183,13 +183,13 @@ jobs:
         id: meta
         uses: docker/metadata-action@369eb591f429131d6889c46b94e711f089e6ca96 # v5.6.1
         # ECR tags are immutable and the main build of the same commit already pushed sha-<short>:
-        # a release tag build pushes only its version tags.
+        # a release tag build pushes only its version tag (no moving `major.minor` tag, which an
+        # immutable repository refuses once it exists).
         with:
           images: ${{ env.ECR_REGISTRY }}/ohttp-relay-simulator
           tags: |
             type=ref,event=pr,prefix=pr-
             type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
             type=sha,format=short,enable=${{ !startsWith(github.ref, 'refs/tags/') }}
 
       - name: Set up Docker Buildx
@@ -260,13 +260,13 @@ jobs:
         id: meta
         uses: docker/metadata-action@369eb591f429131d6889c46b94e711f089e6ca96 # v5.6.1
         # ECR tags are immutable and the main build of the same commit already pushed sha-<short>:
-        # a release tag build pushes only its version tags.
+        # a release tag build pushes only its version tag (no moving `major.minor` tag, which an
+        # immutable repository refuses once it exists).
         with:
           images: ${{ env.ECR_REGISTRY }}/ohttp-e2e
           tags: |
             type=ref,event=pr,prefix=pr-
             type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
             type=sha,format=short,enable=${{ !startsWith(github.ref, 'refs/tags/') }}
 
       - name: Set up Docker Buildx
