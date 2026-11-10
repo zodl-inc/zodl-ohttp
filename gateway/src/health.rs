@@ -31,7 +31,7 @@ lazy_static::lazy_static! {
     static ref OHTTP_REQUEST_DURATION_SECONDS: HistogramVec = HistogramVec::new(
         prometheus::HistogramOpts::new("ohttp_request_duration_seconds", "OHTTP request duration in seconds")
             .buckets(vec![0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0]),
-        &["network", "hop", "backend"]
+        &["network", "hop", "backend", "rpc"]
     )
     .unwrap();
 
@@ -700,9 +700,9 @@ pub fn record_request_detailed(
         .inc();
 }
 
-pub fn record_duration(network: &str, hop: &str, backend: &str, duration_secs: f64) {
+pub fn record_duration(network: &str, hop: &str, backend: &str, rpc: &str, duration_secs: f64) {
     OHTTP_REQUEST_DURATION_SECONDS
-        .with_label_values(&[network, hop, backend])
+        .with_label_values(&[network, hop, backend, rpc])
         .observe(duration_secs);
 }
 
@@ -1839,6 +1839,60 @@ mod tests {
                 normalize_backend(&format!("r{}.x", i), &gateway_hosts, &backends),
                 "other"
             );
+        }
+    }
+
+    #[test]
+    fn test_record_duration_with_rpc_label() {
+        init_metrics();
+        // Record durations with different RPC methods
+        record_duration("testnet", "ohttp", "lwd", "GetLatestBlock", 0.15);
+        record_duration("testnet", "ohttp", "lwd", "SendTransaction", 0.25);
+        record_duration("testnet", "ohttp", "lwd", "GetBlockRange", 0.10);
+        record_duration("testnet", "ohttp", "lwd", "other", 0.05);
+
+        let families = REGISTRY.gather();
+        let histogram = families
+            .iter()
+            .find(|f| f.get_name() == "ohttp_request_duration_seconds")
+            .expect("histogram not registered");
+
+        let metrics: Vec<_> = histogram
+            .get_metric()
+            .iter()
+            .filter(|m| {
+                m.get_label()
+                    .iter()
+                    .any(|l| l.get_name() == "network" && l.get_value() == "testnet")
+            })
+            .collect();
+
+        // Verify we have series for each RPC method
+        let rpc_values: std::collections::HashSet<_> = metrics
+            .iter()
+            .filter_map(|m| {
+                m.get_label()
+                    .iter()
+                    .find(|l| l.get_name() == "rpc")
+                    .map(|l| l.get_value())
+            })
+            .collect();
+
+        assert!(rpc_values.contains("GetLatestBlock"));
+        assert!(rpc_values.contains("SendTransaction"));
+        assert!(rpc_values.contains("GetBlockRange"));
+        assert!(rpc_values.contains("other"));
+
+        // Verify counts match observations
+        for m in &metrics {
+            let rpc = m
+                .get_label()
+                .iter()
+                .find(|l| l.get_name() == "rpc")
+                .map(|l| l.get_value())
+                .unwrap();
+            let count = m.get_histogram().get_sample_count();
+            assert_eq!(count, 1, "Expected 1 sample for rpc={}", rpc);
         }
     }
 

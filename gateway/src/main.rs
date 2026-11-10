@@ -2259,6 +2259,7 @@ async fn gateway_handler(
         &state.config.gateway_hosts,
         &state.config.backends,
     );
+    let rpc = health::normalize_rpc_name(&inner_request.path, &inner_request.method);
 
     // Third-party backends: an answer from THIRD_PARTY_CACHE_ROUTES, or the per-backend cap's
     // inner 429 (THIRD_PARTY_RATE_LIMITS), before the usual streamed forward. The gateway cannot
@@ -2294,7 +2295,7 @@ async fn gateway_handler(
                 &backend,
                 "mapped",
             );
-            health::record_duration(&network, "ohttp", &backend, start.elapsed().as_secs_f64());
+            health::record_duration(&network, "ohttp", &backend, &rpc, start.elapsed().as_secs_f64());
             log.served_third_party(status, resp.body.len());
             return responder.collected(resp);
         }
@@ -2345,7 +2346,7 @@ async fn gateway_handler(
             &backend,
             "mapped",
         );
-        health::record_duration(&network, "ohttp", &backend, start.elapsed().as_secs_f64());
+        health::record_duration(&network, "ohttp", &backend, &rpc, start.elapsed().as_secs_f64());
         return responder.stream(status, headers, log.stream("backend_stream", "-", stream));
     }
 
@@ -2354,7 +2355,6 @@ async fn gateway_handler(
     // and every other RPC goes through the chain-validated per-request cache (hit: stream the
     // stored response; miss: one shared upstream call, stored behind the client).
     let grpc_headers = vec![("content-type".to_string(), "application/grpc".to_string())];
-    let rpc = health::normalize_rpc_name(&inner_request.path, &inner_request.method);
     let served = |status: u16, grpc_status: &str, route: &str| {
         health::record_request_detailed(
             "success",
@@ -2367,7 +2367,7 @@ async fn gateway_handler(
             &backend,
             route,
         );
-        health::record_duration(&network, "ohttp", &backend, start.elapsed().as_secs_f64());
+        health::record_duration(&network, "ohttp", &backend, &rpc, start.elapsed().as_secs_f64());
     };
 
     if inner_request.path == block_cache::GET_BLOCK_RANGE_PATH {
