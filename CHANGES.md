@@ -3,6 +3,11 @@
 Behaviour changes of the gateway, the relay simulator and the e2e client. The client library
 keeps its own log in [client/CHANGELOG.md](client/CHANGELOG.md).
 
+## 1.0.1
+
+crates.io metadata, no code change: `zodl-ohttp-client` 1.0.1 is published on crates.io, the e2e
+client follows its version. The gateway and the relay simulator are unchanged.
+
 ## 1.0.0
 
 The first stable release of the gateway, the relay simulator, the e2e client and the client

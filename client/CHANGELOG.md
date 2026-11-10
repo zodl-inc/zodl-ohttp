@@ -2,6 +2,12 @@
 
 [Keep a Changelog](https://keepachangelog.com).
 
+## 1.0.1
+
+crates.io metadata, no code change: the crate is published on crates.io (repository, homepage,
+documentation, readme, keywords and categories in the manifest; the package carries a README and
+the license files).
+
 ## 1.0.0
 
 The crate carries no OHTTP endpoints or keys any more, not even from its build: the application
