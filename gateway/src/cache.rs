@@ -97,6 +97,12 @@ pub struct ResponseCache {
     cache_conn: Arc<ArcSwapOption<ConnectionManager>>,
     /// Consecutive failed housekeeping PINGs of the cache Redis (see CACHE_PING_FAILURES_RECONNECT).
     cache_ping_failures: Arc<AtomicU32>,
+    /// Whether the main cache tier is a read-only replica: writes are skipped on the main tier and
+    /// routed to the overlay when configured.
+    main_tier_replica: Arc<AtomicBool>,
+    /// Local writable cache overlay (CACHE_LOCAL_REDIS_URL): when the main cache tier is a
+    /// read-only replica, cacheable responses go here. Fail-open. None when not configured.
+    cache_overlay_conn: Option<Arc<ArcSwapOption<ConnectionManager>>>,
     /// Security Redis (noeviction, fail-closed): replay nonces and the shared epoch. Follows a
     /// failover of the store (`StoreConn`, `Role::Primary`).
     security_conn: Option<Arc<StoreConn>>,
@@ -1125,9 +1131,11 @@ pub fn tree_state_path() -> &'static str {
 }
 
 impl ResponseCache {
+    #[allow(clippy::too_many_arguments)]
     pub async fn connect(
         redis_url: &str,
         redis_security_url: Option<&str>,
+        cache_local_redis_url: Option<&str>,
         network: String,
         backend_host: String,
         redis_op_timeout_ms: u64,
@@ -1157,6 +1165,41 @@ impl ResponseCache {
                 );
                 None
             }
+        };
+
+        // Local writable cache overlay (CACHE_LOCAL_REDIS_URL): when the main cache tier is a
+        // read-only replica, cacheable responses go here. Fail-open like the main tier.
+        let cache_overlay_conn = if let Some(overlay_url) = cache_local_redis_url {
+            if !overlay_url.is_empty() && overlay_url != redis_url {
+                match redis::Client::open(overlay_url) {
+                    Ok(client) => match ConnectionManager::new(client).await {
+                        Ok(conn) => {
+                            info!(network = %network, "Local cache overlay connected");
+                            Some(Arc::new(ArcSwapOption::from(Some(Arc::new(conn)))))
+                        }
+                        Err(e) => {
+                            warn!(
+                                network = %network,
+                                error = %e,
+                                "Failed to connect to local cache overlay, continuing without it (fail-open)"
+                            );
+                            None
+                        }
+                    },
+                    Err(e) => {
+                        warn!(
+                            network = %network,
+                            error = %e,
+                            "Invalid local cache overlay URL, continuing without it (fail-open)"
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            }
+        } else {
+            None
         };
 
         // Separate security connection if configured. Its failure still fails startup
@@ -1196,6 +1239,8 @@ impl ResponseCache {
         let cache = Self {
             cache_conn: Arc::new(ArcSwapOption::from(cache_conn.map(Arc::new))),
             cache_ping_failures: Arc::new(AtomicU32::new(0)),
+            main_tier_replica: Arc::new(AtomicBool::new(false)),
+            cache_overlay_conn,
             security_conn,
             tip: Arc::new(TipCell::new()),
             epoch: Arc::new(AtomicU64::new(0)),
@@ -1244,6 +1289,38 @@ impl ResponseCache {
                 false
             }
         }
+    }
+
+    /// Ask the main cache tier for its role (`INFO replication`) and remember it; an unanswered
+    /// or unparsable probe keeps the last known role.
+    pub async fn refresh_main_tier_role(&self) {
+        let Some(conn) = self.cache_conn.load_full() else {
+            return;
+        };
+        let mut conn = (*conn).clone();
+        let r = timeout(
+            self.redis_timeout,
+            redis::cmd("INFO")
+                .arg("replication")
+                .query_async::<_, String>(&mut conn),
+        )
+        .await;
+        if let Ok(Ok(info)) = r {
+            if let Some(replica) = info_replication_is_replica(&info) {
+                self.set_main_tier_replica(replica);
+            }
+        }
+    }
+
+    fn set_main_tier_replica(&self, replica: bool) {
+        if self.main_tier_replica.swap(replica, Ordering::Relaxed) != replica {
+            if replica {
+                info!(network = %self.network, "main cache tier is a read-only replica: writes routed to overlay");
+            } else {
+                info!(network = %self.network, "main cache tier is a primary: writes resume on main tier");
+            }
+        }
+        crate::health::record_cache_replica(&self.network, replica);
     }
 
     /// Attach the pinned tier (REDIS_PINNED_URL + PINNED_TREESTATE_RANGE).
@@ -3060,29 +3137,83 @@ impl CacheStore for ResponseCache {
             if n == 0 {
                 return Vec::new();
             }
-            let Some(conn) = self.cache_conn.load_full() else {
-                return vec![None; n];
+
+            // Check main tier first
+            let main_values = if let Some(conn) = self.cache_conn.load_full() {
+                let mut conn = (*conn).clone();
+                let mut cmd = redis::cmd("MGET");
+                cmd.arg(&keys);
+                let fut = cmd.query_async::<_, Vec<Option<Vec<u8>>>>(&mut conn);
+                match timeout(self.redis_timeout, fut).await {
+                    Ok(Ok(values)) if values.len() == n => {
+                        values.into_iter().map(|v| v.map(Bytes::from)).collect()
+                    }
+                    Ok(Ok(_)) => vec![None; n],
+                    Ok(Err(e)) => {
+                        warn!(network = %self.network, error = %e, "cache mget error");
+                        crate::health::record_cache_redis_timeout(&self.network, "mget_error");
+                        vec![None; n]
+                    }
+                    Err(_) => {
+                        warn!(network = %self.network, timeout_ms = self.redis_timeout.as_millis(), "cache mget timeout");
+                        crate::health::record_cache_redis_timeout(&self.network, "mget_timeout");
+                        vec![None; n]
+                    }
+                }
+            } else {
+                vec![None; n]
             };
-            let mut conn = (*conn).clone();
-            let mut cmd = redis::cmd("MGET");
-            cmd.arg(&keys);
-            let fut = cmd.query_async::<_, Vec<Option<Vec<u8>>>>(&mut conn);
-            match timeout(self.redis_timeout, fut).await {
-                Ok(Ok(values)) if values.len() == n => {
-                    values.into_iter().map(|v| v.map(Bytes::from)).collect()
-                }
-                Ok(Ok(_)) => vec![None; n],
-                Ok(Err(e)) => {
-                    warn!(network = %self.network, error = %e, "cache mget error");
-                    crate::health::record_cache_redis_timeout(&self.network, "mget_error");
-                    vec![None; n]
-                }
-                Err(_) => {
-                    warn!(network = %self.network, timeout_ms = self.redis_timeout.as_millis(), "cache mget timeout");
-                    crate::health::record_cache_redis_timeout(&self.network, "mget_timeout");
-                    vec![None; n]
+
+            // Check overlay for misses when it's configured
+            if let Some(overlay) = &self.cache_overlay_conn {
+                let overlay_needed: Vec<(usize, String)> = keys
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, k)| main_values[i].is_none().then_some((i, k.clone())))
+                    .collect();
+
+                if !overlay_needed.is_empty() {
+                    if let Some(overlay_conn) = overlay.load_full() {
+                        let overlay_keys: Vec<String> =
+                            overlay_needed.iter().map(|(_, k)| k.clone()).collect();
+                        let mut conn = (*overlay_conn).clone();
+                        let mut cmd = redis::cmd("MGET");
+                        cmd.arg(&overlay_keys);
+                        let fut = cmd.query_async::<_, Vec<Option<Vec<u8>>>>(&mut conn);
+                        match timeout(self.redis_timeout, fut).await {
+                            Ok(Ok(overlay_values))
+                                if overlay_values.len() == overlay_needed.len() =>
+                            {
+                                let mut result = main_values;
+                                let mut overlay_hits = 0u64;
+                                for (j, (i, _)) in overlay_needed.iter().enumerate() {
+                                    if let Some(v) = &overlay_values[j] {
+                                        result[*i] = Some(Bytes::from(v.clone()));
+                                        overlay_hits += 1;
+                                    }
+                                }
+                                if overlay_hits > 0 {
+                                    crate::health::record_cache_overlay(
+                                        &self.network,
+                                        "hit",
+                                        overlay_hits,
+                                    );
+                                }
+                                return result;
+                            }
+                            Ok(Err(e)) => {
+                                debug!(network = %self.network, error = %e, "cache overlay mget error (fail-open)");
+                            }
+                            Err(_) => {
+                                debug!(network = %self.network, "cache overlay mget timeout (fail-open)");
+                            }
+                            _ => {}
+                        }
+                    }
                 }
             }
+
+            main_values
         })
     }
 
@@ -3094,6 +3225,61 @@ impl CacheStore for ResponseCache {
         epoch: Option<u64>,
     ) -> BoxFuture<'_, ()> {
         Box::pin(async move {
+            // When main tier is a replica and overlay is configured, write to overlay instead
+            let is_replica = self.main_tier_replica.load(Ordering::Relaxed);
+            if is_replica && self.cache_overlay_conn.is_some() {
+                // Epoch check: only write if the epoch at read time is still current
+                if let Some(e) = epoch {
+                    let epoch_key = format!("epoch:{}", self.network);
+                    if let Some(sec) = self.security_conn.as_ref() {
+                        let current: redis::RedisResult<Option<u64>> = redis::cmd("GET")
+                            .arg(&epoch_key)
+                            .query_async(&mut sec.get())
+                            .await;
+                        sec.observe(&current);
+                        match current {
+                            Ok(Some(current_epoch)) if current_epoch == e => {}
+                            _ => {
+                                // Epoch mismatch or error: don't write (fail-open)
+                                return;
+                            }
+                        }
+                    } else {
+                        // No security connection: can't validate epoch, skip the write (fail-open)
+                        return;
+                    }
+                }
+
+                // Write to overlay
+                if let Some(overlay) = &self.cache_overlay_conn {
+                    if let Some(overlay_conn) = overlay.load_full() {
+                        let mut conn = (*overlay_conn).clone();
+                        let mut cmd = redis::cmd("SET");
+                        cmd.arg(&key).arg(&value[..]);
+                        if let Some(t) = ttl_secs {
+                            cmd.arg("EX").arg(t);
+                        }
+                        match timeout(self.redis_timeout, async move {
+                            cmd.query_async::<_, ()>(&mut conn).await
+                        })
+                        .await
+                        {
+                            Ok(Ok(_)) => {
+                                crate::health::record_cache_overlay(&self.network, "write", 1);
+                            }
+                            Ok(Err(e)) => {
+                                debug!(network = %self.network, error = %e, "cache overlay set error (fail-open)");
+                            }
+                            Err(_) => {
+                                debug!(network = %self.network, "cache overlay set timeout (fail-open)");
+                            }
+                        }
+                    }
+                }
+                return;
+            }
+
+            // Main tier write path (not a replica, or no overlay configured)
             let result = match epoch {
                 Some(e) => {
                     timeout(
@@ -3603,6 +3789,16 @@ fn spawn_cache_reconnect_task(cache: ResponseCache) {
     });
 }
 
+/// Probe the main cache tier for its role every HOUSEKEEPING_SECS (replica vs primary).
+pub fn spawn_cache_replica_probe(cache: ResponseCache) {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(HOUSEKEEPING_SECS)).await;
+            cache.refresh_main_tier_role().await;
+        }
+    });
+}
+
 /// Spawn `workers` tasks that fill the pinned tier for every height in PINNED_TREESTATE_RANGE.
 /// Heights are claimed with INCR on a cursor in the pinned Redis, so all gateway processes share
 /// one pass and a restart resumes where it stopped. A height that keeps failing is skipped (the
@@ -3745,6 +3941,9 @@ mod tests {
     ) -> ResponseCache {
         ResponseCache {
             cache_conn: Arc::new(ArcSwapOption::from(Some(Arc::new(conn)))),
+            cache_ping_failures: Arc::new(AtomicU32::new(0)),
+            main_tier_replica: Arc::new(AtomicBool::new(false)),
+            cache_overlay_conn: None,
             // The client is only used to reconnect after a failover signal, which these tests
             // do not produce (store_failover.rs does).
             security_conn: security.map(|c| {
@@ -3756,7 +3955,6 @@ mod tests {
                     Role::Primary,
                 )
             }),
-            cache_ping_failures: Arc::new(AtomicU32::new(0)),
             tip: Arc::new(TipCell::new()),
             epoch: Arc::new(AtomicU64::new(0)),
             network: network.to_string(),

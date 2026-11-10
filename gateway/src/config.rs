@@ -205,6 +205,9 @@ pub struct Config {
     /// Redis URL for security-critical operations (replay nonces, epoch state).
     /// Uses noeviction policy. Required in OHTTP mode together with redis_url (main.rs).
     pub redis_security_url: String,
+    /// Local writable cache overlay for read origins. When the main cache tier is a read-only
+    /// replica, cacheable responses are written here. Fail-open. Unset or empty = no overlay.
+    pub cache_local_redis_url: String,
     /// Multi-backend map: authority → backend base URL.
     /// Format: "api1.example.com=https://api-backend1.example,api2.example.com=https://api-backend2.example"
     /// Unknown authorities go to LWD only while GATEWAY_HOSTS is empty (see gateway_hosts).
@@ -502,6 +505,7 @@ impl Config {
             },
             redis_url: env::var("REDIS_URL").unwrap_or_default(),
             redis_security_url: env::var("REDIS_SECURITY_URL").unwrap_or_default(),
+            cache_local_redis_url: env::var("CACHE_LOCAL_REDIS_URL").unwrap_or_default(),
             backends: {
                 // Strict BACKENDS parsing: error on malformed entries instead of silently skipping them.
                 let backends_str = env::var("BACKENDS").unwrap_or_default();
@@ -835,6 +839,7 @@ impl std::fmt::Debug for Config {
             .field("network", &self.network)
             .field("redis_url", &"<REDACTED>")
             .field("redis_security_url", &"<REDACTED>")
+            .field("cache_local_redis_url", &"<REDACTED>")
             .field("configs_signing_seed", &"<REDACTED>")
             .field("flexa_publishable_key", &"<REDACTED>")
             .field("flexa_alias", &self.flexa_alias)

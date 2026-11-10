@@ -985,6 +985,7 @@ mod tests {
             sse_keepalive_secs: 20,
             redis_url: String::new(),
             redis_security_url: String::new(),
+            cache_local_redis_url: String::new(),
             backends: std::collections::HashMap::new(),
             backend_headers: std::collections::HashMap::new(),
             backends_policy: std::collections::HashMap::new(),

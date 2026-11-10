@@ -136,6 +136,18 @@ lazy_static::lazy_static! {
     )
     .unwrap();
 
+    static ref OHTTP_CACHE_OVERLAY_TOTAL: IntCounterVec = IntCounterVec::new(
+        Opts::new("ohttp_cache_overlay_total", "Local cache overlay operations: hit (main-tier miss served from overlay) or write (response written to overlay)"),
+        &["network", "operation"]
+    )
+    .unwrap();
+
+    static ref OHTTP_CACHE_REPLICA: IntGaugeVec = IntGaugeVec::new(
+        Opts::new("ohttp_cache_replica", "Whether the main cache tier is a read-only replica (1) or writable primary (0)"),
+        &["network"]
+    )
+    .unwrap();
+
     pub static ref OHTTP_REPLAY_REJECTED: IntCounterVec = IntCounterVec::new(
         Opts::new("ohttp_replay_rejected_total", "Total requests rejected as replays"),
         &["network"]
@@ -576,6 +588,12 @@ pub fn init_metrics() {
         .register(Box::new(OHTTP_CACHE_TIP_HEIGHT.clone()))
         .ok();
     REGISTRY
+        .register(Box::new(OHTTP_CACHE_OVERLAY_TOTAL.clone()))
+        .ok();
+    REGISTRY
+        .register(Box::new(OHTTP_CACHE_REPLICA.clone()))
+        .ok();
+    REGISTRY
         .register(Box::new(OHTTP_THIRD_PARTY_CACHE_TOTAL.clone()))
         .ok();
     REGISTRY
@@ -816,6 +834,18 @@ pub fn record_cache_tip_height(network: &str, height: u64) {
     OHTTP_CACHE_TIP_HEIGHT
         .with_label_values(&[network])
         .set(height as i64);
+}
+
+pub fn record_cache_overlay(network: &str, operation: &str, count: u64) {
+    OHTTP_CACHE_OVERLAY_TOTAL
+        .with_label_values(&[network, operation])
+        .inc_by(count);
+}
+
+pub fn record_cache_replica(network: &str, is_replica: bool) {
+    OHTTP_CACHE_REPLICA
+        .with_label_values(&[network])
+        .set(if is_replica { 1 } else { 0 });
 }
 
 pub fn record_lwd_shed(network: &str, class: &str) {

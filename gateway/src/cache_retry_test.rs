@@ -33,6 +33,7 @@ mod tests {
         let result = ResponseCache::connect(
             "redis://invalid-host:9999", // Non-existent Redis
             None,
+            None, // cache_local_redis_url
             "testnet".to_string(),
             "test-backend".to_string(),
             250,
@@ -69,6 +70,7 @@ mod tests {
         let cache = ResponseCache::connect(
             "redis://invalid-host:9999",
             None,
+            None, // cache_local_redis_url
             "testnet".to_string(),
             "test-backend".to_string(),
             250,
@@ -100,6 +102,7 @@ mod tests {
         let result = ResponseCache::connect(
             "redis://127.0.0.1:6379",              // Assume cache Redis might exist
             Some("redis://invalid-security:9999"), // Invalid security Redis
+            None,                                  // cache_local_redis_url
             "testnet".to_string(),
             "test-backend".to_string(),
             250,

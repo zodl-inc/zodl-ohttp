@@ -324,10 +324,16 @@ async fn main() -> anyhow::Result<()> {
 
         // Without the security Redis no OHTTP request can be served (replay protection fails
         // closed), and the cache is never retried once startup gave up on it: wait for it.
+        let overlay_url = if !config.cache_local_redis_url.is_empty() {
+            Some(config.cache_local_redis_url.as_str())
+        } else {
+            None
+        };
         let connected = loop {
             match cache::ResponseCache::connect(
                 &config.redis_url,
                 security_url,
+                overlay_url,
                 network.clone(),
                 backend_host.clone(),
                 config.redis_op_timeout_ms,
@@ -668,6 +674,13 @@ async fn main() -> anyhow::Result<()> {
         }
         _ => None,
     };
+
+    // Cache replica probe housekeeping: check main tier role when overlay is configured.
+    if let Some(c) = &cache_state {
+        if overlay_url.is_some() {
+            cache::spawn_cache_replica_probe(c.clone());
+        }
+    }
 
     // Per-block cache for GetBlockRange and the chain follower that validates it, both on the
     // same Redis; the follower tells the mempool fan-out about new blocks.
