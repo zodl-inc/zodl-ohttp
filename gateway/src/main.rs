@@ -62,6 +62,7 @@ mod ohttp;
 mod ohttp_chunked;
 mod origin;
 mod padding;
+mod prefetch;
 mod proxy;
 mod replication;
 mod request_id;
@@ -707,6 +708,8 @@ async fn main() -> anyhow::Result<()> {
         },
         _ => chain::DEFAULT_TIP_STALE_AFTER,
     };
+    // PREFETCH_TIP / PREFETCH_BLOCK_TXS / PREFETCH_BLOCK_TXS_MAX (prefetch.rs).
+    let prefetch_config = prefetch::PrefetchConfig::from_env()?;
     let follower = cache_state.as_ref().map(|c| {
         let mut f = chain::ChainFollower::new(
             Arc::new(c.clone()),
@@ -721,6 +724,15 @@ async fn main() -> anyhow::Result<()> {
         f = f.with_stale_after(chain_tip_stale_after);
         let f = Arc::new(f);
         f.add_listener(mempool_fanout.clone());
+        if !prefetch_config.is_off() {
+            f.add_listener(Arc::new(prefetch::TipPrefetch::new(
+                Arc::new(c.clone()),
+                flights.clone(),
+                config.network.clone(),
+                prefetch_config.clone(),
+            )));
+            info!(network = %config.network, prefetch = ?prefetch_config, "Tip prefetch enabled");
+        }
         tokio::spawn(f.clone().run());
         cache::spawn_redis_housekeeping(c.clone());
         info!(network = %config.network, "Chain follower started");

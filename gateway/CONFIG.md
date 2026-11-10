@@ -139,6 +139,9 @@ only, and `REPLAY_STANDBY_URLS`). See `docs/architecture.md`, "Multiple origins"
 | `PERMANENT_MIN_HEIGHT` | Sapling activation of `NETWORK` | Lowest height kept in the permanent tier. |
 | `PERMANENT_OP_TIMEOUT_MS` | `2000` (serving), `5000` (`backfill`) | Timeout of one permanent-tier operation. |
 | `CHAIN_TIP_STALE_SECS` | `150` | A stored chain tip unmoved for longer makes the chain follower's other processes compare it with their own lightwalletd: one that is ahead serves its own tip and, still ahead on the next check, takes the leader lock over. |
+| `PREFETCH_TIP` | `1` | On every new tip, the chain follower's leader fetches `GetLightdInfo` and `GetLatestTreeState` once and caches them under the tip, and writes the tip's `GetSubtreeRoots` end markers from the tip block's commitment tree sizes, so the first requests after a block are cache hits. `0` turns it off. |
+| `PREFETCH_BLOCK_TXS` | `0` | `1`: the leader also fetches every transaction of each new block with `GetTransaction` and caches it (validated like a Client's answer), so wallets syncing to the tip find recent transactions cached. Costs one upstream call per transaction. |
+| `PREFETCH_BLOCK_TXS_MAX` | `100` | With `PREFETCH_BLOCK_TXS=1`: blocks with more transactions than this are skipped. |
 | `REDIS_PINNED_URL` | unset | Optional Redis (no eviction) for `GetTreeState` answers by height. Needs `PINNED_TREESTATE_RANGE`. |
 | `PINNED_TREESTATE_RANGE` | unset | Inclusive height range for the pinned tier, `start-end` or `start-` (open end); `start` at least 1. |
 | `PINNED_BACKFILL_WORKERS` | `0` | Background workers per process that fill the pinned range; `0`: write-through only. |
