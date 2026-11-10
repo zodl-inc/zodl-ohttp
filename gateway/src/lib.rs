@@ -52,6 +52,7 @@ pub mod local;
 pub mod mempool;
 pub mod ohttp_chunked;
 pub mod origin;
+pub mod prefetch;
 pub mod replication;
 pub mod rpc_cache;
 pub mod server;
