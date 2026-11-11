@@ -65,8 +65,8 @@ use tracing::{debug, warn};
 /// The one RPC this cache serves.
 pub const GET_SUBTREE_ROOTS_PATH: &str = "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetSubtreeRoots";
 
-/// `ShieldedProtocol` values lightwalletd knows: sapling 0, orchard 1.
-pub const PROTOCOLS: [u32; 2] = [0, 1];
+/// `ShieldedProtocol` values lightwalletd knows: sapling 0, orchard 1, ironwood 2.
+pub const PROTOCOLS: [u32; 3] = [0, 1, 2];
 
 /// Indices looked up per round trip while walking the cached prefix.
 const MGET_BATCH: usize = 64;
@@ -990,9 +990,17 @@ mod tests {
                 max_entries: 3
             })
         );
+        assert_eq!(
+            SubtreeRootsRequest::parse(&SubtreeRootsRequest::grpc_body(17, 2, 0)),
+            Some(SubtreeRootsRequest {
+                start_index: 17,
+                protocol: 2,
+                max_entries: 0
+            })
+        );
         // Unknown protocol, unknown field, wrong wire type, compressed, two frames.
         assert_eq!(
-            SubtreeRootsRequest::parse(&SubtreeRootsRequest::grpc_body(0, 2, 0)),
+            SubtreeRootsRequest::parse(&SubtreeRootsRequest::grpc_body(0, 3, 0)),
             None
         );
         assert_eq!(SubtreeRootsRequest::parse(&grpc_frame(&[0x20, 1])), None);
@@ -1359,6 +1367,46 @@ mod tests {
         settle().await;
         collect(&cache, request(0, 0, 3)).await;
         assert_eq!(lwd.calls().len(), 1, "0..=2 are cached by now");
+    }
+
+    #[tokio::test]
+    async fn protocol_2_is_served_via_per_entry_cache() {
+        let ironwood: Vec<(u64, Vec<u8>)> =
+            vec![(5000, block_hash(5000, 0)), (6000, block_hash(6000, 0))];
+        let store = Arc::new(MemStore::default());
+        store.tip.set(Tip {
+            height: 10_000,
+            hash: block_hash(10_000, 0),
+        });
+        let lwd = Arc::new(FakeRoots::new(vec![vec![], vec![], ironwood]));
+        let cache = Arc::new(SubtreeRootsCache::new(
+            store.clone(),
+            lwd.clone(),
+            "testnet".to_string(),
+        ));
+        // First call fetches from lightwalletd.
+        let (body, trailers) = collect(&cache, request(0, 2, 0)).await;
+        assert_eq!(
+            body,
+            lwd.frames_for(2, 0, 0)
+                .iter()
+                .flat_map(|f| f.to_vec())
+                .collect::<Vec<u8>>()
+        );
+        assert_eq!(trailers, ok_trailers());
+        assert_eq!(lwd.calls(), vec![(0, 2, 0)]);
+        settle().await;
+        // Second call served entirely from cache, no upstream call.
+        let (body, trailers) = collect(&cache, request(0, 2, 0)).await;
+        assert_eq!(
+            body,
+            lwd.frames_for(2, 0, 0)
+                .iter()
+                .flat_map(|f| f.to_vec())
+                .collect::<Vec<u8>>()
+        );
+        assert_eq!(trailers, ok_trailers());
+        assert_eq!(lwd.calls().len(), 1);
     }
 
     #[tokio::test]
