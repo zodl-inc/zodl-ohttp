@@ -3,6 +3,15 @@
 Behaviour changes of the gateway, the relay simulator and the e2e client. The client library
 keeps its own log in [client/CHANGELOG.md](client/CHANGELOG.md).
 
+## Unreleased
+
+### Gateway
+
+- `GetSubtreeRoots` requests for the Ironwood pool (shielded protocol 2) are now served via the
+  per-entry cache, as Sapling and Orchard requests already were. Wallets syncing the Ironwood pool
+  after a network upgrade that activates it see the same cache hit rate as for the other pools.
+  Requests for unknown protocols still take the generic per-request path.
+
 ## 1.0.1
 
 crates.io metadata, no code change: `zodl-ohttp-client` 1.0.1 is published on crates.io, the e2e

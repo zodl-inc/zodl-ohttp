@@ -125,6 +125,8 @@ struct ChainMetadata {
     sapling_commitment_tree_size: u32,
     #[prost(uint32, tag = "2")]
     orchard_commitment_tree_size: u32,
+    #[prost(uint32, tag = "3")]
+    ironwood_commitment_tree_size: u32,
 }
 
 /// `TxFilter { hash }`, as a Client sends it for `GetTransaction`.
@@ -152,11 +154,16 @@ pub fn get_transaction_body(txid: &[u8]) -> Vec<u8> {
     )
 }
 
-/// Completed subtrees of each pool (sapling 0, orchard 1) after a block with these tree sizes.
-pub fn completed_subtrees(sapling_size: u32, orchard_size: u32) -> [(u32, u32); 2] {
+/// Completed subtrees of each pool (sapling 0, orchard 1, ironwood 2) after a block with these tree sizes.
+pub fn completed_subtrees(
+    sapling_size: u32,
+    orchard_size: u32,
+    ironwood_size: u32,
+) -> [(u32, u32); 3] {
     [
         (0, sapling_size / SUBTREE_LEAVES),
         (1, orchard_size / SUBTREE_LEAVES),
+        (2, ironwood_size / SUBTREE_LEAVES),
     ]
 }
 
@@ -279,6 +286,7 @@ impl Inner {
         for (protocol, count) in completed_subtrees(
             meta.sapling_commitment_tree_size,
             meta.orchard_commitment_tree_size,
+            meta.ironwood_commitment_tree_size,
         ) {
             if count == 0 {
                 continue;
@@ -484,12 +492,13 @@ mod tests {
         }
     }
 
-    fn block(txids: &[[u8; 32]], sapling: u32, orchard: u32) -> Vec<u8> {
+    fn block(txids: &[[u8; 32]], sapling: u32, orchard: u32, ironwood: u32) -> Vec<u8> {
         BlockTail {
             vtx: txids.iter().map(|h| TxHead { hash: h.to_vec() }).collect(),
             chain_metadata: Some(ChainMetadata {
                 sapling_commitment_tree_size: sapling,
                 orchard_commitment_tree_size: orchard,
+                ironwood_commitment_tree_size: ironwood,
             }),
         }
         .encode_to_vec()
@@ -517,6 +526,7 @@ mod tests {
                 &[[1; 32], [2; 32]],
                 3 * SUBTREE_LEAVES + 5,
                 SUBTREE_LEAVES - 1,
+                0,
             ),
         );
         let lwd = Arc::new(FakeLwd {
@@ -639,6 +649,15 @@ mod tests {
             )),
             None
         );
+        // Ironwood has no completed subtree yet: no marker.
+        assert_eq!(
+            r.store.get(&crate::subtree_cache::subtree_end_key(
+                &prefix,
+                2,
+                &r.tip.hash
+            )),
+            None
+        );
         // Tip-scoped: it carries the tip-scoped expiry.
         assert_eq!(
             r.store.ttl(&crate::subtree_cache::subtree_end_key(
@@ -652,14 +671,14 @@ mod tests {
 
     #[test]
     fn completed_subtrees_round_down() {
-        assert_eq!(completed_subtrees(0, 0), [(0, 0), (1, 0)]);
+        assert_eq!(completed_subtrees(0, 0, 0), [(0, 0), (1, 0), (2, 0)]);
         assert_eq!(
-            completed_subtrees(SUBTREE_LEAVES - 1, SUBTREE_LEAVES),
-            [(0, 0), (1, 1)]
+            completed_subtrees(SUBTREE_LEAVES - 1, SUBTREE_LEAVES, 2 * SUBTREE_LEAVES),
+            [(0, 0), (1, 1), (2, 2)]
         );
         assert_eq!(
-            completed_subtrees(5 * SUBTREE_LEAVES + 1, 0),
-            [(0, 5), (1, 0)]
+            completed_subtrees(5 * SUBTREE_LEAVES + 1, 0, SUBTREE_LEAVES - 1),
+            [(0, 5), (1, 0), (2, 0)]
         );
     }
 
