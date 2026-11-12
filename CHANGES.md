@@ -11,6 +11,12 @@ keeps its own log in [client/CHANGELOG.md](client/CHANGELOG.md).
   per-entry cache, as Sapling and Orchard requests already were. Wallets syncing the Ironwood pool
   after a network upgrade that activates it see the same cache hit rate as for the other pools.
   Requests for unknown protocols still take the generic per-request path.
+- The tip prefetch writes the `GetSubtreeRoots` end markers of a new tip before it asks
+  lightwalletd for the tip-scoped answers, instead of after. The markers come from the tip block
+  the chain follower already stored, so they need no upstream call. Wallets that ask for subtree
+  roots right after a block no longer fall through to lightwalletd while the tip RPCs are in
+  flight, which on a gateway far from its lightwalletd took one or more round trips per tip. No
+  new settings or metrics.
 
 ## 1.0.1
 

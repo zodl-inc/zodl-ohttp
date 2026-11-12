@@ -28,7 +28,8 @@
 //!   ([`crate::subtree_cache::subtree_end_key`]), so a `GetSubtreeRoots` whose cached prefix
 //!   reaches it needs no upstream call. The count is an upper bound of what the node lists
 //!   (it cannot list a subtree that is not complete), so the marker never hides a root: a
-//!   request below it still fetches what is missing.
+//!   request below it still fetches what is missing. The markers come from the stored tip
+//!   block, so they are written first, before any upstream call of the tip.
 //! - **Block transactions** (`PREFETCH_BLOCK_TXS=1`, off by default): the transactions of each
 //!   new block (the `CompactTx` hashes of the follower's own block fetch) are fetched once with
 //!   `GetTransaction` and stored as validated entries, so wallets syncing to the tip find their
@@ -229,16 +230,18 @@ impl Inner {
     async fn run(&self, tip: &Tip) {
         let epoch = self.store.epoch().await;
         let prefix = self.store.key_prefix(epoch);
-        if self.config.tip {
-            for rpc in TIP_RPCS {
-                self.prefetch(&prefix, epoch, tip, rpc, grpc_frame(&[]))
-                    .await;
-            }
-        }
+        // The follower stores the tip block before it announces the tip, so the end markers need
+        // no upstream call: write them first. Subtree requests that wallets send right after a
+        // new block then find them, instead of waiting for the tip RPCs below, which take one
+        // lightwalletd round trip each.
         let blocks = self.blocks(&prefix, tip).await;
         if self.config.tip {
             if let Some((_, tail)) = blocks.iter().find(|(h, _)| *h == tip.height) {
                 self.write_end_markers(&prefix, epoch, tip, tail).await;
+            }
+            for rpc in TIP_RPCS {
+                self.prefetch(&prefix, epoch, tip, rpc, grpc_frame(&[]))
+                    .await;
             }
         }
         if let Some(max_txs) = self.config.block_txs {
@@ -443,6 +446,8 @@ mod tests {
         calls: Mutex<Vec<(String, Vec<u8>)>>,
         tx_height: u64,
         fail: bool,
+        /// When set, every call waits for a permit before it answers (a slow lightwalletd).
+        gate: Option<Arc<tokio::sync::Semaphore>>,
     }
 
     #[derive(Clone, PartialEq, prost::Message)]
@@ -465,6 +470,7 @@ mod tests {
                 .unwrap()
                 .push((path.clone(), body.clone()));
             let fail = self.fail;
+            let gate = self.gate.clone();
             let msg = if path.ends_with("GetTransaction") {
                 RawTx {
                     data: body.clone(),
@@ -475,6 +481,9 @@ mod tests {
                 path.as_bytes().to_vec()
             };
             Box::pin(async move {
+                if let Some(gate) = gate {
+                    gate.acquire().await.expect("gate open").forget();
+                }
                 if fail {
                     anyhow::bail!("upstream down");
                 }
@@ -512,6 +521,14 @@ mod tests {
     }
 
     async fn rig(config: PrefetchConfig, fail: bool) -> Rig {
+        rig_with_gate(config, fail, None).await
+    }
+
+    async fn rig_with_gate(
+        config: PrefetchConfig,
+        fail: bool,
+        gate: Option<Arc<tokio::sync::Semaphore>>,
+    ) -> Rig {
         let store = Arc::new(MemStore::default());
         let tip = Tip {
             height: 1000,
@@ -533,6 +550,7 @@ mod tests {
             calls: Mutex::new(Vec::new()),
             tx_height: 1000,
             fail,
+            gate,
         });
         let flights = Arc::new(RpcFlights::new(lwd.clone(), "testnet".to_string()));
         let prefetch = TipPrefetch::new(store.clone(), flights, "testnet".to_string(), config);
@@ -667,6 +685,45 @@ mod tests {
             )),
             Some(Some(rpc_cache::TIP_SCOPED_TTL_SECS))
         );
+    }
+
+    #[tokio::test]
+    async fn end_markers_do_not_wait_for_the_tip_rpcs() {
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let r = rig_with_gate(
+            PrefetchConfig {
+                tip: true,
+                block_txs: None,
+            },
+            false,
+            Some(gate.clone()),
+        )
+        .await;
+        let prefetch = TipPrefetch {
+            inner: r.prefetch.inner.clone(),
+        };
+        let tip = r.tip.clone();
+        let run = tokio::spawn(async move { prefetch.run(&tip).await });
+        let prefix = r.store.key_prefix(r.store.epoch);
+        let key = crate::subtree_cache::subtree_end_key(&prefix, 0, &r.tip.hash);
+        // lightwalletd has not answered any tip RPC yet, and the marker is already there.
+        let mut found = false;
+        for _ in 0..200 {
+            if r.store.get(&key).is_some() {
+                found = true;
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(found, "end marker written before the tip RPCs answered");
+        assert!(!run.is_finished());
+        // Let the tip RPCs answer: the run completes and caches them as before.
+        gate.add_permits(TIP_RPCS.len());
+        tokio::time::timeout(std::time::Duration::from_secs(5), run)
+            .await
+            .expect("prefetch finishes once lightwalletd answers")
+            .unwrap();
+        assert!(is_hit(&r.store, "GetLightdInfo", &grpc_frame(&[])).await);
     }
 
     #[test]
