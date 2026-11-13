@@ -2,6 +2,18 @@
 
 [Keep a Changelog](https://keepachangelog.com).
 
+## Unreleased
+
+### Changed
+
+- Every `OuterHeaders` preset (`LIBRARY`, `ANDROID`, `IOS`, `SLIPSTREAM`) now sends the same fixed
+  `User-Agent: zodl-ohttp/1` to the relay, on the post and on the key-configuration fetch, and
+  the library `Client` sends it on its key-configuration fetch too. The relay sees the client
+  address, and a User-Agent that differs per client or HTTP stack lets it tell clients apart.
+  The value is the new public constant `RELAY_USER_AGENT`; changing it later is a breaking
+  change. Behaviour change for callers that relied on the HTTP stack's default User-Agent
+  (`LIBRARY`, `ANDROID`, `IOS`) or on the old slipstream value `zodl-slipstream-ohttp/0.1`.
+
 ## 1.0.1
 
 crates.io metadata, no code change: the crate is published on crates.io (repository, homepage,
