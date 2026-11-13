@@ -75,17 +75,40 @@ jobs:
           cargo build --locked
           cargo test --locked
 
-  build-gateway:
-    name: Build OHTTP Gateway
-    runs-on: ubuntu-24.04
+  # One build per image and platform, each on a runner of its own architecture (no emulation: Rust
+  # builds under QEMU are many times slower). A push build pushes every platform image by digest
+  # only, without a tag; the publish job below tags the multi-platform index once.
+  build:
+    name: Build ${{ matrix.image.name }} (${{ matrix.arch.suffix }})
+    runs-on: ${{ matrix.arch.runner }}
     needs: test
     permissions:
       id-token: write
       contents: read
-      packages: write
 
-    outputs:
-      image-digest: ${{ steps.build.outputs.digest }}
+    strategy:
+      fail-fast: false
+      matrix:
+        image:
+          - name: ohttp-gateway
+            short: gateway
+            context: ./gateway
+            file: ./gateway/Dockerfile
+          - name: ohttp-relay-simulator
+            short: relay-simulator
+            context: ./relay-simulator
+            file: ./relay-simulator/Dockerfile
+          - name: ohttp-e2e
+            short: e2e
+            context: .
+            file: ./e2e-client/Dockerfile
+        arch:
+          - platform: linux/amd64
+            suffix: amd64
+            runner: ubuntu-24.04
+          - platform: linux/arm64
+            suffix: arm64
+            runner: ubuntu-24.04-arm
 
     steps:
       - name: Checkout
@@ -105,223 +128,97 @@ jobs:
       - name: Docker meta
         id: meta
         uses: docker/metadata-action@369eb591f429131d6889c46b94e711f089e6ca96 # v5.6.1
-        # ECR tags are immutable and the main build of the same commit already pushed sha-<short>:
-        # a release tag build pushes only its version tag (no moving `major.minor` tag, which an
-        # immutable repository refuses once it exists).
+        # Labels only: a platform image is pushed by digest, the tags go on the index.
         with:
-          images: ${{ env.ECR_REGISTRY }}/ohttp-gateway
-          flavor: |
-            latest=false
-          tags: |
-            type=ref,event=pr,prefix=pr-
-            type=semver,pattern={{version}}
-            type=sha,format=short,enable=${{ !startsWith(github.ref, 'refs/tags/') }}
+          images: ${{ env.ECR_REGISTRY }}/${{ matrix.image.name }}
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@c47758b77c9736f4b2ef4073d4d51994fabfe349 # v3.7.1
 
-      - name: Build and push
+      - name: Build and push by digest
         id: build
         uses: docker/build-push-action@4f58ea79222b3b9dc2c8bbdd6debcef730109a75 # v6.9.0
         with:
-          context: ./gateway
-          file: ./gateway/Dockerfile
-          platforms: linux/amd64
-          push: ${{ github.event_name != 'pull_request' }}
-          tags: ${{ steps.meta.outputs.tags }}
+          context: ${{ matrix.image.context }}
+          file: ${{ matrix.image.file }}
+          platforms: ${{ matrix.arch.platform }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # Pull requests build without pushing (no output).
+          outputs: ${{ github.event_name != 'pull_request' && format('type=image,name={0}/{1},push-by-digest=true,name-canonical=true,push=true', env.ECR_REGISTRY, matrix.image.name) || '' }}
+          cache-from: type=gha,scope=${{ matrix.image.short }}-${{ matrix.arch.suffix }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.image.short }}-${{ matrix.arch.suffix }}
 
+      - name: Export digest
+        if: github.event_name != 'pull_request'
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          mkdir -p "${RUNNER_TEMP}/digests"
+          touch "${RUNNER_TEMP}/digests/${DIGEST#sha256:}"
+
+      - name: Upload digest
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
+        with:
+          name: digests-${{ matrix.image.short }}-${{ matrix.arch.suffix }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+      # One SBOM per platform image: an SBOM describes the packages of one concrete image, and
+      # the scanner resolves an index to a single platform.
       - name: Generate SBOM
         if: github.event_name != 'pull_request'
         uses: anchore/sbom-action@251a468eed47e5082b105c3ba6ee500c0e65a764 # v0.17.6
         env:
           # The SBOM names the image by this name, not by its registry reference; the action's
           # own artifact is off, the next step uploads the file.
-          SYFT_SOURCE_NAME: ohttp-gateway
+          SYFT_SOURCE_NAME: ${{ matrix.image.name }}
         with:
-          image: ${{ env.ECR_REGISTRY }}/ohttp-gateway@${{ steps.build.outputs.digest }}
+          image: ${{ env.ECR_REGISTRY }}/${{ matrix.image.name }}@${{ steps.build.outputs.digest }}
           format: spdx-json
-          artifact-name: gateway-sbom.spdx.json
+          artifact-name: ${{ matrix.image.short }}-sbom-${{ matrix.arch.suffix }}.spdx.json
           upload-artifact: false
-          output-file: gateway-sbom.spdx.json
+          output-file: ${{ matrix.image.short }}-sbom-${{ matrix.arch.suffix }}.spdx.json
 
       - name: Upload SBOM artifact
         if: github.event_name != 'pull_request'
         uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
         with:
-          name: gateway-sbom
-          path: gateway-sbom.spdx.json
+          name: ${{ matrix.image.short }}-sbom-${{ matrix.arch.suffix }}
+          path: ${{ matrix.image.short }}-sbom-${{ matrix.arch.suffix }}.spdx.json
 
-  build-relay-simulator:
-    name: Build Relay Simulator
+  # Runs only when every platform image of an image was built and pushed: it creates the tag(s) on
+  # the multi-platform index, then signs and attests the index digest. A failed platform build
+  # leaves no tag behind.
+  publish:
+    name: Publish, sign & attest ${{ matrix.image.name }}
     runs-on: ubuntu-24.04
-    needs: test
-    permissions:
-      id-token: write
-      contents: read
-      packages: write
-
-    outputs:
-      image-digest: ${{ steps.build.outputs.digest }}
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-
-      - name: Configure AWS credentials
-        if: github.event_name != 'pull_request'
-        uses: aws-actions/configure-aws-credentials@5579c002bb4778aa43395ef1df492868a9a1c83f # v4.0.2
-        with:
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-          aws-region: ${{ env.AWS_REGION }}
-
-      - name: Login to ECR
-        if: github.event_name != 'pull_request'
-        uses: aws-actions/amazon-ecr-login@4625ce35226a7557230889aae2f52eb50ec3dcda # v2.0.1
-
-      - name: Docker meta
-        id: meta
-        uses: docker/metadata-action@369eb591f429131d6889c46b94e711f089e6ca96 # v5.6.1
-        # ECR tags are immutable and the main build of the same commit already pushed sha-<short>:
-        # a release tag build pushes only its version tag (no moving `major.minor` tag, which an
-        # immutable repository refuses once it exists).
-        with:
-          images: ${{ env.ECR_REGISTRY }}/ohttp-relay-simulator
-          flavor: |
-            latest=false
-          tags: |
-            type=ref,event=pr,prefix=pr-
-            type=semver,pattern={{version}}
-            type=sha,format=short,enable=${{ !startsWith(github.ref, 'refs/tags/') }}
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@c47758b77c9736f4b2ef4073d4d51994fabfe349 # v3.7.1
-
-      - name: Build and push
-        id: build
-        uses: docker/build-push-action@4f58ea79222b3b9dc2c8bbdd6debcef730109a75 # v6.9.0
-        with:
-          context: ./relay-simulator
-          file: ./relay-simulator/Dockerfile
-          platforms: linux/amd64
-          push: ${{ github.event_name != 'pull_request' }}
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
-      - name: Generate SBOM
-        if: github.event_name != 'pull_request'
-        uses: anchore/sbom-action@251a468eed47e5082b105c3ba6ee500c0e65a764 # v0.17.6
-        env:
-          # The SBOM names the image by this name, not by its registry reference; the action's
-          # own artifact is off, the next step uploads the file.
-          SYFT_SOURCE_NAME: ohttp-relay-simulator
-        with:
-          image: ${{ env.ECR_REGISTRY }}/ohttp-relay-simulator@${{ steps.build.outputs.digest }}
-          format: spdx-json
-          artifact-name: relay-simulator-sbom.spdx.json
-          upload-artifact: false
-          output-file: relay-simulator-sbom.spdx.json
-
-      - name: Upload SBOM artifact
-        if: github.event_name != 'pull_request'
-        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
-        with:
-          name: relay-simulator-sbom
-          path: relay-simulator-sbom.spdx.json
-
-  build-e2e:
-    name: Build e2e client (ohttp-e2e)
-    runs-on: ubuntu-24.04
-    needs: test
-    permissions:
-      id-token: write
-      contents: read
-      packages: write
-
-    outputs:
-      image-digest: ${{ steps.build.outputs.digest }}
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-
-      - name: Configure AWS credentials
-        if: github.event_name != 'pull_request'
-        uses: aws-actions/configure-aws-credentials@5579c002bb4778aa43395ef1df492868a9a1c83f # v4.0.2
-        with:
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-          aws-region: ${{ env.AWS_REGION }}
-
-      - name: Login to ECR
-        if: github.event_name != 'pull_request'
-        uses: aws-actions/amazon-ecr-login@4625ce35226a7557230889aae2f52eb50ec3dcda # v2.0.1
-
-      - name: Docker meta
-        id: meta
-        uses: docker/metadata-action@369eb591f429131d6889c46b94e711f089e6ca96 # v5.6.1
-        # ECR tags are immutable and the main build of the same commit already pushed sha-<short>:
-        # a release tag build pushes only its version tag (no moving `major.minor` tag, which an
-        # immutable repository refuses once it exists).
-        with:
-          images: ${{ env.ECR_REGISTRY }}/ohttp-e2e
-          flavor: |
-            latest=false
-          tags: |
-            type=ref,event=pr,prefix=pr-
-            type=semver,pattern={{version}}
-            type=sha,format=short,enable=${{ !startsWith(github.ref, 'refs/tags/') }}
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@c47758b77c9736f4b2ef4073d4d51994fabfe349 # v3.7.1
-
-      - name: Build and push
-        id: build
-        uses: docker/build-push-action@4f58ea79222b3b9dc2c8bbdd6debcef730109a75 # v6.9.0
-        with:
-          context: .
-          file: ./e2e-client/Dockerfile
-          platforms: linux/amd64
-          push: ${{ github.event_name != 'pull_request' }}
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
-      - name: Generate SBOM
-        if: github.event_name != 'pull_request'
-        uses: anchore/sbom-action@251a468eed47e5082b105c3ba6ee500c0e65a764 # v0.17.6
-        env:
-          # The SBOM names the image by this name, not by its registry reference; the action's
-          # own artifact is off, the next step uploads the file.
-          SYFT_SOURCE_NAME: ohttp-e2e
-        with:
-          image: ${{ env.ECR_REGISTRY }}/ohttp-e2e@${{ steps.build.outputs.digest }}
-          format: spdx-json
-          artifact-name: e2e-sbom.spdx.json
-          upload-artifact: false
-          output-file: e2e-sbom.spdx.json
-
-      - name: Upload SBOM artifact
-        if: github.event_name != 'pull_request'
-        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
-        with:
-          name: e2e-sbom
-          path: e2e-sbom.spdx.json
-
-  sign-attest-gateway:
-    name: Sign & Attest Gateway
-    runs-on: ubuntu-24.04
-    needs: build-gateway
+    needs: build
     if: github.event_name != 'pull_request'
     permissions:
       id-token: write
       contents: read
 
+    strategy:
+      fail-fast: false
+      matrix:
+        image:
+          - name: ohttp-gateway
+            short: gateway
+          - name: ohttp-relay-simulator
+            short: relay-simulator
+          - name: ohttp-e2e
+            short: e2e
+
     steps:
+      - name: Download platform digests
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digests-${{ matrix.image.short }}-*
+          merge-multiple: true
+
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@5579c002bb4778aa43395ef1df492868a9a1c83f # v4.0.2
         with:
@@ -331,14 +228,56 @@ jobs:
       - name: Login to ECR
         uses: aws-actions/amazon-ecr-login@4625ce35226a7557230889aae2f52eb50ec3dcda # v2.0.1
 
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@369eb591f429131d6889c46b94e711f089e6ca96 # v5.6.1
+        # ECR tags are immutable and the main build of the same commit already pushed sha-<short>:
+        # a release tag build pushes only its version tag (no moving `major.minor` tag, which an
+        # immutable repository refuses once it exists).
+        with:
+          images: ${{ env.ECR_REGISTRY }}/${{ matrix.image.name }}
+          flavor: |
+            latest=false
+          tags: |
+            type=semver,pattern={{version}}
+            type=sha,format=short,enable=${{ !startsWith(github.ref, 'refs/tags/') }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@c47758b77c9736f4b2ef4073d4d51994fabfe349 # v3.7.1
+
+      - name: Create the multi-platform index
+        id: index
+        working-directory: ${{ runner.temp }}/digests
+        env:
+          IMAGE: ${{ env.ECR_REGISTRY }}/${{ matrix.image.name }}
+        run: |
+          set -euo pipefail
+          # Both platforms must be present; never tag an index that misses one.
+          files=(*)
+          test "${#files[@]}" -eq 2
+          tags=()
+          while read -r tag; do tags+=(-t "$tag"); done < <(jq -r '.tags[]' <<< "$DOCKER_METADATA_OUTPUT_JSON")
+          test "${#tags[@]}" -gt 0
+          sources=()
+          for d in "${files[@]}"; do sources+=("${IMAGE}@sha256:${d}"); done
+          docker buildx imagetools create "${tags[@]}" "${sources[@]}"
+          first="$(jq -r '.tags[0]' <<< "$DOCKER_METADATA_OUTPUT_JSON")"
+          digest="$(docker buildx imagetools inspect "$first" --format '{{json .Manifest}}' | jq -r .digest)"
+          test -n "$digest"
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+          docker buildx imagetools inspect "${IMAGE}@${digest}"
+
       - name: Install cosign
         uses: sigstore/cosign-installer@1aa8e0f2454b781fbf0fbf306a4c9533a0c57409 # v3.7.0
 
+      # The signature and the attestation are on the index digest, the digest a deployment pins.
+      # The platform images are reachable only through the index.
       - name: Sign image
         env:
-          DIGEST: ${{ needs.build-gateway.outputs.image-digest }}
+          IMAGE: ${{ env.ECR_REGISTRY }}/${{ matrix.image.name }}
+          DIGEST: ${{ steps.index.outputs.digest }}
         run: |
-          cosign sign --yes "${ECR_REGISTRY}/ohttp-gateway@${DIGEST}"
+          cosign sign --yes "${IMAGE}@${DIGEST}"
 
       - name: Generate SLSA provenance
         env:
@@ -375,140 +314,7 @@ jobs:
 
       - name: Attest with SLSA provenance
         env:
-          DIGEST: ${{ needs.build-gateway.outputs.image-digest }}
+          IMAGE: ${{ env.ECR_REGISTRY }}/${{ matrix.image.name }}
+          DIGEST: ${{ steps.index.outputs.digest }}
         run: |
-          cosign attest --yes --predicate provenance.json --type slsaprovenance "${ECR_REGISTRY}/ohttp-gateway@${DIGEST}"
-
-  sign-attest-relay-simulator:
-    name: Sign & Attest Relay Simulator
-    runs-on: ubuntu-24.04
-    needs: build-relay-simulator
-    if: github.event_name != 'pull_request'
-    permissions:
-      id-token: write
-      contents: read
-
-    steps:
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@5579c002bb4778aa43395ef1df492868a9a1c83f # v4.0.2
-        with:
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-          aws-region: ${{ env.AWS_REGION }}
-
-      - name: Login to ECR
-        uses: aws-actions/amazon-ecr-login@4625ce35226a7557230889aae2f52eb50ec3dcda # v2.0.1
-
-      - name: Install cosign
-        uses: sigstore/cosign-installer@1aa8e0f2454b781fbf0fbf306a4c9533a0c57409 # v3.7.0
-
-      - name: Sign image
-        env:
-          DIGEST: ${{ needs.build-relay-simulator.outputs.image-digest }}
-        run: |
-          cosign sign --yes "${ECR_REGISTRY}/ohttp-relay-simulator@${DIGEST}"
-
-      - name: Generate SLSA provenance
-        env:
-          WORKFLOW_REF: ${{ github.workflow_ref }}
-          SOURCE_SHA: ${{ github.sha }}
-          RUN_ID: ${{ github.run_id }}
-          STARTED_ON: ${{ github.event.head_commit.timestamp }}
-        run: |
-          jq -n \
-            --arg builder "$WORKFLOW_REF" \
-            --arg sha "$SOURCE_SHA" \
-            --arg run_id "$RUN_ID" \
-            --arg started "$STARTED_ON" \
-            '{
-              builder: {id: $builder},
-              buildType: "https://github.com/zodl-inc/zodl-ohttp/.github/workflows/ohttp-build.yml@main",
-              invocation: {
-                configSource: {
-                  uri: "https://github.com/zodl-inc/zodl-ohttp",
-                  digest: {sha1: $sha},
-                  entryPoint: ".github/workflows/ohttp-build.yml"
-                }
-              },
-              metadata: {
-                buildInvocationId: $run_id,
-                buildStartedOn: $started,
-                completeness: {parameters: true, environment: false, materials: false}
-              },
-              materials: [{
-                uri: "https://github.com/zodl-inc/zodl-ohttp",
-                digest: {sha1: $sha}
-              }]
-            }' > provenance.json
-
-      - name: Attest with SLSA provenance
-        env:
-          DIGEST: ${{ needs.build-relay-simulator.outputs.image-digest }}
-        run: |
-          cosign attest --yes --predicate provenance.json --type slsaprovenance "${ECR_REGISTRY}/ohttp-relay-simulator@${DIGEST}"
-
-  sign-attest-e2e:
-    name: Sign & Attest e2e client (ohttp-e2e)
-    runs-on: ubuntu-24.04
-    needs: build-e2e
-    if: github.event_name != 'pull_request'
-    permissions:
-      id-token: write
-      contents: read
-
-    steps:
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@5579c002bb4778aa43395ef1df492868a9a1c83f # v4.0.2
-        with:
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-          aws-region: ${{ env.AWS_REGION }}
-
-      - name: Login to ECR
-        uses: aws-actions/amazon-ecr-login@4625ce35226a7557230889aae2f52eb50ec3dcda # v2.0.1
-
-      - name: Install cosign
-        uses: sigstore/cosign-installer@1aa8e0f2454b781fbf0fbf306a4c9533a0c57409 # v3.7.0
-
-      - name: Sign image
-        env:
-          DIGEST: ${{ needs.build-e2e.outputs.image-digest }}
-        run: |
-          cosign sign --yes "${ECR_REGISTRY}/ohttp-e2e@${DIGEST}"
-
-      - name: Generate SLSA provenance
-        env:
-          WORKFLOW_REF: ${{ github.workflow_ref }}
-          SOURCE_SHA: ${{ github.sha }}
-          RUN_ID: ${{ github.run_id }}
-          STARTED_ON: ${{ github.event.head_commit.timestamp }}
-        run: |
-          jq -n \
-            --arg builder "$WORKFLOW_REF" \
-            --arg sha "$SOURCE_SHA" \
-            --arg run_id "$RUN_ID" \
-            --arg started "$STARTED_ON" \
-            '{
-              builder: {id: $builder},
-              buildType: "https://github.com/zodl-inc/zodl-ohttp/.github/workflows/ohttp-build.yml@main",
-              invocation: {
-                configSource: {
-                  uri: "https://github.com/zodl-inc/zodl-ohttp",
-                  digest: {sha1: $sha},
-                  entryPoint: ".github/workflows/ohttp-build.yml"
-                }
-              },
-              metadata: {
-                buildInvocationId: $run_id,
-                buildStartedOn: $started,
-                completeness: {parameters: true, environment: false, materials: false}
-              },
-              materials: [{
-                uri: "https://github.com/zodl-inc/zodl-ohttp",
-                digest: {sha1: $sha}
-              }]
-            }' > provenance.json
-
-      - name: Attest with SLSA provenance
-        env:
-          DIGEST: ${{ needs.build-e2e.outputs.image-digest }}
-        run: |
-          cosign attest --yes --predicate provenance.json --type slsaprovenance "${ECR_REGISTRY}/ohttp-e2e@${DIGEST}"
+          cosign attest --yes --predicate provenance.json --type slsaprovenance "${IMAGE}@${DIGEST}"
