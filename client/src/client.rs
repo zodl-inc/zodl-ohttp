@@ -256,13 +256,11 @@ impl Client {
     }
 
     async fn fetch(&self, timeout: Duration) -> Result<Fetched, Error> {
-        let resp = self
-            .http
-            .get(self.keys.url())
-            .timeout(timeout)
-            .send()
-            .await?
-            .error_for_status()?;
+        let mut get = self.http.get(self.keys.url());
+        for (name, value) in OuterHeaders::LIBRARY.key_fetch(None) {
+            get = get.header(name, value);
+        }
+        let resp = get.timeout(timeout).send().await?.error_for_status()?;
         let max_age = unsigned_cache_secs(
             resp.headers()
                 .get(CACHE_CONTROL)

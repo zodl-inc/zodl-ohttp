@@ -188,15 +188,22 @@ pub fn classify_outer_response(
     OuterOutcome::Sealed
 }
 
+/// The `User-Agent` every [`OuterHeaders`] preset sends to the relay, on the post and on the
+/// key-configuration fetch. The relay sees the client address, so one fixed value keeps it from
+/// telling the clients apart by their HTTP stack or application. It is part of this crate's
+/// public surface: changing it is a breaking change.
+pub const RELAY_USER_AGENT: &str = "zodl-ohttp/1";
+
 /// The headers the client sets on its own requests to the relay (those the HTTP stack adds
-/// by itself, `Host`, `Content-Length`, a default `User-Agent`, are not listed).
+/// by itself, `Host` and `Content-Length`, are not listed). Every preset sets the fixed
+/// [`RELAY_USER_AGENT`], so the stack's default `User-Agent` is never sent.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OuterHeaders {
     /// `Accept: message/ohttp-chunked-res` on the post.
     pub post_accept: bool,
     /// `Accept-Encoding: identity` on the post.
     pub post_accept_encoding_identity: bool,
-    /// A fixed `User-Agent` on every request.
+    /// A fixed `User-Agent` on every request ([`RELAY_USER_AGENT`] in every preset).
     pub user_agent: Option<&'static str>,
     /// The `Accept` of the key-configuration fetch, if set.
     pub key_fetch_accept: Option<&'static str>,
@@ -211,7 +218,7 @@ impl OuterHeaders {
     pub const LIBRARY: OuterHeaders = OuterHeaders {
         post_accept: true,
         post_accept_encoding_identity: true,
-        user_agent: None,
+        user_agent: Some(RELAY_USER_AGENT),
         key_fetch_accept: None,
         key_fetch_accept_encoding_identity: false,
         trace_on_key_fetch: false,
@@ -221,7 +228,7 @@ impl OuterHeaders {
     pub const ANDROID: OuterHeaders = OuterHeaders {
         post_accept: true,
         post_accept_encoding_identity: true,
-        user_agent: None,
+        user_agent: Some(RELAY_USER_AGENT),
         key_fetch_accept: Some("application/json"),
         key_fetch_accept_encoding_identity: false,
         trace_on_key_fetch: false,
@@ -231,16 +238,16 @@ impl OuterHeaders {
     pub const IOS: OuterHeaders = OuterHeaders {
         post_accept: true,
         post_accept_encoding_identity: true,
-        user_agent: None,
+        user_agent: Some(RELAY_USER_AGENT),
         key_fetch_accept: Some("application/ohttp-keys"),
         key_fetch_accept_encoding_identity: false,
         trace_on_key_fetch: true,
     };
-    /// Slipstream: a fixed `User-Agent`, identity encoding on the fetch too.
+    /// Slipstream: identity encoding on the fetch too.
     pub const SLIPSTREAM: OuterHeaders = OuterHeaders {
         post_accept: true,
         post_accept_encoding_identity: true,
-        user_agent: Some("zodl-slipstream-ohttp/0.1"),
+        user_agent: Some(RELAY_USER_AGENT),
         key_fetch_accept: Some("application/json"),
         key_fetch_accept_encoding_identity: true,
         trace_on_key_fetch: false,
@@ -955,7 +962,7 @@ mod tests {
         }
         assert_eq!(
             names(OuterHeaders::LIBRARY.relay_post(None)),
-            ["Content-Type", "Accept", "Accept-Encoding"]
+            ["Content-Type", "Accept", "Accept-Encoding", "User-Agent"]
         );
         assert_eq!(
             names(OuterHeaders::ANDROID.relay_post(Some("t"))),
@@ -963,21 +970,48 @@ mod tests {
                 "Content-Type",
                 "Accept",
                 "Accept-Encoding",
+                "User-Agent",
                 "X-Client-Trace-Id"
             ]
         );
         assert_eq!(
             names(OuterHeaders::ANDROID.key_fetch(Some("t"))),
-            ["Accept"]
+            ["Accept", "User-Agent"]
         );
         assert_eq!(
             names(OuterHeaders::IOS.key_fetch(Some("t"))),
-            ["Accept", "X-Client-Trace-Id"]
+            ["Accept", "User-Agent", "X-Client-Trace-Id"]
         );
         assert_eq!(
             names(OuterHeaders::SLIPSTREAM.key_fetch(Some("t"))),
             ["Accept", "Accept-Encoding", "User-Agent"]
         );
-        assert!(OuterHeaders::LIBRARY.key_fetch(Some("t")).is_empty());
+        assert_eq!(
+            names(OuterHeaders::LIBRARY.key_fetch(Some("t"))),
+            ["User-Agent"]
+        );
+    }
+
+    #[test]
+    fn every_preset_sends_the_one_fixed_user_agent() {
+        fn agents(h: Vec<(&'static str, String)>) -> Vec<String> {
+            h.into_iter()
+                .filter(|(k, _)| k.eq_ignore_ascii_case("user-agent"))
+                .map(|(_, v)| v)
+                .collect()
+        }
+        assert_eq!(RELAY_USER_AGENT, "zodl-ohttp/1");
+        for preset in [
+            OuterHeaders::LIBRARY,
+            OuterHeaders::ANDROID,
+            OuterHeaders::IOS,
+            OuterHeaders::SLIPSTREAM,
+        ] {
+            assert_eq!(preset.user_agent, Some(RELAY_USER_AGENT));
+            for trace in [None, Some("t")] {
+                assert_eq!(agents(preset.relay_post(trace)), ["zodl-ohttp/1"]);
+                assert_eq!(agents(preset.key_fetch(trace)), ["zodl-ohttp/1"]);
+            }
+        }
     }
 }
