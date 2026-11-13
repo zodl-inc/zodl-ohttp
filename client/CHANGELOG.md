@@ -2,7 +2,7 @@
 
 [Keep a Changelog](https://keepachangelog.com).
 
-## Unreleased
+## 1.1.0
 
 ### Changed
 

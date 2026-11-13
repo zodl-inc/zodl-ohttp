@@ -3,7 +3,18 @@
 Behaviour changes of the gateway, the relay simulator and the e2e client. The client library
 keeps its own log in [client/CHANGELOG.md](client/CHANGELOG.md).
 
-## Unreleased
+## 1.1.0
+
+The gateway caches `GetSubtreeRoots` for the Ironwood pool and writes its subtree end markers before
+the tip RPCs; all images are published for linux/amd64 and linux/arm64; the client library
+(`zodl-ohttp-client` 1.1.0) sends one fixed User-Agent to the relay (see its changelog), and the
+e2e client follows its version.
+
+### Images
+
+- The gateway, relay simulator and e2e client images are published for linux/amd64 and
+  linux/arm64. Each tag names a multi-platform index; the signature and the provenance
+  attestation are on the index digest, which is the digest to pin.
 
 ### Gateway
 
