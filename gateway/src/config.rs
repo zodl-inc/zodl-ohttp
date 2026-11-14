@@ -260,7 +260,9 @@ pub struct Config {
     /// Gateway's own host names (e.g., "ohttp-gateway.example,ohttp-gateway-testnet.example").
     /// Requests whose authority matches one of these hosts are forwarded to LWD (an empty
     /// authority is refused).
-    /// If empty, falls back to permissive behavior (any unknown authority goes to LWD) with a startup warning.
+    /// Required in ohttp mode: the gateway refuses to start without it. Routing still treats an
+    /// empty list as permissive (any unknown authority goes to LWD), which only a `Config` built
+    /// in code (tests, proxy mode) can reach.
     pub gateway_hosts: Vec<String>,
     /// Ed25519 seed for signing /ohttp-configs/signed (32-byte hex, 64 chars)
     pub configs_signing_seed: Option<String>,
@@ -842,6 +844,19 @@ impl std::fmt::Debug for Config {
             .finish()
     }
 }
+
+/// An OHTTP gateway answers only for its own host names, so `GATEWAY_HOSTS` is required in
+/// `ohttp` mode: without it every unknown authority would reach lightwalletd.
+pub fn require_gateway_hosts(mode: &str, gateway_hosts: &[String]) -> anyhow::Result<()> {
+    if mode == "ohttp" && gateway_hosts.is_empty() {
+        anyhow::bail!(
+            "GATEWAY_HOSTS is required in ohttp mode: set it to the gateway's own host names \
+             (comma-separated); any other authority that is not a BACKENDS alias gets an inner 403"
+        );
+    }
+    Ok(())
+}
+
 /// Serialises the tests that set or read the process environment (`Config::from_env`): the
 /// test harness runs them on parallel threads and the environment is process-wide.
 #[cfg(test)]

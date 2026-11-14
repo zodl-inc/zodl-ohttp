@@ -231,13 +231,9 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    // Warn if GATEWAY_HOSTS is not configured (permissive fallback)
-    if config.gateway_hosts.is_empty() {
-        warn!(
-            "GATEWAY_HOSTS not configured; unknown authorities will fall back to LWD. \
-             Set GATEWAY_HOSTS to enable strict authority validation per ZIP draft."
-        );
-    }
+    // An OHTTP gateway answers only for its own host names (ZIP "Gateway behaviour" rule 5).
+    // Without GATEWAY_HOSTS every unknown authority would reach lightwalletd, so refuse to start.
+    config::require_gateway_hosts(&config.mode, &config.gateway_hosts)?;
 
     match config.flexa_alias.as_deref() {
         Some(alias) if !config.backends.contains_key(alias) => warn!(

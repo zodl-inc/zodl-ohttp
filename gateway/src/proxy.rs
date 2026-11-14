@@ -689,7 +689,8 @@ fn build_validated_uri(base_url: &str, path: &str, expected_host: &str) -> Resul
 /// 2. Validate path structurally (malformed → 400)
 /// 3. Exact match of the lowercase authority in the backends map → mapped backend
 /// 4. Empty authority → 403
-/// 5. If GATEWAY_HOSTS not configured (empty) → LWD fallback (permissive compatibility mode)
+/// 5. If GATEWAY_HOSTS not configured (empty) → LWD fallback (permissive; the binary refuses to
+///    start in ohttp mode without GATEWAY_HOSTS, so only a `Config` built in code reaches this)
 /// 6. If authority matches gateway_hosts → LWD
 /// 7. Otherwise → reject with 403
 pub fn resolve_backend(config: &Config, inner_request: &InnerRequest) -> BackendTarget {

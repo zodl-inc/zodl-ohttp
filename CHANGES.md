@@ -7,6 +7,10 @@ keeps its own log in [client/CHANGELOG.md](client/CHANGELOG.md).
 
 ### Gateway
 
+- **`GATEWAY_HOSTS` is required in `ohttp` mode:** the gateway refuses to start when it is unset
+  or empty, instead of warning and sending every unknown authority to lightwalletd. A deployment
+  that already sets it is unaffected; one that does not must set it to the gateway's own host
+  names before upgrading.
 - Third-party backend calls (`BACKENDS`, `https://`) reuse pooled HTTPS connections (idle
   60 s, at most 16 idle per host) instead of a new connection per request, which saves the TCP
   and TLS handshake on every call after the first. Same TLS connector, roots and HTTP/1.1 as
