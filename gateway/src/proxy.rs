@@ -27,12 +27,44 @@ use axum::{body::Bytes, extract::State, http::StatusCode, response::IntoResponse
 use http_body_util::{BodyExt, Full};
 use hyper::Request;
 use hyper_tls::HttpsConnector;
-use hyper_util::{client::legacy::Client, rt::TokioExecutor};
+use hyper_util::{
+    client::legacy::{connect::HttpConnector, Client},
+    rt::{TokioExecutor, TokioTimer},
+};
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::time::timeout;
 use tracing::{debug, info, warn};
+
+/// How long an idle connection to a third-party HTTPS backend is kept for reuse.
+const BACKEND_POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+/// Idle connections kept per third-party backend host.
+const BACKEND_POOL_MAX_IDLE_PER_HOST: usize = 16;
+
+type BackendClient = Client<HttpsConnector<HttpConnector>, Full<Bytes>>;
+
+/// Client settings of the shared third-party backend pool, independent of the connector.
+fn backend_pool_builder() -> hyper_util::client::legacy::Builder {
+    let mut builder = Client::builder(TokioExecutor::new());
+    builder
+        .pool_timer(TokioTimer::new())
+        .pool_idle_timeout(BACKEND_POOL_IDLE_TIMEOUT)
+        .pool_max_idle_per_host(BACKEND_POOL_MAX_IDLE_PER_HOST);
+    builder
+}
+
+/// The one client for all `https://` third-party backends, built on first use.
+///
+/// Connections are pooled per scheme and authority, so a request reuses an idle connection to
+/// the same backend instead of a new TCP and TLS handshake. The connector is the default
+/// `hyper_tls::HttpsConnector` (system roots, no ALPN, so HTTP/1.1). Headers, timeouts and
+/// credentials stay per request; a response body dropped before its end closes its connection
+/// instead of returning it to the pool.
+fn https_backend_client() -> &'static BackendClient {
+    static CLIENT: OnceLock<BackendClient> = OnceLock::new();
+    CLIENT.get_or_init(|| backend_pool_builder().build(HttpsConnector::new()))
+}
 
 /// Track the end offset of the last complete gRPC message in a buffer.
 /// gRPC framing: 1 byte compressed flag + 4 bytes big-endian length + payload.
@@ -1106,9 +1138,7 @@ async fn forward_to_backend_internal(
 
     // Use a TLS-capable client for https:// backends and an h2c client for http:// upstreams.
     let http_response = if lwd_uri.starts_with("https://") {
-        let https = HttpsConnector::new();
-        let client: Client<_, Full<Bytes>> = Client::builder(TokioExecutor::new()).build(https);
-        timeout(overall, client.request(http_request))
+        timeout(overall, https_backend_client().request(http_request))
             .await
             .map_err(|_| anyhow!("Backend did not respond within {:?}", overall))?
             .map_err(|e| anyhow!("HTTPS request failed: {:?}", e))?
@@ -1675,9 +1705,7 @@ pub async fn forward_to_backend_stream(
     // (b) The overall timeout bounds the worst case.
     // (c) A backend that takes >25s to send headers is effectively unavailable.
     let http_response = if backend_uri.starts_with("https://") {
-        let https = HttpsConnector::new();
-        let client: Client<_, Full<Bytes>> = Client::builder(TokioExecutor::new()).build(https);
-        timeout(overall, client.request(http_request))
+        timeout(overall, https_backend_client().request(http_request))
             .await
             .map_err(|_| anyhow!("Backend did not respond within {:?}", overall))?
             .map_err(|e| anyhow!("HTTPS request failed: {:?}", e))?
@@ -3975,5 +4003,98 @@ mod stream_tests {
             bytes_received <= 5000,
             "Should not have received more than the limit"
         );
+    }
+
+    /// A keep-alive HTTP/1.1 server that counts accepted connections. `/open` answers with one
+    /// chunk and then never ends its body; every other path answers `ok`.
+    async fn counting_server() -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let counter = accepted.clone();
+        tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                counter.fetch_add(1, Ordering::SeqCst);
+                let service = service_fn(|req: Request<hyper::body::Incoming>| async move {
+                    use futures_util::stream;
+                    let first = stream::once(async {
+                        Ok::<_, Infallible>(hyper::body::Frame::data(Bytes::from_static(b"ok")))
+                    });
+                    let body: futures_util::stream::BoxStream<'static, _> =
+                        if req.uri().path() == "/open" {
+                            Box::pin(first.chain(stream::pending()))
+                        } else {
+                            Box::pin(first)
+                        };
+                    Ok::<_, Infallible>(
+                        Response::builder()
+                            .status(200)
+                            .body(http_body_util::StreamBody::new(body))
+                            .unwrap(),
+                    )
+                });
+                tokio::spawn(async move {
+                    let _ = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new())
+                        .serve_connection(TokioIo::new(stream), service)
+                        .await;
+                });
+            }
+        });
+        (format!("http://{}", addr), accepted)
+    }
+
+    fn get(url: &str) -> Request<Full<Bytes>> {
+        Request::builder()
+            .uri(url)
+            .body(Full::new(Bytes::new()))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn backend_pool_reuses_connection_for_sequential_requests() {
+        let (base, accepted) = counting_server().await;
+        let client: Client<HttpConnector, Full<Bytes>> =
+            backend_pool_builder().build(HttpConnector::new());
+        for _ in 0..3 {
+            let resp = client.request(get(&format!("{base}/a"))).await.unwrap();
+            assert_eq!(resp.status(), 200);
+            let body = resp.into_body().collect().await.unwrap().to_bytes();
+            assert_eq!(&body[..], b"ok");
+            // The connection goes back to the pool in a background task once its body ended;
+            // let it run, else the next request races a new connect against the checkout.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn backend_pool_does_not_reuse_connection_of_unfinished_body() {
+        let (base, accepted) = counting_server().await;
+        let client: Client<HttpConnector, Full<Bytes>> =
+            backend_pool_builder().build(HttpConnector::new());
+        // A stream read in part and then dropped, like an event stream cut at its timeout.
+        let resp = client.request(get(&format!("{base}/open"))).await.unwrap();
+        let mut body = resp.into_body();
+        let frame = body.frame().await.unwrap().unwrap();
+        assert_eq!(&frame.into_data().unwrap()[..], b"ok");
+        drop(body);
+        // The next request must get a complete answer on a new connection.
+        let resp = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.request(get(&format!("{base}/a"))),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body[..], b"ok");
+        assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn https_backend_client_is_shared() {
+        assert!(std::ptr::eq(https_backend_client(), https_backend_client()));
     }
 }
