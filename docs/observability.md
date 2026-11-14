@@ -92,4 +92,6 @@ relay's network, never a client, and is never logged per request.
 ## Cardinality
 
 `request_id`, `relay_request_id` and `client_trace_id` are never metric labels. The `rpc` label
-is one of the known lightwalletd method names or `other`; third-party paths never become labels.
+is one of the known lightwalletd method names, for a third-party (`BACKENDS`) request the method
+and path pattern of the `BACKENDS_POLICY` entry that admitted it (`GET /v0/status`, so bounded by
+the configuration), or `other`; a request's own path, query or ids never become labels.

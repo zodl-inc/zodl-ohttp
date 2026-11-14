@@ -24,6 +24,13 @@ keeps its own log in [client/CHANGELOG.md](client/CHANGELOG.md).
   of each new tip height once and caches it under a Client's key. Wallets ask for the tree
   state at the height they last synced to, so with it these requests are cache hits instead of
   one upstream call per height per gateway. Counted as `result="prefetched"`.
+- The `rpc` label of a third-party (`BACKENDS`) request is the method and path pattern of the
+  `BACKENDS_POLICY` entry that admitted it (`GET /v0/status`, `GET /*`) instead of `other`, in
+  `ohttp_upstream_requests_total`, `ohttp_upstream_request_duration_seconds` and
+  `ohttp_request_duration_seconds`. The values stay bounded by the configuration; a request's
+  own path, query or ids never become labels. A request no entry admits stays `other`.
+  Queries that selected these series with `rpc="other"` need `backend` (or the new values).
+- `GetTaddressTransactions` has its own `rpc` label value instead of `other`.
 
 ## 1.1.0
 
