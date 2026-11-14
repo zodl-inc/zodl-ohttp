@@ -2281,6 +2281,8 @@ async fn gateway_handler(
         &state.config.backends,
     );
     let rpc = health::normalize_rpc_name(&inner_request.path, &inner_request.method);
+    // Third-party requests: the policy entry that admits them (proxy::rpc_label).
+    let backend_rpc = proxy::rpc_label(&state.config, &inner_request);
 
     // Third-party backends: an answer from THIRD_PARTY_CACHE_ROUTES, or the per-backend cap's
     // inner 429 (THIRD_PARTY_RATE_LIMITS), before the usual streamed forward. The gateway cannot
@@ -2316,7 +2318,13 @@ async fn gateway_handler(
                 &backend,
                 "mapped",
             );
-            health::record_duration(&network, "ohttp", &backend, &rpc, start.elapsed().as_secs_f64());
+            health::record_duration(
+                &network,
+                "ohttp",
+                &backend,
+                &backend_rpc,
+                start.elapsed().as_secs_f64(),
+            );
             log.served_third_party(status, resp.body.len());
             return responder.collected(resp);
         }
@@ -2367,7 +2375,13 @@ async fn gateway_handler(
             &backend,
             "mapped",
         );
-        health::record_duration(&network, "ohttp", &backend, &rpc, start.elapsed().as_secs_f64());
+        health::record_duration(
+            &network,
+            "ohttp",
+            &backend,
+            &backend_rpc,
+            start.elapsed().as_secs_f64(),
+        );
         return responder.stream(status, headers, log.stream("backend_stream", "-", stream));
     }
 

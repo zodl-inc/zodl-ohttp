@@ -129,6 +129,24 @@ pub fn loggable_route(config: &Config, inner_request: &InnerRequest) -> String {
         .unwrap_or_else(|| "(not in policy)".to_string())
 }
 
+/// The `rpc` metric label of `inner_request`: for a `BACKENDS` (third-party) request the method
+/// and path pattern of the policy entry that admits it (`GET /v0/status`, `* /*`), so that the
+/// label names the operation while its values stay bounded by the configuration (never the
+/// request's own path, query or resource ids); `other` when no entry admits it. Any other
+/// request: [`crate::health::normalize_rpc_name`].
+pub fn rpc_label(config: &Config, inner_request: &InnerRequest) -> String {
+    let authority = inner_request.authority.to_ascii_lowercase();
+    if !config.backends.contains_key(&authority) {
+        return crate::health::normalize_rpc_name(&inner_request.path, &inner_request.method);
+    }
+    config
+        .backends_policy
+        .get(&authority)
+        .and_then(|policies| matching_rule(policies, &inner_request.method, &inner_request.path))
+        .map(|(method, pattern)| format!("{} {pattern}", method.to_ascii_uppercase()))
+        .unwrap_or_else(|| "other".to_string())
+}
+
 /// Check if a request matches the per-alias operation policy.
 /// Returns None if allowed, Some(reason) if denied.
 ///
@@ -1298,7 +1316,7 @@ async fn forward_to_backend_internal(
         &config.gateway_hosts,
         &config.backends,
     );
-    let rpc_name = health::normalize_rpc_name(&inner_request.path, &inner_request.method);
+    let rpc_name = rpc_label(config, inner_request);
     let duration_secs = upstream_start.elapsed().as_secs_f64();
 
     health::record_upstream_request(
@@ -1693,9 +1711,8 @@ pub async fn forward_to_backend_stream(
     let network = config.network.clone();
     let backend_label = backend_type.clone();
 
-    // Clone values needed in the stream to avoid capturing borrowed references
-    let request_path = inner_request.path.clone();
-    let request_method = inner_request.method.clone();
+    // Computed before the stream, which captures no borrowed references.
+    let rpc_name = rpc_label(config, inner_request);
 
     // GW-SILENCE: SSE keep-alive interval to prevent relay between-bytes timeouts
     let sse_keepalive = if event_stream {
@@ -1838,7 +1855,6 @@ pub async fn forward_to_backend_stream(
 
         // Log completion
         let duration_secs = upstream_start.elapsed().as_secs_f64();
-        let rpc_name = health::normalize_rpc_name(&request_path, &request_method);
         health::record_upstream_request(
             &network,
             &backend_label,
@@ -2605,6 +2621,62 @@ mod policy_enforcement_tests {
                 )
             ),
             "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetLatestBlock"
+        );
+    }
+
+    #[test]
+    fn third_party_requests_are_labelled_by_their_policy_entry() {
+        let config = test_config();
+        let req = |authority: &str, method: &str, path: &str| InnerRequest {
+            method: method.to_string(),
+            authority: authority.to_string(),
+            path: path.to_string(),
+            headers: vec![],
+            body: vec![],
+        };
+        // The entry that admits the request: method and pattern, never the request's own path,
+        // query or ids; the authority's case does not matter.
+        assert_eq!(
+            rpc_label(
+                &config,
+                &req("api2.example.com", "GET", "/v0/status?depositAddress=t1x")
+            ),
+            "GET /v0/status"
+        );
+        assert_eq!(
+            rpc_label(&config, &req("API2.example.com", "post", "/v0/quote")),
+            "POST /v0/quote"
+        );
+        assert_eq!(
+            rpc_label(
+                &config,
+                &req("vote.example", "GET", "/rounds/cs_abcdefgh/votes")
+            ),
+            "GET /*"
+        );
+        // No entry admits it: "other".
+        assert_eq!(
+            rpc_label(
+                &config,
+                &req("api2.example.com", "DELETE", "/v0/tokens/cs_abcdefgh")
+            ),
+            "other"
+        );
+        // Not a BACKENDS authority: the light client server's method names, as before.
+        assert_eq!(
+            rpc_label(
+                &config,
+                &req(
+                    "ohttp-gateway.example",
+                    "POST",
+                    "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetTreeState"
+                )
+            ),
+            "GetTreeState"
+        );
+        assert_eq!(
+            rpc_label(&config, &req("unknown.example", "GET", "/v1/anything")),
+            "other"
         );
     }
 

@@ -754,8 +754,9 @@ pub fn record_lwd_connect_retry() {
 
 /// Normalize RPC name for metrics (bounded label set to prevent cardinality explosion).
 /// For LWD (gRPC) paths: only known CompactTxStreamer method names, else "other".
-/// For HTTP backends: "other" (the backend is the separate `backend` label), never the raw path.
-/// Rejected requests: "other".
+/// For HTTP backends: "other" (the backend is the separate `backend` label), never the raw path;
+/// third-party (`BACKENDS`) requests are labelled by their policy entry instead
+/// (`proxy::rpc_label`). Rejected requests: "other".
 pub fn normalize_rpc_name(path: &str, _method: &str) -> String {
     // LWD gRPC paths
     if path.contains("/cash.z.wallet.sdk.rpc.CompactTxStreamer/") || path.starts_with("/cash.z.") {
@@ -769,6 +770,7 @@ pub fn normalize_rpc_name(path: &str, _method: &str) -> String {
             | "GetTransaction"
             | "SendTransaction"
             | "GetTaddressTxids"
+            | "GetTaddressTransactions"
             | "GetTaddressBalance"
             | "GetTaddressBalanceStream"
             | "GetMempoolTx"
@@ -1640,6 +1642,13 @@ mod tests {
             ),
             "SendTransaction"
         );
+        assert_eq!(
+            normalize_rpc_name(
+                "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetTaddressTransactions",
+                "POST"
+            ),
+            "GetTaddressTransactions"
+        );
     }
 
     #[test]
@@ -1681,6 +1690,7 @@ mod tests {
             "GetTransaction",
             "SendTransaction",
             "GetTaddressTxids",
+            "GetTaddressTransactions",
             "GetTaddressBalance",
             "GetTaddressBalanceStream",
             "GetMempoolTx",
@@ -1705,7 +1715,7 @@ mod tests {
             labels.insert(normalize_rpc_name(&path, "GET"));
         }
 
-        // Should have: 19 known methods + 1 "other" = 20 labels max
+        // Should have: 20 known methods + 1 "other" = 21 labels max
         assert!(labels.len() <= 25, "Label count: {}", labels.len());
         assert!(labels.contains("GetLatestBlock"));
         assert!(labels.contains("other"));

@@ -182,7 +182,7 @@ trace ids are never labels. `network` is `NETWORK`.
 | `ohttp_freshness_total` | `network, result` | Freshness verdicts: `fresh`, `missing`, `malformed`, `stale`. |
 | `ohttp_chunks_sent_total` | `network, kind` | Sealed response chunks: `full`, `flush`, `final`. |
 | `ohttp_response_truncated_total` | `network` | Upstream answers cut at `MAX_UPSTREAM_RESPONSE_BYTES`. |
-| `ohttp_upstream_requests_total` | `network, backend, rpc, http_status, grpc_status` | Upstream requests. `rpc` is a known lightwalletd method name or `other`. |
+| `ohttp_upstream_requests_total` | `network, backend, rpc, http_status, grpc_status` | Upstream requests. `rpc` is a known lightwalletd method name; for a third-party (`BACKENDS`) request the `BACKENDS_POLICY` entry that admitted it (`GET /v0/status`); else `other`. |
 | `ohttp_upstream_request_duration_seconds` | `network, backend, rpc` | Upstream duration (histogram). |
 | `ohttp_upstream_errors_total` | `network, backend, error_type` | Upstream errors. |
 | `ohttp_upstream_calls_total` | `network, rpc` | Calls actually sent to lightwalletd, after caches and coalescing. |
