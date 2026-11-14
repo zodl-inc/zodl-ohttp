@@ -7,6 +7,12 @@ keeps its own log in [client/CHANGELOG.md](client/CHANGELOG.md).
 
 ### Gateway
 
+- Third-party backend calls (`BACKENDS`, `https://`) reuse pooled HTTPS connections (idle
+  60 s, at most 16 idle per host) instead of a new connection per request, which saves the TCP
+  and TLS handshake on every call after the first. Same TLS connector, roots and HTTP/1.1 as
+  before; headers, credentials and timeouts stay per request, and a response body that is not
+  read to its end (an event stream cut at its timeout) closes its connection instead of
+  returning it to the pool.
 - A pinned store (`REDIS_PINNED_URL`) that is a read replica is recognised: the gateway asks its
   `ROLE` at startup (and after a `READONLY` answer) and stops sending it pinned writes, which
   only failed and logged a `pinned set error` warning for every such miss. It asks again every
