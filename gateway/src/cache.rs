@@ -33,7 +33,8 @@
 //
 // The pinned tier (REDIS_PINNED_URL + PINNED_TREESTATE_RANGE) is a third Redis (noeviction,
 // persistent) holding GetTreeState answers for a fixed finalized height range; it is served
-// first and written through.
+// first and written through (to REDIS_PINNED_WRITE_URL when the pinned store is a read replica;
+// a read replica alone is never written to).
 //
 // The permanent block tier (PERMANENT_REDIS_URL, `PermanentRedis` below) is a fourth store,
 // a disk-backed Redis-protocol store: every final CompactBlock (depth >= 100,
@@ -64,6 +65,12 @@ pub use crate::rpc_cache::{grpc_block_id, height_key, CacheLookup, CacheMiss, MA
 pub const FINALIZED_DEPTH: u64 = 100;
 /// How often a caught-up pinned backfill worker checks for newly final heights.
 pub const PINNED_FOLLOW_INTERVAL: Duration = Duration::from_secs(60);
+/// After the store pinned entries are written to answers as a read replica, writes are skipped
+/// for this long; then its `ROLE` is asked again before the next write.
+pub const PINNED_READ_ONLY_RECHECK: Duration = Duration::from_secs(300);
+/// Lower bound of the operation timeout on the separate pinned write store
+/// (REDIS_PINNED_WRITE_URL), which can be far away; the write is off the request path.
+const PINNED_REMOTE_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 /// Cache key version: bump to orphan old entries on a format change.
 const KEY_VERSION: u32 = 4;
 /// Epoch refresh interval for per-request sync (seconds).
@@ -111,6 +118,12 @@ pub struct ResponseCache {
     /// Policy/limits hash for cache namespace isolation (MAX_BLOCK_RANGE + BACKENDS_POLICY).
     policy_hash: String,
     pinned_conn: Option<Arc<StoreConn>>,
+    /// Where pinned entries are written when `pinned_conn` is a read replica
+    /// (REDIS_PINNED_WRITE_URL, normally its primary); None: they are written to `pinned_conn`.
+    pinned_write_conn: Option<Arc<StoreConn>>,
+    /// Pinned writes are skipped until this time (ms since the UNIX epoch, 0 = not skipped):
+    /// the store they go to is a read replica (see `pinned_writer`).
+    pinned_read_only_until: Arc<AtomicU64>,
     /// Inclusive height range served from the pinned tier.
     pinned_range: Option<(u64, u64)>,
     cache_redis_url: String,
@@ -1205,6 +1218,8 @@ impl ResponseCache {
             redis_timeout: Duration::from_millis(redis_op_timeout_ms),
             policy_hash,
             pinned_conn: None,
+            pinned_write_conn: None,
+            pinned_read_only_until: Arc::new(AtomicU64::new(0)),
             pinned_range: None,
             cache_redis_url: redis_url.to_string(),
             replay_peers: None,
@@ -1246,11 +1261,38 @@ impl ResponseCache {
         }
     }
 
-    /// Attach the pinned tier (REDIS_PINNED_URL + PINNED_TREESTATE_RANGE).
-    pub async fn with_pinned(mut self, url: &str, range: (u64, u64)) -> anyhow::Result<Self> {
+    /// Attach the pinned tier (REDIS_PINNED_URL + PINNED_TREESTATE_RANGE), and optionally a
+    /// separate store its entries are written to (REDIS_PINNED_WRITE_URL), for a pinned store
+    /// that is a read replica. An unreachable write store is not fatal: the entries are then
+    /// written to the pinned store, or not at all when it is a read replica.
+    pub async fn with_pinned(
+        mut self,
+        url: &str,
+        write_url: Option<&str>,
+        range: (u64, u64),
+    ) -> anyhow::Result<Self> {
         self.pinned_conn =
             Some(StoreConn::connect(url, "pinned", self.network.clone(), Role::Any).await?);
         self.pinned_range = Some(range);
+        if let Some(write_url) = write_url {
+            match StoreConn::connect(write_url, "pinned_write", self.network.clone(), Role::Any)
+                .await
+            {
+                Ok(c) => self.pinned_write_conn = Some(c),
+                Err(e) => {
+                    warn!(network = %self.network, error = %e, "pinned write store unreachable at startup, writing pinned entries to the pinned store")
+                }
+            }
+        }
+        if let Some(writer) = self
+            .pinned_write_conn
+            .as_ref()
+            .or(self.pinned_conn.as_ref())
+        {
+            if !self.probe_pinned_writer(writer).await {
+                info!(network = %self.network, "pinned store is a read replica, pinned entries are not written");
+            }
+        }
         Ok(self)
     }
 
@@ -2036,7 +2078,10 @@ impl ResponseCache {
         )
     }
 
-    /// Height of a height-only GetTreeState request inside the pinned range, if any.
+    /// Height of a height-only GetTreeState request inside the pinned range, if any. Heights
+    /// within FINALIZED_DEPTH of a fresh tip are left out: `pinned_put` never writes them, so
+    /// a lookup could only miss (they are answered by the chain-validated cache). Without a
+    /// fresh tip every height in the range is looked up.
     fn pinned_height(&self, method: &str, path: &str, body: &[u8]) -> Option<u64> {
         let (start, end) = self.pinned_range?;
         self.pinned_conn.as_ref()?;
@@ -2047,7 +2092,76 @@ impl ResponseCache {
         if !id.hash.is_empty() || id.height < start || id.height > end {
             return None;
         }
+        if let Some(tip) = self.tip.get() {
+            if tip.height.saturating_sub(id.height) <= FINALIZED_DEPTH {
+                return None;
+            }
+        }
         Some(id.height)
+    }
+
+    fn unix_ms() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+    }
+
+    /// Skip pinned writes for PINNED_READ_ONLY_RECHECK. Returns true when they were not skipped
+    /// before (the caller logs the change once).
+    fn mark_pinned_read_only(&self) -> bool {
+        let until = Self::unix_ms() + PINNED_READ_ONLY_RECHECK.as_millis() as u64;
+        self.pinned_read_only_until.swap(until, Ordering::Relaxed) == 0
+    }
+
+    /// Ask `conn` for its `ROLE`. A replica turns pinned writes off for
+    /// PINNED_READ_ONLY_RECHECK and returns false; a primary, a store without `ROLE` or no
+    /// answer in time return true.
+    async fn probe_pinned_writer(&self, conn: &Arc<StoreConn>) -> bool {
+        let answer = timeout(
+            self.pinned_write_timeout(),
+            redis::cmd("ROLE").query_async::<_, redis::Value>(&mut conn.get()),
+        )
+        .await;
+        match answer {
+            Ok(Ok(v)) if crate::store_conn::parse_role(&v) == Some(false) => {
+                self.mark_pinned_read_only();
+                false
+            }
+            _ => true,
+        }
+    }
+
+    /// The store pinned entries are written to: REDIS_PINNED_WRITE_URL's when set, else the
+    /// pinned store. None while that store is known to be a read replica: its writes would only
+    /// fail. After PINNED_READ_ONLY_RECHECK the store is asked again (`ROLE`), so a replica
+    /// that was promoted is written to again.
+    async fn pinned_writer(&self) -> Option<&Arc<StoreConn>> {
+        let conn = self
+            .pinned_write_conn
+            .as_ref()
+            .or(self.pinned_conn.as_ref())?;
+        let until = self.pinned_read_only_until.load(Ordering::Relaxed);
+        if until == 0 {
+            return Some(conn);
+        }
+        if Self::unix_ms() < until || !self.probe_pinned_writer(conn).await {
+            return None;
+        }
+        if self.pinned_read_only_until.swap(0, Ordering::Relaxed) != 0 {
+            info!(network = %self.network, "pinned store accepts writes again");
+        }
+        Some(conn)
+    }
+
+    /// Operation timeout of pinned writes: at least PINNED_REMOTE_WRITE_TIMEOUT on a separate
+    /// write store.
+    fn pinned_write_timeout(&self) -> Duration {
+        if self.pinned_write_conn.is_some() {
+            self.redis_timeout.max(PINNED_REMOTE_WRITE_TIMEOUT)
+        } else {
+            self.redis_timeout
+        }
     }
 
     async fn pinned_get(&self, height: u64) -> Option<Vec<u8>> {
@@ -2108,10 +2222,11 @@ impl ResponseCache {
 
     /// Store a pinned entry. Only finalized heights (depth > FINALIZED_DEPTH against a fresh
     /// tip) and only responses that decode to a TreeState for the same height. SET NX, no TTL.
+    /// Written to `pinned_writer`; nothing while that is a read replica.
     async fn pinned_put(&self, height: u64, response: &[u8]) -> bool {
-        let Some(pinned) = self.pinned_conn.as_ref() else {
+        if self.pinned_conn.is_none() {
             return false;
-        };
+        }
         let tip = self.tip_height();
         if tip == 0 || tip.saturating_sub(height) <= FINALIZED_DEPTH {
             return false;
@@ -2119,8 +2234,11 @@ impl ResponseCache {
         if !Self::is_tree_state_for(response, height) {
             return false;
         }
+        let Some(pinned) = self.pinned_writer().await else {
+            return false;
+        };
         let res = timeout(
-            self.redis_timeout,
+            self.pinned_write_timeout(),
             redis::cmd("SET")
                 .arg(self.pinned_key(height))
                 .arg(response)
@@ -2131,6 +2249,12 @@ impl ResponseCache {
         pinned.observe_timed(&res);
         match res {
             Ok(Ok(_)) => true,
+            Ok(Err(e)) if e.kind() == redis::ErrorKind::ReadOnly => {
+                if self.mark_pinned_read_only() {
+                    info!(network = %self.network, "pinned store is a read replica, pinned entries are not written");
+                }
+                false
+            }
             Ok(Err(e)) => {
                 warn!(network = %self.network, height, error = %e, "pinned set error");
                 crate::health::record_cache_redis_timeout(&self.network, "pinned_set_error");
@@ -3614,9 +3738,18 @@ where
     F: Fn(u64) -> Fut + Clone + Send + Sync + 'static,
     Fut: std::future::Future<Output = anyhow::Result<Vec<u8>>> + Send + 'static,
 {
-    let (Some((start, end)), Some(conn)) = (cache.pinned_range, cache.pinned_conn.clone()) else {
+    // The cursor lives in the store the entries are written to.
+    let writer = cache
+        .pinned_write_conn
+        .clone()
+        .or_else(|| cache.pinned_conn.clone());
+    let (Some((start, end)), Some(conn)) = (cache.pinned_range, writer) else {
         return;
     };
+    if cache.pinned_read_only_until.load(Ordering::Relaxed) != 0 {
+        warn!(network = %cache.network, "pinned backfill not started: the pinned store is a read replica");
+        return;
+    }
     for worker in 0..workers {
         let cache = cache.clone();
         let fetch = fetch.clone();
@@ -3765,6 +3898,8 @@ mod tests {
             redis_timeout: LOCAL_TEST_OP_TIMEOUT,
             policy_hash: "test".to_string(),
             pinned_conn: None,
+            pinned_write_conn: None,
+            pinned_read_only_until: Arc::new(AtomicU64::new(0)),
             pinned_range: None,
             cache_redis_url: "redis://127.0.0.1:6379".to_string(),
             replay_peers: None,
@@ -5043,6 +5178,169 @@ mod tests {
         let _: () = redis::cmd("DEL")
             .arg(&epoch_key)
             .query_async(&mut sec)
+            .await
+            .unwrap();
+    }
+
+    /// A GetTreeState answer for `height`, as the gateway stores it.
+    fn tree_state_answer(height: u64) -> Vec<u8> {
+        let msg = prost::Message::encode_to_vec(&rpc_cache::TreeStateHead {
+            height,
+            hash: "ab".repeat(32),
+        });
+        let mut body = vec![0u8];
+        body.extend_from_slice(&(msg.len() as u32).to_be_bytes());
+        body.extend_from_slice(&msg);
+        bincode::serialize(&crate::ohttp::InnerResponse {
+            status: 200,
+            headers: vec![("grpc-status".to_string(), "0".to_string())],
+            body,
+        })
+        .unwrap()
+    }
+
+    fn unique_network(s: &str) -> String {
+        String::from_utf8(unique(s)).unwrap().replace(' ', "-")
+    }
+
+    fn tip_at(cache: &ResponseCache, height: u64) {
+        cache.tip.set(crate::store::Tip {
+            height,
+            hash: vec![1u8; 32],
+        });
+    }
+
+    #[tokio::test]
+    async fn pinned_lookup_leaves_out_heights_that_are_not_final() {
+        let Some(conn) = local_redis().await else {
+            return;
+        };
+        let network = unique_network("pinned-depth");
+        let mut cache = test_cache(conn.clone(), None, &network);
+        cache.pinned_conn = Some(StoreConn::from_parts(
+            redis::Client::open("redis://127.0.0.1:6379").unwrap(),
+            conn,
+            "pinned",
+            network.clone(),
+            Role::Any,
+        ));
+        cache.pinned_range = Some((1, u64::MAX));
+        let at =
+            |h: u64| cache.pinned_height("POST", GET_TREE_STATE_PATH, &grpc_tree_state_request(h));
+
+        // Without a fresh tip every height of the range is looked up.
+        assert_eq!(at(950), Some(950));
+        assert_eq!(at(1005), Some(1005));
+
+        // With one, only heights pinned_put can have written (deeper than FINALIZED_DEPTH).
+        tip_at(&cache, 1000);
+        assert_eq!(at(899), Some(899));
+        assert_eq!(at(900), None);
+        assert_eq!(at(1000), None);
+        assert_eq!(at(1005), None);
+    }
+
+    #[tokio::test]
+    async fn pinned_writes_pause_while_the_store_is_read_only() {
+        let Some(conn) = local_redis().await else {
+            return;
+        };
+        let network = unique_network("pinned-read-only");
+        let mut cache = test_cache(conn.clone(), None, &network);
+        cache.pinned_conn = Some(StoreConn::from_parts(
+            redis::Client::open("redis://127.0.0.1:6379").unwrap(),
+            conn.clone(),
+            "pinned",
+            network.clone(),
+            Role::Any,
+        ));
+        cache.pinned_range = Some((1, u64::MAX));
+        tip_at(&cache, 1000);
+        let answer = tree_state_answer(500);
+
+        // Known to be read-only: nothing is sent.
+        assert!(cache.mark_pinned_read_only());
+        assert!(!cache.mark_pinned_read_only(), "logged once per change");
+        assert!(!cache.pinned_put(500, &answer).await);
+        assert_eq!(cache.pinned_get(500).await, None);
+
+        // Once the pause is over the store is asked again; a primary is written to again.
+        cache.pinned_read_only_until.store(1, Ordering::Relaxed);
+        assert!(cache.pinned_put(500, &answer).await);
+        assert_eq!(cache.pinned_read_only_until.load(Ordering::Relaxed), 0);
+        assert_eq!(cache.pinned_get(500).await, Some(answer));
+
+        let mut c = conn;
+        let _: () = redis::cmd("DEL")
+            .arg(cache.pinned_key(500))
+            .query_async(&mut c)
+            .await
+            .unwrap();
+    }
+
+    /// `Some(true)` when the Redis at `url` is a replica, `Some(false)` for a primary.
+    async fn is_replica(url: &str) -> Option<bool> {
+        let client = redis::Client::open(url).ok()?;
+        let mut c = timeout(Duration::from_secs(5), ConnectionManager::new(client))
+            .await
+            .ok()?
+            .ok()?;
+        let v: redis::Value = redis::cmd("ROLE").query_async(&mut c).await.ok()?;
+        crate::store_conn::parse_role(&v).map(|primary| !primary)
+    }
+
+    /// With the primary and replica of tests/failover (OHTTP_FAILOVER_REDIS=1): a pinned store
+    /// that is a replica is detected at startup and never written to; with the primary as
+    /// write store the entry is written there and read back through the replica.
+    #[tokio::test]
+    async fn pinned_entries_of_a_read_replica_go_to_the_write_store() {
+        if std::env::var("OHTTP_FAILOVER_REDIS").is_err() {
+            return;
+        }
+        let Some(local) = local_redis().await else {
+            return;
+        };
+        let a = "redis://127.0.0.1:6391";
+        let b = "redis://127.0.0.1:6392";
+        // tests/store_failover.rs swaps the two, so ask them.
+        let (primary, replica) = match (is_replica(a).await, is_replica(b).await) {
+            (Some(false), Some(true)) => (a, b),
+            (Some(true), Some(false)) => (b, a),
+            other => panic!("expected one primary and one replica, got {other:?}"),
+        };
+        let network = unique_network("pinned-replica");
+        let range = (1, u64::MAX);
+        let answer = tree_state_answer(500);
+
+        let cache = test_cache(local.clone(), None, &network)
+            .with_pinned(replica, None, range)
+            .await
+            .unwrap();
+        assert_ne!(cache.pinned_read_only_until.load(Ordering::Relaxed), 0);
+        tip_at(&cache, 1000);
+        assert!(!cache.pinned_put(500, &answer).await);
+
+        let cache = test_cache(local, None, &network)
+            .with_pinned(replica, Some(primary), range)
+            .await
+            .unwrap();
+        assert_eq!(cache.pinned_read_only_until.load(Ordering::Relaxed), 0);
+        tip_at(&cache, 1000);
+        assert!(cache.pinned_put(500, &answer).await);
+        let mut replicated = None;
+        for _ in 0..50 {
+            replicated = cache.pinned_get(500).await;
+            if replicated.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert_eq!(replicated, Some(answer));
+
+        let mut p = cache.pinned_write_conn.as_ref().unwrap().get();
+        let _: () = redis::cmd("DEL")
+            .arg(cache.pinned_key(500))
+            .query_async(&mut p)
             .await
             .unwrap();
     }

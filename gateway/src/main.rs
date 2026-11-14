@@ -354,12 +354,21 @@ async fn main() -> anyhow::Result<()> {
                 // Pinned tier (optional): REDIS_PINNED_URL + PINNED_TREESTATE_RANGE.
                 let pinned_url = std::env::var("REDIS_PINNED_URL").unwrap_or_default();
                 let pinned_range = std::env::var("PINNED_TREESTATE_RANGE").unwrap_or_default();
+                // REDIS_PINNED_WRITE_URL (optional): where pinned entries are written when
+                // REDIS_PINNED_URL is a read replica (its primary).
+                let pinned_write_url = std::env::var("REDIS_PINNED_WRITE_URL")
+                    .ok()
+                    .filter(|u| !u.trim().is_empty());
                 let c = if pinned_url.is_empty() || pinned_range.is_empty() {
                     c
                 } else {
                     match cache::parse_pinned_range(&pinned_range) {
                         None => anyhow::bail!("Malformed PINNED_TREESTATE_RANGE: {pinned_range}"),
-                        Some(range) => match c.clone().with_pinned(&pinned_url, range).await {
+                        Some(range) => match c
+                            .clone()
+                            .with_pinned(&pinned_url, pinned_write_url.as_deref(), range)
+                            .await
+                        {
                             Ok(p) => {
                                 info!(network = %network, start = range.0, end = range.1, "Pinned GetTreeState tier enabled");
                                 p

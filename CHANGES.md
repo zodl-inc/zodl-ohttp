@@ -3,6 +3,28 @@
 Behaviour changes of the gateway, the relay simulator and the e2e client. The client library
 keeps its own log in [client/CHANGELOG.md](client/CHANGELOG.md).
 
+## Unreleased
+
+### Gateway
+
+- A pinned store (`REDIS_PINNED_URL`) that is a read replica is recognised: the gateway asks its
+  `ROLE` at startup (and after a `READONLY` answer) and stops sending it pinned writes, which
+  only failed and logged a `pinned set error` warning for every such miss. It asks again every
+  5 minutes, so a promoted replica is written to again.
+- New `REDIS_PINNED_WRITE_URL`: the store pinned entries are written to when `REDIS_PINNED_URL`
+  is a read replica (its primary). A final height a replica misses is then fetched once and
+  written where every replica gets it, instead of missing on every request at every gateway
+  reading a replica. The pinned backfill cursor moves to this store as well.
+- `GetTreeState` heights within 100 blocks of a fresh tip are no longer looked up in the pinned
+  tier: they are never written there, so the lookup could only miss. They go straight to the
+  chain-validated cache, one Redis round trip earlier, and no longer count as
+  `ohttp_cache_requests_total{result="pinned_miss"}`, which now counts only final heights the
+  tier does not have.
+- New `PREFETCH_TREE_STATE` (default off): the chain follower's leader fetches `GetTreeState`
+  of each new tip height once and caches it under a Client's key. Wallets ask for the tree
+  state at the height they last synced to, so with it these requests are cache hits instead of
+  one upstream call per height per gateway. Counted as `result="prefetched"`.
+
 ## 1.1.0
 
 The gateway caches `GetSubtreeRoots` for the Ironwood pool and writes its subtree end markers before
