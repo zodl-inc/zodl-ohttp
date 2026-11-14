@@ -30,6 +30,12 @@
 //!   (it cannot list a subtree that is not complete), so the marker never hides a root: a
 //!   request below it still fetches what is missing. The markers come from the stored tip
 //!   block, so they are written first, before any upstream call of the tip.
+//! - **Tree states** (`PREFETCH_TREE_STATE=1`, off by default): `GetTreeState` of each new tip
+//!   height (and of the tips since the last run, at most [`MAX_BLOCKS_PER_TIP`]), stored as the
+//!   validated entry a Client's height-only request has. A wallet that synced to a tip asks for
+//!   the tree state at that height when it next scans; heights this close to the tip are not
+//!   final, so they are never in the pinned tier, and without this each one is fetched from
+//!   lightwalletd on its first request. One upstream call per block.
 //! - **Block transactions** (`PREFETCH_BLOCK_TXS=1`, off by default): the transactions of each
 //!   new block (the `CompactTx` hashes of the follower's own block fetch) are fetched once with
 //!   `GetTransaction` and stored as validated entries, so wallets syncing to the tip find their
@@ -70,11 +76,14 @@ pub struct PrefetchConfig {
     pub tip: bool,
     /// Block transactions: the largest block (in transactions) that is prefetched; `None` = off.
     pub block_txs: Option<usize>,
+    /// `GetTreeState` of each new tip height.
+    pub tree_state: bool,
 }
 
 impl PrefetchConfig {
     /// From `PREFETCH_TIP` (default on; `0` turns it off), `PREFETCH_BLOCK_TXS` (default off;
-    /// `1` turns it on) and `PREFETCH_BLOCK_TXS_MAX` (default 100).
+    /// `1` turns it on), `PREFETCH_BLOCK_TXS_MAX` (default 100) and `PREFETCH_TREE_STATE`
+    /// (default off; `1` turns it on).
     pub fn from_env() -> anyhow::Result<Self> {
         let flag = |name: &str, default: bool| -> anyhow::Result<bool> {
             match std::env::var(name) {
@@ -96,11 +105,12 @@ impl PrefetchConfig {
         Ok(Self {
             tip: flag("PREFETCH_TIP", true)?,
             block_txs: flag("PREFETCH_BLOCK_TXS", false)?.then_some(max),
+            tree_state: flag("PREFETCH_TREE_STATE", false)?,
         })
     }
 
     pub fn is_off(&self) -> bool {
-        !self.tip && self.block_txs.is_none()
+        !self.tip && self.block_txs.is_none() && !self.tree_state
     }
 }
 
@@ -168,6 +178,18 @@ pub fn completed_subtrees(
     ]
 }
 
+/// The heights a tip at `tip` covers when `done` was the last one done (0 = none): the tip
+/// alone on the first run or after a reorg to a lower or equal height, else the heights since
+/// `done`, at most [`MAX_BLOCKS_PER_TIP`] (a catch-up only does the newest).
+fn since_last(done: u64, tip: u64) -> std::ops::RangeInclusive<u64> {
+    let from = if done == 0 || done >= tip {
+        tip
+    } else {
+        (done + 1).max(tip.saturating_sub(MAX_BLOCKS_PER_TIP - 1))
+    };
+    from..=tip
+}
+
 /// The prefetch, registered as a listener of the chain follower.
 pub struct TipPrefetch {
     inner: Arc<Inner>,
@@ -180,6 +202,8 @@ struct Inner {
     config: PrefetchConfig,
     /// Highest block whose transactions were prefetched (0 = none yet).
     tx_height: AtomicU64,
+    /// Highest height whose tree state was prefetched (0 = none yet).
+    tree_height: AtomicU64,
     /// One prefetch at a time: a tip that arrives while one runs is skipped (the next covers
     /// its blocks).
     running: AtomicBool,
@@ -199,6 +223,7 @@ impl TipPrefetch {
                 network,
                 config,
                 tx_height: AtomicU64::new(0),
+                tree_height: AtomicU64::new(0),
                 running: AtomicBool::new(false),
             }),
         }
@@ -244,6 +269,20 @@ impl Inner {
                     .await;
             }
         }
+        if self.config.tree_state {
+            let done = self.tree_height.load(Ordering::Acquire);
+            for height in since_last(done, tip.height) {
+                self.prefetch(
+                    &prefix,
+                    epoch,
+                    tip,
+                    "GetTreeState",
+                    rpc_cache::grpc_block_id(height, &[]),
+                )
+                .await;
+                self.tree_height.fetch_max(height, Ordering::AcqRel);
+            }
+        }
         if let Some(max_txs) = self.config.block_txs {
             for (height, tail) in &blocks {
                 self.prefetch_block_txs(&prefix, epoch, tip, *height, tail, max_txs)
@@ -258,13 +297,10 @@ impl Inner {
     async fn blocks(&self, prefix: &str, tip: &Tip) -> Vec<(u64, BlockTail)> {
         let mut heights: Vec<u64> = Vec::new();
         if self.config.block_txs.is_some() {
-            let done = self.tx_height.load(Ordering::Acquire);
-            let from = if done == 0 || done >= tip.height {
-                tip.height
-            } else {
-                (done + 1).max(tip.height.saturating_sub(MAX_BLOCKS_PER_TIP - 1))
-            };
-            heights.extend(from..=tip.height);
+            heights.extend(since_last(
+                self.tx_height.load(Ordering::Acquire),
+                tip.height,
+            ));
         } else if self.config.tip {
             heights.push(tip.height);
         }
@@ -477,6 +513,13 @@ mod tests {
                     height: self.tx_height,
                 }
                 .encode_to_vec()
+            } else if path.ends_with("GetTreeState") {
+                // The TreeState of the requested height, on the chain of every block 0xab..
+                rpc_cache::TreeStateHead {
+                    height: rpc_cache::BlockId::decode(&body[5..]).unwrap().height,
+                    hash: hex::encode([0xab; 32]),
+                }
+                .encode_to_vec()
             } else {
                 path.as_bytes().to_vec()
             };
@@ -585,6 +628,7 @@ mod tests {
             PrefetchConfig {
                 tip: true,
                 block_txs: None,
+                tree_state: false,
             },
             false,
         )
@@ -612,6 +656,7 @@ mod tests {
             PrefetchConfig {
                 tip: true,
                 block_txs: None,
+                tree_state: false,
             },
             false,
         )
@@ -643,6 +688,7 @@ mod tests {
             PrefetchConfig {
                 tip: true,
                 block_txs: None,
+                tree_state: false,
             },
             false,
         )
@@ -694,6 +740,7 @@ mod tests {
             PrefetchConfig {
                 tip: true,
                 block_txs: None,
+                tree_state: false,
             },
             false,
             Some(gate.clone()),
@@ -745,6 +792,7 @@ mod tests {
             PrefetchConfig {
                 tip: false,
                 block_txs: Some(100),
+                tree_state: false,
             },
             false,
         )
@@ -775,6 +823,7 @@ mod tests {
             PrefetchConfig {
                 tip: false,
                 block_txs: Some(1),
+                tree_state: false,
             },
             false,
         )
@@ -789,6 +838,7 @@ mod tests {
             PrefetchConfig {
                 tip: false,
                 block_txs: None,
+                tree_state: false,
             },
             false,
         )
@@ -801,6 +851,7 @@ mod tests {
             PrefetchConfig {
                 tip: true,
                 block_txs: Some(100),
+                tree_state: false,
             },
             true,
         )
@@ -818,5 +869,84 @@ mod tests {
             .await,
             CacheLookup::Miss(_)
         ));
+    }
+
+    fn tree_state_calls(lwd: &FakeLwd) -> Vec<u64> {
+        lwd.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(p, _)| p.ends_with("GetTreeState"))
+            .map(|(_, b)| rpc_cache::BlockId::decode(&b[5..]).unwrap().height)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn tree_state_of_new_tips_is_cached_under_a_clients_key() {
+        let r = rig(
+            PrefetchConfig {
+                tip: false,
+                block_txs: None,
+                tree_state: true,
+            },
+            false,
+        )
+        .await;
+        let body = |h: u64| rpc_cache::grpc_block_id(h, &[]);
+        r.prefetch.run(&r.tip).await;
+        assert!(is_hit(&r.store, "GetTreeState", &body(1000)).await);
+        assert_eq!(tree_state_calls(&r.lwd), vec![1000]);
+
+        // The same tip again: cached, no upstream call.
+        r.prefetch.run(&r.tip).await;
+        assert_eq!(tree_state_calls(&r.lwd), vec![1000]);
+
+        // Tips the follower moved past while a run was busy are filled in.
+        for h in 1001..=1003 {
+            r.store
+                .put(&index_key(&r.store.chain_prefix(), h), vec![0xab; 32]);
+        }
+        let tip = Tip {
+            height: 1003,
+            hash: vec![0xab; 32],
+        };
+        r.store.tip.set(tip.clone());
+        r.prefetch.run(&tip).await;
+        for h in 1001..=1003 {
+            assert!(is_hit(&r.store, "GetTreeState", &body(h)).await, "{h}");
+        }
+        assert_eq!(tree_state_calls(&r.lwd), vec![1000, 1001, 1002, 1003]);
+        // Nothing else was asked for.
+        assert!(r
+            .lwd
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|(p, _)| p.ends_with("GetTreeState")));
+    }
+
+    #[test]
+    fn heights_since_the_last_run() {
+        assert_eq!(since_last(0, 1000), 1000..=1000);
+        assert_eq!(since_last(1000, 1000), 1000..=1000);
+        assert_eq!(since_last(1005, 1000), 1000..=1000);
+        assert_eq!(since_last(997, 1000), 998..=1000);
+        assert_eq!(since_last(500, 1000), (1001 - MAX_BLOCKS_PER_TIP)..=1000);
+    }
+
+    #[tokio::test]
+    async fn tree_state_is_not_prefetched_when_off() {
+        let r = rig(
+            PrefetchConfig {
+                tip: true,
+                block_txs: Some(100),
+                tree_state: false,
+            },
+            false,
+        )
+        .await;
+        r.prefetch.run(&r.tip).await;
+        assert!(tree_state_calls(&r.lwd).is_empty());
     }
 }

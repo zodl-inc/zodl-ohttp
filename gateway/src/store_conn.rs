@@ -107,7 +107,7 @@ pub fn signal_reason(e: &RedisError) -> &'static str {
 
 /// `ROLE`'s first element: Some(true) for a primary, Some(false) for anything else, None when
 /// the store does not answer `ROLE` (treated as "unknown", accepted).
-fn parse_role(v: &Value) -> Option<bool> {
+pub(crate) fn parse_role(v: &Value) -> Option<bool> {
     let Value::Bulk(items) = v else {
         return None;
     };
