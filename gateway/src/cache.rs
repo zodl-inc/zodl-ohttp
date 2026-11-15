@@ -319,6 +319,10 @@ pub struct PeerCheck {
     /// The WRITE's route may run on one store's verdict (`WritePolicy::OneSided`); the replica
     /// wait that follows (`confirm_write_nonce`) applies the same policy.
     one_sided: bool,
+    /// The peers (bit `i` = peer `i`) that did not take the nonce (tolerated) and get it
+    /// asynchronously once the WRITE is finally admitted: `confirm_write_nonce` hands it over
+    /// only if the local replica wait lets the WRITE run.
+    replicate_to_after: Vec<usize>,
 }
 
 impl PeerCheck {
@@ -334,6 +338,7 @@ impl PeerCheck {
             hub_unavailable: false,
             local_bypassed: false,
             one_sided: false,
+            replicate_to_after: Vec::new(),
         }
     }
 
@@ -345,14 +350,6 @@ impl PeerCheck {
     /// Whether it belongs to the request whose local check is `local`.
     fn belongs_to(&self, local: &LocalCheck) -> bool {
         !self.key.is_empty() && self.key == local.key
-    }
-
-    /// A copy for the internal steps of the replica wait (never handed out).
-    fn duplicate(&self) -> Self {
-        Self {
-            key: self.key.clone(),
-            ..*self
-        }
     }
 
     /// A peer (or the fallback store) already held the nonce: a cross-origin replay.
@@ -3321,9 +3318,23 @@ impl ResponseCache {
         if check.replay {
             anyhow::bail!("Replay check: the peer stage found a replay (fail-closed)");
         }
-        // The steps of the replica wait below take it by value.
-        let check = check.duplicate();
         let key = local.key.clone();
+        let admission = self.confirm_write_nonce_key(&key, check).await;
+        // The tolerated peers get the nonce of a WRITE that runs, and only of one that runs.
+        if !check.replicate_to_after.is_empty() && matches!(admission, Ok(WriteAdmission::Run)) {
+            if let Some(r) = &self.replicator {
+                r.enqueue_to(&key, |i| check.replicate_to_after.contains(&i));
+            }
+        }
+        admission
+    }
+
+    async fn confirm_write_nonce_key(
+        &self,
+        key: &str,
+        check: &PeerCheck,
+    ) -> anyhow::Result<WriteAdmission> {
+        let key = key.to_string();
         let Some(ww) = self.write_wait.as_ref() else {
             // `deferred` is only ever set with the wait on; keep the replication anyway.
             if check.deferred {
@@ -3410,7 +3421,11 @@ impl ResponseCache {
     /// synchronously, with the peers' verdict, on every WRITE (write_fallback.rs, "Check at
     /// the fallback store"); without one asynchronously. A peer that does not answer leaves the
     /// local verdict alone: that runs a WRITE only under `WritePolicy::ONE_SIDED`.
-    async fn after_local_ack(&self, key: &str, check: PeerCheck) -> anyhow::Result<WriteAdmission> {
+    async fn after_local_ack(
+        &self,
+        key: &str,
+        check: &PeerCheck,
+    ) -> anyhow::Result<WriteAdmission> {
         if !check.deferred {
             return Ok(WriteAdmission::Run);
         }
@@ -3462,7 +3477,7 @@ impl ResponseCache {
     async fn short_ack_fallback(
         &self,
         key: String,
-        check: PeerCheck,
+        check: &PeerCheck,
         e: anyhow::Error,
         path: &'static str,
     ) -> anyhow::Result<WriteAdmission> {
@@ -4974,6 +4989,7 @@ impl ResponseCache {
                 // are down).
                 let mut at_standby = false;
                 let mut hub_needs_local_ack = false;
+                let mut replicate_to_after = Vec::new();
                 if !replay {
                     let fresh = |i: usize| outcomes.get(i) == Some(&PeerOutcome::Fresh);
                     let all_fresh =
@@ -5030,8 +5046,14 @@ impl ResponseCache {
                     // gets it asynchronously once it is reachable again, until the nonce TTL:
                     // after the switch back, the origins that check there must refuse a replay
                     // of a WRITE that ran here meanwhile.
-                    if let Some(r) = &self.replicator {
-                        if !outcomes.iter().all(|o| *o == PeerOutcome::Fresh) {
+                    // Only once the WRITE is admitted: with the local replica wait still to come
+                    // (`confirm_write_nonce`) the hand-off waits for its verdict, so a WRITE that
+                    // then fails closed leaves no nonce at a peer for bytes that never ran here.
+                    if !outcomes.iter().all(|o| *o == PeerOutcome::Fresh) {
+                        if self.write_wait.is_some() {
+                            replicate_to_after =
+                                (0..outcomes.len()).filter(|i| !fresh(*i)).collect();
+                        } else if let Some(r) = &self.replicator {
                             r.enqueue_to(&key, |i| !fresh(i));
                         }
                     }
@@ -5048,6 +5070,7 @@ impl ResponseCache {
                     durable_at_peers,
                     at_standby,
                     hub_needs_local_ack,
+                    replicate_to_after,
                     ..PeerCheck::blank()
                 })
             }

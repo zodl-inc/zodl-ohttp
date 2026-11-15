@@ -249,10 +249,12 @@ impl Store {
         let session = self.sessions.fetch_add(1, Ordering::SeqCst);
         let (r, mut w) = sock.into_split();
         let mut r = BufReader::new(r);
+        // SELECT n: this connection's keys live under "n/" (n > 0).
+        let mut db = String::new();
         // A command read ahead (`hold_set_xx_until_wait`), handled next.
         let mut next: Option<Vec<String>> = None;
         loop {
-            let args = match next.take() {
+            let mut args = match next.take() {
                 Some(a) => a,
                 None => match read_command(&mut r).await {
                     Some(a) => a,
@@ -263,6 +265,17 @@ impl Store {
                 .first()
                 .map(|a| a.to_ascii_uppercase())
                 .unwrap_or_default();
+            if name == "SELECT" {
+                db = args
+                    .get(1)
+                    .cloned()
+                    .filter(|d| d != "0")
+                    .unwrap_or_default();
+            }
+            if !db.is_empty() && matches!(name.as_str(), "SET" | "GET" | "EXISTS") && args.len() > 1
+            {
+                args[1] = format!("{db}/{}", args[1]);
+            }
             let is = |c: &str| args.first().is_some_and(|a| a.eq_ignore_ascii_case(c));
             let xx = is("SET") && args.iter().skip(3).any(|a| a.eq_ignore_ascii_case("XX"));
             self.session_log.lock().unwrap().push((
@@ -2566,4 +2579,96 @@ async fn housekeeping_checks_hanging_peers_concurrently() {
     // One peer: a PING (250 ms) and its WAIT connections' PINGs (300 ms). Six in a row: 3.3 s.
     assert!(took < Duration::from_millis(2200), "{took:?}");
     assert!(ohttp_gateway::health::is_security_redis_connected(net));
+}
+
+// ---------------------------------------------------------------------------------------------
+// The asynchronous hand-off to a peer that did not take a WRITE's nonce (tolerated) follows the
+// final admission: a WRITE that the local replica wait then fails closed never ran, and its
+// nonce must not reach the peer.
+
+#[tokio::test]
+async fn a_tolerated_peer_gets_only_the_nonces_of_writes_that_ran() {
+    let net = "testnet-handoff-ran";
+    let w = World::new().await;
+    let (hub_link, hub_url) = w.to_p().await;
+    let (_own, own_url) = w.to_f().await;
+    // The standby origin: own store with the replica wait, tolerates an unreachable hub.
+    let standby = spoke_origin_with(net, &own_url, &hub_url, false, false).await;
+    hub_link.lose();
+    // The own replicas do not acknowledge: the WRITE fails closed after the hub check.
+    w.f.set_acks(0);
+    let refused = request("hub unreachable, own replicas short");
+    assert!(admit(&standby, &refused, RouteClass::Write).await.is_err());
+    // The own replicas acknowledge: the WRITE runs.
+    w.f.set_acks(1);
+    let ran = request("hub unreachable, own replicas acknowledge");
+    assert!(admit(&standby, &ran, RouteClass::Write).await.unwrap());
+    hub_link.restore();
+    until(
+        "the WRITE that ran reached the hub",
+        Duration::from_secs(20),
+        || w.p.has(&key(net, &ran)),
+    )
+    .await;
+    // Batches go out every 20 ms in this test: the refused one would be there by now.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        !w.p.has(&key(net, &refused)),
+        "the nonce of a WRITE that failed closed was handed to the hub"
+    );
+}
+
+/// More than 64 peers: the hand-off to the one that did not take the nonce still waits for the
+/// WRITE's final admission.
+#[tokio::test]
+async fn the_hand_off_follows_the_admission_with_65_peers() {
+    let net = "testnet-handoff-65";
+    let w = World::new().await;
+    ohttp_gateway::health::init_metrics();
+    // 65 hub stores: databases 0..=64 of one fake store; the last one behind a link.
+    let (link, link_url) = w.to_p().await;
+    let mut urls: Vec<String> = (0..64)
+        .map(|i| format!("{}/{i}", addr_url(w.p_addr)))
+        .collect();
+    urls.push(format!("{link_url}/64"));
+    let own = addr_url(w.f_addr);
+    let c = ResponseCache::connect(
+        &cache_store().await,
+        Some(&own),
+        net.to_string(),
+        "lwd.example.com:9067".to_string(),
+        250,
+        100,
+        &HashMap::new(),
+    )
+    .await
+    .unwrap();
+    let peers = ReplayPeers::connect(&urls, net.to_string(), 250, false)
+        .await
+        .with_mode(ReplayPeerMode::AsyncReads, false)
+        .with_wait_conns(Some(WAIT), 1);
+    let standby = c
+        .with_replay_peers(peers)
+        .with_async_replication(replication(net, ReplayPeerMode::AsyncReads))
+        .with_write_wait_conns(&own, WAIT, 1)
+        .await
+        .unwrap();
+    link.lose();
+    w.f.set_acks(0);
+    let refused = request("65 peers, own replicas short");
+    assert!(admit(&standby, &refused, RouteClass::Write).await.is_err());
+    w.f.set_acks(1);
+    let ran = request("65 peers, own replicas acknowledge");
+    assert!(admit(&standby, &ran, RouteClass::Write).await.unwrap());
+    assert!(
+        w.p.has(&format!("63/{}", key(net, &ran))),
+        "taken by peer 63 at once"
+    );
+    link.restore();
+    until("handed to peer 64", Duration::from_secs(20), || {
+        w.p.has(&format!("64/{}", key(net, &ran)))
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(!w.p.has(&format!("64/{}", key(net, &refused))));
 }

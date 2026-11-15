@@ -221,6 +221,11 @@ keeps its own log in [client/CHANGELOG.md](client/CHANGELOG.md).
   ends a `LOADING` backoff at once. Repeated store warnings are logged at most once a minute per
   kind, and store errors in log lines carry only their I/O kind or a listed server code (never
   the server's text after it, nor an address).
+- An `async-reads` origin with its own replica wait that tolerates an unreachable peer
+  (`REPLAY_PEER_FAIL_CLOSED_WRITES=0`, a route on `REPLAY_ONE_SIDED_WRITE_ROUTES`) queued the
+  WRITE's nonce for that peer before its local replica wait; when the wait then failed the WRITE
+  closed, the peer still got the nonce later, for bytes that never ran. The hand-off now follows
+  the final admission, for any number of peers.
 - A read origin with a confirming standby store (`REPLAY_STANDBY_URLS` with
   `REPLAY_PEER_WAIT_REPLICAS`) asks the standby store about a WRITE's nonce (`SET NX`) at the same
   time as the hub (`SET NX`, then the hub's replica wait), instead of after the hub answered. A
