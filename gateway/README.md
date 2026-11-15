@@ -131,7 +131,12 @@ chain state:
   deletes the affected index entries and cached blocks, nullifiers and tree states. A
   lightwalletd answering with a lower tip on the indexed chain is behind, not a reorg. A leader
   whose stored tip stops moving while another process's lightwalletd is ahead is replaced by
-  that process (`CHAIN_TIP_STALE_SECS`).
+  that process (`CHAIN_TIP_STALE_SECS`). The tip, every index entry with its block and every
+  deletion of a reorg are written only while the writer holds the lock with its own token, so
+  a leader replaced during a slow tick cannot write the index of another fork, delete what its
+  successor wrote or move the tip back. Followers keep the tip fresh only while the leader
+  confirms it (`{chain}tip_seen`); a leader whose lightwalletd is stuck at or behind the tip
+  stops confirming it, and one that stays behind gives the lock up.
 - Blocks (`GetBlockRange` per block, `GetBlock`, `GetBlockNullifiers`) are served only while
   their hash matches the index; final blocks can live in the permanent tier
   (`PERMANENT_REDIS_URL`). `GetTreeState`, mined `GetTransaction` and `GetSubtreeRoots` entries

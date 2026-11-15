@@ -37,7 +37,9 @@ jobs:
       # first job of the run, began (the build jobs start after it).
       started: ${{ steps.started.outputs.started }}
     # The gateway's Redis-backed tests (replay peers, async replication, cache) run against this
-    # service and are skipped silently without it.
+    # service. Most are skipped without it; those that use `required_redis` (the chain
+    # follower's fence scripts, the cache's compare-and-set, the pinned tier) fail instead when
+    # `CI` is set, so a missing service cannot pass them silently.
     services:
       redis:
         image: redis:7-alpine@sha256:7f7d30b7fdd09467bac58198a1f166dd69789d348d4fe859cccb20e0cf287fbe

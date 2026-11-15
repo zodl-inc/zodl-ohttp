@@ -62,6 +62,48 @@ keeps its own log in [client/CHANGELOG.md](client/CHANGELOG.md).
 
 ### Gateway
 
+- Chain follower fencing: every index entry is now written together with its cached block, and
+  every deletion of a reorg (index entries and the cached blocks, nullifiers, tree states and
+  subtree roots above the fork), only while the writer holds the leader lock with its own token,
+  in the same kind of script as the tip (they were plain writes, and only the tip was fenced).
+  A leader replaced while a tick was in flight (a slow block fetch, a pause) could otherwise
+  write the index and blocks of another fork, or delete what its successor wrote, before its
+  tip write was refused; now the refused batch and every later one are not written and it
+  stops leading. The fenced writes no longer accept an absent lock: a paused leader cannot
+  write an older tip after the process that replaced it released or lost the lock again; one
+  whose own lock lapsed acquires it again on its next tick. A store error or timeout in a fenced
+  write (after a timeout its outcome is unknown) now stops the tick and hands the lock over,
+  instead of going on without it. One script carries
+  at most 32 blocks and 1 MiB of block payload (a larger block goes alone), so large blocks do
+  not make a script outlast the store's operation timeout.
+- Leader work that runs longer than the lock TTL (a cold start, a catch-up) keeps renewing the
+  lock with its own token, and is cancelled as soon as a renewal finds the lock held by another
+  process (or no renewal succeeded for a whole TTL), instead of running on until its next write
+  was refused.
+- The leader confirms the stored tip on every tick its lightwalletd answers with it, in a new
+  key `{chain}tip_seen`, and followers refresh their tip only when that value changed (no
+  clock comparison between processes), so a tip the leader no longer confirms goes stale on
+  every gateway after 30 s; before, followers refreshed whatever was stored on every read. The
+  leader stops confirming after 300 ticks with the same tip (at least 10 minutes: a
+  lightwalletd stuck at the tip height; at a 75 s block spacing such a gap is rarer than one
+  block in a thousand, and during one requests are answered from upstream). A leader whose
+  lightwalletd stays below the indexed tip for 15 ticks in a row (about 30 s) gives the lock up
+  and does not try to take it again for 5 ticks, so a process with another lightwalletd leads.
+  During a rolling upgrade, a leader of the previous version does not write `tip_seen`: its
+  followers of this version refresh on every read as before, both while the key is absent and
+  while a key left by an earlier leader of this version stays unchanged as the stored tip moves
+  (until the value changes again). Older followers ignore the key.
+- Stale-leader takeover: a follower takes the lock over only on a second probe in a row with
+  the same stored tip (height and hash) and the same lock holder, re-read on every probe, in one
+  script that checks both; a refused takeover or another holder starts the observation again.
+  Two followers that saw the same stale tip no longer take it from each other, and a holder
+  change between probes no longer blocks the takeover forever.
+- What a follower serves while its own lightwalletd is ahead of a stale leader follows one
+  rule: the highest tip its own lightwalletd answered, for at most 30 s after it last did, while
+  the stored tip stays below it on the same chain. A failed or lower probe never makes it step
+  back (it used to fall back to the lower stored tip and back up again between probes); it
+  serves the stored tip again once the held tip ages out, the stored tip catches up, or the
+  stored chain changes at or below the observed height.
 - `REPLAY_WRITE_WAIT_MS` and `REPLAY_PEER_WAIT_MS` must stay below about 1.25 s (the budget of a
   housekeeping check of a `WAIT` connection); a pool of one `WAIT` connection is not PINGed
   while it hands out its connection exclusively. A reopen of a `WAIT` connection that starts

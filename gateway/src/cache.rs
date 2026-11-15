@@ -6050,17 +6050,26 @@ impl CacheStore for ResponseCache {
         ttl_ms: u64,
         guard_key: String,
         guard: Bytes,
+        holder: Option<String>,
     ) -> BoxFuture<'_, Option<bool>> {
         Box::pin(async move {
             let conn = self.cache_conn.load_full()?;
             let mut conn = (*conn).clone();
+            // ARGV[4] = the holder the caller observed, '' = none (a holder is never empty).
             let script = r#"
-                if redis.call('GET', KEYS[2]) == ARGV[3] then
-                    redis.call('SET', KEYS[1], ARGV[1], 'PX', ARGV[2])
-                    return 1
-                else
+                if redis.call('GET', KEYS[2]) ~= ARGV[3] then
                     return 0
                 end
+                local holder = redis.call('GET', KEYS[1])
+                if ARGV[4] == '' then
+                    if holder then
+                        return 0
+                    end
+                elseif holder ~= ARGV[4] then
+                    return 0
+                end
+                redis.call('SET', KEYS[1], ARGV[1], 'PX', ARGV[2])
+                return 1
             "#;
             let script = redis::Script::new(script);
             let mut invocation = script.key(&key);
@@ -6068,7 +6077,8 @@ impl CacheStore for ResponseCache {
                 .key(&guard_key)
                 .arg(&value)
                 .arg(ttl_ms)
-                .arg(&guard[..]);
+                .arg(&guard[..])
+                .arg(holder.as_deref().unwrap_or(""));
             let fut = invocation.invoke_async::<_, i64>(&mut conn);
             match timeout(self.redis_timeout, fut).await {
                 Ok(Ok(v)) => Some(v == 1),
@@ -6096,15 +6106,20 @@ impl CacheStore for ResponseCache {
             let conn = self.cache_conn.load_full()?;
             let mut conn = (*conn).clone();
             // KEYS[1] = the lock, KEYS[2..] the entries; ARGV[1] = the holder, ARGV[2] = the lock
-            // TTL (ms), then value + TTL (s) per entry: KEYS[i] -> ARGV[2i-1], ARGV[2i].
+            // TTL (ms), then value + TTL (s, 0 = none) per entry: KEYS[i] -> ARGV[2i-1], ARGV[2i].
+            // Only the exact holder writes: an absent lock (lapsed, or released by a process
+            // that took over meanwhile) refuses too.
             let script = r#"
-                local holder = redis.call('GET', KEYS[1])
-                if holder and holder ~= ARGV[1] then
+                if redis.call('GET', KEYS[1]) ~= ARGV[1] then
                     return 0
                 end
-                redis.call('SET', KEYS[1], ARGV[1], 'PX', ARGV[2])
+                redis.call('PEXPIRE', KEYS[1], ARGV[2])
                 for i = 2, #KEYS do
-                    redis.call('SET', KEYS[i], ARGV[2 * i - 1], 'EX', ARGV[2 * i])
+                    if tonumber(ARGV[2 * i]) > 0 then
+                        redis.call('SET', KEYS[i], ARGV[2 * i - 1], 'EX', ARGV[2 * i])
+                    else
+                        redis.call('SET', KEYS[i], ARGV[2 * i - 1])
+                    end
                 end
                 return 1
             "#;
@@ -6118,7 +6133,106 @@ impl CacheStore for ResponseCache {
             match timeout(self.redis_timeout, fut).await {
                 Ok(Ok(v)) => Some(v == 1),
                 Ok(Err(e)) => {
-                    warn!(network = %self.network, error = %store_error(&e), "fenced tip write error");
+                    warn!(network = %self.network, error = %store_error(&e), "fenced chain write error");
+                    crate::health::record_cache_redis_timeout(&self.network, "lock_error");
+                    None
+                }
+                Err(_) => {
+                    crate::health::record_cache_redis_timeout(&self.network, "lock_timeout");
+                    None
+                }
+            }
+        })
+    }
+
+    fn del_if_lock_held(
+        &self,
+        lock: String,
+        value: String,
+        keys: Vec<String>,
+    ) -> BoxFuture<'_, Option<bool>> {
+        Box::pin(async move {
+            let conn = self.cache_conn.load_full()?;
+            let mut conn = (*conn).clone();
+            let script = r#"
+                if redis.call('GET', KEYS[1]) ~= ARGV[1] then
+                    return 0
+                end
+                for i = 2, #KEYS do
+                    redis.call('DEL', KEYS[i])
+                end
+                return 1
+            "#;
+            let script = redis::Script::new(script);
+            let mut invocation = script.key(&lock);
+            invocation.arg(&value);
+            for k in &keys {
+                invocation.key(k);
+            }
+            let fut = invocation.invoke_async::<_, i64>(&mut conn);
+            match timeout(self.redis_timeout, fut).await {
+                Ok(Ok(v)) => Some(v == 1),
+                Ok(Err(e)) => {
+                    warn!(network = %self.network, error = %store_error(&e), "fenced index delete error");
+                    crate::health::record_cache_redis_timeout(&self.network, "lock_error");
+                    None
+                }
+                Err(_) => {
+                    crate::health::record_cache_redis_timeout(&self.network, "lock_timeout");
+                    None
+                }
+            }
+        })
+    }
+
+    fn epoch_current(&self, epoch: u64) -> BoxFuture<'_, Option<bool>> {
+        Box::pin(async move {
+            // Where the epoch lives, as in `write_if_epoch_current`: the security Redis, or the
+            // cache Redis without one (absent = 0).
+            let current: Option<u64> = match self.security_conn.as_ref() {
+                Some(sec) => {
+                    let r = timeout(
+                        self.redis_timeout,
+                        redis::cmd("GET")
+                            .arg(format!("epoch:{}", self.network))
+                            .query_async::<_, Option<u64>>(&mut sec.get()),
+                    )
+                    .await;
+                    sec.observe_timed(&r);
+                    match r {
+                        Ok(Ok(v)) => v,
+                        _ => return None,
+                    }
+                }
+                None => {
+                    let conn = self.cache_conn.load_full()?;
+                    let mut conn = (*conn).clone();
+                    let r = timeout(
+                        self.redis_timeout,
+                        redis::cmd("GET")
+                            .arg(format!("epoch:{}", self.network))
+                            .query_async::<_, Option<u64>>(&mut conn),
+                    )
+                    .await;
+                    match r {
+                        Ok(Ok(v)) => Some(v.unwrap_or(0)),
+                        _ => return None,
+                    }
+                }
+            };
+            Some(current == Some(epoch))
+        })
+    }
+
+    fn lock_holder(&self, key: String) -> BoxFuture<'_, Option<Option<String>>> {
+        Box::pin(async move {
+            let conn = self.cache_conn.load_full()?;
+            let mut conn = (*conn).clone();
+            let fut = conn.get::<_, Option<String>>(&key);
+            match timeout(self.redis_timeout, fut).await {
+                Ok(Ok(v)) => Some(v),
+                Ok(Err(e)) => {
+                    warn!(network = %self.network, error = %store_error(&e), "leader lock read error");
                     crate::health::record_cache_redis_timeout(&self.network, "lock_error");
                     None
                 }
@@ -9631,6 +9745,208 @@ mod tests {
             .ok()?;
         let v: redis::Value = redis::cmd("ROLE").query_async(&mut c).await.ok()?;
         crate::store_conn::parse_role(&v).map(|primary| !primary)
+    }
+
+    /// The local Redis these tests need; in CI (where it runs as a service) its absence is a
+    /// failure, not a skip.
+    async fn required_redis() -> Option<ConnectionManager> {
+        let conn = local_redis().await;
+        if conn.is_none() && std::env::var("CI").is_ok() {
+            panic!("the local test Redis is expected in CI");
+        }
+        conn
+    }
+
+    /// The chain follower's fence scripts against a real store (the Lua is the fence): keys of
+    /// their own, the lock absent, held by another process and held by the caller.
+    #[tokio::test]
+    async fn the_fence_scripts_write_only_for_the_exact_lock_holder() {
+        let Some(conn) = required_redis().await else {
+            return;
+        };
+        let network = unique_network("fence-scripts");
+        let cache = test_cache(conn.clone(), None, &network);
+        let mut c = conn;
+        let key = |name: &str| format!("{network}:fence:{name}");
+        let (lock, index, block, tip) = (key("lock"), key("index"), key("block"), key("tip"));
+        let entries = || {
+            vec![
+                (index.clone(), Bytes::from_static(b"hash"), 600u64),
+                (block.clone(), Bytes::from_static(b"\x00block\xff"), 0u64),
+            ]
+        };
+        let me = || "me".to_string();
+        macro_rules! get {
+            ($k:expr) => {
+                redis::cmd("GET")
+                    .arg($k)
+                    .query_async::<_, Option<Vec<u8>>>(&mut c)
+                    .await
+                    .unwrap()
+            };
+        }
+        macro_rules! ttl {
+            ($cmd:expr, $k:expr) => {
+                redis::cmd($cmd)
+                    .arg($k)
+                    .query_async::<_, i64>(&mut c)
+                    .await
+                    .unwrap()
+            };
+        }
+
+        // set_if_lock_held. The lock absent: refused, nothing written, no lock created.
+        assert_eq!(cache.lock_holder(lock.clone()).await, Some(None));
+        assert_eq!(
+            cache
+                .set_if_lock_held(lock.clone(), me(), 10_000, entries())
+                .await,
+            Some(false)
+        );
+        assert_eq!(get!(&index), None);
+        assert_eq!(get!(&block), None);
+        assert_eq!(get!(&lock), None);
+        // Held by another process: refused, nothing written, the lock and its TTL untouched.
+        let _: () = redis::cmd("SET")
+            .arg(&lock)
+            .arg("other")
+            .arg("PX")
+            .arg(1_500)
+            .query_async(&mut c)
+            .await
+            .unwrap();
+        assert_eq!(
+            cache.lock_holder(lock.clone()).await,
+            Some(Some("other".to_string()))
+        );
+        assert_eq!(
+            cache
+                .set_if_lock_held(lock.clone(), me(), 10_000, entries())
+                .await,
+            Some(false)
+        );
+        assert_eq!(get!(&index), None);
+        assert_eq!(get!(&block), None);
+        assert_eq!(get!(&lock), Some(b"other".to_vec()));
+        assert!(ttl!("PTTL", &lock) <= 1_500);
+        // Held by the caller: every entry at its key with its value, the index entry with its
+        // TTL, the entry with TTL 0 without one, the lock extended.
+        let _: () = redis::cmd("SET")
+            .arg(&lock)
+            .arg("me")
+            .arg("PX")
+            .arg(1_500)
+            .query_async(&mut c)
+            .await
+            .unwrap();
+        assert_eq!(
+            cache
+                .set_if_lock_held(lock.clone(), me(), 10_000, entries())
+                .await,
+            Some(true)
+        );
+        assert_eq!(get!(&index), Some(b"hash".to_vec()));
+        assert_eq!(get!(&block), Some(b"\x00block\xff".to_vec()));
+        let index_ttl = ttl!("TTL", &index);
+        assert!((590..=600).contains(&index_ttl), "{index_ttl}");
+        assert_eq!(ttl!("TTL", &block), -1, "no expiry");
+        let lock_ttl = ttl!("PTTL", &lock);
+        assert!((5_000..=10_000).contains(&lock_ttl), "{lock_ttl}");
+        assert_eq!(get!(&lock), Some(b"me".to_vec()));
+
+        // del_if_lock_held. Another holder, then no holder: refused, nothing deleted.
+        let keys = || vec![index.clone(), block.clone()];
+        let _: () = redis::cmd("SET")
+            .arg(&lock)
+            .arg("other")
+            .query_async(&mut c)
+            .await
+            .unwrap();
+        assert_eq!(
+            cache.del_if_lock_held(lock.clone(), me(), keys()).await,
+            Some(false)
+        );
+        let _: () = redis::cmd("DEL")
+            .arg(&lock)
+            .query_async(&mut c)
+            .await
+            .unwrap();
+        assert_eq!(
+            cache.del_if_lock_held(lock.clone(), me(), keys()).await,
+            Some(false)
+        );
+        assert!(get!(&index).is_some() && get!(&block).is_some());
+        assert_eq!(get!(&lock), None, "a refused delete creates no lock");
+        // The caller holds it: deleted.
+        let _: () = redis::cmd("SET")
+            .arg(&lock)
+            .arg("me")
+            .query_async(&mut c)
+            .await
+            .unwrap();
+        assert_eq!(
+            cache.del_if_lock_held(lock.clone(), me(), keys()).await,
+            Some(true)
+        );
+        assert_eq!(get!(&index), None);
+        assert_eq!(get!(&block), None);
+        assert_eq!(get!(&lock), Some(b"me".to_vec()));
+
+        // take_lock_if: the guard (the stored tip) and the observed holder must both match.
+        let _: () = redis::cmd("SET")
+            .arg(&tip)
+            .arg("tip-1")
+            .query_async(&mut c)
+            .await
+            .unwrap();
+        let _: () = redis::cmd("SET")
+            .arg(&lock)
+            .arg("stale-leader")
+            .query_async(&mut c)
+            .await
+            .unwrap();
+        let take = |guard: &'static [u8], holder: Option<&str>| {
+            cache.take_lock_if(
+                lock.clone(),
+                me(),
+                10_000,
+                tip.clone(),
+                Bytes::from_static(guard),
+                holder.map(str::to_string),
+            )
+        };
+        // The guard changed (the leader moved the tip).
+        assert_eq!(take(b"tip-0", Some("stale-leader")).await, Some(false));
+        // Another holder than the one observed.
+        assert_eq!(take(b"tip-1", Some("someone-else")).await, Some(false));
+        // Observed as not held, but it is held.
+        assert_eq!(take(b"tip-1", None).await, Some(false));
+        assert_eq!(get!(&lock), Some(b"stale-leader".to_vec()));
+        assert_eq!(ttl!("PTTL", &lock), -1, "refusals leave the lock as it was");
+        // The observed holder: taken, with the TTL.
+        assert_eq!(take(b"tip-1", Some("stale-leader")).await, Some(true));
+        assert_eq!(cache.lock_holder(lock.clone()).await, Some(Some(me())));
+        let lock_ttl = ttl!("PTTL", &lock);
+        assert!((5_000..=10_000).contains(&lock_ttl), "{lock_ttl}");
+        // Observed as not held while a holder is expected, and while it is absent.
+        let _: () = redis::cmd("DEL")
+            .arg(&lock)
+            .query_async(&mut c)
+            .await
+            .unwrap();
+        assert_eq!(take(b"tip-1", Some("stale-leader")).await, Some(false));
+        assert_eq!(cache.lock_holder(lock.clone()).await, Some(None));
+        assert_eq!(take(b"tip-1", None).await, Some(true));
+        assert_eq!(cache.lock_holder(lock.clone()).await, Some(Some(me())));
+
+        let _: () = redis::cmd("DEL")
+            .arg(&lock)
+            .arg(&index)
+            .arg(&block)
+            .arg(&tip)
+            .query_async(&mut c)
+            .await
+            .unwrap();
     }
 
     /// With the primary and replica of tests/failover (OHTTP_FAILOVER_REDIS=1): a pinned store
