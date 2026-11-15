@@ -7,6 +7,12 @@ keeps its own log in [client/CHANGELOG.md](client/CHANGELOG.md).
 
 ### Gateway
 
+- `ohttp_request_duration_seconds` and `ohttp_upstream_request_duration_seconds` use finer
+  buckets: 0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.15, 0.25, 0.35, 0.5, 0.75, 1, 1.5, 2.5, 5 and
+  10 s (were 0.01, 0.05, 0.1, 0.25, 0.5, 1, 2.5 and 5 s). Calls that cross a long network path
+  took one or a few round trips of 50 to 300 ms each, and their quantiles were interpolated
+  across buckets up to 0.5 s wide. Every old bound is kept, so queries over a range that spans
+  the upgrade still work. The number of series of both histograms roughly doubles.
 - **`GATEWAY_HOSTS` is required in `ohttp` mode:** the gateway refuses to start when it is unset
   or empty, instead of warning and sending every unknown authority to lightwalletd. A deployment
   that already sets it is unaffected; one that does not must set it to the gateway's own host
