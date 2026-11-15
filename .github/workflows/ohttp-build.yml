@@ -14,6 +14,9 @@ permissions:
   contents: read
 
 env:
+  # Release tags (vMAJOR.MINOR.PATCH[-PRERELEASE]) build nothing: the release-check and promote
+  # jobs tag the images the main build of the tagged commit pushed as sha-<short> (same digest)
+  # with the version, see scripts/promote-image.sh. Branch and pull request runs never promote.
   # Repository secrets, so that the registry, the push role and the region stay out of the logs.
   # Pull requests from forks get no secrets: their images are built but never pushed, under a
   # placeholder registry name.
@@ -27,12 +30,17 @@ env:
 jobs:
   test:
     name: Test
+    if: ${{ !startsWith(github.ref, 'refs/tags/') }}
     runs-on: ubuntu-24.04
+    outputs:
+      # buildStartedOn of the provenance attestation: the time the first step of this job, the
+      # first job of the run, began (the build jobs start after it).
+      started: ${{ steps.started.outputs.started }}
     # The gateway's Redis-backed tests (replay peers, async replication, cache) run against this
     # service and are skipped silently without it.
     services:
       redis:
-        image: redis:7-alpine
+        image: redis:7-alpine@sha256:7f7d30b7fdd09467bac58198a1f166dd69789d348d4fe859cccb20e0cf287fbe
         ports:
           - 6379:6379
         options: >-
@@ -41,11 +49,28 @@ jobs:
           --health-timeout 3s
           --health-retries 10
     steps:
+      - name: Record the start time
+        id: started
+        run: echo "started=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
       - name: Checkout
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
 
-      - name: Test verify-image identity regexes
+      # Signing, verification and the release path (which runs only on a tag push), against a
+      # fake registry with stub tools and throwaway signing keys: no network, no secrets.
+      - name: Test verify-image
         run: bash scripts/verify-image-test.sh
+
+      - name: Test sign-image
+        run: bash scripts/sign-image-test.sh
+
+      - name: Test publish-index
+        run: bash scripts/publish-index-test.sh
+
+      - name: Test promote-image (release tag checks, promotion)
+        run: bash scripts/promote-image-test.sh
 
       - name: Start the failover test stores (Redis primary + replica)
         run: docker compose -f gateway/tests/failover/docker-compose.yml up -d --wait
@@ -82,6 +107,7 @@ jobs:
     name: Build ${{ matrix.image.name }} (${{ matrix.arch.suffix }})
     runs-on: ${{ matrix.arch.runner }}
     needs: test
+    if: ${{ !startsWith(github.ref, 'refs/tags/') }}
     permissions:
       id-token: write
       contents: read
@@ -113,6 +139,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
 
       - name: Configure AWS credentials
         if: github.event_name != 'pull_request'
@@ -120,6 +148,7 @@ jobs:
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
+          mask-aws-account-id: true
 
       - name: Login to ECR
         if: github.event_name != 'pull_request'
@@ -163,7 +192,9 @@ jobs:
           name: digests-${{ matrix.image.short }}-${{ matrix.arch.suffix }}
           path: ${{ runner.temp }}/digests/*
           if-no-files-found: error
-          retention-days: 1
+          # Kept for "Re-run failed jobs" of a failed publish, which reuses them; a full re-run
+          # rebuilds with new digests and is refused once sha-<short> exists.
+          retention-days: 14
 
       # One SBOM per platform image: an SBOM describes the packages of one concrete image, and
       # the scanner resolves an index to a single platform.
@@ -188,14 +219,15 @@ jobs:
           name: ${{ matrix.image.short }}-sbom-${{ matrix.arch.suffix }}
           path: ${{ matrix.image.short }}-sbom-${{ matrix.arch.suffix }}.spdx.json
 
-  # Runs only when every platform image of an image was built and pushed: it creates the tag(s) on
-  # the multi-platform index, then signs and attests the index digest. A failed platform build
-  # leaves no tag behind.
+  # Runs only when every platform image of every image was built and pushed (`needs` waits for the
+  # whole build matrix and is skipped if any leg failed): it creates the sha-<short> tag on the
+  # multi-platform index, then signs and attests the index and each platform image
+  # (scripts/sign-image.sh, re-run safe). A failed platform build leaves no tag behind.
   publish:
     name: Publish, sign & attest ${{ matrix.image.name }}
     runs-on: ubuntu-24.04
-    needs: build
-    if: github.event_name != 'pull_request'
+    needs: [test, build]
+    if: ${{ github.event_name != 'pull_request' && !startsWith(github.ref, 'refs/tags/') }}
     permissions:
       id-token: write
       contents: read
@@ -212,6 +244,11 @@ jobs:
             short: e2e
 
     steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
       - name: Download platform digests
         uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
         with:
@@ -224,97 +261,121 @@ jobs:
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
+          mask-aws-account-id: true
 
       - name: Login to ECR
         uses: aws-actions/amazon-ecr-login@4625ce35226a7557230889aae2f52eb50ec3dcda # v2.0.1
 
-      - name: Docker meta
-        id: meta
-        uses: docker/metadata-action@369eb591f429131d6889c46b94e711f089e6ca96 # v5.6.1
-        # ECR tags are immutable and the main build of the same commit already pushed sha-<short>:
-        # a release tag build pushes only its version tag (no moving `major.minor` tag, which an
-        # immutable repository refuses once it exists).
-        with:
-          images: ${{ env.ECR_REGISTRY }}/${{ matrix.image.name }}
-          flavor: |
-            latest=false
-          tags: |
-            type=semver,pattern={{version}}
-            type=sha,format=short,enable=${{ !startsWith(github.ref, 'refs/tags/') }}
-
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@c47758b77c9736f4b2ef4073d4d51994fabfe349 # v3.7.1
 
+      # Tags are immutable: a main build tags sha-<short> only; a release tag later adds its
+      # version to the same digest (promote job). Re-run safe: an existing sha-<short> is kept
+      # only if it is the index of this run's platform images (scripts/publish-index.sh).
       - name: Create the multi-platform index
         id: index
-        working-directory: ${{ runner.temp }}/digests
         env:
-          IMAGE: ${{ env.ECR_REGISTRY }}/${{ matrix.image.name }}
+          IMAGE: ${{ matrix.image.name }}
         run: |
-          set -euo pipefail
-          # Both platforms must be present; never tag an index that misses one.
-          files=(*)
-          test "${#files[@]}" -eq 2
-          tags=()
-          while read -r tag; do tags+=(-t "$tag"); done < <(jq -r '.tags[]' <<< "$DOCKER_METADATA_OUTPUT_JSON")
-          test "${#tags[@]}" -gt 0
-          sources=()
-          for d in "${files[@]}"; do sources+=("${IMAGE}@sha256:${d}"); done
-          docker buildx imagetools create "${tags[@]}" "${sources[@]}"
-          first="$(jq -r '.tags[0]' <<< "$DOCKER_METADATA_OUTPUT_JSON")"
-          digest="$(docker buildx imagetools inspect "$first" --format '{{json .Manifest}}' | jq -r .digest)"
-          test -n "$digest"
-          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
-          docker buildx imagetools inspect "${IMAGE}@${digest}"
+          bash scripts/publish-index.sh --registry "$ECR_REGISTRY" --image "$IMAGE" \
+            --commit "$GITHUB_SHA" --digests-dir "${RUNNER_TEMP}/digests" --output "$GITHUB_OUTPUT"
 
       - name: Install cosign
         uses: sigstore/cosign-installer@1aa8e0f2454b781fbf0fbf306a4c9533a0c57409 # v3.7.0
 
-      # The signature and the attestation are on the index digest, the digest a deployment pins.
-      # The platform images are reachable only through the index.
-      - name: Sign image
+      # The index digest is the digest a deployment pins; its platform images are signed and
+      # attested too, for a verifier that resolves the index to one platform first. A digest
+      # that already carries the main build's signature (attestation) of this commit is not
+      # signed (attested) again: a re-run of a failed publish completes without rewriting a
+      # signature tag, which the registry's immutable tags would refuse.
+      - name: Sign and attest the index and its platform images
         env:
-          IMAGE: ${{ env.ECR_REGISTRY }}/${{ matrix.image.name }}
+          IMAGE: ${{ matrix.image.name }}
           DIGEST: ${{ steps.index.outputs.digest }}
+          STARTED_ON: ${{ needs.test.outputs.started }}
         run: |
-          cosign sign --yes "${IMAGE}@${DIGEST}"
+          bash scripts/sign-image.sh --registry "$ECR_REGISTRY" --image "$IMAGE" --digest "$DIGEST" \
+            --workflow ohttp-build.yml --repository "$GITHUB_REPOSITORY" --run-id "$GITHUB_RUN_ID" \
+            --commit "$GITHUB_SHA" --workflow-sha "$GITHUB_SHA" --started-on "$STARTED_ON"
 
-      - name: Generate SLSA provenance
-        env:
-          WORKFLOW_REF: ${{ github.workflow_ref }}
-          SOURCE_SHA: ${{ github.sha }}
-          RUN_ID: ${{ github.run_id }}
-          STARTED_ON: ${{ github.event.head_commit.timestamp }}
-        run: |
-          jq -n \
-            --arg builder "$WORKFLOW_REF" \
-            --arg sha "$SOURCE_SHA" \
-            --arg run_id "$RUN_ID" \
-            --arg started "$STARTED_ON" \
-            '{
-              builder: {id: $builder},
-              buildType: "https://github.com/zodl-inc/zodl-ohttp/.github/workflows/ohttp-build.yml@main",
-              invocation: {
-                configSource: {
-                  uri: "https://github.com/zodl-inc/zodl-ohttp",
-                  digest: {sha1: $sha},
-                  entryPoint: ".github/workflows/ohttp-build.yml"
-                }
-              },
-              metadata: {
-                buildInvocationId: $run_id,
-                buildStartedOn: $started,
-                completeness: {parameters: true, environment: false, materials: false}
-              },
-              materials: [{
-                uri: "https://github.com/zodl-inc/zodl-ohttp",
-                digest: {sha1: $sha}
-              }]
-            }' > provenance.json
+  # Release tag push, first job: refuses a tag that is not vMAJOR.MINOR.PATCH[-PRERELEASE], is not
+  # an annotated tag signed by a key of .github/release-signing-keys.asc (on main), whose commit
+  # is not on main, or whose version differs from the gateway and relay-simulator crate versions
+  # and lock entries. Nothing is pushed when it fails. A consistency check: the security boundary
+  # is the tag ruleset (only admins create release tags). A tag on a revision older than this
+  # job runs that revision's workflow instead.
+  release-check:
+    name: Release tag check
+    if: ${{ startsWith(github.ref, 'refs/tags/') }}
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          # The whole history: the ancestry check walks main back to the tagged commit.
+          fetch-depth: 0
+          persist-credentials: false
 
-      - name: Attest with SLSA provenance
+      # The checkout keeps no credentials: the token reaches only this one git fetch, as a
+      # header of that invocation (masked, never echoed). The tag is fetched again by name so
+      # that the annotated tag object (and its signature) is the one of the remote.
+      - name: Check the tag
+        id: check
         env:
-          IMAGE: ${{ env.ECR_REGISTRY }}/${{ matrix.image.name }}
-          DIGEST: ${{ steps.index.outputs.digest }}
+          TAG: ${{ github.ref_name }}
+          FETCH_TOKEN: ${{ github.token }}
         run: |
-          cosign attest --yes --predicate provenance.json --type slsaprovenance "${IMAGE}@${DIGEST}"
+          set -euo pipefail
+          auth="$(printf 'x-access-token:%s' "$FETCH_TOKEN" | base64 -w0)"
+          echo "::add-mask::${auth}"
+          git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic ${auth}" \
+            fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main "+refs/tags/${TAG}:refs/tags/${TAG}"
+          unset auth FETCH_TOKEN
+          bash scripts/promote-image.sh check-tag --tag "$TAG" --commit "$GITHUB_SHA" \
+            --main-ref origin/main --keys-file .github/release-signing-keys.asc >> "$GITHUB_OUTPUT"
+
+  # Release tag push: promotes the sha-<short> index of the tagged commit (pushed, signed and
+  # attested by its main build) of every image to the version tag, without a rebuild. One job:
+  # all three images pass the preflight (scripts/promote-image.sh) before any tag is written.
+  # Nothing is signed or attested: the digests keep the main build's signature and attestation.
+  # If a tag write fails, re-run the job (already written tags with the same digest are
+  # accepted). (id-token: the push role only.)
+  promote:
+    name: Promote images
+    runs-on: ubuntu-24.04
+    needs: release-check
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@5579c002bb4778aa43395ef1df492868a9a1c83f # v4.0.2
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          mask-aws-account-id: true
+
+      - name: Login to ECR
+        uses: aws-actions/amazon-ecr-login@4625ce35226a7557230889aae2f52eb50ec3dcda # v2.0.1
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@c47758b77c9736f4b2ef4073d4d51994fabfe349 # v3.7.1
+
+      # cosign only verifies the main build's signature and attestation.
+      - name: Install cosign
+        uses: sigstore/cosign-installer@1aa8e0f2454b781fbf0fbf306a4c9533a0c57409 # v3.7.0
+
+      - name: Promote sha-<short> to the version
+        env:
+          VERSION: ${{ needs.release-check.outputs.version }}
+        run: |
+          bash scripts/promote-image.sh promote --registry "$ECR_REGISTRY" \
+            --commit "$GITHUB_SHA" --version "$VERSION" --repository "$GITHUB_REPOSITORY"

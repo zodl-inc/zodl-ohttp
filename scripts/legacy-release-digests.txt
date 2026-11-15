@@ -1,0 +1,12 @@
+# Release images that their tag builds rebuilt and signed under the tag identity
+# (ohttp-build.yml on refs/tags/v<version>), before releases were promoted from main builds:
+# ohttp-e2e 1.0.1 and the three 1.1.0 images. scripts/verify-image.sh accepts the tag identity
+# of <version> for exactly these digests and nothing else. The three 1.0.0 images verify
+# through the main build's identity and are not listed; the ohttp-gateway and
+# ohttp-relay-simulator 1.0.1 images were never signed and cannot be verified. Every later
+# release image verifies through the main build's identity.
+# Format: <image> <version> sha256:<64 hex>. Lines that do not match the format match nothing.
+ohttp-e2e 1.0.1 sha256:edf23986f59723bad5716eef9fd65149fc783e8bd0b0f6d7c34d7026f58b3c25
+ohttp-gateway 1.1.0 sha256:aa3ab572822fe7a03f959ab95edc8654711dbcf1f49e9d1d91b174039217027b
+ohttp-relay-simulator 1.1.0 sha256:1f7f58d98e6da9ff4a72abd336023bbb1d4b673879bf5c8de18046f8643f97ea
+ohttp-e2e 1.1.0 sha256:c5d4abd3c9766a09f1d00ceb0b4ea3eb1a63741177d8e6b9e3de4d1282325265

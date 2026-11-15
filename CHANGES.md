@@ -5,6 +5,61 @@ keeps its own log in [client/CHANGELOG.md](client/CHANGELOG.md).
 
 ## Unreleased
 
+### Images and releases
+
+- A release tag no longer rebuilds the images: it adds the version tag to the `sha-<short>`
+  multi-platform index the main build of the tagged commit pushed, so the version and
+  `sha-<short>` name the same digest (the one that was tested). All three images pass a
+  preflight before any tag is written; it fails, and tags nothing, if an index is missing, is
+  not a linux/amd64 + linux/arm64 index whose platform images are labelled with the tagged
+  commit, if the index or one of its platform images lacks the main build's signature or
+  provenance attestation for that commit and that image (an attestation of another image does
+  not count), or if a version tag already names another digest.
+  Only a registry "manifest not found" answer for exactly the requested reference counts as an
+  absent tag, in a single-line answer; local tool, authorisation and transport errors and mixed
+  diagnostics are fatal. Values read from the registry (revision labels, platforms, tag object
+  headers, file names) are printed only when well-formed; malformed data gets a fixed message. A re-run after a failed write completes the rest.
+  Nothing is signed or attested on a release (`scripts/promote-image.sh`).
+- Release tags must be signed annotated tags `vMAJOR.MINOR.PATCH[-PRERELEASE]` (SemVer, at most
+  128 characters after the `v`) by a key of `.github/release-signing-keys.asc`, whose signed
+  tag object carries the tag's name and names the commit directly, on a commit of `main`, and
+  match the gateway and relay-simulator crate versions and lock entries. The
+  gateway and relay-simulator crates are at 1.1.0, the latest release.
+- `scripts/verify-image.sh` verifies a release image by the main build's signer identity; the
+  tag identity is accepted only for the images listed by digest in
+  `scripts/legacy-release-digests.txt` (ohttp-e2e 1.0.1 and the three 1.1.0 images, which their
+  tag builds rebuilt and signed). The three 1.0.0 images verify through the main build's
+  identity; ohttp-gateway and ohttp-relay-simulator 1.0.1 were never signed and cannot be
+  verified. The attestation must name the verified digest. New `--commit <sha>`: only
+  certificates issued to a build run at that commit, with an attestation naming it; Sign
+  Existing Image signatures only with `--allow-sign-existing` (then bound to the commit only by
+  their attestation). The attestation must name the image: subject named after the image's
+  repository, and `invocation.parameters.image` when present. The output names the image by
+  short name and digest.
+- The main build signs and attests the index and each platform image (`scripts/sign-image.sh`),
+  so a platform digest verifies on its own. The provenance names the image
+  (`invocation.parameters.image`). A digest that already carries the signature
+  (attestation) is not signed (attested) again, and an existing `sha-<short>` index is kept if
+  it is the index of the run's platform pushes, with the same descriptors (media type, digest,
+  size and platform; annotations are not compared)
+  (`scripts/publish-index.sh`; otherwise the run fails), so "Re-run failed jobs" of a failed
+  publish completes on an immutable registry; the platform digests are kept 14 days for it.
+  Before writing, the pushes must be exactly one linux/amd64 and one linux/arm64 image labelled
+  with the commit, whose descriptors match their configurations (os, architecture, variant,
+  os.version, os.features). The provenance names the repository it was built in, `buildStartedOn` is
+  the time the run's first job began (was the commit time), and the predicate no longer claims
+  complete parameters.
+- `Sign Existing Image` runs only from `main` (a dispatch from another branch gets no
+  credentials; `scripts/sign-image.sh` also refuses to sign in a workflow run not on `main`),
+  signs `ohttp-e2e` too, works with a registry path prefix and in any
+  repository (identity and provenance from the repository it runs in), fails if the digest does
+  not exist, signs and attests the platform images of an index, and writes no `buildStartedOn`.
+- The test Redis images are pinned by digest. Checkouts keep no credentials (the release check
+  passes the token to its one fetch only); the AWS account ID is masked in the logs; tool
+  output (stdout and stderr, of successful and failed commands) is shown only with
+  `IMAGE_TOOLS_VERBOSE=1` or in a debug run. Options without a value are refused with a
+  message; `verify-image.sh --commit` requires a full commit SHA.
+
 ### Gateway
 
 - `ohttp_request_duration_seconds` and `ohttp_upstream_request_duration_seconds` use finer
