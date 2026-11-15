@@ -171,6 +171,8 @@ struct Store {
     /// The next WAIT closes its connection instead of answering (a reset of that one
     /// connection).
     close_on_wait_once: AtomicBool,
+    /// `ROLE` is refused by the ACL (`NOPERM`).
+    role_noperm: AtomicBool,
 }
 
 impl Default for Store {
@@ -192,6 +194,7 @@ impl Default for Store {
             waits_max: AtomicU64::new(0),
             replica: AtomicBool::new(false),
             close_on_wait_once: AtomicBool::new(false),
+            role_noperm: AtomicBool::new(false),
         }
     }
 }
@@ -353,6 +356,9 @@ impl Store {
             .unwrap_or_default();
         match cmd.as_str() {
             "PING" => "+PONG\r\n".into(),
+            "ROLE" if self.role_noperm.load(Ordering::SeqCst) => {
+                "-NOPERM User default has no permissions to run the 'role' command\r\n".into()
+            }
             "ROLE" if self.replica.load(Ordering::SeqCst) => "*1\r\n$5\r\nslave\r\n".into(),
             "ROLE" => "*3\r\n$6\r\nmaster\r\n:0\r\n*0\r\n".into(),
             "SET" => {
@@ -2671,4 +2677,46 @@ async fn the_hand_off_follows_the_admission_with_65_peers() {
     .await;
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert!(!w.p.has(&format!("64/{}", key(net, &refused))));
+}
+
+// ---------------------------------------------------------------------------------------------
+// A restricted ACL that does not allow `ROLE`: connections are accepted as for a store without
+// `ROLE` (writes on a replica still fail with READONLY).
+
+#[tokio::test]
+async fn stores_whose_acl_refuses_role_are_still_connected() {
+    let net = "testnet-noperm";
+    let w = World::new().await;
+    w.p.role_noperm.store(true, Ordering::SeqCst);
+    w.f.role_noperm.store(true, Ordering::SeqCst);
+    let (p_link, p_url) = w.to_p().await;
+    let primary = primary_origin(net, &p_url, &addr_url(w.f_addr), false).await;
+    // The peer connection is opened with the primary check at startup.
+    assert!(primary.replay_peers().unwrap().any_connected());
+    let write = request("ROLE not allowed");
+    assert!(admit_strict(&primary, &write, RouteClass::Write)
+        .await
+        .unwrap());
+    // A broken security connection is replaced (the replacement is primary-checked too).
+    p_link.lose();
+    p_link.restore();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let _ = admit_strict(&primary, &request("after the reset"), RouteClass::Write).await;
+        if reconnects(net, "security", "replaced") >= 1.0 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "security connection never replaced"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(admit_strict(
+        &primary,
+        &request("after the replacement"),
+        RouteClass::Write
+    )
+    .await
+    .unwrap());
 }

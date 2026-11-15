@@ -226,6 +226,12 @@ keeps its own log in [client/CHANGELOG.md](client/CHANGELOG.md).
   WRITE's nonce for that peer before its local replica wait; when the wait then failed the WRITE
   closed, the peer still got the nonce later, for bytes that never ran. The hand-off now follows
   the final admission, for any number of peers.
+- A store whose ACL does not allow `ROLE` (`NOPERM`) is treated like a store without `ROLE`: its
+  connections are accepted without the check against a demoted node (a write on a replica still
+  fails with `READONLY`, so replay checks stay fail-closed), and the gateway warns once. Before,
+  every primary-checked connection to it was refused: replay peer connections never connected,
+  and after the first failover signal the security and `WAIT` connections never got a
+  replacement, so every request failed closed until a restart. Granting `ROLE` keeps the check.
 - A read origin with a confirming standby store (`REPLAY_STANDBY_URLS` with
   `REPLAY_PEER_WAIT_REPLICAS`) asks the standby store about a WRITE's nonce (`SET NX`) at the same
   time as the hub (`SET NX`, then the hub's replica wait), instead of after the hub answered. A

@@ -99,7 +99,7 @@ The Encapsulated Request body is limited to 10 MiB (outer 413 above it) and must
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `REDIS_SECURITY_URL` | unset | Redis (`redis://` or `rediss://`) for replay nonces and the cache epoch; must use `maxmemory-policy noeviction`. Required in `ohttp` mode together with `REDIS_URL`. While it is unreachable at startup the gateway retries every 5 s before listening. |
+| `REDIS_SECURITY_URL` | unset | Redis (`redis://` or `rediss://`) for replay nonces and the cache epoch; must use `maxmemory-policy noeviction`. Its user (and the users of `REPLAY_PEER_URLS` / `REPLAY_STANDBY_URLS`) should be allowed `ROLE`: every new connection is accepted only on a node that says `ROLE master`; where the ACL refuses `ROLE` (`NOPERM`) connections are accepted without that check (a write on a replica still fails closed with `READONLY`). Required in `ohttp` mode together with `REDIS_URL`. While it is unreachable at startup the gateway retries every 5 s before listening. |
 | `REPLAY_FRESHNESS` | `observe` | Inner `ohttp-freshness` timestamp check. `off`: ignored. `observe`: missing or stale timestamps are counted (`ohttp_freshness_total`) but served. `enforce`: refused with inner 400 carrying `ohttp-freshness: rejected`. |
 | `REPLAY_FRESHNESS_WINDOW_SECS` | `300` | Accepted distance from the gateway clock, either direction. At most half the nonce TTL (600 s). |
 | `REPLAY_WRITE_WAIT_REPLICAS` | `0` | When above 0, a WRITE request (anything not on `REPLAY_READ_ROUTES`) runs only after its nonce is acknowledged by this many replicas of the security Redis (`WAIT` on a dedicated connection); otherwise it is refused with inner 503 (grpc-status 14 for lightwalletd calls). For a replicated store with automatic failover. |

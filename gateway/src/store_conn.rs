@@ -337,6 +337,16 @@ pub fn signal_reason(e: &RedisError) -> &'static str {
     }
 }
 
+/// Whether `ROLE` was refused because the store cannot or may not answer it: an unknown command
+/// (`ERR ...`) or an ACL that does not allow it (`NOPERM ...`). The role is then unknown and the
+/// connection is accepted, as for a store without `ROLE`: a write on a replica still fails with
+/// `READONLY` (a failover signal), so the replay checks stay fail-closed; only the early check
+/// against a demoted node is lost. Rejecting such a connection instead would never accept one:
+/// every reconnect after a failover signal, and every peer connection, would keep failing.
+pub fn role_not_available(e: &RedisError) -> bool {
+    e.kind() == ErrorKind::ResponseError || e.code() == Some("NOPERM")
+}
+
 /// `ROLE`'s first element: Some(true) for a primary, Some(false) for anything else, None when
 /// the store does not answer `ROLE` (treated as "unknown", accepted).
 pub(crate) fn parse_role(v: &Value) -> Option<bool> {
@@ -750,9 +760,12 @@ impl StoreConn {
     }
 }
 
+/// The warning of `role_not_available` is logged once per process.
+static ROLE_UNAVAILABLE_WARNED: AtomicBool = AtomicBool::new(false);
+
 /// `open`, and for `Role::Primary` accept the connection only if its node reports `ROLE master`
-/// (or does not know `ROLE`): right after a failover the endpoint name can still reach the
-/// demoted node for a few seconds.
+/// (or does not know `ROLE`, or its ACL does not allow it: `role_not_available`): right after a
+/// failover the endpoint name can still reach the demoted node for a few seconds.
 pub async fn open_checked(client: &redis::Client, role: Role) -> anyhow::Result<ConnectionManager> {
     let mut conn = open(client).await?;
     if role == Role::Primary {
@@ -767,8 +780,13 @@ pub async fn open_checked(client: &redis::Client, role: Role) -> anyhow::Result<
                 anyhow::bail!("the endpoint still reaches a replica")
             }
             Ok(_) => {}
-            // A store without ROLE: accepted, its writes still report READONLY.
-            Err(e) if e.kind() == ErrorKind::ResponseError => {}
+            // A store without ROLE, or an ACL without it: accepted, its writes still report
+            // READONLY.
+            Err(e) if role_not_available(&e) => {
+                if !ROLE_UNAVAILABLE_WARNED.swap(true, Ordering::Relaxed) {
+                    warn!(error = %store_error(&e), "Store does not answer ROLE (unknown command or not allowed by its ACL): connections are accepted without the primary check; writes on a replica still fail with READONLY");
+                }
+            }
             Err(e) => return Err(e.into()),
         }
     }
@@ -946,6 +964,16 @@ mod tests {
             &server_error("ERR unknown command 'ROLE'"),
             Role::Primary
         ));
+        let noperm =
+            server_error("NOPERM User default has no permissions to run the 'role' command");
+        assert!(!is_failover_signal(&noperm, Role::Primary));
+        // Both mean "the role cannot be asked": accepted like a store without ROLE.
+        assert!(role_not_available(&noperm));
+        assert!(role_not_available(&server_error(
+            "ERR unknown command 'ROLE'"
+        )));
+        assert!(!role_not_available(&readonly));
+        assert!(!role_not_available(&io));
     }
 
     #[test]
