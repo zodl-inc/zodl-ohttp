@@ -5,7 +5,7 @@
 # It also needs the plain test Redis on 127.0.0.1:6379 (the cache store).
 services:
   redis-a:
-    image: redis:7-alpine
+    image: redis:7-alpine@sha256:7f7d30b7fdd09467bac58198a1f166dd69789d348d4fe859cccb20e0cf287fbe
     command: ["redis-server", "--save", "", "--appendonly", "no", "--repl-diskless-sync-delay", "0"]
     ports:
       - "127.0.0.1:6391:6379"
@@ -15,7 +15,7 @@ services:
       timeout: 2s
       retries: 15
   redis-b:
-    image: redis:7-alpine
+    image: redis:7-alpine@sha256:7f7d30b7fdd09467bac58198a1f166dd69789d348d4fe859cccb20e0cf287fbe
     command: ["redis-server", "--save", "", "--appendonly", "no", "--repl-diskless-sync-delay", "0", "--replicaof", "redis-a", "6379"]
     ports:
       - "127.0.0.1:6392:6379"

@@ -2,16 +2,15 @@ name: Sign Existing Image
 
 on:
   workflow_dispatch:
-    branches:
-      - main
     inputs:
       image:
-        description: 'Image name (ohttp-gateway or ohttp-relay-simulator)'
+        description: 'Image name (ohttp-gateway, ohttp-relay-simulator or ohttp-e2e)'
         required: true
         type: choice
         options:
           - ohttp-gateway
           - ohttp-relay-simulator
+          - ohttp-e2e
       digest:
         description: 'Image digest (sha256:...)'
         required: true
@@ -29,8 +28,10 @@ permissions:
 jobs:
   sign:
     name: Sign Image
+    # A dispatch from any other branch runs nothing: no credentials, no writes.
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
-    
+
     # Inputs reach the scripts only through env (never as expressions inside run:) and are validated
     # before any other step uses them.
     env:
@@ -45,9 +46,9 @@ jobs:
             exit 1
           fi
           case "$IMAGE" in
-            ohttp-gateway|ohttp-relay-simulator) ;;
+            ohttp-gateway|ohttp-relay-simulator|ohttp-e2e) ;;
             *)
-              echo "Error: invalid image. Expected ohttp-gateway or ohttp-relay-simulator"
+              echo "Error: invalid image. Expected ohttp-gateway, ohttp-relay-simulator or ohttp-e2e"
               exit 1
               ;;
           esac
@@ -55,109 +56,45 @@ jobs:
             echo "Error: Invalid digest format. Expected sha256:<64-hex-chars>"
             exit 1
           fi
-          if [[ ! "$ECR_REGISTRY" =~ ^[A-Za-z0-9.-]+(:[0-9]+)?$ ]]; then
-            echo "Error: ECR_REGISTRY is not a registry host name"
+          # A registry host, optionally with a path prefix for the repositories.
+          if [[ ! "$ECR_REGISTRY" =~ ^[A-Za-z0-9.-]+(:[0-9]+)?(/[a-z0-9._-]+)*$ ]]; then
+            echo "Error: ECR_REGISTRY is not a registry name"
             exit 1
           fi
-          echo "IMAGE_REF=${ECR_REGISTRY}/${IMAGE}@${DIGEST}" >> "$GITHUB_ENV"
+
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@5579c002bb4778aa43395ef1df492868a9a1c83f # v4.0.2
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
+          mask-aws-account-id: true
 
       - name: Login to ECR
         uses: aws-actions/amazon-ecr-login@4625ce35226a7557230889aae2f52eb50ec3dcda # v2.0.1
 
-      - name: Verify image exists
-        run: |
-          aws ecr batch-get-image \
-            --repository-name "$IMAGE" \
-            --image-ids imageDigest="$DIGEST" \
-            --query 'images[0].imageId.imageDigest' \
-            --output text
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@c47758b77c9736f4b2ef4073d4d51994fabfe349 # v3.7.1
 
       - name: Install cosign
         uses: sigstore/cosign-installer@1aa8e0f2454b781fbf0fbf306a4c9533a0c57409 # v3.7.0
 
-      - name: Sign image
+      # scripts/sign-image.sh fails if the digest does not exist, takes the source commit from
+      # the image's org.opencontainers.image.revision label (every platform image of an index
+      # must agree), signs and attests the digest and each platform image under this workflow's
+      # identity (derived from the repository the workflow runs in), skips a digest that already
+      # carries this workflow's signature (attestation), and verifies both. The predicate has no
+      # buildStartedOn: the build time of an existing image is not known here.
+      # Existing artifacts must be absent or already verify under this workflow and the expected
+      # image/commit policy: the registry's tags are immutable, so foreign or incompatible
+      # signatures or attestations (another workflow's, an older format) cannot be replaced. To
+      # backfill the platform images of an index that is already signed, give each platform
+      # digest directly.
+      - name: Sign, attest and verify
         run: |
-          cosign sign --yes "$IMAGE_REF"
-
-      - name: Verify signature
-        run: |
-          cosign verify \
-            --certificate-identity-regexp "^https://github\.com/zodl-inc/zodl-ohttp/\.github/workflows/sign-existing-image\.yml@refs/heads/main$" \
-            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
-            "$IMAGE_REF"
-
-      - name: Install crane
-        env:
-          CRANE_VERSION: v0.20.2
-          # sha256 of go-containerregistry_Linux_x86_64.tar.gz v0.20.2 (release checksums.txt).
-          CRANE_SHA256: c14340087103ba9dadf61d45acd20675490fd0ccbd56ac7901fc1b502137f44b
-        run: |
-          curl -fsSL -o crane.tar.gz \
-            "https://github.com/google/go-containerregistry/releases/download/${CRANE_VERSION}/go-containerregistry_Linux_x86_64.tar.gz"
-          echo "${CRANE_SHA256}  crane.tar.gz" | sha256sum -c -
-          tar xzf crane.tar.gz crane
-          sudo install -m 0755 crane /usr/local/bin/crane
-          rm -f crane crane.tar.gz
-
-      - name: Extract source commit from image
-        id: extract
-        run: |
-          SOURCE_SHA=$(crane config "$IMAGE_REF" | jq -r '.config.Labels["org.opencontainers.image.revision"]')
-          if [[ ! "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
-            echo "Error: Could not extract a source commit SHA from image labels"
-            exit 1
-          fi
-          echo "source_sha=$SOURCE_SHA" >> "$GITHUB_OUTPUT"
-          echo "Extracted source commit: $SOURCE_SHA"
-
-      - name: Create SLSA provenance predicate
-        env:
-          SOURCE_SHA: ${{ steps.extract.outputs.source_sha }}
-          WORKFLOW_REF: ${{ github.workflow_ref }}
-          RUN_ID: ${{ github.run_id }}
-          STARTED_ON: ${{ github.event.repository.updated_at }}
-        run: |
-          jq -n \
-            --arg builder "$WORKFLOW_REF" \
-            --arg sha "$SOURCE_SHA" \
-            --arg run_id "$RUN_ID" \
-            --arg started "$STARTED_ON" \
-            '{
-              builder: {id: $builder},
-              buildType: "https://github.com/zodl-inc/zodl-ohttp/.github/workflows/sign-existing-image.yml@main",
-              invocation: {
-                configSource: {
-                  uri: "https://github.com/zodl-inc/zodl-ohttp",
-                  digest: {sha1: $sha},
-                  entryPoint: ".github/workflows/sign-existing-image.yml"
-                }
-              },
-              metadata: {
-                buildInvocationId: $run_id,
-                buildStartedOn: $started,
-                completeness: {parameters: true, environment: false, materials: false}
-              },
-              materials: [{
-                uri: "https://github.com/zodl-inc/zodl-ohttp",
-                digest: {sha1: $sha}
-              }]
-            }' > provenance.json
-          cat provenance.json
-
-      - name: Attest with SLSA provenance
-        run: |
-          cosign attest --yes --predicate provenance.json --type slsaprovenance "$IMAGE_REF"
-
-      - name: Verify attestation
-        run: |
-          cosign verify-attestation \
-            --type slsaprovenance \
-            --certificate-identity-regexp "^https://github\.com/zodl-inc/zodl-ohttp/\.github/workflows/sign-existing-image\.yml@refs/heads/main$" \
-            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
-            "$IMAGE_REF"
+          bash scripts/sign-image.sh --registry "$ECR_REGISTRY" --image "$IMAGE" --digest "$DIGEST" \
+            --workflow sign-existing-image.yml --repository "$GITHUB_REPOSITORY" --run-id "$GITHUB_RUN_ID"

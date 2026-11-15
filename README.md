@@ -119,15 +119,23 @@ Images can be pushed to any OCI registry (`REGISTRY_URL`, see `scripts/deploy.sh
 
 - `.github/workflows/ohttp-build.yml`: `cargo test` for the gateway and the relay simulator,
   `rustfmt` + `clippy` + `cargo test` for the client library and a build of the e2e client, on pull
-  requests and pushes to `main`; gateway, relay-simulator and e2e-client images are built on every run and,
-  from `main` and `v*` tags only, pushed (tags `sha-<short>`, semver for `v*` tags); every pushed
-  image (gateway, relay simulator and e2e client) gets an SPDX SBOM (workflow artifact), a cosign
-  signature and a SLSA provenance attestation. The registry, the push role and the region come
+  requests and pushes to `main`; gateway, relay-simulator and e2e-client images are built on every
+  run and, from `main` only, pushed (tag `sha-<short>`); every pushed image (gateway, relay
+  simulator and e2e client) gets an SPDX SBOM (workflow artifact), and its index and each
+  platform image a cosign signature and a SLSA provenance attestation (`scripts/sign-image.sh`).
+  A signed `vMAJOR.MINOR.PATCH` release tag (admins only) on a commit of `main` builds and signs
+  nothing: it adds the version tag to that commit's `sha-<short>` images (same digest), which
+  keep the main build's signature and attestation (`scripts/promote-image.sh`, rules in
+  [CONTRIBUTING.md](CONTRIBUTING.md#releases)). A tag on an older revision runs that revision's
+  workflow; the images it signs under the tag identity are refused by `scripts/verify-image.sh`,
+  except the listed legacy images (ohttp-e2e 1.0.1 and the three 1.1.0 images). Deployments pin `sha-<short>` digests
+  verified with the main build's identity. The registry, the push role and the region come
   from repository secrets.
 - `.github/workflows/fuzz.yml`: every fuzz target for 60 s on pull requests and pushes, 10 min
   nightly.
-- `.github/workflows/sign-existing-image.yml` (manual) signs an already pushed image;
-  `scripts/verify-image.sh` checks an image's signature and provenance.
+- `.github/workflows/sign-existing-image.yml` (manual) signs and attests an already pushed image
+  that has no signature yet; `scripts/verify-image.sh` checks an image's signature and
+  provenance.
 
 ## Documentation
 
