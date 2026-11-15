@@ -121,10 +121,17 @@ async fn pump(
 // A fake store (always a primary): SET [NX|XX] [EX], WAIT (answers `acks`), ROLE, PING;
 // anything else +OK.
 
+/// The commands the stores received, in arrival order ("<store> <COMMAND> [NX|XX]").
+type CommandLog = Arc<Mutex<Vec<String>>>;
+
 struct Store {
     keys: Mutex<HashSet<String>>,
     /// The answer to WAIT: the replicas that acknowledged (0 = a primary whose replicas resync).
     acks: AtomicI64,
+    /// Delay before each SET and WAIT reply, in ms: a store a long round trip away.
+    delay_ms: AtomicU64,
+    /// Arrival order of the commands across all stores (`record_into`), with this store's name.
+    log: Mutex<Option<(String, CommandLog)>>,
 }
 
 impl Default for Store {
@@ -132,6 +139,8 @@ impl Default for Store {
         Self {
             keys: Mutex::default(),
             acks: AtomicI64::new(1),
+            delay_ms: AtomicU64::new(0),
+            log: Mutex::default(),
         }
     }
 }
@@ -167,10 +176,34 @@ impl Store {
         self.acks.store(n, Ordering::SeqCst);
     }
 
+    fn set_delay(&self, ms: u64) {
+        self.delay_ms.store(ms, Ordering::SeqCst);
+    }
+
+    /// Append "<name> <COMMAND> [flag]" to `log` when a command arrives (before any delay).
+    fn record_into(&self, name: &str, log: CommandLog) {
+        *self.log.lock().unwrap() = Some((name.to_string(), log));
+    }
+
     async fn serve(self: Arc<Self>, sock: TcpStream) {
         let (r, mut w) = sock.into_split();
         let mut r = BufReader::new(r);
         while let Some(args) = read_command(&mut r).await {
+            let delay = self.delay_ms.load(Ordering::SeqCst);
+            let cmd = args.first().map(|c| c.to_ascii_uppercase());
+            if let Some((name, log)) = self.log.lock().unwrap().as_ref() {
+                let flag = args
+                    .iter()
+                    .skip(3)
+                    .map(|a| a.to_ascii_uppercase())
+                    .find(|a| a == "NX" || a == "XX")
+                    .unwrap_or_default();
+                let entry = format!("{name} {} {flag}", cmd.clone().unwrap_or_default());
+                log.lock().unwrap().push(entry.trim_end().to_string());
+            }
+            if delay > 0 && matches!(cmd.as_deref(), Some("SET" | "WAIT")) {
+                tokio::time::sleep(Duration::from_millis(delay)).await;
+            }
             if w.write_all(self.answer(&args).as_bytes()).await.is_err() {
                 return;
             }
@@ -453,6 +486,80 @@ async fn read_origin_confirms_at_the_standby_store_while_the_hub_resyncs() {
     })
     .await;
     assert!(w.hub.has(&key(net, &write)));
+}
+
+/// The standby store's `SET NX` runs concurrently with the hub's `SET NX` and replica wait, not
+/// after them, and every path uses its answer instead of asking again. Checked by the order in
+/// which the stores receive the commands, not by wall-clock time.
+#[tokio::test]
+async fn read_origin_asks_the_standby_store_concurrently_with_the_hub() {
+    let net = "testnet-hub-fb-concurrent";
+    let w = world(net, true).await;
+    let log = Arc::new(Mutex::new(Vec::new()));
+    w.hub.record_into("hub", log.clone());
+    w.standby.record_into("standby", log.clone());
+    // The hub answers slowly: its `SET NX` reply takes 100 ms, so a standby `SET NX` sent only
+    // after it would arrive after the hub's `WAIT`.
+    w.hub.set_delay(100);
+    let taken = |log: &CommandLog| std::mem::take(&mut *log.lock().unwrap());
+    let position = |log: &[String], entry: &str| {
+        log.iter()
+            .position(|e| e == entry)
+            .unwrap_or_else(|| panic!("{entry} not sent: {log:?}"))
+    };
+
+    let write = request("concurrent check");
+    assert!(admit(&w.read_origin, &write, RouteClass::Write)
+        .await
+        .unwrap());
+    let sent = taken(&log);
+    assert!(
+        position(&sent, "standby SET NX") < position(&sent, "hub WAIT"),
+        "the standby check waited for the hub: {sent:?}"
+    );
+    assert_eq!(
+        sent.iter().filter(|e| *e == "standby SET NX").count(),
+        1,
+        "asked once: {sent:?}"
+    );
+    assert!(w.hub.has(&key(net, &write)) && w.standby.has(&key(net, &write)));
+    assert_eq!(
+        fallback(net, "hub_window", "accepted") + fallback(net, "hub_check", "accepted"),
+        1.0
+    );
+
+    // Held only by the standby store: refused, although the hub took it as new.
+    let elsewhere = request("concurrent, only at the standby store");
+    w.standby.put(&key(net, &elsewhere));
+    assert!(!admit(&w.read_origin, &elsewhere, RouteClass::Write)
+        .await
+        .unwrap());
+    // Held only by the hub: refused; the standby store now holds it as well.
+    let at_hub = request("concurrent, only at the hub");
+    w.hub.put(&key(net, &at_hub));
+    assert!(!admit(&w.read_origin, &at_hub, RouteClass::Write)
+        .await
+        .unwrap());
+    assert!(w.standby.has(&key(net, &at_hub)));
+    taken(&log);
+
+    // The hub resyncs: the short-acknowledgement path takes the concurrent answer as its own
+    // (asking again would find its own nonce and refuse) and confirms it there with `WAIT`.
+    w.hub.set_delay(0);
+    w.hub.set_acks(0);
+    let resync = request("concurrent, hub resync");
+    assert!(admit(&w.read_origin, &resync, RouteClass::Write)
+        .await
+        .unwrap());
+    let sent = taken(&log);
+    assert_eq!(
+        sent.iter().filter(|e| *e == "standby SET NX").count(),
+        1,
+        "asked once: {sent:?}"
+    );
+    assert!(sent.iter().any(|e| e == "standby WAIT"), "{sent:?}");
+    assert_eq!(fallback(net, "hub_short_ack", "accepted"), 1.0);
+    assert!(w.standby.has(&key(net, &resync)));
 }
 
 #[tokio::test]

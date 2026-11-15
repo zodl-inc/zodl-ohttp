@@ -2398,7 +2398,13 @@ async fn gateway_handler(
             &backend,
             route,
         );
-        health::record_duration(&network, "ohttp", &backend, &rpc, start.elapsed().as_secs_f64());
+        health::record_duration(
+            &network,
+            "ohttp",
+            &backend,
+            &rpc,
+            start.elapsed().as_secs_f64(),
+        );
     };
 
     if inner_request.path == block_cache::GET_BLOCK_RANGE_PATH {
