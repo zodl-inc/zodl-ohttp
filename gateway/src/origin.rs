@@ -89,6 +89,15 @@
 //!   deployment whose `BACKENDS` aliases have read-only routes lists them itself, together with
 //!   the `lwd=` entry (a set value replaces the default). The effective list is logged at
 //!   startup.
+//! - `REPLAY_ONE_SIDED_WRITE_ROUTES` (default empty): the WRITE routes that may run on the verdict
+//!   of one store alone, same syntax as `REPLAY_READ_ROUTES`. Every other WRITE runs only once
+//!   both the store that decides it and the second store it is configured to consult took its
+//!   nonce as new (`write_fallback.rs`, "Partition tolerance"); a path that would admit it on one
+//!   store's verdict (an unreachable peer tolerated by `REPLAY_PEER_FAIL_CLOSED[_WRITES]=0`, an
+//!   unreachable fallback store in the check of every WRITE, the unavailable fallback) fails it
+//!   closed instead. List only routes whose upstream refuses a second copy of the same request
+//!   by itself (lightwalletd `SendTransaction`: the chain rejects a transaction it already has):
+//!   one network partition between two stores can run such a request once at each side.
 
 use std::collections::BTreeMap;
 use std::env;
@@ -211,6 +220,19 @@ impl ReadRoutes {
         if spec.is_empty() {
             return Self::parse(&default_read_routes_spec());
         }
+        Self::parse_named("REPLAY_READ_ROUTES", spec)
+    }
+
+    /// Parse a route list of the same syntax for the variable `name`. Empty = no route.
+    pub fn parse_list(name: &str, spec: &str) -> anyhow::Result<Self> {
+        let spec = spec.trim();
+        if spec.is_empty() {
+            return Ok(Self::default());
+        }
+        Self::parse_named(name, spec)
+    }
+
+    fn parse_named(name: &str, spec: &str) -> anyhow::Result<Self> {
         let mut rules: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
         for entry in spec.split(';') {
             let entry = entry.trim();
@@ -218,11 +240,11 @@ impl ReadRoutes {
                 continue;
             }
             let Some((authority, policies)) = entry.split_once('=') else {
-                anyhow::bail!("Malformed REPLAY_READ_ROUTES entry (missing '='): {entry}");
+                anyhow::bail!("Malformed {name} entry (missing '='): {entry}");
             };
             let authority = authority.trim().to_ascii_lowercase();
             if authority.is_empty() {
-                anyhow::bail!("Malformed REPLAY_READ_ROUTES: missing authority in '{entry}'");
+                anyhow::bail!("Malformed {name}: missing authority in '{entry}'");
             }
             let mut list = Vec::new();
             for policy in policies.split(',') {
@@ -232,7 +254,7 @@ impl ReadRoutes {
                 }
                 let Some((method, path)) = policy.split_once(' ') else {
                     anyhow::bail!(
-                        "Malformed REPLAY_READ_ROUTES: '{policy}' must be 'METHOD /path' (entry: '{entry}')"
+                        "Malformed {name}: '{policy}' must be 'METHOD /path' (entry: '{entry}')"
                     );
                 };
                 let method = method.trim().to_ascii_uppercase();
@@ -242,25 +264,21 @@ impl ReadRoutes {
                     "GET" | "POST" | "PUT" | "DELETE" | "HEAD" | "OPTIONS" | "PATCH" | "*"
                 ) {
                     anyhow::bail!(
-                        "Invalid REPLAY_READ_ROUTES method '{method}' in '{policy}': must be GET/POST/PUT/DELETE/HEAD/OPTIONS/PATCH/*"
+                        "Invalid {name} method '{method}' in '{policy}': must be GET/POST/PUT/DELETE/HEAD/OPTIONS/PATCH/*"
                     );
                 }
                 if !path.starts_with('/') {
-                    anyhow::bail!(
-                        "Invalid REPLAY_READ_ROUTES path '{path}' in '{policy}': must start with /"
-                    );
+                    anyhow::bail!("Invalid {name} path '{path}' in '{policy}': must start with /");
                 }
                 list.push((method, path));
             }
             if list.is_empty() {
-                anyhow::bail!(
-                    "Malformed REPLAY_READ_ROUTES: no routes for authority '{authority}'"
-                );
+                anyhow::bail!("Malformed {name}: no routes for authority '{authority}'");
             }
             rules.entry(authority).or_default().extend(list);
         }
         if rules.is_empty() {
-            anyhow::bail!("Malformed REPLAY_READ_ROUTES: no entries");
+            anyhow::bail!("Malformed {name}: no entries");
         }
         Ok(Self { rules })
     }
@@ -274,8 +292,17 @@ impl ReadRoutes {
     /// (`proxy::resolve_backend(..).is_lwd()`), which the pseudo-authority `lwd` matches.
     /// Unknown authority, method or path => `Write` (fail-safe).
     pub fn classify(&self, is_lwd: bool, authority: &str, method: &str, path: &str) -> RouteClass {
+        if self.matches(is_lwd, authority, method, path) {
+            RouteClass::Read
+        } else {
+            RouteClass::Write
+        }
+    }
+
+    /// Whether the inner request is on the list (an unknown authority, method or path is not).
+    pub fn matches(&self, is_lwd: bool, authority: &str, method: &str, path: &str) -> bool {
         if path.is_empty() || !path.starts_with('/') {
-            return RouteClass::Write;
+            return false;
         }
         let host = authority
             .to_ascii_lowercase()
@@ -296,11 +323,11 @@ impl ReadRoutes {
                     continue;
                 }
                 if path_matches(pattern, path) {
-                    return RouteClass::Read;
+                    return true;
                 }
             }
         }
-        RouteClass::Write
+        false
     }
 
     pub fn len(&self) -> usize {
@@ -360,6 +387,8 @@ pub struct OriginSettings {
     pub replay_read_routes: ReadRoutes,
     /// `REPLAY_UNAVAILABLE_FALLBACK` (default false).
     pub replay_unavailable_fallback: bool,
+    /// `REPLAY_ONE_SIDED_WRITE_ROUTES` (default empty: no WRITE runs on one store's verdict).
+    pub replay_one_sided_write_routes: ReadRoutes,
 }
 
 /// The raw environment of `OriginSettings::parse_env`, so tests can build it without `set_var`.
@@ -377,6 +406,7 @@ pub struct RawOriginEnv<'a> {
     pub async_failures_before_strict: Option<&'a str>,
     pub read_routes: Option<&'a str>,
     pub unavailable_fallback: Option<&'a str>,
+    pub one_sided_write_routes: Option<&'a str>,
 }
 
 impl OriginSettings {
@@ -395,6 +425,7 @@ impl OriginSettings {
             async_failures_before_strict,
             read_routes,
             unavailable_fallback,
+            one_sided_write_routes,
         ) = (
             get("ORIGIN_ID"),
             get("REPLAY_PEER_URLS"),
@@ -408,6 +439,7 @@ impl OriginSettings {
             get("REPLAY_ASYNC_FAILURES_BEFORE_STRICT"),
             get("REPLAY_READ_ROUTES"),
             get("REPLAY_UNAVAILABLE_FALLBACK"),
+            get("REPLAY_ONE_SIDED_WRITE_ROUTES"),
         );
         Self::parse_env(RawOriginEnv {
             origin_id: origin_id.as_deref(),
@@ -422,6 +454,7 @@ impl OriginSettings {
             async_failures_before_strict: async_failures_before_strict.as_deref(),
             read_routes: read_routes.as_deref(),
             unavailable_fallback: unavailable_fallback.as_deref(),
+            one_sided_write_routes: one_sided_write_routes.as_deref(),
         })
     }
 
@@ -490,6 +523,10 @@ impl OriginSettings {
         let replay_peer_mode = ReplayPeerMode::parse(raw.peer_mode.unwrap_or_default())?;
         let replay_read_routes = ReadRoutes::parse(raw.read_routes.unwrap_or_default())?;
         let replay_unavailable_fallback = parse_flag(raw.unavailable_fallback, false);
+        let replay_one_sided_write_routes = ReadRoutes::parse_list(
+            "REPLAY_ONE_SIDED_WRITE_ROUTES",
+            raw.one_sided_write_routes.unwrap_or_default(),
+        )?;
 
         Ok(Self {
             origin_id,
@@ -504,6 +541,7 @@ impl OriginSettings {
             replay_async_failures_before_strict,
             replay_read_routes,
             replay_unavailable_fallback,
+            replay_one_sided_write_routes,
         })
     }
 
@@ -1023,6 +1061,44 @@ pay.example=GET /*";
     }
 
     #[test]
+    fn one_sided_write_routes_default_to_none() {
+        let s = OriginSettings::parse(None, None, None, None).unwrap();
+        assert!(s.replay_one_sided_write_routes.is_empty());
+        assert!(!s.replay_one_sided_write_routes.matches(
+            true,
+            "lwd.example.com",
+            "POST",
+            &lwd("SendTransaction")
+        ));
+
+        let s = OriginSettings::parse_env(RawOriginEnv {
+            one_sided_write_routes: Some(
+                "lwd=POST /cash.z.wallet.sdk.rpc.CompactTxStreamer/SendTransaction",
+            ),
+            ..RawOriginEnv::default()
+        })
+        .unwrap();
+        let r = &s.replay_one_sided_write_routes;
+        assert_eq!(r.len(), 1);
+        assert!(r.matches(true, "lwd.example.com", "POST", &lwd("SendTransaction")));
+        // Only the gateway's own lightwalletd: the pseudo-authority never matches a third party.
+        assert!(!r.matches(false, "api.example.com", "POST", &lwd("SendTransaction")));
+        assert!(!r.matches(true, "lwd.example.com", "POST", &lwd("GetBlock")));
+        // The READ allowlist keeps its own default.
+        assert_eq!(s.replay_read_routes, ReadRoutes::default_list());
+
+        let err = OriginSettings::parse_env(RawOriginEnv {
+            one_sided_write_routes: Some("api.example.com=SEND /x"),
+            ..RawOriginEnv::default()
+        })
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("REPLAY_ONE_SIDED_WRITE_ROUTES"),
+            "{err}"
+        );
+    }
+
+    #[test]
     fn secret_fingerprint_is_short_and_domain_separated() {
         let a = secret_fingerprint("relay-secret", b"s3cret");
         assert_eq!(a.len(), 8);
@@ -1046,6 +1122,7 @@ pay.example=GET /*";
                 replay_async_failures_before_strict: DEFAULT_REPLAY_ASYNC_FAILURES_BEFORE_STRICT,
                 replay_read_routes: ReadRoutes::default_list(),
                 replay_unavailable_fallback: false,
+                replay_one_sided_write_routes: ReadRoutes::default(),
             }
         }
     }

@@ -1259,7 +1259,7 @@ lazy_static::lazy_static! {
     )
     .unwrap();
     static ref OHTTP_REPLAY_WRITE_FALLBACK_TOTAL: IntCounterVec = IntCounterVec::new(
-        Opts::new("ohttp_replay_write_fallback_total", "WRITE replay nonces decided at a second store (write_fallback.rs). path: short_ack (the local replica acknowledgement was short, e.g. a resync after a failover of the local store), local_unavailable (the local store gave no verdict, REPLAY_UNAVAILABLE_FALLBACK), hub_short_ack / hub_unavailable (the same for the hub of an async-reads origin), window / hub_window (the check of every WRITE at the fallback store, inside the window after startup or a disruption), check / hub_check (the same check outside the window). result: accepted (the WRITE runs), replay (a store held the nonce: refused), unavailable (a store did not answer: the fallbacks fail closed, the checks keep the first verdict), unacknowledged (the store's own replicas did not confirm: fail-closed), overflow (write-back queue full: fail-closed)"),
+        Opts::new("ohttp_replay_write_fallback_total", "WRITE replay nonces decided at a second store (write_fallback.rs). path: short_ack (the local replica acknowledgement was short, e.g. a resync after a failover of the local store), local_unavailable (the local store gave no verdict, REPLAY_UNAVAILABLE_FALLBACK), hub_short_ack / hub_unavailable (the same for the hub of an async-reads origin), window / hub_window (the check of every WRITE at the fallback store, inside the window after startup or a disruption), check / hub_check (the same check outside the window), peer_tolerated (a peer that gave no verdict was tolerated: REPLAY_PEER_FAIL_CLOSED=0 in sync mode, REPLAY_PEER_FAIL_CLOSED_WRITES=0). result: accepted (the WRITE runs), replay (a store held the nonce: refused), unavailable (a store did not answer: the fallbacks fail closed, the checks keep the first verdict of a route on REPLAY_ONE_SIDED_WRITE_ROUTES), unacknowledged (the store's own replicas did not confirm: fail-closed), overflow (write-back queue full: fail-closed), one_sided_refused (only one store took the nonce and the route is not on REPLAY_ONE_SIDED_WRITE_ROUTES: fail-closed)"),
         &["network", "path", "result"]
     )
     .unwrap();
@@ -1427,7 +1427,8 @@ pub fn record_lwd_pool_reset(network: &str) {
 }
 
 /// `path`: short_ack | local_unavailable | hub_short_ack | hub_unavailable | window | check |
-/// hub_window | hub_check; `result`: accepted | replay | unavailable | unacknowledged | overflow.
+/// hub_window | hub_check | peer_tolerated; `result`: accepted | replay | unavailable |
+/// unacknowledged | overflow | one_sided_refused.
 pub fn record_replay_write_fallback(network: &str, path: &str, result: &str) {
     OHTTP_REPLAY_WRITE_FALLBACK_TOTAL
         .with_label_values(&[network, path, result])

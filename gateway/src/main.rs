@@ -229,6 +229,12 @@ async fn main() -> anyhow::Result<()> {
             routes = %origin.replay_read_routes,
             "Replay READ routes (REPLAY_READ_ROUTES): these inner routes replicate their nonce asynchronously in async-reads mode; everything else is a WRITE (synchronous)"
         );
+        info!(
+            network = %config.network,
+            one_sided_routes = origin.replay_one_sided_write_routes.len(),
+            routes = %origin.replay_one_sided_write_routes,
+            "WRITE routes that may run on one replay store's verdict (REPLAY_ONE_SIDED_WRITE_ROUTES); every other WRITE fails closed unless both stores take its nonce"
+        );
     }
 
     // An OHTTP gateway answers only for its own host names (ZIP "Gateway behaviour" rule 5).
@@ -502,6 +508,14 @@ async fn main() -> anyhow::Result<()> {
                     warn!(
                         network = %network,
                         "WRITEs admitted here reach the fallback store only asynchronously: REPLAY_UNAVAILABLE_FALLBACK on another origin of these stores could admit one of them again"
+                    );
+                }
+                // failover mode without the peer fallback: no second store is consulted on the
+                // request path, so the both-stores rule has nothing to apply to here.
+                if c.replay_peer_mode() == origin::ReplayPeerMode::Failover && !checks {
+                    warn!(
+                        network = %network,
+                        "failover mode without the peer fallback (REPLAY_WRITE_WAIT_REPLICAS and REPLAY_PEER_WAIT_REPLICAS >= 1 needed): every WRITE is decided by the local store alone and its nonce only replicated to the peers afterwards; REPLAY_ONE_SIDED_WRITE_ROUTES does not apply, and a request sent to this origin and to a peer at once can run at both (active/passive only)"
                     );
                 }
                 let local_fallback = c.decides_at_peers_without_local();
@@ -1698,8 +1712,18 @@ async fn gateway_handler(
     // The local store gave no verdict and the unavailable fallback decides at the peer stores
     // once the inner request is classified (GW-REPLAY-INNER below).
     let mut local_unavailable = false;
+    // What the local check saw; every later admission step needs it (`cache::LocalCheck`).
+    let mut local_check: Option<cache::LocalCheck> = None;
     if let Some(ref cache) = state.cache {
-        match cache.check_replay_detailed(&body_hash).await {
+        let checked = cache.check_replay_detailed(&body_hash).await;
+        let verdict = checked
+            .as_ref()
+            .map(|c| c.verdict())
+            .map_err(|e| e.to_string());
+        if let Ok(c) = checked {
+            local_check = Some(c);
+        }
+        match verdict {
             Ok(cache::LocalReplayCheck::Replay) => {
                 warn!(
                     request_id = %request_id,
@@ -1721,7 +1745,7 @@ async fn gateway_handler(
                 )
                     .into_response();
             }
-            Ok(cache::LocalReplayCheck::New) => {
+            Ok(cache::LocalReplayCheck::New | cache::LocalReplayCheck::NewPeersUnconfirmed) => {
                 // Not a replay, continue
             }
             Ok(cache::LocalReplayCheck::Unavailable) => local_unavailable = true,
@@ -1962,36 +1986,37 @@ async fn gateway_handler(
     // and a nonce a peer holds is refused like a local replay.
     // Returns inner responses so the relay learns nothing about side effects.
     // With `local_unavailable` the peer stores decide alone (admit_without_local).
-    let mut peer_check = cache::PeerCheck::default();
-    if let Some(cache) = state
-        .cache
-        .as_ref()
-        .filter(|c| local_unavailable || c.replay_peers().is_some())
-    {
+    // REPLAY_ONE_SIDED_WRITE_ROUTES: whether this WRITE may run on one store's verdict
+    // (write_fallback.rs, "Partition tolerance"). Not on the list: both stores must take it.
+    let write_policy =
+        cache::WritePolicy::for_route(state.origin.replay_one_sided_write_routes.matches(
+            cache_allowed,
+            &inner_request.authority,
+            &inner_request.method,
+            &inner_request.path,
+        ));
+    // The peer stage runs for every request the local check admitted (without peers it decides
+    // nothing): its result, bound to this request's nonce, is what the later steps require.
+    let mut peer_check: Option<cache::PeerCheck> = None;
+    if let (Some(cache), Some(local)) = (state.cache.as_ref(), local_check.as_ref()) {
         let class = state.origin.replay_read_routes.classify(
             cache_allowed,
             &inner_request.authority,
             &inner_request.method,
             &inner_request.path,
         );
-        health::record_replay_class(&network, class.as_str());
+        if local_unavailable || cache.replay_peers().is_some() {
+            health::record_replay_class(&network, class.as_str());
+        }
         let verdict = if local_unavailable {
-            match cache.admit_without_local(&body_hash, class).await {
-                Ok(cache::WriteAdmission::Run) => Ok(cache::PeerCheck {
-                    local_bypassed: true,
-                    ..cache::PeerCheck::default()
-                }),
-                Ok(cache::WriteAdmission::Replay) => Ok(cache::PeerCheck {
-                    replay: true,
-                    ..cache::PeerCheck::default()
-                }),
-                Err(e) => Err(e),
-            }
+            cache.admit_without_local(local, class, write_policy).await
         } else {
-            cache.replicate_nonce_checked(&body_hash, class).await
+            cache
+                .replicate_nonce_checked(local, class, write_policy)
+                .await
         };
         match verdict {
-            Ok(check) if !check.replay => peer_check = check,
+            Ok(check) if !check.replay() => peer_check = Some(check),
             Ok(_) => {
                 warn!(
                     request_id = %request_id,
@@ -2080,11 +2105,11 @@ async fn gateway_handler(
     // READs skip this: a replayed READ changes no state. Decided before
     // anything is executed or served from the cache; fail-closed like the replay check.
     // Returns inner responses so the relay learns nothing about side effects.
-    if let Some(cache) = state
-        .cache
-        .as_ref()
-        .filter(|c| c.write_wait().is_some() && !peer_check.local_bypassed)
-    {
+    if let (Some(cache), Some(local), Some(check)) = (
+        state.cache.as_ref().filter(|c| c.write_wait().is_some()),
+        local_check.as_ref(),
+        peer_check.as_ref().filter(|c| !c.local_bypassed()),
+    ) {
         let class = state.origin.replay_read_routes.classify(
             cache_allowed,
             &inner_request.authority,
@@ -2092,7 +2117,7 @@ async fn gateway_handler(
             &inner_request.path,
         );
         if class == origin::RouteClass::Write {
-            let result = cache.confirm_write_nonce(&body_hash, peer_check).await;
+            let result = cache.confirm_write_nonce(local, check).await;
             if let Ok(cache::WriteAdmission::Replay) = result {
                 warn!(
                     request_id = %request_id,
@@ -2175,11 +2200,14 @@ async fn gateway_handler(
     // GW-REPLAY-STANDBY: The WRITE passed every replay check and is about to run: its nonce goes
     // to the standby origins' stores too (REPLAY_STANDBY_URLS), asynchronously. A standby that
     // later takes over the WRITEs (shared store unreachable) then refuses a replay of it.
-    if let Some(cache) = state
-        .cache
-        .as_ref()
-        .filter(|c| c.standby_replicator().is_some())
-    {
+    if let (Some(cache), Some(local), Some(check)) = (
+        state
+            .cache
+            .as_ref()
+            .filter(|c| c.standby_replicator().is_some()),
+        local_check.as_ref(),
+        peer_check.take(),
+    ) {
         let class = state.origin.replay_read_routes.classify(
             cache_allowed,
             &inner_request.authority,
@@ -2187,8 +2215,8 @@ async fn gateway_handler(
             &inner_request.path,
         );
         // Already confirmed there synchronously (the hub fallback or window).
-        if class == origin::RouteClass::Write && !peer_check.at_standby {
-            cache.replicate_write_to_standby(&body_hash);
+        if class == origin::RouteClass::Write {
+            cache.replicate_write_to_standby(local, check);
         }
     }
 
@@ -2662,4 +2690,772 @@ async fn gateway_handler(
     let body = chunked_stream::ensure_grpc_status(grpc_status != "-", resp.body);
     let body = log.stream("lwd_stream", &grpc_status, body);
     responder.stream(resp.status, resp.headers, body)
+}
+
+/// The replay admission of `gateway_handler` end to end: a sealed request in, the decrypted inner
+/// response out, the upstream calls counted at mocks. In each mode one replay peer never answers,
+/// so every WRITE could only run on one store's verdict: with `SendTransaction` on
+/// `REPLAY_ONE_SIDED_WRITE_ROUTES`, a third-party WRITE is refused before anything goes upstream
+/// and `SendTransaction` passes the replay checks to its upstream.
+#[cfg(test)]
+mod handler_tests {
+    use super::*;
+    use ::hpke::{
+        aead::AesGcm128, kdf::HkdfSha256, kem::X25519HkdfSha256, Deserializable, Kem, OpModeS,
+        Serializable,
+    };
+    use aes_gcm::aead::{Aead, KeyInit, Payload};
+    use rand_core::TryRngCore;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    const SEND_TX: &str = "/cash.z.wallet.sdk.rpc.CompactTxStreamer/SendTransaction";
+    /// A port nothing listens on: the replay peer never connects.
+    const NO_PEER: &str = "redis://127.0.0.1:1";
+
+    /// Whether the store at `url` answers. In CI a missing store fails the test instead of
+    /// skipping it.
+    async fn store_up(url: &str, what: &str) -> bool {
+        let ok = match redis::Client::open(url) {
+            Ok(c) => redis::aio::ConnectionManager::new(c).await.is_ok(),
+            Err(_) => false,
+        };
+        if !ok && (std::env::var("CI").is_ok() || std::env::var("OHTTP_FAILOVER_REDIS").is_ok()) {
+            panic!("{what} not reachable in CI");
+        }
+        ok
+    }
+
+    /// An upstream mock: the third-party one counts the requests it gets and answers `200 ok`,
+    /// the lightwalletd one counts the connections and closes them.
+    async fn upstream(answer: bool) -> (String, Arc<AtomicUsize>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        // BACKENDS takes a URL, LWD_ADDR a bare `host:port`.
+        let addr = listener.local_addr().unwrap();
+        let url = if answer {
+            format!("http://{addr}")
+        } else {
+            addr.to_string()
+        };
+        let hits = Arc::new(AtomicUsize::new(0));
+        let h = hits.clone();
+        tokio::spawn(async move {
+            while let Ok((sock, _)) = listener.accept().await {
+                if !answer {
+                    // lightwalletd: counted per connection, closed at once.
+                    h.fetch_add(1, Ordering::SeqCst);
+                    continue;
+                }
+                // The third-party backend (h2c or HTTP/1.1): counted per request, `200 ok`.
+                let h = h.clone();
+                tokio::spawn(async move {
+                    let service = hyper::service::service_fn(
+                        move |_req: hyper::Request<hyper::body::Incoming>| {
+                            h.fetch_add(1, Ordering::SeqCst);
+                            async move {
+                                Ok::<_, std::convert::Infallible>(hyper::Response::new(
+                                    http_body_util::Full::new(bytes::Bytes::from_static(b"ok")),
+                                ))
+                            }
+                        },
+                    );
+                    let _ = hyper_util::server::conn::auto::Builder::new(
+                        hyper_util::rt::TokioExecutor::new(),
+                    )
+                    .serve_connection(hyper_util::rt::TokioIo::new(sock), service)
+                    .await;
+                });
+            }
+        });
+        (url, hits)
+    }
+
+    fn config(network: &str, security: &str, lwd: &str, third_party: &str) -> Config {
+        let mut backends = HashMap::new();
+        backends.insert("api.example.com".to_string(), third_party.to_string());
+        Config {
+            port: 0,
+            lwd_addr: lwd.to_string(),
+            mode: "ohttp".to_string(),
+            relay_secrets: vec![],
+            hpke_private_key: None,
+            hpke_key_id: 1,
+            hpke_keys: vec![(1, format!("{:064x}", 0xa1u64))],
+            lwd_timeout_secs: 2,
+            long_poll_max_initial_silence_secs: 25,
+            long_poll_idle_secs: 3,
+            sse_keepalive_secs: 20,
+            redis_url: "redis://127.0.0.1:6379/0".to_string(),
+            redis_security_url: security.to_string(),
+            backends,
+            backend_headers: HashMap::new(),
+            backends_policy: HashMap::new(),
+            backends_policy_default_allow: true,
+            max_upstream_response_bytes: 64 * 1024 * 1024,
+            max_inflight_upstream: 256,
+            max_inflight_per_backend: 64,
+            max_inflight_lwd: 128,
+            max_inflight_lwd_heavy: 32,
+            lwd_heavy_block_range: 100,
+            max_block_range: 1000,
+            lwd_permit_wait_ms: 2000,
+            lwd_permit_max_waiters: 0,
+            redis_op_timeout_ms: 1000,
+            max_cache_get_concurrency: 64,
+            max_large_response_concurrency: 2,
+            large_response_threshold: 8 * 1024 * 1024,
+            allow_unauthenticated_relay: true,
+            proxy_allow_suffixes: vec![],
+            network: network.to_string(),
+            log_outer_header_names: false,
+            gateway_hosts: vec!["lwd.example.com".to_string()],
+            configs_signing_seed: None,
+            chunk_size: 16384,
+            chunk_flush_ms: 50,
+            flexa_publishable_key: None,
+            flexa_alias: None,
+            near_alias: None,
+            relay_secret_on_key_config: config::RelaySecretOnKeyConfig::Off,
+        }
+    }
+
+    fn varint(n: usize, out: &mut Vec<u8>) {
+        if n < 64 {
+            out.push(n as u8);
+        } else {
+            out.extend_from_slice(&[0x40 | (n >> 8) as u8, n as u8]);
+        }
+    }
+
+    fn read_varint(bytes: &[u8]) -> (u64, &[u8]) {
+        let first = bytes[0];
+        let len = 1usize << (first >> 6);
+        let mut value = u64::from(first & 0x3f);
+        for b in &bytes[1..len] {
+            value = (value << 8) | u64::from(*b);
+        }
+        (value, &bytes[len..])
+    }
+
+    /// A known-length Binary HTTP request (RFC 9292 §3.1).
+    fn bhttp(method: &str, authority: &str, path: &str, ct: &str, body: &[u8]) -> Vec<u8> {
+        let mut m = vec![0];
+        for field in [method, "https", authority, path] {
+            varint(field.len(), &mut m);
+            m.extend_from_slice(field.as_bytes());
+        }
+        let mut header = Vec::new();
+        varint("content-type".len(), &mut header);
+        header.extend_from_slice(b"content-type");
+        varint(ct.len(), &mut header);
+        header.extend_from_slice(ct.as_bytes());
+        varint(header.len(), &mut m);
+        m.extend_from_slice(&header);
+        varint(body.len(), &mut m);
+        m.extend_from_slice(body);
+        m.push(0);
+        m
+    }
+
+    /// The client half of a chunked OHTTP request (one chunk, then the final one), and what
+    /// opening the response needs (`enc`, the exported secret).
+    fn seal(key_config: &[u8], request: &[u8]) -> (Vec<u8>, Vec<u8>, [u8; hpke::N_K]) {
+        let key_id = key_config[2];
+        let mut hdr = vec![key_id];
+        hdr.extend_from_slice(&0x0020u16.to_be_bytes());
+        hdr.extend_from_slice(&0x0001u16.to_be_bytes());
+        hdr.extend_from_slice(&0x0001u16.to_be_bytes());
+        let mut info = b"message/bhttp chunked request".to_vec();
+        info.push(0);
+        info.extend_from_slice(&hdr);
+        let pk = <X25519HkdfSha256 as Kem>::PublicKey::from_bytes(&key_config[5..37]).unwrap();
+        let mut rng = rand_core::OsRng.unwrap_err();
+        let (enc, mut ctx) = ::hpke::setup_sender::<AesGcm128, HkdfSha256, X25519HkdfSha256, _>(
+            &OpModeS::Base,
+            &pk,
+            &info,
+            &mut rng,
+        )
+        .unwrap();
+        let sealed = ctx.seal(request, b"").unwrap();
+        let fin = ctx.seal(&[], b"final").unwrap();
+        let mut out = hdr;
+        out.extend_from_slice(&enc.to_bytes());
+        varint(sealed.len(), &mut out);
+        out.extend_from_slice(&sealed);
+        out.push(0);
+        out.extend_from_slice(&fin);
+        let mut secret = [0u8; hpke::N_K];
+        ctx.export(b"message/bhttp chunked response", &mut secret)
+            .unwrap();
+        (out, enc.to_bytes().to_vec(), secret)
+    }
+
+    /// The inner response: (status, every header and trailer as `name: value`, body).
+    fn open(enc: &[u8], secret: &[u8], wire: &[u8]) -> (u64, String, Vec<u8>) {
+        let (response_nonce, mut rest) = wire.split_at(hpke::N_N.max(hpke::N_K));
+        let mut salt = enc.to_vec();
+        salt.extend_from_slice(response_nonce);
+        let hkdf = hkdf::Hkdf::<sha2::Sha256>::new(Some(&salt), secret);
+        let mut key = [0u8; hpke::N_K];
+        hkdf.expand(b"key", &mut key).unwrap();
+        let mut base_nonce = [0u8; hpke::N_N];
+        hkdf.expand(b"nonce", &mut base_nonce).unwrap();
+        let cipher = aes_gcm::Aes128Gcm::new_from_slice(&key).unwrap();
+        let mut plain = Vec::new();
+        let mut counter = 0u64;
+        loop {
+            let (len, tail) = read_varint(rest);
+            let (sealed, aad, tail) = if len == 0 {
+                (tail, &b"final"[..], &[][..])
+            } else {
+                let (s, t) = tail.split_at(len as usize);
+                (s, &b""[..], t)
+            };
+            let chunk = cipher
+                .decrypt(
+                    aes_gcm::Nonce::from_slice(&chunked_stream::chunk_nonce(&base_nonce, counter)),
+                    Payload { msg: sealed, aad },
+                )
+                .expect("the response opens under the client's keys");
+            counter += 1;
+            plain.extend_from_slice(&chunk);
+            rest = tail;
+            if len == 0 {
+                break;
+            }
+        }
+        // Binary HTTP response, known-length (1) or indeterminate-length (3) framing.
+        let (framing, rest) = read_varint(&plain);
+        let (status, mut rest) = read_varint(rest);
+        let mut fields = String::new();
+        let mut body = Vec::new();
+        fn field_section(rest: &mut &[u8], sized: bool, out: &mut String) {
+            let all: &[u8] = *rest;
+            let mut section: &[u8] = if sized {
+                let (n, tail) = read_varint(all);
+                let (sec, tail) = tail.split_at(n as usize);
+                *rest = tail;
+                sec
+            } else {
+                all
+            };
+            loop {
+                if section.is_empty() {
+                    break;
+                }
+                let (n, tail) = read_varint(section);
+                if n == 0 {
+                    section = tail;
+                    break;
+                }
+                let (name, tail) = tail.split_at(n as usize);
+                let (v, tail) = read_varint(tail);
+                let (value, tail) = tail.split_at(v as usize);
+                out.push_str(&format!(
+                    "{}: {}\n",
+                    String::from_utf8_lossy(name),
+                    String::from_utf8_lossy(value)
+                ));
+                section = tail;
+            }
+            if !sized {
+                *rest = section;
+            }
+        }
+        if framing == 1 {
+            field_section(&mut rest, true, &mut fields);
+            let (n, tail) = read_varint(rest);
+            body.extend_from_slice(&tail[..n as usize]);
+            rest = &tail[n as usize..];
+            if !rest.is_empty() {
+                field_section(&mut rest, true, &mut fields);
+            }
+        } else {
+            field_section(&mut rest, false, &mut fields);
+            loop {
+                let (n, tail) = read_varint(rest);
+                rest = tail;
+                if n == 0 {
+                    break;
+                }
+                body.extend_from_slice(&rest[..n as usize]);
+                rest = &rest[n as usize..];
+            }
+            field_section(&mut rest, false, &mut fields);
+        }
+        (status, fields, body)
+    }
+
+    fn counter(name: &str, labels: &[(&str, &str)]) -> f64 {
+        health::REGISTRY
+            .gather()
+            .iter()
+            .filter(|f| f.get_name() == name)
+            .flat_map(|f| f.get_metric().iter())
+            .filter(|m| {
+                labels.iter().all(|(n, v)| {
+                    m.get_label()
+                        .iter()
+                        .any(|l| l.get_name() == *n && l.get_value() == *v)
+                })
+            })
+            .map(|m| m.get_counter().get_value())
+            .sum()
+    }
+
+    /// Send `inner` through `gateway_handler`; the decrypted inner response.
+    async fn post(state: &Arc<AppState>, inner: Vec<u8>) -> (u64, String, Vec<u8>) {
+        let key_config = state.hpke.as_ref().unwrap().public_config();
+        let (sealed, enc, secret) = seal(&key_config, &inner);
+        let (status, wire) = post_sealed(state, sealed).await;
+        assert_eq!(status, StatusCode::OK, "an encapsulated answer");
+        open(&enc, &secret, &wire)
+    }
+
+    /// Send one encapsulated request as it is (the same bytes twice = a replay).
+    async fn post_sealed(state: &Arc<AppState>, sealed: Vec<u8>) -> (StatusCode, Vec<u8>) {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            "content-type",
+            ohttp_chunked::CONTENT_TYPE_CHUNKED_REQ.parse().unwrap(),
+        );
+        let response = gateway_handler(
+            State(state.clone()),
+            axum::extract::ConnectInfo("127.0.0.1:9".parse().unwrap()),
+            headers,
+            Body::from(sealed),
+        )
+        .await
+        .into_response();
+        let status = response.status();
+        let wire = axum::body::to_bytes(response.into_body(), 1 << 24)
+            .await
+            .unwrap();
+        (status, wire.to_vec())
+    }
+
+    fn app_state(
+        config: Config,
+        origin: origin::OriginSettings,
+        cache: cache::ResponseCache,
+    ) -> Arc<AppState> {
+        let lwd_semaphore = Arc::new(Semaphore::new(config.max_inflight_lwd));
+        let sources = Arc::new(lwd::LwdSources::new(config.clone(), lwd_semaphore.clone()));
+        let network = config.network.clone();
+        Arc::new(AppState {
+            hpke: Some(hpke::KeyState::new(&config).unwrap()),
+            origin,
+            cache: Some(cache),
+            block_cache: None,
+            subtree_cache: None,
+            follower: None,
+            mempool: Arc::new(mempool::MempoolFanout::new(
+                sources.clone(),
+                network.clone(),
+            )),
+            flights: Arc::new(singleflight::RpcFlights::new(sources.clone(), network)),
+            sources,
+            signing: None,
+            global_semaphore: Arc::new(Semaphore::new(config.max_inflight_upstream)),
+            per_backend_semaphores: Arc::new(RwLock::new(HashMap::new())),
+            lwd_semaphore,
+            cache_get_semaphore: Arc::new(Semaphore::new(config.max_cache_get_concurrency)),
+            large_response_semaphore: Arc::new(Semaphore::new(
+                config.max_large_response_concurrency,
+            )),
+            third_party: third_party_cache::ThirdParty::from_env(None, None).unwrap(),
+            request_semaphore: Arc::new(Semaphore::new(16)),
+            config,
+        })
+    }
+
+    /// The two requests of every case: the third-party WRITE refused (path `refused_path`,
+    /// nothing upstream), `SendTransaction` admitted to its upstream.
+    async fn check_case(
+        state: Arc<AppState>,
+        refused_path: &[&str],
+        third_party: Arc<AtomicUsize>,
+        lwd: Arc<AtomicUsize>,
+    ) {
+        let network = state.config.network.clone();
+        let refused = |paths: &[&str]| -> f64 {
+            paths
+                .iter()
+                .map(|p| {
+                    counter(
+                        "ohttp_replay_write_fallback_total",
+                        &[
+                            ("network", &network),
+                            ("path", p),
+                            ("result", "one_sided_refused"),
+                        ],
+                    )
+                })
+                .sum()
+        };
+        let nonce = Uuid::new_v4().to_string();
+        let (status, _, body) = post(
+            &state,
+            bhttp(
+                "POST",
+                "api.example.com",
+                "/v1/send",
+                "application/json",
+                format!("{{\"n\":\"{nonce}\"}}").as_bytes(),
+            ),
+        )
+        .await;
+        // Refused in the peer stage ("replay protection unavailable") or, in failover mode, by
+        // the check of every WRITE after the local replica wait ("not acknowledged").
+        let text = String::from_utf8_lossy(&body);
+        assert_eq!(status, 503, "{text}");
+        assert!(text.starts_with("Service unavailable"), "{text}");
+        assert_eq!(refused(refused_path), 1.0);
+        assert_eq!(
+            third_party.load(Ordering::SeqCst),
+            0,
+            "nothing sent upstream"
+        );
+
+        // RawTransaction { data: <bytes> } in one gRPC frame.
+        let mut raw = vec![0x0a, nonce.len() as u8];
+        raw.extend_from_slice(nonce.as_bytes());
+        let mut grpc = vec![0u8, 0, 0, 0, raw.len() as u8];
+        grpc.extend_from_slice(&raw);
+        let (_, fields, body) = post(
+            &state,
+            bhttp(
+                "POST",
+                "lwd.example.com",
+                SEND_TX,
+                "application/grpc",
+                &grpc,
+            ),
+        )
+        .await;
+        let answer = format!("{fields}{}", String::from_utf8_lossy(&body));
+        assert!(
+            !answer.contains("replay protection unavailable"),
+            "SendTransaction passed the replay checks: {answer}"
+        );
+        assert_eq!(refused(refused_path), 1.0);
+        assert!(
+            lwd.load(Ordering::SeqCst) >= 1,
+            "SendTransaction went upstream: {answer}"
+        );
+    }
+
+    fn origin_env(mode: &str, fail_closed: bool) -> origin::OriginSettings {
+        let routes = format!("lwd=POST {SEND_TX}");
+        origin::OriginSettings::parse_env(origin::RawOriginEnv {
+            peer_urls: Some(NO_PEER),
+            peer_mode: Some(mode),
+            peer_fail_closed: Some("0"),
+            peer_fail_closed_writes: Some(if fail_closed { "1" } else { "0" }),
+            one_sided_write_routes: Some(&routes),
+            ..origin::RawOriginEnv::default()
+        })
+        .unwrap()
+    }
+
+    /// The peer replica wait of the handler tests that need one (REPLAY_PEER_WAIT_REPLICAS=1,
+    /// the default), set here instead of read from the process environment.
+    const PEER_WAIT: Option<cache::WriteWaitConfig> = Some(cache::WriteWaitConfig {
+        replicas: 1,
+        timeout_ms: 100,
+    });
+
+    async fn base_cache(
+        config: &Config,
+        origin: &origin::OriginSettings,
+        peer_wait: Option<cache::WriteWaitConfig>,
+    ) -> cache::ResponseCache {
+        let peers = cache::ReplayPeers::connect(
+            &origin.replay_peer_urls,
+            config.network.clone(),
+            origin.replay_peer_timeout_ms,
+            origin.replay_peer_fail_closed,
+        )
+        .await
+        .with_mode(
+            origin.replay_peer_mode,
+            origin.replay_peer_fail_closed_writes,
+        )
+        .with_wait(peer_wait);
+        cache::ResponseCache::connect(
+            &config.redis_url,
+            Some(&config.redis_security_url),
+            config.network.clone(),
+            "lwd.example.com".to_string(),
+            config.redis_op_timeout_ms,
+            config.max_block_range,
+            &config.backends_policy,
+        )
+        .await
+        .unwrap()
+        .with_replay_peers(peers)
+    }
+
+    /// `sync` mode, `REPLAY_PEER_FAIL_CLOSED=0`.
+    #[tokio::test]
+    async fn sync_mode_refuses_an_unlisted_one_sided_write_and_admits_a_listed_one() {
+        if !store_up("redis://127.0.0.1:6379", "the test Redis").await {
+            return;
+        }
+        health::init_metrics();
+        let (tp, tp_hits) = upstream(true).await;
+        let (lwd, lwd_hits) = upstream(false).await;
+        let config = config(
+            "testnet-handler-sync",
+            "redis://127.0.0.1:6379/1",
+            &lwd,
+            &tp,
+        );
+        let origin = origin_env("sync", true);
+        let cache = base_cache(&config, &origin, PEER_WAIT).await;
+        check_case(
+            app_state(config, origin, cache),
+            &["peer_tolerated"],
+            tp_hits,
+            lwd_hits,
+        )
+        .await;
+    }
+
+    /// `async-reads`, `REPLAY_PEER_FAIL_CLOSED_WRITES=0` (an unreachable hub tolerated).
+    #[tokio::test]
+    async fn async_reads_refuses_an_unlisted_one_sided_write_and_admits_a_listed_one() {
+        if !store_up("redis://127.0.0.1:6379", "the test Redis").await {
+            return;
+        }
+        health::init_metrics();
+        let (tp, tp_hits) = upstream(true).await;
+        let (lwd, lwd_hits) = upstream(false).await;
+        let config = config(
+            "testnet-handler-async",
+            "redis://127.0.0.1:6379/2",
+            &lwd,
+            &tp,
+        );
+        let origin = origin_env("async-reads", false);
+        let cache = base_cache(&config, &origin, PEER_WAIT).await;
+        check_case(
+            app_state(config, origin, cache),
+            &["peer_tolerated"],
+            tp_hits,
+            lwd_hits,
+        )
+        .await;
+    }
+
+    /// A fake peer store: `SET ... NX` / `XX` on a set of keys, `WAIT` acknowledged by one
+    /// replica, anything else `+OK` (`PING`: `+PONG`). Whole RESP commands, pipelines included.
+    async fn acking_store() -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let keys = Arc::new(std::sync::Mutex::new(
+            std::collections::HashSet::<String>::new(),
+        ));
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let keys = keys.clone();
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut chunk = vec![0u8; 8192];
+                    loop {
+                        let Ok(n) = sock.read(&mut chunk).await else {
+                            return;
+                        };
+                        if n == 0 {
+                            return;
+                        }
+                        buf.extend_from_slice(&chunk[..n]);
+                        while let Some((args, used)) = resp_command(&buf) {
+                            buf.drain(..used);
+                            let name = args.first().map(|a| a.to_ascii_uppercase());
+                            let has =
+                                |w: &str| args.iter().skip(3).any(|a| a.eq_ignore_ascii_case(w));
+                            let reply: Vec<u8> = match name.as_deref() {
+                                Some("PING") => b"+PONG\r\n".to_vec(),
+                                Some("WAIT") => b":1\r\n".to_vec(),
+                                Some("ROLE") => b"*3\r\n$6\r\nmaster\r\n:0\r\n*0\r\n".to_vec(),
+                                Some("SET") if args.len() > 1 => {
+                                    let mut k = keys.lock().unwrap();
+                                    let key = args[1].clone();
+                                    if has("NX") {
+                                        if k.insert(key) {
+                                            b"+OK\r\n".to_vec()
+                                        } else {
+                                            b"$-1\r\n".to_vec()
+                                        }
+                                    } else if has("XX") && !k.contains(&key) {
+                                        b"$-1\r\n".to_vec()
+                                    } else {
+                                        k.insert(key);
+                                        b"+OK\r\n".to_vec()
+                                    }
+                                }
+                                Some("GET") => b"$-1\r\n".to_vec(),
+                                _ => b"+OK\r\n".to_vec(),
+                            };
+                            if sock.write_all(&reply).await.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        format!("redis://{addr}")
+    }
+
+    /// One whole RESP command (an array of bulk strings) at the start of `buf`, and its length.
+    fn resp_command(buf: &[u8]) -> Option<(Vec<String>, usize)> {
+        let line = |at: usize| -> Option<(&[u8], usize)> {
+            let p = buf.get(at..)?.windows(2).position(|w| w == b"\r\n")?;
+            Some((&buf[at..at + p], at + p + 2))
+        };
+        let (head, mut at) = line(0)?;
+        let count: usize = std::str::from_utf8(head.get(1..)?).ok()?.parse().ok()?;
+        let mut args = Vec::with_capacity(count);
+        for _ in 0..count {
+            let (len, next) = line(at)?;
+            let len: usize = std::str::from_utf8(len.get(1..)?).ok()?.parse().ok()?;
+            let end = next + len;
+            if buf.len() < end + 2 {
+                return None;
+            }
+            args.push(String::from_utf8_lossy(&buf[next..end]).into_owned());
+            at = end + 2;
+        }
+        Some((args, at))
+    }
+
+    /// `sync` mode with a reachable peer and REPLAY_PEER_FAIL_CLOSED=1: a WRITE that is not on
+    /// REPLAY_ONE_SIDED_WRITE_ROUTES runs once both stores took its nonce (and, with the peer
+    /// replica wait, the peer acknowledged it), and reaches its upstream exactly once (the same
+    /// encapsulated request again is a replay).
+    async fn strict_write_runs_once(
+        network: &str,
+        security: &str,
+        peer: &str,
+        peer_wait: Option<cache::WriteWaitConfig>,
+    ) {
+        health::init_metrics();
+        let (tp, tp_hits) = upstream(true).await;
+        let (lwd, _) = upstream(false).await;
+        let config = config(network, security, &lwd, &tp);
+        let origin = origin::OriginSettings::parse_env(origin::RawOriginEnv {
+            peer_urls: Some(peer),
+            // The test Redis is shared with tests that slow it down on purpose.
+            peer_timeout_ms: Some("5000"),
+            peer_mode: Some("sync"),
+            peer_fail_closed: Some("1"),
+            peer_fail_closed_writes: Some("1"),
+            ..origin::RawOriginEnv::default()
+        })
+        .unwrap();
+        let cache = base_cache(&config, &origin, peer_wait).await;
+        if peer_wait.is_some() {
+            // The peer WAIT connections open in the background.
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        let state = app_state(config, origin, cache);
+        let nonce = Uuid::new_v4().to_string();
+        let inner = bhttp(
+            "POST",
+            "api.example.com",
+            "/v1/send",
+            "application/json",
+            format!("{{\"n\":\"{nonce}\"}}").as_bytes(),
+        );
+        let key_config = state.hpke.as_ref().unwrap().public_config();
+        let (sealed, enc, secret) = seal(&key_config, &inner);
+        let (status, wire) = post_sealed(&state, sealed.clone()).await;
+        assert_eq!(status, StatusCode::OK);
+        let (inner_status, _, body) = open(&enc, &secret, &wire);
+        assert_eq!(inner_status, 200, "{}", String::from_utf8_lossy(&body));
+        assert_eq!(body, b"ok");
+        assert_eq!(tp_hits.load(Ordering::SeqCst), 1);
+        let (status, _) = post_sealed(&state, sealed).await;
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "the same request again is a replay"
+        );
+        assert_eq!(
+            tp_hits.load(Ordering::SeqCst),
+            1,
+            "upstream reached exactly once"
+        );
+    }
+
+    /// Without the peer replica wait (the test Redis has no replica).
+    #[tokio::test]
+    async fn a_strict_write_with_both_stores_up_runs_once() {
+        if !store_up("redis://127.0.0.1:6379", "the test Redis").await {
+            return;
+        }
+        strict_write_runs_once(
+            "testnet-handler-strict",
+            "redis://127.0.0.1:6379/4",
+            "redis://127.0.0.1:6379/5",
+            None,
+        )
+        .await;
+    }
+
+    /// With the peer replica wait on, against a peer store that acknowledges.
+    #[tokio::test]
+    async fn a_strict_write_acknowledged_at_the_peer_runs_once() {
+        if !store_up("redis://127.0.0.1:6379", "the test Redis").await {
+            return;
+        }
+        let peer = acking_store().await;
+        strict_write_runs_once(
+            "testnet-handler-strict-wait",
+            "redis://127.0.0.1:6379/6",
+            &peer,
+            PEER_WAIT,
+        )
+        .await;
+    }
+
+    /// `failover` mode with the peer fallback (the local replica wait on a primary with a
+    /// replica: tests/failover/docker-compose.yml, `OHTTP_FAILOVER_REDIS=1`): the check of every
+    /// WRITE at the peer gets no answer.
+    #[tokio::test]
+    async fn failover_mode_refuses_an_unlisted_one_sided_write_and_admits_a_listed_one() {
+        if std::env::var("OHTTP_FAILOVER_REDIS").is_err() {
+            eprintln!(
+                "skipped: set OHTTP_FAILOVER_REDIS=1 with tests/failover/docker-compose.yml up"
+            );
+            return;
+        }
+        let security = "redis://127.0.0.1:6391/3";
+        assert!(store_up(security, "the failover test primary").await);
+        assert!(store_up("redis://127.0.0.1:6379", "the test Redis").await);
+        health::init_metrics();
+        let (tp, tp_hits) = upstream(true).await;
+        let (lwd, lwd_hits) = upstream(false).await;
+        let config = config("testnet-handler-failover", security, &lwd, &tp);
+        let origin = origin_env("failover", true);
+        let wait = cache::WriteWaitConfig {
+            replicas: 1,
+            timeout_ms: 500,
+        };
+        let cache = base_cache(&config, &origin, PEER_WAIT)
+            .await
+            .with_write_wait(security, wait)
+            .await
+            .unwrap();
+        check_case(
+            app_state(config, origin, cache),
+            &["check", "window"],
+            tp_hits,
+            lwd_hits,
+        )
+        .await;
+    }
 }

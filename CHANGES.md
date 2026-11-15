@@ -62,6 +62,37 @@ keeps its own log in [client/CHANGELOG.md](client/CHANGELOG.md).
 
 ### Gateway
 
+- `confirm_write_nonce` refuses a `PeerCheck` whose peer stage found a replay (fail-closed),
+  whatever the caller did with that verdict.
+- **New `REPLAY_ONE_SIDED_WRITE_ROUTES` (default empty); WRITEs that are not on it no longer run
+  on the verdict of one replay store.** One network partition between the region of the store
+  that decides a WRITE and the region of the second store could run the same request twice: a
+  `failover`-mode gateway that got no answer from its peer kept its local verdict, and an
+  `async-reads` origin on the other side that got no answer from the hub ran it on its own store
+  (`REPLAY_PEER_FAIL_CLOSED_WRITES=0`, or `REPLAY_UNAVAILABLE_FALLBACK` with its own replicas),
+  so the same sealed bytes delivered to both ran at both. The earlier statement that this needed
+  two failures at once was wrong. A WRITE now runs only once both the deciding store and the
+  second store the gateway consults synchronously took its nonce as new; every path that would
+  admit it on one store's verdict fails it closed (inner 503 / grpc-status 14), counted as
+  `ohttp_replay_write_fallback_total{result="one_sided_refused"}`: a peer tolerated by
+  `REPLAY_PEER_FAIL_CLOSED=0` (`sync` mode) or `REPLAY_PEER_FAIL_CLOSED_WRITES=0` (new
+  `path="peer_tolerated"`), a fallback store that did not answer the check of every WRITE
+  (`check`, `window`, `hub_check`, `hub_window`), and the unavailable fallback
+  (`local_unavailable`, `hub_unavailable`). The short-acknowledgement paths are unchanged (both
+  stores took the nonce there). Routes on the new list (same syntax as `REPLAY_READ_ROUTES`) keep
+  every one-sided path; list only routes whose upstream refuses a second copy of the same request,
+  e.g. `lwd=POST /cash.z.wallet.sdk.rpc.CompactTxStreamer/SendTransaction`. **Upgrading:** a
+  deployment that relies on WRITEs running while a peer, the hub or a standby store is
+  unreachable must list those routes before it upgrades, or those WRITEs fail closed during such
+  an outage. READs are not affected. A `failover`-mode origin without the peer fallback consults
+  no second store and is unchanged.
+  A both-stores WRITE whose peer or standby `SET NX` timed out (on the check and the fallbacks)
+  asks that store once more, at once (`SET key value NX GET` with the request's own value):
+  **needs Redis >= 7.0 at those stores; older ones answer an error and the WRITE fails closed as
+  before.** The admission API takes the local check's result (`LocalCheck`, from
+  `check_replay_detailed`) in every later step, and the peer stage's result (`PeerCheck`, no
+  public constructor, bound to the request's nonce) in the steps after it, so what a check saw
+  can neither be dropped nor forged nor used for another request.
 - A read origin with a confirming standby store (`REPLAY_STANDBY_URLS` with
   `REPLAY_PEER_WAIT_REPLICAS`) asks the standby store about a WRITE's nonce (`SET NX`) at the same
   time as the hub (`SET NX`, then the hub's replica wait), instead of after the hub answered. A

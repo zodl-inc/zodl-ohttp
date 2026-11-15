@@ -35,7 +35,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use ohttp_gateway::cache::{
-    LocalReplayCheck, PeerCheck, ReplayPeers, ResponseCache, WriteAdmission, WriteWaitConfig,
+    LocalReplayCheck, ReplayPeers, ResponseCache, WriteAdmission, WritePolicy, WriteWaitConfig,
     REPLAY_TTL_SECS,
 };
 use ohttp_gateway::origin::{ReplayPeerMode, RouteClass};
@@ -139,18 +139,25 @@ async fn pump(
 
 struct Store {
     keys: Mutex<HashSet<String>>,
+    /// The values of the keys SET with one (GET answers them).
+    values: Mutex<HashMap<String, String>>,
     /// The answer to WAIT: the replicas that acknowledged (0 = a primary whose replicas resync).
     acks: AtomicI64,
     /// WAIT gets no answer at all (the node stops answering after the SET).
     wait_hangs: AtomicBool,
+    /// The next `SET ... NX` is applied and answered only after this many ms (a reply that
+    /// arrives after the client gave up).
+    set_nx_delay_once_ms: AtomicU64,
 }
 
 impl Default for Store {
     fn default() -> Self {
         Self {
             keys: Mutex::default(),
+            values: Mutex::default(),
             acks: AtomicI64::new(1),
             wait_hangs: AtomicBool::new(false),
+            set_nx_delay_once_ms: AtomicU64::new(0),
         }
     }
 }
@@ -185,6 +192,14 @@ impl Store {
         let (r, mut w) = sock.into_split();
         let mut r = BufReader::new(r);
         while let Some(args) = read_command(&mut r).await {
+            if args.first().is_some_and(|c| c.eq_ignore_ascii_case("SET"))
+                && args.iter().skip(3).any(|a| a.eq_ignore_ascii_case("NX"))
+            {
+                let ms = self.set_nx_delay_once_ms.swap(0, Ordering::SeqCst);
+                if ms > 0 {
+                    tokio::time::sleep(Duration::from_millis(ms)).await;
+                }
+            }
             if args.first().is_some_and(|c| c.eq_ignore_ascii_case("WAIT"))
                 && self.wait_hangs.load(Ordering::SeqCst)
             {
@@ -210,10 +225,32 @@ impl Store {
                 let flags: Vec<String> = args[3..].iter().map(|a| a.to_ascii_uppercase()).collect();
                 let mut keys = self.keys.lock().unwrap();
                 let exists = keys.contains(&key);
+                // SET ... NX GET: the old value when the key exists (nothing set), else set + nil.
+                if flags.iter().any(|f| f == "NX") && flags.iter().any(|f| f == "GET") {
+                    if exists {
+                        let v = self
+                            .values
+                            .lock()
+                            .unwrap()
+                            .get(&key)
+                            .cloned()
+                            .unwrap_or_else(|| "1".to_string());
+                        return format!("${}\r\n{v}\r\n", v.len());
+                    }
+                    self.values
+                        .lock()
+                        .unwrap()
+                        .insert(key.clone(), args[2].clone());
+                    keys.insert(key);
+                    return "$-1\r\n".into();
+                }
                 if (flags.iter().any(|f| f == "NX") && exists)
                     || (flags.iter().any(|f| f == "XX") && !exists)
                 {
                     return "$-1\r\n".into();
+                }
+                if let Some(v) = args.get(2) {
+                    self.values.lock().unwrap().insert(key.clone(), v.clone());
                 }
                 keys.insert(key);
                 "+OK\r\n".into()
@@ -426,37 +463,44 @@ async fn spoke_origin_with(
         .with_unavailable_fallback(on)
 }
 
-/// The gateway's admission (main.rs). Ok(true) = runs; Ok(false) = replay; Err = fail-closed.
+/// The gateway's admission (main.rs) of a WRITE route on `REPLAY_ONE_SIDED_WRITE_ROUTES` (and
+/// of READs). Ok(true) = runs; Ok(false) = replay; Err = fail-closed.
 async fn admit(c: &ResponseCache, hash: &[u8], class: RouteClass) -> anyhow::Result<bool> {
+    admit_with(c, hash, class, WritePolicy::ONE_SIDED).await
+}
+
+/// `admit` for a WRITE route that is not on `REPLAY_ONE_SIDED_WRITE_ROUTES` (the default).
+async fn admit_strict(c: &ResponseCache, hash: &[u8], class: RouteClass) -> anyhow::Result<bool> {
+    admit_with(c, hash, class, WritePolicy::BOTH_STORES).await
+}
+
+async fn admit_with(
+    c: &ResponseCache,
+    hash: &[u8],
+    class: RouteClass,
+    policy: WritePolicy,
+) -> anyhow::Result<bool> {
     let local = c.check_replay_detailed(hash).await?;
-    if local == LocalReplayCheck::Replay {
+    if local.verdict() == LocalReplayCheck::Replay {
         return Ok(false);
     }
-    let check = if local == LocalReplayCheck::Unavailable {
-        match c.admit_without_local(hash, class).await? {
-            WriteAdmission::Run => PeerCheck {
-                local_bypassed: true,
-                ..PeerCheck::default()
-            },
-            WriteAdmission::Replay => return Ok(false),
-        }
-    } else if c.replay_peers().is_some() {
-        c.replicate_nonce_checked(hash, class).await?
+    let check = if local.verdict() == LocalReplayCheck::Unavailable {
+        c.admit_without_local(&local, class, policy).await?
     } else {
-        PeerCheck::default()
+        c.replicate_nonce_checked(&local, class, policy).await?
     };
-    if check.replay {
+    if check.replay() {
         return Ok(false);
     }
     if class == RouteClass::Write
         && c.write_wait().is_some()
-        && !check.local_bypassed
-        && c.confirm_write_nonce(hash, check).await? == WriteAdmission::Replay
+        && !check.local_bypassed()
+        && c.confirm_write_nonce(&local, &check).await? == WriteAdmission::Replay
     {
         return Ok(false);
     }
-    if class == RouteClass::Write && !check.at_standby {
-        c.replicate_write_to_standby(hash);
+    if class == RouteClass::Write {
+        c.replicate_write_to_standby(&local, check);
     }
     Ok(true)
 }
@@ -1225,4 +1269,325 @@ async fn spoke_writes_back_a_nonce_its_refusing_store_never_saw() {
     )
     .await;
     assert!(w.f.has(&key(net, &write)));
+}
+
+// ---------------------------------------------------------------------------------------------
+// Partition tolerance (`REPLAY_ONE_SIDED_WRITE_ROUTES`, write_fallback.rs): a WRITE that is not
+// on the list runs only once both the store that decides it and the second store it consults
+// took its nonce as new. Every path that would admit it on one store's verdict fails it closed
+// (`result="one_sided_refused"`); a WRITE on the list (`admit`) keeps those paths.
+
+fn refused(network: &str, path: &str) -> f64 {
+    fallback(network, path, "one_sided_refused")
+}
+
+/// A `sync`-mode origin: its own store `own`, the peer `peer` asked on every request, an
+/// unreachable peer tolerated (`REPLAY_PEER_FAIL_CLOSED=0`).
+async fn sync_origin(network: &str, own: &str, peer: &str) -> ResponseCache {
+    ohttp_gateway::health::init_metrics();
+    let c = ResponseCache::connect(
+        &cache_store().await,
+        Some(own),
+        network.to_string(),
+        "lwd.example.com:9067".to_string(),
+        250,
+        100,
+        &HashMap::new(),
+    )
+    .await
+    .unwrap();
+    let peers = ReplayPeers::connect(&[peer.to_string()], network.to_string(), 250, false)
+        .await
+        .with_mode(ReplayPeerMode::Sync, true)
+        .with_wait(Some(WAIT));
+    c.with_replay_peers(peers)
+}
+
+/// The inter-region partition: the link between the hub region (store `P`, a `failover`-mode
+/// gateway whose peer is `F`) and the standby region (store `F`, the standby origin, which
+/// tolerates an unreachable hub) is cut; each side still reaches its own store. The same sealed
+/// bytes delivered to both sides (a relay that sends a request twice) used to run at both.
+#[tokio::test]
+async fn an_inter_region_partition_never_runs_a_write_twice_unless_its_route_is_one_sided() {
+    let net = "testnet-onesided-partition";
+    let w = World::new().await;
+    let (_hp, hp_url) = w.to_p().await;
+    let (hf_link, hf_url) = w.to_f().await;
+    let hub_side = primary_origin(net, &hp_url, &hf_url, true).await;
+    let (sp_link, sp_url) = w.to_p().await;
+    let (_sf, sf_url) = w.to_f().await;
+    let standby_side = spoke_origin_with(net, &sf_url, &sp_url, true, false).await;
+
+    // Both stores reachable: a WRITE that is not on the list runs on either side.
+    for (side, c) in [("hub", &hub_side), ("standby", &standby_side)] {
+        let write = request(&format!("both stores reachable at the {side} side"));
+        assert!(
+            admit_strict(c, &write, RouteClass::Write).await.unwrap(),
+            "{side}"
+        );
+        assert!(w.p.has(&key(net, &write)) && w.f.has(&key(net, &write)));
+        assert!(!admit_strict(c, &write, RouteClass::Write).await.unwrap());
+    }
+
+    hf_link.lose();
+    sp_link.lose();
+    for i in 0..5 {
+        let write = request(&format!("partition, not on the list {i}"));
+        let (a, b) = tokio::join!(
+            admit_strict(&hub_side, &write, RouteClass::Write),
+            admit_strict(&standby_side, &write, RouteClass::Write),
+        );
+        assert!(
+            a.is_err(),
+            "hub side ran it on its own store's verdict: {a:?}"
+        );
+        assert!(
+            b.is_err(),
+            "standby side ran it on its own store's verdict: {b:?}"
+        );
+    }
+    assert!(refused(net, "check") + refused(net, "window") >= 5.0);
+    assert!(refused(net, "peer_tolerated") >= 5.0);
+
+    // A route on the list keeps the one-sided paths: each side runs it once. Its upstream must
+    // refuse the second copy (a transaction the chain already has).
+    let write = request("partition, on the list");
+    let (a, b) = tokio::join!(
+        admit(&hub_side, &write, RouteClass::Write),
+        admit(&standby_side, &write, RouteClass::Write),
+    );
+    assert!(a.unwrap() && b.unwrap());
+    // READs are not affected.
+    for c in [&hub_side, &standby_side] {
+        assert!(
+            admit_strict(c, &request("partition, read"), RouteClass::Read)
+                .await
+                .unwrap()
+        );
+    }
+}
+
+#[tokio::test]
+async fn primary_origin_refuses_a_strict_write_its_peer_did_not_confirm() {
+    let net = "testnet-onesided-primary-peer";
+    let w = World::new().await;
+    let (_p, p_url) = w.to_p().await;
+    let (f_link, f_url) = w.to_f().await;
+    // Also without the unavailable fallback: the check of every WRITE at the peer keeps the
+    // local verdict when the peer does not answer.
+    let primary = primary_origin(net, &p_url, &f_url, false).await;
+    primary.write_fallback().unwrap().close_window();
+    f_link.hang();
+    let write = request("peer silent, not on the list");
+    assert!(admit_strict(&primary, &write, RouteClass::Write)
+        .await
+        .is_err());
+    assert_eq!(refused(net, "check"), 1.0);
+    assert_eq!(fallback(net, "check", "unavailable"), 0.0);
+    let write = request("peer silent, on the list");
+    assert!(admit(&primary, &write, RouteClass::Write).await.unwrap());
+    assert_eq!(fallback(net, "check", "unavailable"), 1.0);
+}
+
+#[tokio::test]
+async fn primary_origin_refuses_a_strict_write_while_its_own_store_is_unreachable() {
+    let net = "testnet-onesided-primary-own";
+    let w = World::new().await;
+    let (p_link, p_url) = w.to_p().await;
+    let (_f, f_url) = w.to_f().await;
+    let primary = primary_origin(net, &p_url, &f_url, true).await;
+    p_link.hang();
+    let write = request("own store silent, not on the list");
+    assert!(admit_strict(&primary, &write, RouteClass::Write)
+        .await
+        .is_err());
+    assert_eq!(refused(net, "local_unavailable"), 1.0);
+    assert!(
+        !w.f.has(&key(net, &write)),
+        "refused before the peer is asked"
+    );
+    // READs and listed WRITEs are still decided at the peer.
+    assert!(admit_strict(
+        &primary,
+        &request("own store silent, read"),
+        RouteClass::Read
+    )
+    .await
+    .unwrap());
+    let listed = request("own store silent, on the list");
+    assert!(admit(&primary, &listed, RouteClass::Write).await.unwrap());
+    assert_eq!(fallback(net, "local_unavailable", "accepted"), 1.0);
+}
+
+/// The short-acknowledgement paths ask both stores (the local `SET NX` took the nonce, the peer
+/// took and acknowledged it): they stay open to every WRITE.
+#[tokio::test]
+async fn a_short_local_acknowledgement_still_admits_a_strict_write() {
+    let net = "testnet-onesided-short";
+    let w = World::new().await;
+    let (_p, p_url) = w.to_p().await;
+    let (_f, f_url) = w.to_f().await;
+    let primary = primary_origin(net, &p_url, &f_url, true).await;
+    w.p.set_acks(0);
+    let write = request("local resync, not on the list");
+    assert!(admit_strict(&primary, &write, RouteClass::Write)
+        .await
+        .unwrap());
+    assert!(w.p.has(&key(net, &write)) && w.f.has(&key(net, &write)));
+    assert_eq!(fallback(net, "short_ack", "accepted"), 1.0);
+    w.p.set_acks(1);
+}
+
+#[tokio::test]
+async fn read_origin_refuses_a_strict_write_without_the_hub() {
+    let net = "testnet-onesided-reader-hub";
+    let w = World::new().await;
+    let (rp_link, rp_url) = w.to_p().await;
+    let (_rf, rf_url) = w.to_f().await;
+    let reader = read_origin(net, &rp_url, &rf_url, true).await;
+    rp_link.lose();
+    let write = request("hub unreachable, not on the list");
+    assert!(admit_strict(&reader, &write, RouteClass::Write)
+        .await
+        .is_err());
+    assert_eq!(refused(net, "hub_unavailable"), 1.0);
+    assert_eq!(fallback(net, "hub_unavailable", "accepted"), 0.0);
+    let write = request("hub unreachable, on the list");
+    assert!(admit(&reader, &write, RouteClass::Write).await.unwrap());
+    assert_eq!(fallback(net, "hub_unavailable", "accepted"), 1.0);
+}
+
+#[tokio::test]
+async fn read_origin_refuses_a_strict_write_its_standby_store_did_not_confirm() {
+    let net = "testnet-onesided-reader-standby";
+    let w = World::new().await;
+    let (_rp, rp_url) = w.to_p().await;
+    let (rf_link, rf_url) = w.to_f().await;
+    let reader = read_origin(net, &rp_url, &rf_url, true).await;
+    let write = request("standby reachable, not on the list");
+    assert!(admit_strict(&reader, &write, RouteClass::Write)
+        .await
+        .unwrap());
+    rf_link.lose();
+    let write = request("standby unreachable, not on the list");
+    assert!(admit_strict(&reader, &write, RouteClass::Write)
+        .await
+        .is_err());
+    assert!(w.p.has(&key(net, &write)), "the hub took it");
+    assert_eq!(refused(net, "hub_check") + refused(net, "hub_window"), 1.0);
+    let write = request("standby unreachable, on the list");
+    assert!(admit(&reader, &write, RouteClass::Write).await.unwrap());
+    assert_eq!(
+        fallback(net, "hub_check", "unavailable") + fallback(net, "hub_window", "unavailable"),
+        1.0
+    );
+}
+
+#[tokio::test]
+async fn spoke_refuses_a_strict_write_without_the_hub() {
+    let net = "testnet-onesided-spoke-hub";
+    let w = World::new().await;
+    let (hub_link, hub_url) = w.to_p().await;
+    let (_own, own_url) = w.to_f().await;
+    // The unavailable fallback with the local replicas as target (the hub's verdict is
+    // replaced by the own replicas), and the standby origin's tolerance of an unreachable hub.
+    for (tolerant, path) in [(false, "hub_unavailable"), (true, "peer_tolerated")] {
+        let spoke = spoke_origin_with(net, &own_url, &hub_url, true, !tolerant).await;
+        hub_link.lose();
+        let write = request(&format!("hub unreachable, not on the list, {path}"));
+        assert!(
+            admit_strict(&spoke, &write, RouteClass::Write)
+                .await
+                .is_err(),
+            "{path}"
+        );
+        assert_eq!(refused(net, path), 1.0, "{path}");
+        let write = request(&format!("hub unreachable, on the list, {path}"));
+        assert!(
+            admit(&spoke, &write, RouteClass::Write).await.unwrap(),
+            "{path}"
+        );
+        hub_link.restore();
+    }
+}
+
+#[tokio::test]
+async fn spoke_refuses_a_strict_write_while_its_own_store_is_unreachable() {
+    let net = "testnet-onesided-spoke-own";
+    let w = World::new().await;
+    let (_hub, hub_url) = w.to_p().await;
+    let (own_link, own_url) = w.to_f().await;
+    let spoke = spoke_origin(net, &own_url, &hub_url, true).await;
+    own_link.hang();
+    let write = request("own store silent, not on the list");
+    assert!(admit_strict(&spoke, &write, RouteClass::Write)
+        .await
+        .is_err());
+    assert_eq!(refused(net, "local_unavailable"), 1.0);
+    assert!(!w.p.has(&key(net, &write)));
+    let write = request("own store silent, on the list");
+    assert!(admit(&spoke, &write, RouteClass::Write).await.unwrap());
+    assert!(w.p.has(&key(net, &write)));
+}
+
+#[tokio::test]
+async fn sync_mode_refuses_a_strict_write_a_peer_did_not_take() {
+    let net = "testnet-onesided-sync";
+    let w = World::new().await;
+    let (_own, own_url) = w.to_p().await;
+    let (peer_link, peer_url) = w.to_f().await;
+    let origin = sync_origin(net, &own_url, &peer_url).await;
+    let write = request("sync, peer reachable");
+    assert!(admit_strict(&origin, &write, RouteClass::Write)
+        .await
+        .unwrap());
+    assert!(w.f.has(&key(net, &write)));
+    peer_link.lose();
+    let write = request("sync, peer unreachable, not on the list");
+    assert!(admit_strict(&origin, &write, RouteClass::Write)
+        .await
+        .is_err());
+    assert_eq!(refused(net, "peer_tolerated"), 1.0);
+    let write = request("sync, peer unreachable, on the list");
+    assert!(admit(&origin, &write, RouteClass::Write).await.unwrap());
+    assert_eq!(fallback(net, "peer_tolerated", "accepted"), 1.0);
+    // A READ is tolerated as before (REPLAY_PEER_FAIL_CLOSED=0).
+    assert!(admit_strict(
+        &origin,
+        &request("sync, peer unreachable, read"),
+        RouteClass::Read
+    )
+    .await
+    .unwrap());
+}
+
+/// A WRITE that both stores must take, whose peer `SET NX` answer came after the budget: asked
+/// once more (`SET key value NX GET`), it runs when its own first `SET NX` landed and is
+/// refused when another request holds the nonce.
+#[tokio::test]
+async fn a_strict_write_retries_a_peer_set_nx_that_timed_out() {
+    let net = "testnet-onesided-retry";
+    let w = World::new().await;
+    let primary = primary_origin(net, &addr_url(w.p_addr), &addr_url(w.f_addr), false).await;
+    w.f.set_nx_delay_once_ms.store(400, Ordering::SeqCst);
+    let write = request("peer answers late");
+    assert!(admit_strict(&primary, &write, RouteClass::Write)
+        .await
+        .unwrap());
+    assert!(w.f.has(&key(net, &write)));
+    assert_eq!(
+        counter(
+            "ohttp_replay_peer_total",
+            &[("network", net), ("result", "timeout_retry")]
+        ),
+        1.0
+    );
+    assert_eq!(refused(net, "check") + refused(net, "window"), 0.0);
+    // Held at the peer by another request, and the first answer late: a replay.
+    let other = request("held at the peer, answer late");
+    w.f.put(&key(net, &other));
+    w.f.set_nx_delay_once_ms.store(400, Ordering::SeqCst);
+    assert!(!admit_strict(&primary, &other, RouteClass::Write)
+        .await
+        .unwrap());
 }

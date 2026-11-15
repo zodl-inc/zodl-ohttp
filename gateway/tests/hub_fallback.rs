@@ -35,7 +35,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use ohttp_gateway::cache::{
-    ReplayPeers, ResponseCache, WriteAdmission, WriteWaitConfig, REPLAY_TTL_SECS,
+    LocalReplayCheck, ReplayPeers, ResponseCache, WriteAdmission, WritePolicy, WriteWaitConfig,
+    REPLAY_TTL_SECS,
 };
 use ohttp_gateway::origin::{ReplayPeerMode, RouteClass};
 use ohttp_gateway::replication::ReplicationConfig;
@@ -339,21 +340,26 @@ async fn origin(
 
 /// The gateway's admission (main.rs). Ok(true) = runs; Ok(false) = replay; Err = fail-closed.
 async fn admit(c: &ResponseCache, hash: &[u8], class: RouteClass) -> anyhow::Result<bool> {
-    if c.check_replay(hash).await? {
-        return Ok(false);
+    let local = c.check_replay_detailed(hash).await?;
+    match local.verdict() {
+        LocalReplayCheck::Replay => return Ok(false),
+        LocalReplayCheck::Unavailable => anyhow::bail!("no verdict from the local store"),
+        _ => {}
     }
-    let check = c.replicate_nonce_checked(hash, class).await?;
-    if check.replay {
+    let check = c
+        .replicate_nonce_checked(&local, class, WritePolicy::ONE_SIDED)
+        .await?;
+    if check.replay() {
         return Ok(false);
     }
     if class == RouteClass::Write
         && c.write_wait().is_some()
-        && c.confirm_write_nonce(hash, check).await? == WriteAdmission::Replay
+        && c.confirm_write_nonce(&local, &check).await? == WriteAdmission::Replay
     {
         return Ok(false);
     }
-    if class == RouteClass::Write && !check.at_standby {
-        c.replicate_write_to_standby(hash);
+    if class == RouteClass::Write {
+        c.replicate_write_to_standby(&local, check);
     }
     Ok(true)
 }

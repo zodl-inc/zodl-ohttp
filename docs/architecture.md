@@ -185,23 +185,21 @@ or by the origin's own replica wait, and the nonce is written back to the hub.
 Every WRITE that the deciding store (the local store in `failover` mode, the hub in
 `async-reads`) admitted is also `SET NX` synchronously at the fallback store (the peers, or a read
 origin's standby stores), and a nonce held there is a replay; an unreachable fallback store keeps
-the first verdict. With `REPLAY_UNAVAILABLE_FALLBACK` a deciding store that gives no verdict at
+the first verdict only for a route on `REPLAY_ONE_SIDED_WRITE_ROUTES` (below) and fails any other
+WRITE closed. With `REPLAY_UNAVAILABLE_FALLBACK` a deciding store that gives no verdict at
 all (unreachable, a timeout, an error) is replaced by the fallback store, under the same rules:
 new and acknowledged there runs, held there is a replay, anything else fails closed, and a WRITE
-nonce is written back. A `failover`-mode gateway decides READs that way too (`SET NX` at the
+nonce is written back; again only READs and listed WRITE routes are decided by one store. A `failover`-mode gateway decides READs that way too (`SET NX` at the
 peers, not written back: a replayed READ changes nothing), after decapsulating the request to
 classify it. A request refused or failed closed after its nonce was stored stays refused for
 those exact bytes; a client seals every attempt afresh, so its retry is a new nonce.
 
 An `async-reads` origin whose own store is the fallback store (no standby stores, its own replica
 wait: the standby origin and its read spoke) does the same when its own store gives no verdict:
-the hub, which decides its WRITEs anyway, decides the request alone (READ: `SET NX`; WRITE: `SET
-NX` + the hub's `WAIT`), and a WRITE nonce is written back to the own store. That holds with
-`REPLAY_PEER_FAIL_CLOSED_WRITES=0` too (an unreachable hub is tolerated there, an unreachable own
-store is not). Every other origin keeps the hub's verdict while the fallback store is silent and
-asks both while it answers, so this adds no new way to admit a nonce twice: two admissions still
-need one gateway that reached only the hub and another that reached only the fallback store at
-the same time.
+the hub, which decides its WRITEs anyway, decides the request alone (READ: `SET NX`; WRITE on
+`REPLAY_ONE_SIDED_WRITE_ROUTES`: `SET NX` + the hub's `WAIT`; any other WRITE fails closed), and a
+WRITE nonce is written back to the own store. That holds with `REPLAY_PEER_FAIL_CLOSED_WRITES=0`
+too (an unreachable hub is tolerated there for listed routes, an unreachable own store is not).
 
 Such a gateway also stays healthy for a load balancer: `/healthz` answers 200
 while its own store does not answer but every peer answered the last housekeeping PING (every
@@ -210,14 +208,31 @@ timeout) in either direction. WRITEs decided this way are queued for write-back 
 store; if that queue is full, further WRITEs fail closed (`result="overflow"`) while READs keep
 being served.
 
-Why the check of every WRITE: two gateways run the same WRITE only if each found its nonce new at
-a store the other did not ask. Every gateway asks every store it reaches, the deciding store is
-replaced only by the fallback store, and `SET NX` on one store admits a key once, so that takes a
-gateway that reached only the deciding store and another that reached only the fallback store at
-the same time: two failures at once. A nonce admitted at one store only reaches the other by the
-write-back or the background hand-off as soon as it is reachable. The guarantee needs the check on
-every gateway that asks the deciding store (gauge `ohttp_replay_fallback_check`, with the settings
-of the WRITE fallback), so the fallback stays off until all of them report it.
+Why both stores: `SET NX` on one store admits a key once, so two gateways run the same WRITE
+only if each found its nonce new at a store the other did not ask. One network partition is
+enough for that, no second failure: cut the link between the region of the deciding store and the
+region of the fallback store, and a gateway on each side reaches only its own side's store. A
+gateway next to the deciding store that kept its own verdict when the fallback store did not
+answer, and an origin next to the fallback store that decided there when the hub did not answer,
+would both run the same sealed bytes sent to each of them (a relay can send a request twice).
+
+So a WRITE runs only once both stores took its nonce as new: the deciding store and the second
+store this gateway consults synchronously (the peers in `sync` and `failover` mode, a read
+origin's confirming standby stores, the own store of an `async-reads` origin with its own replica
+wait). Every path that would let it run on one store's verdict alone fails it closed
+(`ohttp_replay_write_fallback_total{result="one_sided_refused"}`): an unreachable peer tolerated by
+`REPLAY_PEER_FAIL_CLOSED=0` or `REPLAY_PEER_FAIL_CLOSED_WRITES=0`, an unreachable fallback store in
+the check of every WRITE, and the unavailable fallback. The short-acknowledgement paths still
+apply, because both stores took the nonce there and one of them has it on its replicas.
+
+`REPLAY_ONE_SIDED_WRITE_ROUTES` lists the WRITE routes that keep the one-sided paths (empty by
+default). Only a route whose upstream refuses a second copy of the same request belongs there,
+such as lightwalletd `SendTransaction` (the chain never takes one transaction twice): for such a
+route a partition can run the request once at each side, which the upstream turns into one
+effect. A nonce admitted at one store only reaches the other by the write-back or the background
+hand-off as soon as it is reachable. The check of every WRITE must run on every gateway that asks
+the deciding store (gauge `ohttp_replay_fallback_check`, with the settings of the WRITE
+fallback), so the unavailable fallback stays off until all of them report it.
 
 ## Response framing: chunks and padding
 
