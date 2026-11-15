@@ -94,6 +94,16 @@ const PINNED_SWEEP_MARGIN: u64 = 64;
 /// After the store pinned entries are written to answers as a read replica, writes are skipped
 /// for this long; then its `ROLE` is asked again before the next write.
 pub const PINNED_READ_ONLY_RECHECK: Duration = Duration::from_secs(300);
+/// A pinned store that did not answer its `ROLE` (timeout, connection error) is asked again
+/// after this; pinned writes and the backfill wait meanwhile.
+const PINNED_PROBE_RETRY: Duration = Duration::from_secs(30);
+/// How often paused pinned backfill workers check whether the store takes writes again (the
+/// store itself is asked only every PINNED_READ_ONLY_RECHECK).
+const PINNED_BACKFILL_RESUME_CHECK: Duration = if cfg!(test) {
+    Duration::from_millis(100)
+} else {
+    Duration::from_secs(30)
+};
 /// Lower bound of the operation timeout on the separate pinned write store
 /// (REDIS_PINNED_WRITE_URL), which can be far away; the write is off the request path.
 const PINNED_REMOTE_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
@@ -152,10 +162,15 @@ pub struct ResponseCache {
     pinned_conn: Option<Arc<StoreConn>>,
     /// Where pinned entries are written when `pinned_conn` is a read replica
     /// (REDIS_PINNED_WRITE_URL, normally its primary); None: they are written to `pinned_conn`.
-    pinned_write_conn: Option<Arc<StoreConn>>,
+    /// Swappable: a write store unreachable at startup is connected in the background.
+    pinned_write_conn: Arc<ArcSwapOption<StoreConn>>,
     /// Pinned writes are skipped until this time (ms since the UNIX epoch, 0 = not skipped):
     /// the store they go to is a read replica (see `pinned_writer`).
     pinned_read_only_until: Arc<AtomicU64>,
+    /// Bumped whenever the store pinned entries go to changes (the write store connected, the
+    /// store found read-only or writable again): backfill workers bound to an older value go
+    /// back to choosing their store.
+    pinned_writer_gen: Arc<AtomicU64>,
     /// Inclusive height range served from the pinned tier.
     pinned_range: Option<(u64, u64)>,
     cache_redis_url: String,
@@ -2885,8 +2900,9 @@ impl ResponseCache {
             redis_timeout: Duration::from_millis(redis_op_timeout_ms),
             policy_hash,
             pinned_conn: None,
-            pinned_write_conn: None,
+            pinned_write_conn: Default::default(),
             pinned_read_only_until: Arc::new(AtomicU64::new(0)),
+            pinned_writer_gen: Default::default(),
             pinned_range: None,
             cache_redis_url: redis_url.to_string(),
             replay_peers: None,
@@ -2936,7 +2952,8 @@ impl ResponseCache {
     /// Attach the pinned tier (REDIS_PINNED_URL + PINNED_TREESTATE_RANGE), and optionally a
     /// separate store its entries are written to (REDIS_PINNED_WRITE_URL), for a pinned store
     /// that is a read replica. An unreachable write store is not fatal: the entries are then
-    /// written to the pinned store, or not at all when it is a read replica.
+    /// written to the pinned store, or not at all when it is a read replica, until a background
+    /// task has connected it (retried with a backoff of 1 s up to 60 s).
     pub async fn with_pinned(
         mut self,
         url: &str,
@@ -2950,18 +2967,19 @@ impl ResponseCache {
             match StoreConn::connect(write_url, "pinned_write", self.network.clone(), Role::Any)
                 .await
             {
-                Ok(c) => self.pinned_write_conn = Some(c),
+                Ok(c) => self.pinned_write_conn.store(Some(c)),
                 Err(e) => {
-                    warn!(network = %self.network, error = %error_summary(&e), "pinned write store unreachable at startup, writing pinned entries to the pinned store")
+                    warn!(network = %self.network, error = %error_summary(&e), "pinned write store unreachable at startup, writing pinned entries to the pinned store until it is reachable");
+                    self.spawn_pinned_write_reconnect(write_url.to_string());
                 }
             }
         }
         if let Some(writer) = self
             .pinned_write_conn
-            .as_ref()
-            .or(self.pinned_conn.as_ref())
+            .load_full()
+            .or_else(|| self.pinned_conn.clone())
         {
-            if !self.probe_pinned_writer(writer).await {
+            if !self.probe_pinned_writer(&writer).await {
                 info!(network = %self.network, "pinned store is a read replica, pinned entries are not written");
             }
         }
@@ -4151,57 +4169,121 @@ impl ResponseCache {
             .unwrap_or(0)
     }
 
+    /// Connect REDIS_PINNED_WRITE_URL in the background (it was unreachable at startup); once
+    /// connected, pinned writes and the pinned backfill use it. The read-only pause, which was
+    /// about the pinned store, is lifted: the new store is asked (`ROLE`) on its next use, as
+    /// after a pause.
+    fn spawn_pinned_write_reconnect(&self, url: String) {
+        let slot = self.pinned_write_conn.clone();
+        let read_only_until = self.pinned_read_only_until.clone();
+        let generation = self.pinned_writer_gen.clone();
+        let network = self.network.clone();
+        tokio::spawn(async move {
+            let mut backoff = Duration::from_secs(1);
+            loop {
+                tokio::time::sleep(backoff).await;
+                match StoreConn::connect(&url, "pinned_write", network.clone(), Role::Any).await {
+                    Ok(c) => {
+                        slot.store(Some(c));
+                        // Asked on the next use (`pinned_writer` probes a store whose pause is
+                        // over).
+                        read_only_until.store(1, Ordering::Relaxed);
+                        generation.fetch_add(1, Ordering::Relaxed);
+                        info!(network = %network, "pinned write store connected");
+                        return;
+                    }
+                    Err(e) => {
+                        debug!(network = %network, error = %error_summary(&e), "pinned write store still unreachable");
+                        backoff = (backoff * 2).min(Duration::from_secs(60));
+                    }
+                }
+            }
+        });
+    }
+
     /// Skip pinned writes for PINNED_READ_ONLY_RECHECK. Returns true when they were not skipped
     /// before (the caller logs the change once).
     fn mark_pinned_read_only(&self) -> bool {
-        let until = Self::unix_ms() + PINNED_READ_ONLY_RECHECK.as_millis() as u64;
-        self.pinned_read_only_until.swap(until, Ordering::Relaxed) == 0
+        self.mark_pinned_read_only_for(PINNED_READ_ONLY_RECHECK)
     }
 
-    /// Ask `conn` for its `ROLE`. A replica turns pinned writes off for
-    /// PINNED_READ_ONLY_RECHECK and returns false; a primary, a store without `ROLE` or no
-    /// answer in time return true.
+    /// Skip pinned writes for `pause`, then ask the store again.
+    fn mark_pinned_read_only_for(&self, pause: Duration) -> bool {
+        let until = Self::unix_ms() + pause.as_millis() as u64;
+        let changed = self.pinned_read_only_until.swap(until, Ordering::Relaxed) == 0;
+        if changed {
+            self.pinned_writer_gen.fetch_add(1, Ordering::Relaxed);
+        }
+        changed
+    }
+
+    /// Ask `conn` for its `ROLE`. A primary, or a store without `ROLE` (an error answer), is
+    /// writable: true. A replica turns pinned writes off for PINNED_READ_ONLY_RECHECK; no
+    /// answer in time or a connection error for PINNED_PROBE_RETRY (asked again then): false.
     async fn probe_pinned_writer(&self, conn: &Arc<StoreConn>) -> bool {
         let answer = timeout(
             self.pinned_write_timeout(),
             redis::cmd("ROLE").query_async::<_, redis::Value>(&mut conn.get()),
         )
         .await;
+        conn.observe_timed(&answer);
         match answer {
             Ok(Ok(v)) if crate::store_conn::parse_role(&v) == Some(false) => {
                 self.mark_pinned_read_only();
                 false
             }
-            _ => true,
+            Ok(Ok(_)) => true,
+            Ok(Err(e)) if e.kind() == redis::ErrorKind::ResponseError => true,
+            Ok(Err(e)) => {
+                debug!(network = %self.network, error = %store_error(&e), "pinned store ROLE failed");
+                self.mark_pinned_read_only_for(PINNED_PROBE_RETRY);
+                false
+            }
+            Err(_) => {
+                self.mark_pinned_read_only_for(PINNED_PROBE_RETRY);
+                false
+            }
         }
     }
 
     /// The store pinned entries are written to: REDIS_PINNED_WRITE_URL's when set, else the
-    /// pinned store. None while that store is known to be a read replica: its writes would only
-    /// fail. After PINNED_READ_ONLY_RECHECK the store is asked again (`ROLE`), so a replica
-    /// that was promoted is written to again.
-    async fn pinned_writer(&self) -> Option<&Arc<StoreConn>> {
+    /// pinned store. None while that store is known to be a read replica (or did not answer its
+    /// `ROLE`): its writes would only fail. After the pause the store is asked again (`ROLE`),
+    /// so a replica that was promoted is written to again.
+    async fn pinned_writer(&self) -> Option<Arc<StoreConn>> {
+        self.pinned_writer_pair().await.map(|(c, _)| c)
+    }
+
+    /// [`Self::pinned_writer`] and the generation it belongs to (`pinned_writer_gen`).
+    async fn pinned_writer_pair(&self) -> Option<(Arc<StoreConn>, u64)> {
         let conn = self
             .pinned_write_conn
-            .as_ref()
-            .or(self.pinned_conn.as_ref())?;
+            .load_full()
+            .or_else(|| self.pinned_conn.clone())?;
         let until = self.pinned_read_only_until.load(Ordering::Relaxed);
-        if until == 0 {
-            return Some(conn);
+        if until != 0 {
+            if Self::unix_ms() < until || !self.probe_pinned_writer(&conn).await {
+                return None;
+            }
+            if self.pinned_read_only_until.swap(0, Ordering::Relaxed) != 0 {
+                self.pinned_writer_gen.fetch_add(1, Ordering::Relaxed);
+                info!(network = %self.network, "pinned store accepts writes again");
+            }
         }
-        if Self::unix_ms() < until || !self.probe_pinned_writer(conn).await {
-            return None;
-        }
-        if self.pinned_read_only_until.swap(0, Ordering::Relaxed) != 0 {
-            info!(network = %self.network, "pinned store accepts writes again");
-        }
-        Some(conn)
+        let generation = self.pinned_writer_gen.load(Ordering::Relaxed);
+        // The selection may have changed while it was made: use it only if it did not.
+        let now = self
+            .pinned_write_conn
+            .load_full()
+            .or_else(|| self.pinned_conn.clone())?;
+        (Arc::ptr_eq(&now, &conn) && self.pinned_read_only_until.load(Ordering::Relaxed) == 0)
+            .then_some((conn, generation))
     }
 
     /// Operation timeout of pinned writes: at least PINNED_REMOTE_WRITE_TIMEOUT on a separate
     /// write store.
     fn pinned_write_timeout(&self) -> Duration {
-        if self.pinned_write_conn.is_some() {
+        if self.pinned_write_conn.load().is_some() {
             self.redis_timeout.max(PINNED_REMOTE_WRITE_TIMEOUT)
         } else {
             self.redis_timeout
@@ -7169,27 +7251,30 @@ where
 /// the store counted it) or that kept failing is found by a sweep behind the cursor every
 /// PINNED_SWEEP_INTERVAL (`pinned_sweep_pass`) and filled then; one that still fails is left to
 /// the write-through path.
+///
+/// While the store the entries go to does not take writes (a read replica, no `ROLE` answer,
+/// or REDIS_PINNED_WRITE_URL not connected yet with a replica as pinned store), the workers wait
+/// and check again every [`PINNED_BACKFILL_RESUME_CHECK`] and the sweep skips its pass; they
+/// start once it takes writes, so a promoted replica or a write store that became reachable gets
+/// its backfill without a restart. The workers and the sweep use the store `pinned_writer_pair`
+/// chooses; when that changes (its generation), or a cursor command fails, they choose again.
 pub fn spawn_pinned_backfill<F, Fut>(cache: ResponseCache, workers: usize, fetch: F)
 where
     F: Fn(u64) -> Fut + Clone + Send + Sync + 'static,
     Fut: std::future::Future<Output = anyhow::Result<Vec<u8>>> + Send + 'static,
 {
-    // The cursor lives in the store the entries are written to.
-    let writer = cache
-        .pinned_write_conn
-        .clone()
-        .or_else(|| cache.pinned_conn.clone());
-    let (Some((start, end)), Some(conn)) = (cache.pinned_range, writer) else {
+    let Some((start, end)) = cache.pinned_range else {
         return;
     };
-    if cache.pinned_read_only_until.load(Ordering::Relaxed) != 0 {
-        warn!(network = %cache.network, "pinned backfill not started: the pinned store is a read replica");
+    if cache.pinned_conn.is_none() && cache.pinned_write_conn.load().is_none() {
         return;
+    }
+    if cache.pinned_read_only_until.load(Ordering::Relaxed) != 0 {
+        warn!(network = %cache.network, "pinned backfill paused: the pinned store is a read replica; it starts once the store takes writes");
     }
     {
         let cache = cache.clone();
         let fetch = fetch.clone();
-        let conn = conn.clone();
         let margin = PINNED_SWEEP_MARGIN + workers as u64;
         tokio::spawn(async move {
             loop {
@@ -7201,6 +7286,10 @@ where
                 if !cache.is_tip_fresh() {
                     continue;
                 }
+                // The store the backfill uses now; none while it does not take writes.
+                let Some((conn, _)) = cache.pinned_writer_pair().await else {
+                    continue;
+                };
                 match pinned_sweep_pass(&cache, &conn, (start, end), margin, &fetch).await {
                     Ok(pass) => {
                         if pass.filled > 0 {
@@ -7221,67 +7310,88 @@ where
     for worker in 0..workers {
         let cache = cache.clone();
         let fetch = fetch.clone();
-        let conn = conn.clone();
         tokio::spawn(async move {
-            // Wait for a fresh tip so pinned_put's finality check can pass.
-            while !cache.is_tip_fresh() {
-                tokio::time::sleep(Duration::from_secs(5)).await;
-            }
-            info!(network = %cache.network, worker, start, end, "pinned backfill worker started");
-            loop {
-                // Bounded, so that a hung connection is reported (and replaced) instead of
-                // stopping the worker.
-                let incr = timeout(
-                    cache.redis_timeout * 4,
-                    redis::cmd("INCR")
-                        .arg(cache.pinned_cursor_key())
-                        .query_async::<_, u64>(&mut conn.get()),
-                )
-                .await;
-                conn.observe_timed(&incr);
-                let n: u64 = match incr {
-                    Ok(Ok(n)) => n,
-                    Err(_) => {
-                        warn!(network = %cache.network, "pinned backfill cursor timeout");
-                        tokio::time::sleep(Duration::from_secs(10)).await;
-                        continue;
+            'resolve: loop {
+                // The cursor lives in the store the entries are written to: the one that takes
+                // writes, bound to its generation. Every worker chooses the same store, and all
+                // of them choose again when it changes.
+                let (conn, generation) = loop {
+                    if let Some(pair) = cache.pinned_writer_pair().await {
+                        break pair;
                     }
-                    Ok(Err(e)) => {
-                        warn!(network = %cache.network, error = %store_error(&e), "pinned backfill cursor error");
-                        tokio::time::sleep(Duration::from_secs(10)).await;
-                        continue;
-                    }
+                    tokio::time::sleep(PINNED_BACKFILL_RESUME_CHECK).await;
                 };
-                let height = start.saturating_add(n - 1);
-                let limit = end.min(cache.tip_height().saturating_sub(FINALIZED_DEPTH + 1));
-                if height > end {
-                    info!(network = %cache.network, worker, height, "pinned backfill done");
-                    return;
+                #[cfg(test)]
+                test_hooks::backfill_resolved(&cache.network);
+                // Wait for a fresh tip so pinned_put's finality check can pass.
+                while !cache.is_tip_fresh() {
+                    tokio::time::sleep(Duration::from_secs(5)).await;
                 }
-                if height > limit {
-                    // Caught up: hand the height back and wait for the next final block.
-                    let _ = timeout(
+                info!(network = %cache.network, worker, start, end, "pinned backfill worker started");
+                loop {
+                    if cache.pinned_writer_gen.load(Ordering::Relaxed) != generation {
+                        info!(network = %cache.network, worker, "pinned store changed: the backfill chooses its store again");
+                        continue 'resolve;
+                    }
+                    // Bounded, so that a hung connection is reported (and replaced) instead of
+                    // stopping the worker.
+                    let incr = timeout(
                         cache.redis_timeout * 4,
-                        redis::cmd("DECR")
+                        redis::cmd("INCR")
                             .arg(cache.pinned_cursor_key())
-                            .query_async::<_, i64>(&mut conn.get()),
+                            .query_async::<_, u64>(&mut conn.get()),
                     )
                     .await;
-                    tokio::time::sleep(PINNED_FOLLOW_INTERVAL).await;
-                    continue;
-                }
-                if cache.pinned_exists(height).await {
-                    continue;
-                }
-                let stored = pinned_fill(&cache, &fetch, height).await;
-                let result = if stored {
-                    "pinned_backfill"
-                } else {
-                    "pinned_backfill_failed"
-                };
-                crate::health::record_cache_request(&cache.network, "GetTreeState", result);
-                if height.is_multiple_of(1000) {
-                    info!(network = %cache.network, worker, height, "pinned backfill progress");
+                    conn.observe_timed(&incr);
+                    // A cursor error: back to choosing the store (and waiting while none takes
+                    // writes); a read-only answer pauses every worker.
+                    let n: u64 = match incr {
+                        Ok(Ok(n)) => n,
+                        Err(_) => {
+                            warn!(network = %cache.network, "pinned backfill cursor timeout");
+                            tokio::time::sleep(Duration::from_secs(10)).await;
+                            continue 'resolve;
+                        }
+                        Ok(Err(e)) => {
+                            warn!(network = %cache.network, error = %store_error(&e), "pinned backfill cursor error");
+                            if e.kind() == redis::ErrorKind::ReadOnly {
+                                cache.mark_pinned_read_only();
+                            }
+                            tokio::time::sleep(Duration::from_secs(10)).await;
+                            continue 'resolve;
+                        }
+                    };
+                    let height = start.saturating_add(n - 1);
+                    let limit = end.min(cache.tip_height().saturating_sub(FINALIZED_DEPTH + 1));
+                    if height > end {
+                        info!(network = %cache.network, worker, height, "pinned backfill done");
+                        return;
+                    }
+                    if height > limit {
+                        // Caught up: hand the height back and wait for the next final block.
+                        let _ = timeout(
+                            cache.redis_timeout * 4,
+                            redis::cmd("DECR")
+                                .arg(cache.pinned_cursor_key())
+                                .query_async::<_, i64>(&mut conn.get()),
+                        )
+                        .await;
+                        tokio::time::sleep(PINNED_FOLLOW_INTERVAL).await;
+                        continue;
+                    }
+                    if cache.pinned_exists(height).await {
+                        continue;
+                    }
+                    let stored = pinned_fill(&cache, &fetch, height).await;
+                    let result = if stored {
+                        "pinned_backfill"
+                    } else {
+                        "pinned_backfill_failed"
+                    };
+                    crate::health::record_cache_request(&cache.network, "GetTreeState", result);
+                    if height.is_multiple_of(1000) {
+                        info!(network = %cache.network, worker, height, "pinned backfill progress");
+                    }
                 }
             }
         });
@@ -7735,6 +7845,33 @@ mod lease_tests {
 }
 
 #[cfg(test)]
+mod test_hooks {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    static RESOLVED: Mutex<Option<HashMap<String, usize>>> = Mutex::new(None);
+
+    /// A pinned backfill worker of `network` chose its store.
+    pub fn backfill_resolved(network: &str) {
+        *RESOLVED
+            .lock()
+            .unwrap()
+            .get_or_insert_with(HashMap::new)
+            .entry(network.to_string())
+            .or_default() += 1;
+    }
+
+    pub fn backfill_resolutions(network: &str) -> usize {
+        RESOLVED
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|m| m.get(network).copied())
+            .unwrap_or(0)
+    }
+}
+
+#[cfg(test)]
 mod pinned_tests {
     use super::*;
 
@@ -7798,8 +7935,9 @@ mod tests {
             redis_timeout: LOCAL_TEST_OP_TIMEOUT,
             policy_hash: "test".to_string(),
             pinned_conn: None,
-            pinned_write_conn: None,
+            pinned_write_conn: Default::default(),
             pinned_read_only_until: Arc::new(AtomicU64::new(0)),
+            pinned_writer_gen: Default::default(),
             pinned_range: None,
             cache_redis_url: "redis://127.0.0.1:6379".to_string(),
             replay_peers: None,
@@ -9828,6 +9966,229 @@ mod tests {
             .unwrap();
     }
 
+    /// A pinned backfill started while its store is read-only waits, and starts once the store
+    /// takes writes (a promoted replica), without a restart.
+    #[tokio::test]
+    async fn pinned_backfill_starts_once_the_store_takes_writes() {
+        let Some(conn) = required_redis().await else {
+            return;
+        };
+        let network = unique_network("pinned-backfill-resume");
+        let mut cache = test_cache(conn.clone(), None, &network);
+        cache.pinned_conn = Some(StoreConn::from_parts(
+            redis::Client::open("redis://127.0.0.1:6379").unwrap(),
+            conn.clone(),
+            "pinned",
+            network.clone(),
+            Role::Any,
+        ));
+        cache.pinned_range = Some((1, u64::MAX));
+        tip_at(&cache, 1000);
+        assert!(cache.mark_pinned_read_only());
+        let fetches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = fetches.clone();
+        spawn_pinned_backfill(cache.clone(), 1, move |_height| {
+            let counted = counted.clone();
+            async move {
+                counted.fetch_add(1, Ordering::SeqCst);
+                Err::<Vec<u8>, _>(anyhow::anyhow!("not needed by the test"))
+            }
+        });
+        tokio::time::sleep(PINNED_BACKFILL_RESUME_CHECK * 5).await;
+        assert_eq!(fetches.load(Ordering::SeqCst), 0, "paused while read-only");
+        // The pause is over and the store answers ROLE as a primary: the worker starts.
+        cache.pinned_read_only_until.store(1, Ordering::Relaxed);
+        let mut started = false;
+        for _ in 0..100 {
+            if fetches.load(Ordering::SeqCst) > 0 {
+                started = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(started, "the backfill resumed once the store took writes");
+        let mut c = conn;
+        let _: () = redis::cmd("DEL")
+            .arg(cache.pinned_cursor_key())
+            .query_async(&mut c)
+            .await
+            .unwrap();
+    }
+
+    /// A Redis-protocol server that answers `+OK` to every command except `ROLE`, which it
+    /// never answers (a store that hangs on it).
+    async fn role_hanging_store() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    loop {
+                        let Ok(n) = stream.read(&mut chunk).await else {
+                            return;
+                        };
+                        if n == 0 {
+                            return;
+                        }
+                        buf.extend_from_slice(&chunk[..n]);
+                        // Answer every complete command (RESP arrays of bulk strings).
+                        while let Some((len, is_role)) = resp_command(&buf) {
+                            buf.drain(..len);
+                            if !is_role && stream.write_all(b"+OK\r\n").await.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        format!("redis://{addr}")
+    }
+
+    /// The length of the first complete RESP command in `buf` and whether it is `ROLE`.
+    fn resp_command(buf: &[u8]) -> Option<(usize, bool)> {
+        fn line(buf: &[u8], at: usize) -> Option<(&[u8], usize)> {
+            let end = buf[at..].windows(2).position(|w| w == b"\r\n")? + at;
+            Some((&buf[at..end], end + 2))
+        }
+        let (head, mut at) = line(buf, 0)?;
+        let n: usize = std::str::from_utf8(head.strip_prefix(b"*")?)
+            .ok()?
+            .parse()
+            .ok()?;
+        let mut first = None;
+        for _ in 0..n {
+            let (len, next) = line(buf, at)?;
+            let len: usize = std::str::from_utf8(len.strip_prefix(b"$")?)
+                .ok()?
+                .parse()
+                .ok()?;
+            if buf.len() < next + len + 2 {
+                return None;
+            }
+            first.get_or_insert_with(|| buf[next..next + len].to_ascii_uppercase());
+            at = next + len + 2;
+        }
+        Some((at, first.as_deref() == Some(b"ROLE".as_slice())))
+    }
+
+    /// A pinned store that does not answer its ROLE is not written to (asked again later).
+    #[tokio::test]
+    async fn a_pinned_store_without_a_role_answer_is_not_writable() {
+        let Some(conn) = required_redis().await else {
+            return;
+        };
+        let network = unique_network("pinned-role-timeout");
+        let mut cache = test_cache(conn, None, &network);
+        cache.redis_timeout = Duration::from_millis(300);
+        let url = role_hanging_store().await;
+        let store = StoreConn::connect(&url, "pinned", network.clone(), Role::Any)
+            .await
+            .unwrap();
+        let generation = cache.pinned_writer_gen.load(Ordering::Relaxed);
+        assert!(!cache.probe_pinned_writer(&store).await);
+        assert_ne!(cache.pinned_read_only_until.load(Ordering::Relaxed), 0);
+        assert_ne!(cache.pinned_writer_gen.load(Ordering::Relaxed), generation);
+        cache.pinned_conn = Some(store);
+        assert!(cache.pinned_writer().await.is_none(), "paused");
+    }
+
+    /// Backfill workers choose their store again when it changes.
+    #[tokio::test]
+    async fn pinned_backfill_workers_follow_a_change_of_store() {
+        let Some(conn) = required_redis().await else {
+            return;
+        };
+        let network = unique_network("pinned-backfill-switch");
+        let mut cache = test_cache(conn.clone(), None, &network);
+        let pinned = |name| {
+            StoreConn::from_parts(
+                redis::Client::open("redis://127.0.0.1:6379").unwrap(),
+                conn.clone(),
+                name,
+                network.clone(),
+                Role::Any,
+            )
+        };
+        cache.pinned_conn = Some(pinned("pinned"));
+        cache.pinned_range = Some((1, u64::MAX));
+        tip_at(&cache, 1000);
+        spawn_pinned_backfill(cache.clone(), 2, move |_height| async move {
+            Err::<Vec<u8>, _>(anyhow::anyhow!("not needed by the test"))
+        });
+        let wait_for = |n: usize| {
+            let network = network.clone();
+            async move {
+                for _ in 0..400 {
+                    if test_hooks::backfill_resolutions(&network) >= n {
+                        return true;
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                false
+            }
+        };
+        assert!(wait_for(2).await, "both workers chose the pinned store");
+        // The write store becomes available: every worker chooses again.
+        cache.pinned_write_conn.store(Some(pinned("pinned_write")));
+        cache.pinned_writer_gen.fetch_add(1, Ordering::Relaxed);
+        assert!(wait_for(4).await, "both workers chose the new store");
+        let mut c = conn;
+        let _: () = redis::cmd("DEL")
+            .arg(cache.pinned_cursor_key())
+            .query_async(&mut c)
+            .await
+            .unwrap();
+    }
+
+    /// A REDIS_PINNED_WRITE_URL that is unreachable at startup is connected in the background.
+    #[tokio::test]
+    async fn an_unreachable_pinned_write_store_is_connected_later() {
+        let Some(conn) = required_redis().await else {
+            return;
+        };
+        // A port nothing listens on yet; later a forwarder to the local Redis.
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let network = unique_network("pinned-write-later");
+        let cache = test_cache(conn, None, &network)
+            .with_pinned(
+                "redis://127.0.0.1:6379",
+                Some(&format!("redis://127.0.0.1:{port}")),
+                (1, u64::MAX),
+            )
+            .await
+            .unwrap();
+        assert!(cache.pinned_write_conn.load().is_none());
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
+            .await
+            .unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut inbound, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    if let Ok(mut outbound) = tokio::net::TcpStream::connect("127.0.0.1:6379").await
+                    {
+                        let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
+                    }
+                });
+            }
+        });
+        let mut connected = false;
+        for _ in 0..100 {
+            if cache.pinned_write_conn.load().is_some() {
+                connected = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(connected, "the write store was connected in the background");
+    }
+
     /// `Some(true)` when the Redis at `url` is a replica, `Some(false)` for a primary.
     async fn is_replica(url: &str) -> Option<bool> {
         let client = redis::Client::open(url).ok()?;
@@ -10089,7 +10450,7 @@ mod tests {
         }
         assert_eq!(replicated, Some(answer));
 
-        let mut p = cache.pinned_write_conn.as_ref().unwrap().get();
+        let mut p = cache.pinned_write_conn.load_full().unwrap().get();
         let _: () = redis::cmd("DEL")
             .arg(cache.pinned_key(500))
             .query_async(&mut p)

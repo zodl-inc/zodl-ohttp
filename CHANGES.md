@@ -62,6 +62,19 @@ keeps its own log in [client/CHANGELOG.md](client/CHANGELOG.md).
 
 ### Gateway
 
+- Pinned backfill workers (`PINNED_BACKFILL_WORKERS`) are started also when the store the
+  entries go to is a read replica at startup: they wait and start once it takes writes (asked
+  again every 5 minutes, as pinned writes are), so a promoted replica gets its backfill without
+  a restart. Every worker, and the sweep behind the cursor, uses the same store, bound to the
+  generation of that choice: when the store changes (the write store connected, the store found
+  read-only or writable again) or its cursor fails, the workers choose again and wait while none
+  takes writes; the sweep skips its passes meanwhile. A
+  `REDIS_PINNED_WRITE_URL` that is unreachable at startup is connected in the background
+  (backoff 1 s up to 60 s) instead of staying off until a restart; once connected, its `ROLE` is
+  asked before the first write to it.
+- A pinned store whose `ROLE` does not answer in time (or fails on the connection) is treated as
+  not writable and asked again after 30 s, instead of as writable: pinned writes and the
+  backfill wait meanwhile. A store without the `ROLE` command (an error answer) stays writable.
 - Pooled third-party HTTPS connections are kept idle for 30 s instead of 60 s, below the 60 s
   idle timeout common for servers and load balancers: with equal timeouts a request could be
   written to a connection the server was closing at that moment and fail.
