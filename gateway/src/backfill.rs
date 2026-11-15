@@ -37,7 +37,7 @@ use futures_util::StreamExt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 #[derive(Clone, Debug)]
 pub struct BackfillConfig {
@@ -338,7 +338,8 @@ pub async fn main() -> Result<()> {
         pause: Duration::from_millis(env_u64("BACKFILL_PAUSE_MS", 200)),
         pool: std::env::var("BACKFILL_POOL").unwrap_or_default(),
     };
-    info!(network = %cfg.network, tip = tip.height, lwd = %config.lwd_addr, ?cfg, "permanent tier backfill");
+    debug!(network = %cfg.network, lwd = %config.lwd_addr, "permanent tier backfill source");
+    info!(network = %cfg.network, tip = tip.height, ?cfg, "permanent tier backfill");
     let stats = run(cfg, sources, Arc::new(perm)).await?;
     info!(
         written = stats.written(),

@@ -45,8 +45,8 @@ const GRPC_CONTENT_TYPE: &str = "application/grpc";
 /// the TCP handshake, one round trip, per call. For a gateway far from lightwalletd that is one
 /// long round trip per cache miss and per SendTransaction. The trade-off: a pooled connection
 /// stays on one instance until it closes, so a call in flight when that instance exits fails,
-/// and an instance that hangs keeps getting calls until the PING closes the connection; a call
-/// that runs into its deadline therefore replaces the pooled client ([`reset_pool`]).
+/// and an instance that hangs keeps getting calls until the PING closes the connection; calls
+/// that keep running into their deadlines therefore replace the pooled client ([`reset_pool`]).
 pub(crate) fn lwd_client() -> Client<HttpConnector, Full<axum::body::Bytes>> {
     match pooled() {
         Some(client) => (**client.load()).clone(),
@@ -80,30 +80,74 @@ fn new_pooled_client() -> LwdClient {
 
 /// Shortest time between two replacements of the pooled client.
 const POOL_RESET_MIN_INTERVAL: Duration = Duration::from_secs(5);
+/// Calls that ran into a deadline within [`POOL_RESET_WINDOW`] before the pooled client is
+/// replaced: one slow call (a busy node, one slow address query) does not cost every caller its
+/// warm connections; several in a short time point at a connection that hangs.
+const POOL_RESET_TIMEOUTS: usize = 3;
+const POOL_RESET_WINDOW: Duration = Duration::from_secs(10);
 
-/// A call ran into its deadline: replace the pooled client (no-op without the pool), so that
-/// new calls open new connections instead of queueing on one to an instance that may hang.
-/// Calls in flight keep their connection. At most once per [`POOL_RESET_MIN_INTERVAL`].
+/// When the pooled client is replaced: after [`POOL_RESET_TIMEOUTS`] deadline hits within
+/// [`POOL_RESET_WINDOW`], at most once per [`POOL_RESET_MIN_INTERVAL`].
+#[derive(Default)]
+struct ResetGate {
+    hits: std::collections::VecDeque<Instant>,
+    last_reset: Option<Instant>,
+}
+
+impl ResetGate {
+    /// One deadline hit at `now`: whether the pool is replaced now.
+    fn hit(&mut self, now: Instant) -> bool {
+        while self
+            .hits
+            .front()
+            .is_some_and(|t| now.saturating_duration_since(*t) > POOL_RESET_WINDOW)
+        {
+            self.hits.pop_front();
+        }
+        self.hits.push_back(now);
+        if self.hits.len() < POOL_RESET_TIMEOUTS
+            || self
+                .last_reset
+                .is_some_and(|t| now.saturating_duration_since(t) < POOL_RESET_MIN_INTERVAL)
+        {
+            return false;
+        }
+        self.hits.clear();
+        self.last_reset = Some(now);
+        true
+    }
+}
+
+/// A call ran into its deadline: replace the pooled client (no-op without the pool) once that
+/// happened [`POOL_RESET_TIMEOUTS`] times within [`POOL_RESET_WINDOW`], so that new calls open
+/// new connections instead of queueing on one to an instance that may hang. Calls in flight
+/// keep their connection. At most once per [`POOL_RESET_MIN_INTERVAL`].
 pub(crate) fn reset_pool(network: &str) {
-    static LAST: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
+    static GATE: std::sync::Mutex<Option<ResetGate>> = std::sync::Mutex::new(None);
     let Some(pool) = pooled() else { return };
-    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
-    if last.is_some_and(|t| t.elapsed() < POOL_RESET_MIN_INTERVAL) {
+    let mut gate = GATE.lock().unwrap_or_else(|e| e.into_inner());
+    if !gate
+        .get_or_insert_with(ResetGate::default)
+        .hit(Instant::now())
+    {
         return;
     }
-    *last = Some(Instant::now());
     pool.store(std::sync::Arc::new(new_pooled_client()));
     crate::health::record_lwd_pool_reset(network);
     tracing::warn!(
         network,
-        "lightwalletd call ran into its deadline: pooled connections replaced"
+        "lightwalletd calls keep running into their deadlines: pooled connections replaced"
     );
 }
 
 /// Per-class deadlines of a lightwalletd call, below the overall `LWD_TIMEOUT_SECS`.
 ///
 /// - `LWD_UNARY_TIMEOUT_SECS` (default 10): the whole call of an RPC with one answer
-///   (`GetLatestBlock`, `GetTreeState`, `GetTransaction`, `SendTransaction`, ...).
+///   (`GetLatestBlock`, `GetTreeState`, `GetTransaction`, ...).
+/// - `LWD_SEND_TIMEOUT_SECS` (default `LWD_TIMEOUT_SECS`): the whole `SendTransaction` call. A
+///   broadcast that is cut leaves the client with an error for a transaction that may have been
+///   sent, so it keeps the overall timeout unless set; it is never retried after it reached
+///   lightwalletd. Counted as class `send`.
 /// - `LWD_STREAM_IDLE_SECS` (default 20): for a server-streaming RPC (`GetBlockRange`,
 ///   `GetSubtreeRoots`, ...) the wait for the response head and for each next frame; a stream
 ///   that keeps sending runs up to `LWD_TIMEOUT_SECS`. The mempool long poll keeps its own rules.
@@ -118,6 +162,8 @@ pub(crate) fn reset_pool(network: &str) {
 pub struct LwdDeadlines {
     pub unary: Duration,
     pub stream_idle: Duration,
+    /// `LWD_SEND_TIMEOUT_SECS`; None = `LWD_TIMEOUT_SECS`.
+    pub send: Option<Duration>,
 }
 
 pub const DEFAULT_LWD_UNARY_TIMEOUT: Duration = Duration::from_secs(10);
@@ -128,12 +174,21 @@ impl Default for LwdDeadlines {
         Self {
             unary: DEFAULT_LWD_UNARY_TIMEOUT,
             stream_idle: DEFAULT_LWD_STREAM_IDLE,
+            send: None,
         }
     }
 }
 
 impl LwdDeadlines {
     pub fn parse(unary: Option<&str>, stream_idle: Option<&str>) -> Result<Self> {
+        Self::parse_with_send(unary, stream_idle, None)
+    }
+
+    pub fn parse_with_send(
+        unary: Option<&str>,
+        stream_idle: Option<&str>,
+        send: Option<&str>,
+    ) -> Result<Self> {
         let secs = |name: &str, v: Option<&str>, default: Duration| -> Result<Duration> {
             match v.map(str::trim).filter(|v| !v.is_empty()) {
                 None => Ok(default),
@@ -146,13 +201,18 @@ impl LwdDeadlines {
         Ok(Self {
             unary: secs("LWD_UNARY_TIMEOUT_SECS", unary, DEFAULT_LWD_UNARY_TIMEOUT)?,
             stream_idle: secs("LWD_STREAM_IDLE_SECS", stream_idle, DEFAULT_LWD_STREAM_IDLE)?,
+            send: match send.map(str::trim).filter(|v| !v.is_empty()) {
+                None => None,
+                Some(v) => Some(secs("LWD_SEND_TIMEOUT_SECS", Some(v), Duration::ZERO)?),
+            },
         })
     }
 
     pub fn from_env() -> Result<Self> {
-        Self::parse(
+        Self::parse_with_send(
             std::env::var("LWD_UNARY_TIMEOUT_SECS").ok().as_deref(),
             std::env::var("LWD_STREAM_IDLE_SECS").ok().as_deref(),
+            std::env::var("LWD_SEND_TIMEOUT_SECS").ok().as_deref(),
         )
     }
 }
@@ -190,8 +250,9 @@ pub fn is_streaming_rpc(path: &str) -> bool {
 }
 
 /// RPCs whose first answer waits for a transparent-address index query of the node, which can
-/// take long for a busy address: their head (or, for one answer, the whole call) keeps
-/// `LWD_TIMEOUT_SECS`; a stream of them still gets the idle bound between frames.
+/// take long for a busy address: their head and first message (or, for one answer, the whole
+/// call) keep `LWD_TIMEOUT_SECS`; a stream of them gets the idle bound between frames after
+/// its first message.
 pub const LWD_ADDRESS_RPCS: &[&str] = &[
     "GetTaddressTxids",
     "GetTaddressTransactions",
@@ -252,6 +313,7 @@ async fn call_lwd(config: &Config, path: &str, body: Vec<u8>) -> Result<InnerRes
         head: overall,
         class: Some("unary"),
         pooled: pooled().is_some(),
+        may_hedge: true,
     };
     let resp = match crate::lwd_endpoints::request(req, opts).await {
         Ok(r) => r,
@@ -797,6 +859,7 @@ mod tests {
     const SHORT: super::LwdDeadlines = super::LwdDeadlines {
         unary: std::time::Duration::from_secs(1),
         stream_idle: std::time::Duration::from_secs(1),
+        send: None,
     };
 
     fn opts_for(path: &str) -> super::StreamOpts {
@@ -866,6 +929,46 @@ mod tests {
             SHORT,
         );
         assert_eq!(tight.overall, Some(std::time::Duration::from_millis(500)));
+        // SendTransaction: its own class, LWD_TIMEOUT_SECS unless LWD_SEND_TIMEOUT_SECS is set.
+        const SEND: &str = "/cash.z.wallet.sdk.rpc.CompactTxStreamer/SendTransaction";
+        let send = opts_for(SEND);
+        assert_eq!(send.overall, Some(std::time::Duration::from_secs(80)));
+        assert_eq!(send.head, Some(std::time::Duration::from_secs(80)));
+        assert_eq!(send.class, Some("send"));
+        let with_send = super::LwdDeadlines {
+            send: Some(std::time::Duration::from_secs(30)),
+            ..SHORT
+        };
+        let send = super::StreamOpts::for_path(
+            SEND,
+            std::time::Duration::from_secs(80),
+            std::time::Duration::from_secs(3),
+            with_send,
+        );
+        assert_eq!(send.overall, Some(std::time::Duration::from_secs(30)));
+        // Transparent-address streams: the gap bound starts after the first message.
+        assert!(txids.gap_after_first_data);
+        assert!(!stream.gap_after_first_data);
+    }
+
+    #[test]
+    fn the_pool_is_replaced_after_several_deadlines_only() {
+        let mut gate = super::ResetGate::default();
+        let t0 = std::time::Instant::now();
+        let s = std::time::Duration::from_secs;
+        assert!(!gate.hit(t0));
+        assert!(!gate.hit(t0 + s(1)));
+        assert!(gate.hit(t0 + s(2)), "third within the window");
+        // Right after a replacement: not again within the minimum interval.
+        assert!(!gate.hit(t0 + s(3)));
+        assert!(!gate.hit(t0 + s(3)));
+        assert!(!gate.hit(t0 + s(4)));
+        assert!(gate.hit(t0 + s(7)));
+        // Hits spread wider than the window never replace it.
+        let mut gate = super::ResetGate::default();
+        for i in 0..10 {
+            assert!(!gate.hit(t0 + s(6 * i)));
+        }
     }
 
     #[test]
@@ -879,6 +982,14 @@ mod tests {
         assert_eq!(d.stream_idle, std::time::Duration::from_secs(9));
         assert!(super::LwdDeadlines::parse(Some("0"), None).is_err());
         assert!(super::LwdDeadlines::parse(None, Some("x")).is_err());
+        assert_eq!(d.send, None);
+        let d = super::LwdDeadlines::parse_with_send(None, None, Some("45")).unwrap();
+        assert_eq!(d.send, Some(std::time::Duration::from_secs(45)));
+        assert!(super::LwdDeadlines::parse_with_send(None, None, Some("0")).is_err());
+        assert_eq!(
+            super::LwdDeadlines::parse_with_send(None, None, Some(" ")).unwrap(),
+            super::LwdDeadlines::default()
+        );
     }
 
     #[tokio::test]
@@ -945,6 +1056,168 @@ mod tests {
             "a silent stream is an error, not a short answer"
         );
         assert!(start.elapsed() < std::time::Duration::from_secs(3));
+    }
+
+    /// A lightwalletd (h2) that sends the response head at once, its first data frame after
+    /// `delay`, then the trailers.
+    async fn late_first_message_lwd(delay: std::time::Duration) -> String {
+        late_message_lwd(delay, false).await
+    }
+
+    /// As [`late_first_message_lwd`]; with `prefix_first`, the first message's 5-byte prefix is
+    /// sent at once and its payload after `delay`.
+    async fn late_message_lwd(delay: std::time::Duration, prefix_first: bool) -> String {
+        use hyper::body::Frame;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let service = hyper::service::service_fn(
+                    move |_req: hyper::Request<hyper::body::Incoming>| async move {
+                        let body = futures_util::stream::unfold(0u8, move |n| async move {
+                            let frame = match (n, prefix_first) {
+                                (0, true) => {
+                                    Frame::data(axum::body::Bytes::from_static(&[0, 0, 0, 0, 1]))
+                                }
+                                (0, false) => {
+                                    tokio::time::sleep(delay).await;
+                                    Frame::data(axum::body::Bytes::from_static(&[0, 0, 0, 0, 1, 7]))
+                                }
+                                (1, true) => {
+                                    tokio::time::sleep(delay).await;
+                                    Frame::data(axum::body::Bytes::from_static(&[7]))
+                                }
+                                (1, false) | (2, true) => {
+                                    let mut t = hyper::HeaderMap::new();
+                                    t.insert("grpc-status", "0".parse().unwrap());
+                                    Frame::trailers(t)
+                                }
+                                _ => return None,
+                            };
+                            Some((Ok::<_, std::convert::Infallible>(frame), n + 1))
+                        });
+                        Ok::<_, std::convert::Infallible>(
+                            hyper::Response::builder()
+                                .status(200)
+                                .header("content-type", "application/grpc")
+                                .body(http_body_util::StreamBody::new(body))
+                                .unwrap(),
+                        )
+                    },
+                );
+                tokio::spawn(async move {
+                    let _ = hyper_util::server::conn::auto::Builder::new(
+                        hyper_util::rt::TokioExecutor::new(),
+                    )
+                    .serve_connection(hyper_util::rt::TokioIo::new(stream), service)
+                    .await;
+                });
+            }
+        });
+        addr.to_string()
+    }
+
+    #[tokio::test]
+    async fn an_address_stream_whose_head_comes_first_waits_for_its_first_message() {
+        // Head at once, the first message after 1.5 s: longer than the 1 s idle bound.
+        let mut config = test_config();
+        config.lwd_addr = late_first_message_lwd(std::time::Duration::from_millis(1500)).await;
+        const TXIDS: &str = "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetTaddressTxids";
+        let n = drain(
+            super::call_lwd_stream_with(
+                &config,
+                TXIDS,
+                super::grpc_wrap(&[]),
+                None,
+                Vec::new(),
+                opts_for(TXIDS),
+            )
+            .await,
+        )
+        .await
+        .expect("the first message of an address query keeps the overall deadline");
+        assert_eq!(n, 2, "one data frame + the trailers");
+        // Any other stream still gets the idle bound for its first frame.
+        let r = drain(
+            super::call_lwd_stream_with(
+                &config,
+                BLOCK_RANGE,
+                super::grpc_wrap(&[]),
+                None,
+                Vec::new(),
+                opts_for(BLOCK_RANGE),
+            )
+            .await,
+        )
+        .await;
+        assert!(r.is_err());
+    }
+
+    #[tokio::test]
+    async fn the_first_message_allowance_lasts_until_the_message_is_complete() {
+        // The prefix of the first message at once, its payload after 1.5 s (> the 1 s gap).
+        let mut config = test_config();
+        config.lwd_addr = late_message_lwd(std::time::Duration::from_millis(1500), true).await;
+        const TXIDS: &str = "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetTaddressTxids";
+        let n = drain(
+            super::call_lwd_stream_with(
+                &config,
+                TXIDS,
+                super::grpc_wrap(&[]),
+                None,
+                Vec::new(),
+                opts_for(TXIDS),
+            )
+            .await,
+        )
+        .await
+        .expect("a partial first message still has the overall deadline");
+        assert_eq!(n, 3, "two data frames + the trailers");
+    }
+
+    #[test]
+    fn first_message_is_complete_with_its_whole_length() {
+        let mut m = super::FirstMessage::default();
+        assert!(!m.push(&[0, 0]));
+        assert!(!m.push(&[0, 0, 3]));
+        assert!(!m.push(&[1, 2]));
+        assert!(m.push(&[3, 9, 9]));
+        let mut m = super::FirstMessage::default();
+        assert!(m.push(&[0, 0, 0, 0, 0]), "an empty message");
+        let mut m = super::FirstMessage::default();
+        assert!(m.push(&[0, 0, 0, 0, 1, 7, 0, 0]));
+    }
+
+    #[tokio::test]
+    async fn a_mempool_stream_without_a_head_ends_cleanly() {
+        let mut config = test_config();
+        config.lwd_addr = hung_lwd().await;
+        config.lwd_timeout_secs = 1;
+        let r = super::call_lwd_stream_with(
+            &config,
+            crate::mempool::GET_MEMPOOL_STREAM_PATH,
+            super::grpc_wrap(&[]),
+            None,
+            Vec::new(),
+            super::StreamOpts {
+                overall: Some(std::time::Duration::from_secs(5)),
+                ..super::StreamOpts::default()
+            },
+        )
+        .await;
+        let (status, _, body) = r.expect("an empty mempool, not an error");
+        assert!(crate::health::lwd_mempool_no_head(&config.network) >= 1);
+        assert_eq!(status, 200);
+        use futures_util::StreamExt;
+        let frames: Vec<_> = std::pin::pin!(body).collect().await;
+        assert_eq!(frames.len(), 1);
+        match &frames[0] {
+            Ok(crate::chunked_stream::UpFrame::Trailers(t)) => {
+                assert!(t.iter().any(|(k, v)| k == "grpc-status" && v == "0"))
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -1021,7 +1294,11 @@ mod tests {
 /// How long a streamed call may run. `overall` None = no deadline;
 /// `idle` Some = a long poll closed cleanly (grpc-status 0) after that much silence;
 /// `head` Some = the response head must arrive within this (else `LWD_TIMEOUT_SECS`);
-/// `gap` Some = no frame for this long ends the call with an error (a stream that went silent).
+/// `gap` Some = no frame for this long ends the call with an error (a stream that went silent);
+/// with `gap_after_first_data` only once the first complete gRPC message arrived (its 5-byte
+/// prefix and the whole length it declares; before it, the rest of `overall`: a
+/// transparent-address stream may send its head, or part of its first message, before the
+/// node's query ends).
 /// `class` labels the deadlines in `ohttp_lwd_timeouts_total` (None = not counted).
 #[derive(Clone, Copy, Debug, Default)]
 pub struct StreamOpts {
@@ -1029,7 +1306,10 @@ pub struct StreamOpts {
     pub idle: Option<Duration>,
     pub head: Option<Duration>,
     pub gap: Option<Duration>,
+    pub gap_after_first_data: bool,
     pub class: Option<&'static str>,
+    /// A heavy call (`enforcement::is_heavy_lwd_call`): never hedged.
+    pub heavy: bool,
 }
 
 impl StreamOpts {
@@ -1050,6 +1330,15 @@ impl StreamOpts {
                 ..Self::default()
             };
         }
+        if path.ends_with("/SendTransaction") {
+            let send = d.send.map_or(lwd_timeout, |s| s.min(lwd_timeout));
+            return Self {
+                overall: Some(send),
+                head: Some(send),
+                class: Some("send"),
+                ..Self::default()
+            };
+        }
         let address = is_address_rpc(path);
         if is_streaming_rpc(path) {
             let idle = d.stream_idle.min(lwd_timeout);
@@ -1057,6 +1346,7 @@ impl StreamOpts {
                 overall: Some(lwd_timeout),
                 head: Some(if address { lwd_timeout } else { idle }),
                 gap: Some(idle),
+                gap_after_first_data: address,
                 class: Some("stream"),
                 ..Self::default()
             };
@@ -1075,6 +1365,39 @@ impl StreamOpts {
             class: Some("unary"),
             ..Self::default()
         }
+    }
+}
+
+/// Whether the first complete gRPC message of a body has arrived: its 5-byte prefix (flag and
+/// big-endian length) and the whole length it declares.
+#[derive(Default)]
+struct FirstMessage {
+    prefix: Vec<u8>,
+    /// Payload bytes still missing once the prefix is complete.
+    missing: Option<usize>,
+}
+
+impl FirstMessage {
+    /// Feed the next data frame; true once the first message is complete.
+    fn push(&mut self, mut data: &[u8]) -> bool {
+        if self.missing.is_none() {
+            let take = (5 - self.prefix.len()).min(data.len());
+            self.prefix.extend_from_slice(&data[..take]);
+            data = &data[take..];
+            if self.prefix.len() < 5 {
+                return false;
+            }
+            let len = u32::from_be_bytes([
+                self.prefix[1],
+                self.prefix[2],
+                self.prefix[3],
+                self.prefix[4],
+            ]) as usize;
+            self.missing = Some(len);
+        }
+        let missing = self.missing.unwrap_or(0).saturating_sub(data.len());
+        self.missing = Some(missing);
+        missing == 0
     }
 }
 
@@ -1135,6 +1458,7 @@ pub async fn call_lwd_stream_with(
     let deadline = opts.overall.map(|d| Instant::now() + d);
     let idle = opts.idle;
     let gap = opts.gap;
+    let gap_after_first_data = opts.gap_after_first_data;
     let class = opts.class;
     let network = config.network.clone();
 
@@ -1143,26 +1467,48 @@ pub async fn call_lwd_stream_with(
         head: connect,
         class,
         pooled: pooled().is_some(),
+        may_hedge: !opts.heavy,
     };
-    let resp = crate::lwd_endpoints::request(req, call).await?;
-    let status = resp.status().as_u16();
-    let headers: Vec<(String, String)> = resp
-        .headers()
-        .iter()
-        .filter(|(k, _)| {
-            let l = k.as_str().to_ascii_lowercase();
-            l == "content-type" || l == "date" || l.starts_with("grpc-")
-        })
-        .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
-        .collect();
+    // The mempool stream sends its head with its first message: no head in time is an empty
+    // mempool, answered as a clean end (grpc-status 0), not as an error.
+    let resp = match crate::lwd_endpoints::request(req, call).await {
+        Ok(resp) => Some(resp),
+        Err(crate::lwd_endpoints::RequestError::Timeout) if path.ends_with("/GetMempoolStream") => {
+            crate::health::record_lwd_mempool_no_head(&network);
+            None
+        }
+        Err(e) => return Err(e.into()),
+    };
+    let (status, headers): (u16, Vec<(String, String)>) = match &resp {
+        Some(resp) => (
+            resp.status().as_u16(),
+            resp.headers()
+                .iter()
+                .filter(|(k, _)| {
+                    let l = k.as_str().to_ascii_lowercase();
+                    l == "content-type" || l == "date" || l.starts_with("grpc-")
+                })
+                .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
+                .collect(),
+        ),
+        None => (
+            200,
+            vec![("content-type".to_string(), GRPC_CONTENT_TYPE.to_string())],
+        ),
+    };
 
-    let body_stream = resp.into_body();
+    let body_stream = resp.map(|r| r.into_body());
 
     let frame_stream = async_stream::stream! {
         use crate::chunked_stream::UpFrame;
-        let mut body_out = body_stream;
+        let Some(mut body_out) = body_stream else {
+            yield Ok(UpFrame::Trailers(vec![("grpc-status".to_string(), "0".to_string())]));
+            return;
+        };
         // A long wait when nothing bounds the frame (tokio cannot represent Duration::MAX).
         let unbounded = Duration::from_secs(3600 * 24 * 365);
+        let mut first_message = FirstMessage::default();
+        let mut seen_data = false;
 
         loop {
             let remaining = match deadline {
@@ -1183,7 +1529,10 @@ pub async fn call_lwd_stream_with(
                 Some(i) => remaining.min(i),
                 None => remaining,
             };
-            let wait = match gap {
+            // Before the first data frame of a stream whose first message may take long, the
+            // rest of the overall deadline; the gap bound after it.
+            let gap_now = gap.filter(|_| seen_data || !gap_after_first_data);
+            let wait = match gap_now {
                 Some(g) => wait.min(g),
                 None => wait,
             };
@@ -1191,6 +1540,9 @@ pub async fn call_lwd_stream_with(
                 Ok(Some(Ok(frame))) => {
                     match frame.into_data() {
                         Ok(data) => {
+                            if !seen_data {
+                                seen_data = first_message.push(&data);
+                            }
                             yield Ok(UpFrame::Data(data));
                         }
                         Err(frame) => {
@@ -1218,7 +1570,7 @@ pub async fn call_lwd_stream_with(
                         break;
                     }
                     if let Some(class) = class {
-                        let phase = if gap.is_some_and(|g| wait == g) { "gap" } else { "body" };
+                        let phase = if gap_now.is_some_and(|g| wait == g) { "gap" } else { "body" };
                         crate::health::record_lwd_timeout(&network, class, phase);
                         reset_pool(&network);
                     }
@@ -1436,6 +1788,10 @@ impl LwdSources {
                 }
             };
 
+            let opts = StreamOpts {
+                heavy: is_heavy,
+                ..opts
+            };
             let (status, headers, stream) =
                 call_lwd_stream_with(&config, &path, body, request_id, client_headers, opts)
                     .await?;

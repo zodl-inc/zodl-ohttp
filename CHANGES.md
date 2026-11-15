@@ -62,6 +62,56 @@ keeps its own log in [client/CHANGELOG.md](client/CHANGELOG.md).
 
 ### Gateway
 
+- **Hedged lightwalletd reads** replace the retry at half of the head deadline: a read without
+  a response head after `LWD_HEDGE_DELAY_MS` (new, default half of the head deadline, the old
+  cut-off; `0` turns it off) is sent to a *different* `LWD_ENDPOINTS` instance as well, while the
+  first attempt keeps running; the first head wins and the other attempt is cancelled. Both
+  share the call's whole head deadline, so a read that takes 6 s of a 10 s deadline no longer
+  fails on both attempts. Without `LWD_ENDPOINTS` (or with one instance) reads are not hedged,
+  and the one attempt keeps the whole deadline (before, it was cut at half and retried on a new
+  connection to `LWD_ADDR`). Never hedged: `SendTransaction` and any path that is not a
+  `CompactTxStreamer` read, heavy calls (long block ranges, transactions, transparent-address
+  and subtree queries), `GetMempoolStream`, and calls to other backends; a call is still
+  retried after a connect error (any call) or a transport error (reads) as before, but never
+  after a hedge was sent. The loser of a hedge race is not a failure (not counted as a timeout
+  or as a failed call, no pool replacement); an attempt that fails is settled as failed even
+  when the other one answers. An instance that loses two hedges in a row, without a response
+  head from it in between, is skipped for 30 s at that and each further loss
+  (`event="loser_skipped"`), so one that accepts calls and never answers leaves the rotation
+  after its second slow read (it was skipped after the first before) and is tried again every
+  30 s. Two bounds: a hedge takes a permit of `LWD_HEDGE_MAX_INFLIGHT` (new, default an eighth
+  of `MAX_INFLIGHT_LWD`, at most 16, at least 1; up to the semaphore maximum) on top of the
+  caller's lightwalletd permit (hedges are not counted in `MAX_INFLIGHT_LWD`), taken when the
+  hedge is sent and held until the race ends (a read that is not hedged holds none); and a rate cap: six hedges a minute are always allowed, above that
+  hedges stay at most one in ten of the hedgeable reads of the last minute. New metric
+  `ohttp_lwd_hedges_total{event="started|won|no_permit|rate_limited|loser_skipped"}`;
+  `ohttp_lwd_read_retries_total{reason="timeout"}` is no longer produced.
+- The call's head deadline is fixed before `LWD_ENDPOINTS` is resolved and covers the
+  resolution and every attempt (a slow resolution extended it). One resolution runs at a time
+  (abandoned after 30 s); callers use the previous list meanwhile and wait (at most 1 s) only
+  for the first one, instead of every caller resolving again when the list expired.
+- Log lines at warn and info level no longer carry lightwalletd instance addresses or the
+  resolved names: the instance of a failed attempt, the target of a retry or hedge, the
+  `LWD_ENDPOINTS` name and `LWD_ADDR` (the startup line's `lwd` field, the backend of the
+  cache connection line, the permanent tier backfill line) are logged at debug level only.
+- `SendTransaction` has its own deadline class again: `LWD_SEND_TIMEOUT_SECS` (new, default
+  `LWD_TIMEOUT_SECS`, as before the unary deadline existed) instead of `LWD_UNARY_TIMEOUT_SECS`
+  (10 s), which cut slow broadcasts and showed the client an error for a transaction that may
+  have been sent. Counted as `class="send"` in `ohttp_lwd_timeouts_total`. A slow broadcast can
+  thus hold its request up to `LWD_TIMEOUT_SECS` (default 80 s) again: relay and client
+  timeouts must allow that, or `LWD_SEND_TIMEOUT_SECS` must be set lower.
+- Transparent-address streams (`GetTaddressTxids`, `GetTaddressTransactions`,
+  `GetAddressUtxosStream`) keep the rest of `LWD_TIMEOUT_SECS` until their first complete
+  message (its 5-byte prefix and the whole length it declares), not only for the response head:
+  a lightwalletd that sends the head, or part of the first message, before the node's address
+  query ends is no longer cut after `LWD_STREAM_IDLE_SECS`.
+- A late response head of `GetMempoolStream` (an empty mempool) or of a transparent-address RPC
+  (a slow node query) no longer counts as a lightwalletd failure in the `/healthz` error window
+  and no longer ejects the instance; only connect and transport errors do. A `GetMempoolStream`
+  without a head within its deadline ends cleanly (grpc-status 0) and is counted in the new
+  `ohttp_lwd_mempool_no_head_total`, so an instance that does not answer stays visible.
+- With `LWD_CONNECTION_POOL`, the pooled client is replaced after three calls within 10 s ran
+  into a deadline (at most once per 5 s), instead of after any single one.
 - Chain follower fencing: every index entry is now written together with its cached block, and
   every deletion of a reorg (index entries and the cached blocks, nullifiers, tree states and
   subtree roots above the fork), only while the writer holds the leader lock with its own token,

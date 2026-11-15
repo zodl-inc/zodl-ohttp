@@ -106,10 +106,16 @@ async fn main() -> anyhow::Result<()> {
     let lwd_deadlines = lwd::LwdDeadlines::from_env()?;
     lwd::init_deadlines(lwd_deadlines);
     let lwd_transport = lwd_endpoints::Settings::from_env(&config.lwd_addr)?;
-    info!(
+    debug!(
         endpoints = lwd_transport.endpoints.as_deref().unwrap_or("-"),
+        "lightwalletd instances name (LWD_ENDPOINTS)"
+    );
+    info!(
+        endpoints = lwd_transport.endpoints.is_some(),
         connect_timeout_ms = lwd_transport.connect_timeout.as_millis() as u64,
-        "lightwalletd instances (LWD_ENDPOINTS, LWD_CONNECT_TIMEOUT_MS)"
+        hedge_delay = ?lwd_transport.hedge_delay,
+        hedge_max_inflight = lwd_transport.hedge_max_inflight,
+        "lightwalletd instances (LWD_ENDPOINTS, LWD_CONNECT_TIMEOUT_MS, LWD_HEDGE_DELAY_MS, LWD_HEDGE_MAX_INFLIGHT)"
     );
     lwd_endpoints::init(lwd_transport);
     let lwd_error_policy = health::LwdErrorPolicy::from_env()?;
@@ -183,7 +189,6 @@ async fn main() -> anyhow::Result<()> {
         mode = %config.mode,
         network = %config.network,
         origin = origin.label(),
-        lwd = %config.lwd_addr,
         port = config.port,
         lwd_timeout_secs = config.lwd_timeout_secs,
         relay_auth_enabled = !config.relay_secrets.is_empty(),
@@ -351,7 +356,8 @@ async fn main() -> anyhow::Result<()> {
         };
         match connected {
             Ok(c) => {
-                info!(network = %network, backend = %backend_host, "Redis cache connected, starting tip poller");
+                debug!(network = %network, backend = %backend_host, "cache key backend");
+                info!(network = %network, "Redis cache connected, starting tip poller");
 
                 // Pinned tier (optional): REDIS_PINNED_URL + PINNED_TREESTATE_RANGE.
                 let pinned_url = std::env::var("REDIS_PINNED_URL").unwrap_or_default();

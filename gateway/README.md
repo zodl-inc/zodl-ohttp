@@ -162,15 +162,20 @@ without a first message and `LONG_POLL_IDLE_SECS` after the last one; `text/even
 answers get keep-alive comments every `SSE_KEEPALIVE_SECS`; partial data is flushed as a short
 chunk after `CHUNK_FLUSH_MS`. Every upstream call is bounded by `LWD_TIMEOUT_SECS` in total, and
 a lightwalletd call by its class: an RPC with one answer by `LWD_UNARY_TIMEOUT_SECS`, a
-server-streaming RPC by `LWD_STREAM_IDLE_SECS` of silence (for the head and between frames). An
+server-streaming RPC by `LWD_STREAM_IDLE_SECS` of silence (for the head and between frames),
+`SendTransaction` by `LWD_SEND_TIMEOUT_SECS` (default `LWD_TIMEOUT_SECS`). An
 upstream that sends no response head at all (an unresponsive backend) can still exceed a relay's
 silence limit; the client then sees the relay's error.
 
 A lightwalletd connection must be established within `LWD_CONNECT_TIMEOUT_MS`. A call that could
 not connect is sent once more; a read (every lightwalletd RPC except `SendTransaction`) is also
-sent once more when it got a transport error or no response head within half of its head
-deadline (`GetMempoolStream` and the transparent-address RPCs keep their whole head deadline). With `LWD_ENDPOINTS` the second attempt goes to another lightwalletd instance, and an
-instance that failed is skipped for 30 s. A `SendTransaction` that reached lightwalletd is never
+sent once more when it got a transport error. With `LWD_ENDPOINTS`, a read without a response head
+after `LWD_HEDGE_DELAY_MS` (default half of its head deadline) is also sent to another instance
+while the first attempt keeps running: the first head wins, the other attempt is cancelled and
+is not counted as a failure. Heavy calls, `GetMempoolStream` and the transparent-address RPCs
+are not hedged; hedges are bounded by `LWD_HEDGE_MAX_INFLIGHT` and to one in ten reads (six a
+minute are always allowed). The second attempt goes to another lightwalletd instance, and an
+instance that failed, or lost two hedges in a row, is skipped for 30 s. A `SendTransaction` that reached lightwalletd is never
 sent a second time by the gateway, and a call that fails after its response head arrived is not
 retried.
 
@@ -200,11 +205,13 @@ trace ids are never labels. `network` is `NETWORK`.
 | `ohttp_singleflight_joins_total` | `network, rpc` | Calls that joined an identical call in flight. |
 | `ohttp_lwd_errors_total` | - | lightwalletd forwarding errors. |
 | `ohttp_lwd_connect_retries_total` | - | lightwalletd calls retried after a failed connection attempt. |
-| `ohttp_lwd_read_retries_total` | `network, reason` | lightwalletd reads sent a second time because the first attempt got no response head. `reason`: `timeout` (half of the head deadline passed), `error` (transport error). |
+| `ohttp_lwd_read_retries_total` | `network, reason` | lightwalletd reads sent a second time because the first attempt failed before its response head. `reason`: `error` (transport error); `timeout` is no longer produced (see `ohttp_lwd_hedges_total`). |
+| `ohttp_lwd_hedges_total` | `network, event` | Hedged lightwalletd reads: `started` (sent to another instance as well after `LWD_HEDGE_DELAY_MS` without a head), `won` (the hedge's head came first), `no_permit` (not hedged: `LWD_HEDGE_MAX_INFLIGHT` in flight), `rate_limited` (not hedged: six or more hedges in the last minute already, and one more would exceed one in ten of its hedgeable reads), `loser_skipped` (an instance lost its second or a later hedge in a row, with no response head from it in between, and is skipped for 30 s; not a lightwalletd failure). |
+| `ohttp_lwd_mempool_no_head_total` | `network` | `GetMempoolStream` calls without a response head within their deadline, ended cleanly (an empty mempool, or an instance that does not answer). |
 | `ohttp_healthz_lwd_error_ratio` | `network` | Share of failed lightwalletd calls in the `/healthz` error window at the last `/healthz`; `-1` while fewer than `HEALTHZ_LWD_MIN_ERRORS` failed. |
 | `ohttp_lwd_reachable` | `network` | 1 while lightwalletd is reachable. |
 | `ohttp_lwd_shed_total` | `network, class` | lightwalletd calls refused because their class was at its cap. |
-| `ohttp_lwd_timeouts_total` | `network, class, phase` | lightwalletd call attempts cut by their deadline (a read whose first attempt was cut and whose retry answered counts once). `class`: `unary`, `stream`; `phase`: `head` (no response head in time), `body` (the call's overall deadline: the unary deadline, or `LWD_TIMEOUT_SECS` for a stream), `gap` (a stream silent too long). |
+| `ohttp_lwd_timeouts_total` | `network, class, phase` | lightwalletd call attempts cut by their deadline (the attempt of a hedged read that is cancelled when the other one's head arrives is not counted). `class`: `unary`, `stream`, `send` (`SendTransaction`); `phase`: `head` (no response head in time), `body` (the call's overall deadline: the unary deadline, or `LWD_TIMEOUT_SECS` for a stream), `gap` (a stream silent too long). |
 | `ohttp_lwd_pool_resets_total` | `network` | Pooled lightwalletd clients replaced after a call ran into its deadline (`LWD_CONNECTION_POOL`). |
 | `ohttp_lwd_permit_waited_total` | `network, class` | Calls that waited for a permit. |
 | `ohttp_lwd_permit_wait_seconds` | `network, class` | Permit wait time (histogram). |

@@ -1149,6 +1149,11 @@ async fn forward_to_backend_internal(
             head: overall,
             class: None,
             pooled: false,
+            may_hedge: !crate::enforcement::is_heavy_lwd_call(
+                &inner_request.path,
+                &inner_request.body,
+                config.lwd_heavy_block_range,
+            ),
         };
         match crate::lwd_endpoints::request(http_request, call).await {
             Ok(r) => r,
@@ -1716,6 +1721,11 @@ pub async fn forward_to_backend_stream(
             head: overall,
             class: None,
             pooled: false,
+            may_hedge: !crate::enforcement::is_heavy_lwd_call(
+                &inner_request.path,
+                &inner_request.body,
+                config.lwd_heavy_block_range,
+            ),
         };
         match crate::lwd_endpoints::request(http_request, call).await {
             Ok(r) => r,
