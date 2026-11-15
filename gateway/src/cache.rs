@@ -103,6 +103,9 @@ const KEY_VERSION: u32 = 4;
 const EPOCH_REFRESH_SECS: u64 = 2;
 /// How often the housekeeping task syncs the epoch and pings Redis.
 const HOUSEKEEPING_SECS: u64 = 10;
+/// Housekeeping rounds in a row the local store must answer before an epoch switched for a
+/// bump seen at a peer gives way to its own value again (`ResponseCache::sync_epoch`).
+const EPOCH_STEADY_ROUNDS: u32 = 3;
 /// Bound of one housekeeping round's peer and standby checks, which run concurrently: a peer
 /// that has not answered by then counts as not answering.
 const HOUSEKEEPING_DEADLINE: Duration = Duration::from_secs(5);
@@ -179,6 +182,23 @@ pub struct ResponseCache {
     /// Consecutive WRITEs the peers could not confirm while the local store gave no verdict
     /// (`REPLAY_FALLBACK_HEALTH_FAILURES`): `/healthz` stops counting on the fallback then.
     fallback_health: Arc<FallbackHealth>,
+    /// The epoch's state machine (`EpochState`). `epoch` is only written while this lock is
+    /// held, so a refresh from the local store and a switch for a bump seen at a peer never
+    /// overwrite each other.
+    epoch_state: Arc<parking_lot::Mutex<EpochState>>,
+}
+
+/// The shared epoch's state besides its value (`ResponseCache::epoch`, written under the same
+/// lock).
+#[derive(Default)]
+struct EpochState {
+    /// Each replay peer's shared epoch as last read by housekeeping, by store identity (its
+    /// position and a hash of its URL), to notice an epoch bump while the local store gives no
+    /// answer (`sync_epoch`).
+    baselines: std::collections::HashMap<String, u64>,
+    /// While Some: the epoch was moved to a fresh value for a bump seen at a peer, and the
+    /// housekeeping rounds since in which the local store answered (`EPOCH_STEADY_ROUNDS`).
+    switch: Option<u32>,
 }
 
 /// `REPLAY_FALLBACK_HEALTH_FAILURES` default: consecutive WRITEs decided at the peer stores for an
@@ -2882,6 +2902,7 @@ impl ResponseCache {
                 DEFAULT_REPLAY_FALLBACK_HEALTH_FAILURES,
                 Duration::from_secs(DEFAULT_REPLAY_FALLBACK_HEALTH_WINDOW_SECS),
             )),
+            epoch_state: Arc::default(),
         };
 
         if cache.cache_conn.load().is_none() {
@@ -4329,9 +4350,8 @@ impl ResponseCache {
     pub async fn housekeeping_round(&self) -> bool {
         let deadline = tokio::time::Instant::now() + HOUSEKEEPING_DEADLINE;
         let epoch = async {
-            if tokio::time::timeout_at(deadline, self.get_shared_epoch())
-                .await
-                .is_err()
+            self.sync_epoch_until(deadline).await;
+            if tokio::time::Instant::now() >= deadline
                 && crate::health::warn_due(&self.network, "epoch_sync")
             {
                 warn!(network = %self.network, "Shared epoch sync did not finish within the housekeeping deadline");
@@ -5369,6 +5389,168 @@ impl ResponseCache {
     /// The shared epoch from Redis, initialised atomically (SET NX) to the current Unix time
     /// when missing (an existing epoch is kept). Returns the local value on error.
     pub async fn get_shared_epoch(&self) -> u64 {
+        match self.fetch_shared_epoch().await {
+            Some(e) => self.commit_local_epoch(e),
+            None => self.epoch.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Take the local store's epoch `e` (read before, without side effects), unless an epoch
+    /// switched for a bump seen at a peer is in force: decided and written under the epoch's
+    /// lock, so a refresh that read the store before a switch never overwrites it. The epoch
+    /// in force afterwards.
+    fn commit_local_epoch(&self, e: u64) -> u64 {
+        let state = self.epoch_state.lock();
+        if state.switch.is_none() {
+            self.epoch.store(e, Ordering::Relaxed);
+        }
+        // The store answered: the refresh is done either way, so a switched epoch does not
+        // send every request to the store again (`refresh_epoch_if_stale`).
+        self.last_epoch_sync.store(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+            Ordering::Relaxed,
+        );
+        self.epoch.load(Ordering::Relaxed)
+    }
+
+    /// Housekeeping's epoch sync: `get_shared_epoch`, and the replay peers' epochs next to it.
+    /// Each store keeps its own epoch value (initialised when it was first used), so a peer's
+    /// value is never taken over; but while the local store gives no answer (the peer stores
+    /// decide in its place, `REPLAY_UNAVAILABLE_FALLBACK`) an operator bump there could not be
+    /// seen at all.
+    ///
+    /// While the local store answers, every peer's epoch is recorded as its baseline, by store
+    /// identity (`EpochState::baselines`). While it does not, the first peer in `REPLAY_PEER_URLS` order
+    /// that answers is compared with its own baseline: a different value is taken as an
+    /// operator bump, and so is a peer without a baseline yet (nothing tells whether it was
+    /// bumped meanwhile). Either moves the epoch here to a fresh random 64-bit value, under
+    /// which nothing was cached, so cached answers are missed rather than served stale; the peer's
+    /// value becomes its baseline. The switched epoch stays in force until the local store has
+    /// answered `EPOCH_STEADY_ROUNDS` housekeeping rounds in a row (a single answer during a
+    /// flapping outage does not bring the old entries back); then the peers' baselines are taken
+    /// again and the local store's own value applies again: a bump meant to outlast the outage
+    /// must also be applied to every store once it answers.
+    pub async fn sync_epoch(&self) -> u64 {
+        self.sync_epoch_until(tokio::time::Instant::now() + HOUSEKEEPING_DEADLINE)
+            .await
+    }
+
+    /// `sync_epoch` with the local and the peer reads concurrently, both bounded by `deadline`:
+    /// a local read not done by then counts as no answer (a round that does not count toward
+    /// `EPOCH_STEADY_ROUNDS`), a peer read not done as that peer giving none.
+    pub async fn sync_epoch_until(&self, deadline: tokio::time::Instant) -> u64 {
+        let (local, peers) = tokio::join!(
+            async {
+                tokio::time::timeout_at(deadline, self.fetch_shared_epoch())
+                    .await
+                    .ok()
+                    .flatten()
+            },
+            async {
+                tokio::time::timeout_at(deadline, self.peer_epochs_now())
+                    .await
+                    .unwrap_or_default()
+            },
+        );
+        // Everything below is decided and written under the epoch's lock.
+        let mut state = self.epoch_state.lock();
+        let current = self.epoch.load(Ordering::Relaxed);
+        if let Some(e) = local {
+            if let Some(rounds) = state.switch.as_mut() {
+                *rounds += 1;
+                if *rounds < EPOCH_STEADY_ROUNDS {
+                    // Still watching the peers meanwhile.
+                    return self.compare_peer_epochs(&mut state, peers, current);
+                }
+                state.switch = None;
+                info!(network = %self.network, "Security store answered steadily again: its shared epoch applies again");
+            }
+            self.epoch.store(e, Ordering::Relaxed);
+            self.last_epoch_sync.store(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs(),
+                Ordering::Relaxed,
+            );
+            for (id, v) in peers.into_iter().flatten() {
+                state.baselines.insert(id, v);
+            }
+            return e;
+        }
+        if let Some(rounds) = state.switch.as_mut() {
+            *rounds = 0;
+        }
+        self.compare_peer_epochs(&mut state, peers, current)
+    }
+
+    /// The local store gives no verdict (or not steadily yet): compare the first answering peer
+    /// with its baseline, and move to a fresh epoch on a change or without a baseline (under
+    /// the epoch's lock, `state`).
+    fn compare_peer_epochs(
+        &self,
+        state: &mut EpochState,
+        peers: Vec<Option<(String, u64)>>,
+        current: u64,
+    ) -> u64 {
+        let Some((id, value)) = peers.into_iter().flatten().next() else {
+            return current;
+        };
+        let previous = state.baselines.insert(id, value);
+        if previous == Some(value) {
+            return current;
+        }
+        let mut fresh = rand::random::<u64>();
+        while fresh == current || fresh == 0 {
+            fresh = rand::random::<u64>();
+        }
+        self.epoch.store(fresh, Ordering::Relaxed);
+        state.switch = Some(0);
+        if previous.is_some() {
+            if crate::health::warn_due(&self.network, "epoch_switch") {
+                warn!(network = %self.network, "Shared cache epoch changed at a peer store while the security store gives no answer: cache entries of the old epoch are no longer served");
+            }
+        } else {
+            if crate::health::warn_due(&self.network, "epoch_switch_unknown") {
+                warn!(network = %self.network, "Security store gives no answer and its epoch was never compared with this peer store's: cache entries of the old epoch are no longer served");
+            }
+        }
+        crate::health::record_epoch_bump_seen_at_peer(&self.network);
+        fresh
+    }
+
+    /// `GET epoch:{network}` at every replay peer at once, within the peer timeout, in
+    /// `REPLAY_PEER_URLS` order: (store identity, epoch) of each that answered with one.
+    async fn peer_epochs_now(&self) -> Vec<Option<(String, u64)>> {
+        let Some(peers) = self.replay_peers.as_ref() else {
+            return Vec::new();
+        };
+        let key = format!("epoch:{}", self.network);
+        let reads = peers.peers.iter().map(|p| {
+            let key = key.as_str();
+            async move {
+                let conn = p.conn.load_full()?;
+                let mut conn = (*conn).clone();
+                let v = timeout(peers.timeout, conn.get::<_, Option<u64>>(key))
+                    .await
+                    .ok()?
+                    .ok()??;
+                let id = format!(
+                    "{}:{}",
+                    p.index,
+                    hex::encode(&Sha256::digest(p.url.as_bytes())[..8])
+                );
+                Some((id, v))
+            }
+        });
+        futures_util::future::join_all(reads).await
+    }
+
+    /// The shared epoch from the local store (`get_shared_epoch`); None when it gave no answer.
+    async fn fetch_shared_epoch(&self) -> Option<u64> {
         let key = format!("epoch:{}", self.network);
 
         let sec = self.security_conn.as_ref();
@@ -5377,7 +5559,7 @@ impl ResponseCache {
         } else if let Some(cache) = self.cache_conn.load_full().map(|c| (*c).clone()) {
             cache
         } else {
-            return self.epoch.load(Ordering::Relaxed);
+            return None;
         };
 
         let initial_epoch = std::time::SystemTime::now()
@@ -5399,41 +5581,34 @@ impl ResponseCache {
         }
 
         match timeout(self.redis_timeout, conn.get::<_, Option<u64>>(&key)).await {
-            Ok(Ok(Some(epoch))) => {
-                self.epoch.store(epoch, Ordering::Relaxed);
-                self.last_epoch_sync.store(
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap()
-                        .as_secs(),
-                    Ordering::Relaxed,
-                );
-                epoch
-            }
+            // Taken by the caller under the epoch's lock (`commit_local_epoch`, `sync_epoch`).
+            Ok(Ok(Some(epoch))) => Some(epoch),
             Ok(Ok(None)) => {
                 let fallback_epoch = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap()
                     .as_secs();
-                warn!(
-                    fallback_epoch,
-                    "Epoch key vanished after SET NX, using timestamp"
-                );
-                fallback_epoch
+                if crate::health::warn_due(&self.network, "epoch_vanished") {
+                    warn!(
+                        fallback_epoch,
+                        "Epoch key vanished after SET NX, using timestamp"
+                    );
+                }
+                Some(fallback_epoch)
             }
             Ok(Err(e)) => {
                 if crate::health::warn_due(&self.network, "epoch_read") {
                     warn!(network = %self.network, error = %store_error(&e), "Failed to read shared epoch from Redis");
                 }
                 crate::health::record_cache_redis_timeout(&self.network, "epoch_error");
-                self.epoch.load(Ordering::Relaxed)
+                None
             }
             Err(_) => {
                 if crate::health::warn_due(&self.network, "epoch_get_timeout") {
                     warn!(network = %self.network, timeout_ms = self.redis_timeout.as_millis(), "Epoch GET timeout");
                 }
                 crate::health::record_cache_redis_timeout(&self.network, "epoch_timeout");
-                self.epoch.load(Ordering::Relaxed)
+                None
             }
         }
     }
@@ -7479,6 +7654,7 @@ mod tests {
                 DEFAULT_REPLAY_FALLBACK_HEALTH_FAILURES,
                 Duration::from_secs(DEFAULT_REPLAY_FALLBACK_HEALTH_WINDOW_SECS),
             )),
+            epoch_state: Arc::default(),
         }
     }
 
@@ -7620,6 +7796,53 @@ mod tests {
             !p.primary_usable(),
             "the installed one: the node is not the primary"
         );
+    }
+
+    /// A refresh from the local store that read its epoch before a switch for a bump seen at a
+    /// peer commits after it: the switched epoch stays (one lock for the epoch's state).
+    #[tokio::test]
+    async fn a_local_refresh_never_overwrites_a_switched_epoch() {
+        let Some(conn) = local_redis().await else {
+            assert!(std::env::var("CI").is_err(), "Redis not reachable in CI");
+            return;
+        };
+        let c = Arc::new(test_cache(
+            conn.clone(),
+            Some(conn),
+            &format!("testnet-epoch-race-{}", std::process::id()),
+        ));
+        let (read, switched) = (
+            Arc::new(tokio::sync::Barrier::new(2)),
+            Arc::new(tokio::sync::Barrier::new(2)),
+        );
+        let refresh = {
+            let (c, read, switched) = (c.clone(), read.clone(), switched.clone());
+            tokio::spawn(async move {
+                let local = c.fetch_shared_epoch().await.unwrap();
+                read.wait().await;
+                switched.wait().await;
+                c.commit_local_epoch(local)
+            })
+        };
+        read.wait().await;
+        let fresh = {
+            let mut state = c.epoch_state.lock();
+            let current = c.epoch.load(Ordering::Relaxed);
+            c.compare_peer_epochs(&mut state, vec![Some(("peer".to_string(), 7))], current)
+        };
+        c.last_epoch_sync.store(0, Ordering::Relaxed);
+        switched.wait().await;
+        assert_eq!(
+            refresh.await.unwrap(),
+            fresh,
+            "the refresh did not take over"
+        );
+        assert_ne!(
+            c.last_epoch_sync.load(Ordering::Relaxed),
+            0,
+            "the refresh counts as done while the switch is in force"
+        );
+        assert_eq!(c.current_epoch(), fresh);
     }
 
     /// A `PeerCheck` is bound to the request it was built for: another request's, or one that

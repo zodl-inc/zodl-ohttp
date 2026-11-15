@@ -248,6 +248,14 @@ impl Store {
             .collect()
     }
 
+    fn set_value(&self, key: &str, value: &str) {
+        self.keys.lock().unwrap().insert(key.to_string());
+        self.values
+            .lock()
+            .unwrap()
+            .insert(key.to_string(), value.to_string());
+    }
+
     async fn serve(self: Arc<Self>, sock: TcpStream) {
         let session = self.sessions.fetch_add(1, Ordering::SeqCst);
         let (r, mut w) = sock.into_split();
@@ -397,7 +405,13 @@ impl Store {
                 "+OK\r\n".into()
             }
             "WAIT" => format!(":{}\r\n", self.acks.load(Ordering::SeqCst)),
-            "GET" => "$-1\r\n".into(),
+            "GET" => match args
+                .get(1)
+                .and_then(|k| self.values.lock().unwrap().get(k).cloned())
+            {
+                Some(v) => format!("${}\r\n{v}\r\n", v.len()),
+                None => "$-1\r\n".into(),
+            },
             _ => "+OK\r\n".into(),
         }
     }
@@ -2719,4 +2733,157 @@ async fn stores_whose_acl_refuses_role_are_still_connected() {
     )
     .await
     .unwrap());
+}
+
+// ---------------------------------------------------------------------------------------------
+// The shared cache epoch while the security store gives no answer.
+
+#[tokio::test]
+async fn an_epoch_bump_at_the_peer_is_seen_while_the_own_store_is_silent() {
+    let net = "testnet-epoch-peer";
+    let epoch_key = format!("epoch:{net}");
+    let w = World::new().await;
+    let (p_link, p_url) = w.to_p().await;
+    let primary = primary_origin(net, &p_url, &addr_url(w.f_addr), true).await;
+    w.p.set_value(&epoch_key, "500");
+    w.f.set_value(&epoch_key, "9000");
+    // The own store's value is used, never the peer's.
+    assert_eq!(primary.sync_epoch().await, 500);
+    p_link.hang();
+    // Silent own store, unchanged peer epoch: the last value stays.
+    assert_eq!(primary.sync_epoch().await, 500);
+    // An operator bump at the peer: entries of the old epoch are no longer served here.
+    w.f.set_value(&epoch_key, "9001");
+    let bumped = primary.sync_epoch().await;
+    assert_ne!(bumped, 500);
+    assert_eq!(primary.current_epoch(), bumped);
+    assert_eq!(
+        counter("ohttp_epoch_bump_seen_at_peer_total", &[("network", net)]),
+        1.0
+    );
+    assert_eq!(primary.sync_epoch().await, bumped, "one bump, one change");
+    // The own store answers again: its value applies again.
+    p_link.restore();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while primary.sync_epoch().await != 500 {
+        assert!(Instant::now() < deadline, "own epoch not read again");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+/// A cache whose security store is `own` and whose replay peers are `peers`, in that order.
+async fn epoch_origin(network: &str, own: &str, peers: &[String]) -> ResponseCache {
+    ohttp_gateway::health::init_metrics();
+    let c = ResponseCache::connect(
+        &cache_store().await,
+        Some(own),
+        network.to_string(),
+        "lwd.example.com:9067".to_string(),
+        250,
+        100,
+        &HashMap::new(),
+    )
+    .await
+    .unwrap();
+    let peers = ReplayPeers::connect(peers, network.to_string(), 250, false)
+        .await
+        .with_mode(ReplayPeerMode::Failover, true);
+    c.with_replay_peers(peers)
+}
+
+/// Each peer is compared with its own baseline, the first answering one in configuration order.
+#[tokio::test]
+async fn epoch_baselines_are_kept_per_peer_store() {
+    let net = "testnet-epoch-per-store";
+    let epoch_key = format!("epoch:{net}");
+    let w = World::new().await;
+    let (g, g_addr) = Store::start().await;
+    let (p_link, p_url) = w.to_p().await;
+    let (f_link, f_url) = w.to_f().await;
+    w.p.set_value(&epoch_key, "500");
+    w.f.set_value(&epoch_key, "9000");
+    g.set_value(&epoch_key, "77");
+    let origin = epoch_origin(net, &p_url, &[f_url, addr_url(g_addr)]).await;
+    assert_eq!(origin.sync_epoch().await, 500);
+    p_link.hang();
+    // The first peer is silent too: the second one is compared with its own baseline (77),
+    // not with the first one's.
+    f_link.hang();
+    assert_eq!(origin.sync_epoch().await, 500);
+    g.set_value(&epoch_key, "78");
+    let bumped = origin.sync_epoch().await;
+    assert_ne!(bumped, 500);
+    assert_eq!(origin.sync_epoch().await, bumped);
+    // The first peer answers again with its unchanged value: no further change.
+    f_link.restore();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(origin.sync_epoch().await, bumped);
+    assert_eq!(origin.sync_epoch().await, bumped);
+}
+
+/// Without a baseline (the own store was already silent when this gateway first read the
+/// peers' epochs), nothing tells whether the peer was bumped: the epoch here is moved once.
+#[tokio::test]
+async fn an_epoch_without_a_baseline_is_invalidated_once() {
+    let net = "testnet-epoch-no-baseline";
+    let epoch_key = format!("epoch:{net}");
+    let w = World::new().await;
+    let (p_link, p_url) = w.to_p().await;
+    w.p.set_value(&epoch_key, "500");
+    w.f.set_value(&epoch_key, "9000");
+    let origin = epoch_origin(net, &p_url, &[addr_url(w.f_addr)]).await;
+    p_link.hang();
+    let first = origin.sync_epoch().await;
+    assert_ne!(first, 0);
+    assert_eq!(
+        counter("ohttp_epoch_bump_seen_at_peer_total", &[("network", net)]),
+        1.0
+    );
+    assert_eq!(origin.sync_epoch().await, first, "once");
+    // A later bump moves it to another fresh value.
+    w.f.set_value(&epoch_key, "9001");
+    let second = origin.sync_epoch().await;
+    assert_ne!(second, first);
+    assert_ne!(second, 500);
+}
+
+/// A switched epoch stays while the local store flaps: one answer in between does not bring
+/// the old entries back; only answering rounds in a row do.
+#[tokio::test]
+async fn a_switched_epoch_outlasts_a_flapping_local_store() {
+    let net = "testnet-epoch-flapping";
+    let epoch_key = format!("epoch:{net}");
+    let w = World::new().await;
+    let (p_link, p_url) = w.to_p().await;
+    w.p.set_value(&epoch_key, "500");
+    w.f.set_value(&epoch_key, "9000");
+    let origin = epoch_origin(net, &p_url, &[addr_url(w.f_addr)]).await;
+    assert_eq!(origin.sync_epoch().await, 500);
+    p_link.hang();
+    w.f.set_value(&epoch_key, "9001");
+    let switched = origin.sync_epoch().await;
+    assert_ne!(switched, 500);
+    // One answer of the local store, then silence again.
+    p_link.restore();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while origin.get_shared_epoch().await != switched {
+        assert!(Instant::now() < deadline);
+    }
+    assert_eq!(origin.sync_epoch().await, switched, "one answering round");
+    assert_eq!(origin.current_epoch(), switched);
+    p_link.hang();
+    assert_eq!(origin.sync_epoch().await, switched);
+    // Answering steadily: the own value applies again after three rounds in a row.
+    p_link.restore();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut rounds = 0;
+    loop {
+        let e = origin.sync_epoch().await;
+        rounds += 1;
+        if e == 500 {
+            break;
+        }
+        assert_eq!(e, switched);
+        assert!(Instant::now() < deadline, "own epoch not back");
+    }
+    assert!(rounds >= 3, "{rounds}");
 }

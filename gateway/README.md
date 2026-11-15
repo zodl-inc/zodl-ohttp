@@ -141,7 +141,12 @@ chain state:
 - `GetMempoolStream` subscribers share one upstream stream per process; identical upstream calls
   in flight are coalesced; `SendTransaction` is never cached or coalesced.
 - A shared epoch counter in the security Redis is part of every cache key: incrementing it
-  flushes every cached answer at once.
+  flushes every cached answer at once. Each security store keeps its own counter, so a flush of
+  several origins is one increment per store. While the security Redis gives no answer (the peer
+  stores decide in its place) a change of a replay peer's counter against the value last seen
+  for that store (or a peer never seen) is taken as such a flush and the gateway moves to a
+  fresh random epoch (`ohttp_epoch_bump_seen_at_peer_total`); once its own store answers again,
+  that store's counter applies again, so increment it too.
 - Third-party answers are cached only for the routes in `THIRD_PARTY_CACHE_ROUTES`.
 
 ## Timeouts and relays

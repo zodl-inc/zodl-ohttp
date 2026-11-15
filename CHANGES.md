@@ -79,6 +79,10 @@ keeps its own log in [client/CHANGELOG.md](client/CHANGELOG.md).
   back to the pool.
 - The third-party cache get/put errors and the permanent store errors are logged at most once a
   minute per kind, like the other per-request store warnings.
+- While a switched epoch is in force, a refresh from the security store still counts as done,
+  so requests do not each read the store again. The epoch switch warnings and the per-request
+  cache store errors (get, set, delete, pinned get and set) are logged at most once a minute per
+  kind.
 - `confirm_write_nonce` refuses a `PeerCheck` whose peer stage found a replay (fail-closed),
   whatever the caller did with that verdict.
 - `WAIT` pool timeouts: the pool round of a timeout is checked under the lock it only moves
@@ -253,6 +257,21 @@ keeps its own log in [client/CHANGELOG.md](client/CHANGELOG.md).
   passes during an upstream outage do not count), and each height is checked
   again right before it is filled. The sweep of a bounded range ends only once a count of the
   holes says 0.
+- The shared cache epoch lives in the security store; while that store gave no answer (the peer
+  stores deciding in its place) the gateway kept its last value and missed any operator bump.
+  Housekeeping now also reads the replay peers' epochs (one `GET` per peer every 10 s) and keeps
+  each as that store's baseline while the own store answers. While the own store is silent, the
+  first peer in `REPLAY_PEER_URLS` order that answers is compared with its own baseline; a
+  change, or a peer without a baseline yet, moves the epoch here to a fresh random 64-bit value,
+  so entries of the old epoch are missed instead of served (`ohttp_epoch_bump_seen_at_peer_total`).
+  The peer's value itself is never used (each store keeps its own counter), and once the own
+  store answers its value applies again: an operator flush must still increment every store.
+  A switched epoch stays until the own store has answered three housekeeping rounds in a row
+  (one answer during a flapping outage does not bring the old entries back; the local and the
+  peer reads run concurrently under the round's deadline, and a local read not done by then
+  starts the count again), then the peers' baselines are taken again. The epoch, the switch and
+  the peers' baselines change under one lock, so a refresh from the own store that read it
+  before a switch never overwrites the switched epoch.
 - A read origin with a confirming standby store (`REPLAY_STANDBY_URLS` with
   `REPLAY_PEER_WAIT_REPLICAS`) asks the standby store about a WRITE's nonce (`SET NX`) at the same
   time as the hub (`SET NX`, then the hub's replica wait), instead of after the hub answered. A

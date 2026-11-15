@@ -516,6 +516,7 @@ pub fn init_metrics() {
         &*OHTTP_LWD_POOL_RESETS_TOTAL,
         &*OHTTP_LWD_READ_RETRIES_TOTAL,
         &*OHTTP_REPLAY_WAIT_SATURATED_TOTAL,
+        &*OHTTP_EPOCH_BUMP_SEEN_AT_PEER_TOTAL,
     ] {
         REGISTRY.register(Box::new(c.clone())).ok();
     }
@@ -2258,6 +2259,11 @@ lazy_static::lazy_static! {
         &["network"]
     )
     .unwrap();
+    static ref OHTTP_EPOCH_BUMP_SEEN_AT_PEER_TOTAL: IntCounterVec = IntCounterVec::new(
+        Opts::new("ohttp_epoch_bump_seen_at_peer_total", "Times the shared cache epoch of a replay peer changed while the security store gave no answer: the epoch here moved to a fresh value (cache entries of the old epoch no longer served)"),
+        &["network"]
+    )
+    .unwrap();
     static ref OHTTP_REPLAY_WAIT_SATURATED_TOTAL: IntCounterVec = IntCounterVec::new(
         Opts::new("ohttp_replay_wait_saturated_total", "WRITE replay nonces whose replica wait found every dedicated WAIT connection of the store busy for the whole wait budget (REPLAY_WAIT_CONNS): decided as a short acknowledgement after a SET XX found the nonce. store: local | peer"),
         &["network", "store"]
@@ -2311,4 +2317,10 @@ pub fn is_replay_stores_ready(network: &str) -> bool {
         .with_label_values(&[network])
         .get()
         == 0
+}
+
+pub fn record_epoch_bump_seen_at_peer(network: &str) {
+    OHTTP_EPOCH_BUMP_SEEN_AT_PEER_TOTAL
+        .with_label_values(&[network])
+        .inc();
 }
