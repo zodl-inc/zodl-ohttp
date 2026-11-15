@@ -7,6 +7,15 @@ keeps its own log in [client/CHANGELOG.md](client/CHANGELOG.md).
 
 ### Gateway
 
+- A read origin with a confirming standby store (`REPLAY_STANDBY_URLS` with
+  `REPLAY_PEER_WAIT_REPLICAS`) asks the standby store about a WRITE's nonce (`SET NX`) at the same
+  time as the hub (`SET NX`, then the hub's replica wait), instead of after the hub answered. A
+  WRITE now costs the longer of the two paths rather than their sum, which is one round trip to
+  the standby store less per WRITE. The verdict is unchanged: a nonce held by either store is a
+  replay, and the short-acknowledgement and unavailable-hub fallbacks use the answer the
+  standby store already gave instead of asking again. A nonce the standby store took for a
+  request the hub then refuses stays held there until its TTL, like the nonce of any request
+  that fails closed.
 - `ohttp_request_duration_seconds` and `ohttp_upstream_request_duration_seconds` use finer
   buckets: 0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.15, 0.25, 0.35, 0.5, 0.75, 1, 1.5, 2.5, 5 and
   10 s (were 0.01, 0.05, 0.1, 0.25, 0.5, 1, 2.5 and 5 s). Calls that cross a long network path

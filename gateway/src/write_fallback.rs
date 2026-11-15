@@ -109,7 +109,11 @@
 //! stores (`REPLAY_STANDBY_URLS`, with `REPLAY_PEER_WAIT_REPLICAS`): `SET NX` + `WAIT` there,
 //! with the same rules (new + acknowledged = runs, held = replay, anything else fails closed),
 //! and a window after startup or a hub disruption in which every WRITE is also `SET NX` at the
-//! standby stores. An origin with its own replica wait (`REPLAY_WRITE_WAIT_REPLICAS`, the
+//! standby stores. A read origin with a confirming standby store sends that `SET NX` at the same
+//! time as the hub's `SET NX` and replica wait, and every path that can let the WRITE run uses its
+//! answer (the check, both fallbacks), so the standby store costs no round trip of its own; a
+//! nonce it stored for a request the hub then refuses stays held for those exact bytes, as for
+//! any request that fails closed. An origin with its own replica wait (`REPLAY_WRITE_WAIT_REPLICAS`, the
 //! standby origin and its spoke) uses its own store: the WRITE runs only once the local replicas
 //! acknowledge it (no window: these origins always check both stores). Either way the nonce is
 //! written back to the hub until the hub's replicas have it.

@@ -125,6 +125,8 @@ struct Store {
     keys: Mutex<HashSet<String>>,
     /// The answer to WAIT: the replicas that acknowledged (0 = a primary whose replicas resync).
     acks: AtomicI64,
+    /// Delay before each SET and WAIT reply, in ms: a store a long round trip away.
+    delay_ms: AtomicU64,
 }
 
 impl Default for Store {
@@ -132,6 +134,7 @@ impl Default for Store {
         Self {
             keys: Mutex::default(),
             acks: AtomicI64::new(1),
+            delay_ms: AtomicU64::new(0),
         }
     }
 }
@@ -167,10 +170,19 @@ impl Store {
         self.acks.store(n, Ordering::SeqCst);
     }
 
+    fn set_delay(&self, ms: u64) {
+        self.delay_ms.store(ms, Ordering::SeqCst);
+    }
+
     async fn serve(self: Arc<Self>, sock: TcpStream) {
         let (r, mut w) = sock.into_split();
         let mut r = BufReader::new(r);
         while let Some(args) = read_command(&mut r).await {
+            let delay = self.delay_ms.load(Ordering::SeqCst);
+            let cmd = args.first().map(|c| c.to_ascii_uppercase());
+            if delay > 0 && matches!(cmd.as_deref(), Some("SET" | "WAIT")) {
+                tokio::time::sleep(Duration::from_millis(delay)).await;
+            }
             if w.write_all(self.answer(&args).as_bytes()).await.is_err() {
                 return;
             }
@@ -453,6 +465,58 @@ async fn read_origin_confirms_at_the_standby_store_while_the_hub_resyncs() {
     })
     .await;
     assert!(w.hub.has(&key(net, &write)));
+}
+
+/// The standby store's `SET NX` runs concurrently with the hub's `SET NX` and replica wait, not
+/// after them: a WRITE costs the longer of the two paths, not their sum. The verdict is the same.
+#[tokio::test]
+async fn read_origin_asks_the_standby_store_concurrently_with_the_hub() {
+    let net = "testnet-hub-fb-concurrent";
+    let w = world(net, true).await;
+    // Hub: `SET NX`, then `SET XX` + `WAIT` (three replies of 50 ms). Standby: one `SET NX` of
+    // 200 ms. One after the other about 350 ms; concurrently about 200 ms.
+    w.hub.set_delay(50);
+    w.standby.set_delay(200);
+    let write = request("concurrent check");
+    let started = Instant::now();
+    assert!(admit(&w.read_origin, &write, RouteClass::Write)
+        .await
+        .unwrap());
+    let took = started.elapsed();
+    assert!(
+        took < Duration::from_millis(300),
+        "the standby check waited for the hub: {took:?}"
+    );
+    assert!(w.hub.has(&key(net, &write)) && w.standby.has(&key(net, &write)));
+    assert_eq!(
+        fallback(net, "hub_window", "accepted") + fallback(net, "hub_check", "accepted"),
+        1.0
+    );
+
+    // Held only by the standby store: refused, although the hub took it as new.
+    let elsewhere = request("concurrent, only at the standby store");
+    w.standby.put(&key(net, &elsewhere));
+    assert!(!admit(&w.read_origin, &elsewhere, RouteClass::Write)
+        .await
+        .unwrap());
+    // Held only by the hub: refused.
+    let at_hub = request("concurrent, only at the hub");
+    w.hub.put(&key(net, &at_hub));
+    assert!(!admit(&w.read_origin, &at_hub, RouteClass::Write)
+        .await
+        .unwrap());
+
+    // The hub resyncs: the short-acknowledgement path takes the standby's concurrent `SET NX`
+    // as its own (it does not ask again, which would find its own nonce and refuse).
+    w.hub.set_delay(0);
+    w.standby.set_delay(0);
+    w.hub.set_acks(0);
+    let resync = request("concurrent, hub resync");
+    assert!(admit(&w.read_origin, &resync, RouteClass::Write)
+        .await
+        .unwrap());
+    assert_eq!(fallback(net, "hub_short_ack", "accepted"), 1.0);
+    assert!(w.standby.has(&key(net, &resync)));
 }
 
 #[tokio::test]

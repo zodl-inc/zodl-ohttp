@@ -2601,7 +2601,38 @@ impl ResponseCache {
                     .map(replay)
             }
             (ReplayPeerMode::AsyncReads, RouteClass::Write) => {
-                let outcomes = peers.write_nonce(&key, REPLAY_TTL_SECS).await;
+                // With a confirming standby store, every path below that can let the WRITE run
+                // asks it (`SET NX`): the check at the fallback store, the short-acknowledgement
+                // and the unavailable-hub fallbacks. Its `SET NX` runs concurrently with the hub's
+                // `SET NX` and replica wait instead of after them, which saves the round trip to
+                // the standby store on every WRITE. The verdict is the same: a replay at either
+                // store refuses the request; a nonce left at the standby store by a request that
+                // is then refused or fails closed stays held for those exact bytes, which clients
+                // never send again.
+                let early_standby = self.hub_fallback.as_ref().and(self.confirming_standby());
+                let hub = async {
+                    let outcomes = peers.write_nonce(&key, REPLAY_TTL_SECS).await;
+                    let disruptions = peers.disruptions();
+                    // The replica wait of the peers that stored the nonce, unless a peer
+                    // already held it.
+                    let fresh = |i: usize| outcomes.get(i) == Some(&PeerOutcome::Fresh);
+                    let confirmed = if combine_peer_outcomes(&outcomes) != PeerVerdict::Replay
+                        && outcomes.contains(&PeerOutcome::Fresh)
+                    {
+                        Some(peers.confirm_replicated_kind(&key, fresh).await)
+                    } else {
+                        None
+                    };
+                    (outcomes, disruptions, confirmed)
+                };
+                let standby = async {
+                    match early_standby {
+                        Some(s) => Some(s.write_nonce(&key, REPLAY_TTL_SECS).await),
+                        None => None,
+                    }
+                };
+                let ((outcomes, disruptions, confirmed), at_standby_outcomes) =
+                    tokio::join!(hub, standby);
                 // The hub gave no verdict (unreachable, a timeout or an error) where it would fail
                 // the WRITE closed: confirm at the fallback store instead
                 // (REPLAY_UNAVAILABLE_FALLBACK).
@@ -2612,7 +2643,9 @@ impl ResponseCache {
                         Some("standby" | "local_replicas")
                     )
                 {
-                    return self.hub_unavailable_fallback(&key, &outcomes).await;
+                    return self
+                        .hub_unavailable_fallback(&key, &outcomes, at_standby_outcomes)
+                        .await;
                 }
                 let replay = self.peer_verdict(
                     &outcomes,
@@ -2630,14 +2663,15 @@ impl ResponseCache {
                     let all_fresh =
                         !outcomes.is_empty() && outcomes.iter().all(|o| *o == PeerOutcome::Fresh);
                     if let Some(fb) = &self.hub_fallback {
-                        fb.note_generation(peers.disruptions());
+                        fb.note_generation(disruptions);
                     }
-                    match peers.confirm_replicated_kind(&key, fresh).await {
+                    // No peer stored the nonce (tolerated): nothing to wait for.
+                    match confirmed.unwrap_or(Ok(())) {
                         Ok(()) => {
                             // Also when a peer did not answer and the policy tolerated it
                             // (REPLAY_PEER_FAIL_CLOSED_WRITES=0): the WRITE then runs on the
                             // local verdict, and the fallback store must still be asked.
-                            match self.hub_window_check(&key).await {
+                            match self.hub_window_check(&key, at_standby_outcomes).await {
                                 Some(true) => {
                                     return Ok(PeerCheck {
                                         replay: true,
@@ -2650,7 +2684,10 @@ impl ResponseCache {
                             }
                         }
                         Err(f) if f.only_short && all_fresh => {
-                            match self.hub_short_ack_fallback(&key, f).await? {
+                            match self
+                                .hub_short_ack_fallback(&key, f, at_standby_outcomes)
+                                .await?
+                            {
                                 HubFallback::Replay => {
                                     return Ok(PeerCheck {
                                         replay: true,
@@ -2708,8 +2745,9 @@ impl ResponseCache {
     /// `SET NX` at the standby stores (write_fallback.rs, "Check at the fallback store").
     /// Some(true) = a standby store held the nonce (replay), Some(false) = every one took it,
     /// None = no standby store that confirms, or one did not answer (the hub's verdict stands,
-    /// the asynchronous hand-off follows as usual).
-    async fn hub_window_check(&self, key: &str) -> Option<bool> {
+    /// the asynchronous hand-off follows as usual). `asked`: the outcomes of that `SET NX` when
+    /// it already ran (concurrently with the hub's check); else it runs now.
+    async fn hub_window_check(&self, key: &str, asked: Option<Vec<PeerOutcome>>) -> Option<bool> {
         let fb = self.hub_fallback.as_ref()?;
         let standby = self.confirming_standby()?;
         // The label tells a check inside the window (after startup or a hub disruption) from
@@ -2719,7 +2757,10 @@ impl ResponseCache {
         } else {
             "hub_check"
         };
-        let outcomes = standby.write_nonce(key, REPLAY_TTL_SECS).await;
+        let outcomes = match asked {
+            Some(o) => o,
+            None => standby.write_nonce(key, REPLAY_TTL_SECS).await,
+        };
         let verdict = combine_peer_outcomes(&outcomes);
         let result = match verdict {
             PeerVerdict::Fresh => "accepted",
@@ -2737,10 +2778,13 @@ impl ResponseCache {
     /// The hub took the nonce as new but its replicas did not acknowledge it (`f`). With
     /// standby stores: confirm there (`SET NX` + `WAIT`). With the local replica wait: leave it
     /// to the local replicas. Otherwise, or on any other outcome: fail closed with `f`.
+    /// `asked`: the outcomes of the standby `SET NX` when it already ran (see
+    /// `hub_window_check`).
     async fn hub_short_ack_fallback(
         &self,
         key: &str,
         f: ConfirmFailure,
+        asked: Option<Vec<PeerOutcome>>,
     ) -> anyhow::Result<HubFallback> {
         let Some(fb) = self.hub_fallback.as_ref() else {
             anyhow::bail!(f.message);
@@ -2757,7 +2801,10 @@ impl ResponseCache {
             anyhow::bail!("{} (write-back queue full, no fallback)", f.message);
         }
         if let Some(standby) = self.confirming_standby() {
-            let outcomes = standby.write_nonce(key, REPLAY_TTL_SECS).await;
+            let outcomes = match asked {
+                Some(o) => o,
+                None => standby.write_nonce(key, REPLAY_TTL_SECS).await,
+            };
             match combine_peer_outcomes(&outcomes) {
                 PeerVerdict::Replay => {
                     record("replay");
@@ -2794,11 +2841,13 @@ impl ResponseCache {
     /// (new and acknowledged = runs, held = replay, anything else = fail-closed). With the
     /// local replica wait (the local store is the fallback store): the local replicas decide
     /// (`confirm_write_nonce`). Either way the nonce is written back to the hub until the hub's
-    /// replicas have it.
+    /// replicas have it. `asked`: the outcomes of the standby `SET NX` when it already ran (see
+    /// `hub_window_check`).
     async fn hub_unavailable_fallback(
         &self,
         key: &str,
         outcomes: &[PeerOutcome],
+        asked: Option<Vec<PeerOutcome>>,
     ) -> anyhow::Result<PeerCheck> {
         let Some(fb) = self.hub_fallback.as_ref() else {
             anyhow::bail!("Replay check failed at a peer origin (REPLAY_PEER_FAIL_CLOSED_WRITES): {outcomes:?}");
@@ -2820,7 +2869,10 @@ impl ResponseCache {
                 ..PeerCheck::default()
             });
         };
-        let at_standby = standby.write_nonce(key, REPLAY_TTL_SECS).await;
+        let at_standby = match asked {
+            Some(o) => o,
+            None => standby.write_nonce(key, REPLAY_TTL_SECS).await,
+        };
         match combine_peer_outcomes(&at_standby) {
             PeerVerdict::Replay => {
                 record("replay");
