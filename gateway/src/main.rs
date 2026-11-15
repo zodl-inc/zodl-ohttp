@@ -1738,7 +1738,6 @@ async fn gateway_handler(
                 warn!(
                     request_id = %request_id,
                     network = %network,
-                    body_hash = %hex::encode(body_hash),
                     origin = state.origin.label(),
                     "Replay detected"
                 );
@@ -2031,7 +2030,6 @@ async fn gateway_handler(
                 warn!(
                     request_id = %request_id,
                     network = %network,
-                    body_hash = %hex::encode(body_hash),
                     origin = state.origin.label(),
                     class = class.as_str(),
                     "Replay detected at a peer origin"
@@ -2132,7 +2130,6 @@ async fn gateway_handler(
                 warn!(
                     request_id = %request_id,
                     network = %network,
-                    body_hash = %hex::encode(body_hash),
                     origin = state.origin.label(),
                     "Replay detected at a peer origin (WRITE confirmed at the peer stores)"
                 );

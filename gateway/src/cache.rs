@@ -3762,7 +3762,9 @@ impl ResponseCache {
             Ok(Ok(v)) if !v.is_empty() => Some(v),
             Ok(Ok(_)) => None,
             Ok(Err(e)) => {
-                warn!(network = %self.network, height, error = %store_error(&e), "pinned get error");
+                if crate::health::warn_due(&self.network, "pinned_get") {
+                    warn!(network = %self.network, height, error = %store_error(&e), "pinned get error");
+                }
                 crate::health::record_cache_redis_timeout(&self.network, "pinned_get_error");
                 None
             }
@@ -3842,7 +3844,9 @@ impl ResponseCache {
                 false
             }
             Ok(Err(e)) => {
-                warn!(network = %self.network, height, error = %store_error(&e), "pinned set error");
+                if crate::health::warn_due(&self.network, "pinned_set") {
+                    warn!(network = %self.network, height, error = %store_error(&e), "pinned set error");
+                }
                 crate::health::record_cache_redis_timeout(&self.network, "pinned_set_error");
                 false
             }
@@ -5013,7 +5017,9 @@ impl ResponseCache {
         match timeout(self.redis_timeout, conn.get::<_, Option<Vec<u8>>>(key)).await {
             Ok(Ok(data)) => data,
             Ok(Err(e)) => {
-                warn!(error = %store_error(&e), "third-party cache get error");
+                if crate::health::warn_due(&self.network, "third_party_get") {
+                    warn!(network = %self.network, error = %store_error(&e), "third-party cache get error");
+                }
                 None
             }
             Err(_) => {
@@ -5036,7 +5042,11 @@ impl ResponseCache {
         .await
         {
             Ok(Ok(())) => {}
-            Ok(Err(e)) => warn!(error = %store_error(&e), "third-party cache put error"),
+            Ok(Err(e)) => {
+                if crate::health::warn_due(&self.network, "third_party_put") {
+                    warn!(network = %self.network, error = %store_error(&e), "third-party cache put error");
+                }
+            }
             Err(_) => crate::health::record_cache_redis_timeout(&self.network, "third_party_put"),
         }
     }
@@ -5079,12 +5089,16 @@ impl CacheStore for ResponseCache {
                 }
                 Ok(Ok(_)) => vec![None; n],
                 Ok(Err(e)) => {
-                    warn!(network = %self.network, error = %store_error(&e), "cache mget error");
+                    if crate::health::warn_due(&self.network, "cache_mget") {
+                        warn!(network = %self.network, error = %store_error(&e), "cache mget error");
+                    }
                     crate::health::record_cache_redis_timeout(&self.network, "mget_error");
                     vec![None; n]
                 }
                 Err(_) => {
-                    warn!(network = %self.network, timeout_ms = self.redis_timeout.as_millis(), "cache mget timeout");
+                    if crate::health::warn_due(&self.network, "cache_mget_timeout") {
+                        warn!(network = %self.network, timeout_ms = self.redis_timeout.as_millis(), "cache mget timeout");
+                    }
                     crate::health::record_cache_redis_timeout(&self.network, "mget_timeout");
                     vec![None; n]
                 }
@@ -5127,7 +5141,9 @@ impl CacheStore for ResponseCache {
             match result {
                 Ok(Ok(_)) => {}
                 Ok(Err(e)) => {
-                    warn!(network = %self.network, error = %store_error(&e), "cache set error");
+                    if crate::health::warn_due(&self.network, "cache_set") {
+                        warn!(network = %self.network, error = %store_error(&e), "cache set error");
+                    }
                     crate::health::record_cache_redis_timeout(&self.network, "set_error");
                 }
                 Err(_) => {
@@ -5152,7 +5168,9 @@ impl CacheStore for ResponseCache {
             match timeout(self.redis_timeout, fut).await {
                 Ok(Ok(_)) => {}
                 Ok(Err(e)) => {
-                    warn!(network = %self.network, error = %store_error(&e), "cache del error");
+                    if crate::health::warn_due(&self.network, "cache_del") {
+                        warn!(network = %self.network, error = %store_error(&e), "cache del error");
+                    }
                     crate::health::record_cache_redis_timeout(&self.network, "del_error");
                 }
                 Err(_) => {
@@ -5442,7 +5460,9 @@ impl PermanentRedis {
                 None
             }
             Ok(Err(e)) => {
-                warn!(network = %self.network, op, error = %store_error(&e), "permanent store error");
+                if crate::health::warn_due(&self.network, "permanent_store") {
+                    warn!(network = %self.network, op, error = %store_error(&e), "permanent store error");
+                }
                 crate::health::record_cache_redis_timeout(
                     &self.network,
                     &format!("perm_{op}_error"),

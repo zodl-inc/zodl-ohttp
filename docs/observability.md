@@ -91,6 +91,10 @@ relay's network, never a client, and is never logged per request.
 
 ## Cardinality
 
+No log line carries an identifier of a user request's content: a replay refusal is logged with
+the gateway's own `request_id` but without the request's hash (the replay nonce), and counted in
+`ohttp_replay_rejected_total`.
+
 `request_id`, `relay_request_id` and `client_trace_id` are never metric labels. The `rpc` label
 is one of the known lightwalletd method names, for a third-party (`BACKENDS`) request the method
 and path pattern of the `BACKENDS_POLICY` entry that admitted it (`GET /v0/status`, so bounded by

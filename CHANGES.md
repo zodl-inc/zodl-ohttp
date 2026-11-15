@@ -66,6 +66,8 @@ keeps its own log in [client/CHANGELOG.md](client/CHANGELOG.md).
   that reopen (it was left closed until the next request or housekeeping round). A command on a
   `WAIT` or retry connection whose task panics replaces that connection before its slot goes
   back to the pool.
+- The third-party cache get/put errors and the permanent store errors are logged at most once a
+  minute per kind, like the other per-request store warnings.
 - `confirm_write_nonce` refuses a `PeerCheck` whose peer stage found a replay (fail-closed),
   whatever the caller did with that verdict.
 - **New `REPLAY_ONE_SIDED_WRITE_ROUTES` (default empty); WRITEs that are not on it no longer run
@@ -139,6 +141,9 @@ keeps its own log in [client/CHANGELOG.md](client/CHANGELOG.md).
   or a pool replaced since its command went out is ignored. A command is never sent once its
   request's deadline has passed, and the task that owns it records its outcome (the pool's mode,
   the connection's timeout) also when the request went away meanwhile.
+- Replay refusals ("Replay detected", "Replay detected at a peer origin") are no longer logged
+  with the request's hash (`body_hash`, the replay nonce): it identifies one user request. The
+  counts stay in `ohttp_replay_rejected_total`.
 - A read origin with a confirming standby store (`REPLAY_STANDBY_URLS` with
   `REPLAY_PEER_WAIT_REPLICAS`) asks the standby store about a WRITE's nonce (`SET NX`) at the same
   time as the hub (`SET NX`, then the hub's replica wait), instead of after the hub answered. A
