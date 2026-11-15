@@ -127,4 +127,25 @@ mod security_tests {
         assert_eq!(with(&[b"s3cret-\xff"]), None);
         assert_eq!(authenticated_relay(&[], &HeaderMap::new()), None);
     }
+
+    #[test]
+    fn gateway_hosts_required_in_ohttp_mode() {
+        let hosts = vec!["ohttp-gateway.example".to_string()];
+        assert!(require_gateway_hosts("ohttp", &hosts).is_ok());
+        let err = require_gateway_hosts("ohttp", &[]).unwrap_err().to_string();
+        assert!(err.contains("GATEWAY_HOSTS is required"), "{err}");
+        // Proxy mode does not route by authority.
+        assert!(require_gateway_hosts("proxy", &[]).is_ok());
+    }
+
+    #[test]
+    fn gateway_hosts_empty_entries_count_as_unset() {
+        let _g = test_env_lock();
+        std::env::set_var("GATEWAY_HOSTS", " , ");
+        let hosts = Config::from_env().map(|c| c.gateway_hosts);
+        std::env::remove_var("GATEWAY_HOSTS");
+        let hosts = hosts.expect("config loads");
+        assert!(hosts.is_empty());
+        assert!(require_gateway_hosts("ohttp", &hosts).is_err());
+    }
 }
