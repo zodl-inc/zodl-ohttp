@@ -95,8 +95,9 @@ assert!(networks.get(Network::Mainnet).is_none());
 
 1. Fetch the signed envelope through the relay: `signed_config_url(relay_url, rule)` derives its
    URL from the relay URL (`.../relay` becomes `.../ohttp-configs/signed` under the default
-   rules). Do not follow redirects. Read at most `MAX_KEY_CONFIG_BYTES` (64 KiB, enforce it while
-   reading with `Limits::key_config_guard()`).
+   rules), with exactly the headers `profile.headers.key_fetch_signed(None)` lists. Do not follow
+   redirects. Read at most `MAX_KEY_CONFIG_BYTES` (64 KiB, enforce it while reading with
+   `Limits::key_config_guard()`).
 2. Only if that fails, read the envelope from DNS over HTTPS: for each resolver in
    `DOH_RESOLVERS`, in order, `GET doh_query_url(&networks, resolver, network)` (the network's
    `keys_dns_name`) with `accept: application/dns-json`, and pass the body to
@@ -105,7 +106,13 @@ assert!(networks.get(Network::Mainnet).is_none());
    `\\` and `\DDD` decimal escapes), requires exactly one distinct TXT value, base64-decodes it
    (standard alphabet, padded) and refuses an envelope over 64 KiB. The TXT value is the base64
    of the exact bytes `GET /ohttp-configs/signed` returns. Use the same transport as for the
-   relay (over Tor when the wallet is in Tor mode).
+   relay (over Tor when the wallet is in Tor mode). The resolver sees the client's address and
+   the name it asks for, which says that the client is looking for this gateway's keys, so send
+   it no more than the relay: exactly `Accept: application/dns-json`,
+   `Accept-Encoding: identity`, `Accept-Language: en` (`RELAY_ACCEPT_LANGUAGE`) and
+   `User-Agent: zodl-ohttp/1` (`RELAY_USER_AGENT`), each set explicitly, no cookies, no other
+   header, no redirect followed, and the query URL exactly as `doh_query_url` builds it (it asks
+   the resolver not to forward the client's subnet where the resolver supports that).
 3. Either way, verify the envelope with `verify_signed_config(&networks, json, network, now,
    &profile.signed_config)` (or `open_signed_config(json, network, &key, now)` for the library
    policy). It checks version 1, the network, the key id and Ed25519 signature against the
@@ -213,8 +220,27 @@ Rules that matter for privacy and correctness:
   + 16-byte tag) with `BhttpFormat` as soon as its length prefix is read (or, for the final
   chunk, as soon as it grows past it); stop reading the body on that error too. A gateway must
   keep `CHUNK_SIZE` at or below 65536 (default 16384).
+- **Send the relay exactly the listed headers.** `relay_post`, `key_fetch_signed` (also
+  `key_fetch`) and `key_fetch_plain` return the same names and values, in the same order, for
+  every preset: the content type and `Accept` (one per endpoint: `message/ohttp-chunked-res` on
+  the post, `application/json` on the signed envelope, `application/ohttp-keys` on the unsigned
+  document), `Accept-Encoding: identity`, `Accept-Language: en` (`RELAY_ACCEPT_LANGUAGE`, the
+  `accept_language` field) and `User-Agent: zodl-ohttp/1` (`RELAY_USER_AGENT`). Set every one of
+  them explicitly, so that the platform HTTP stack does not add its own `User-Agent`,
+  `Accept-Language` (the device's language list) or `Accept-Encoding`, and add nothing else (no
+  cookies, no cache validators, no application headers). The headers are then identical across
+  presets and do not tell the relay which wallet or platform sent a request. What remains
+  visible: the TLS and HTTP/2 parameters, header order and compression of the HTTP stack,
+  connection reuse and timing, which differ between stacks; a debug build's trace ids (below);
+  and the key-configuration URL where the presets' `SignedConfigUrlRule`s derive different ones.
+  The rules agree only when the relay URL's path is exactly `/relay` or empty: every rule then
+  fetches `/ohttp-configs/signed` at the relay host's root. For any other path, nested ones such
+  as `/testnet/relay` included, `ReplaceRelaySuffix` and `TrimThenReplaceRelaySuffix` keep the rest
+  of the path (`/testnet/ohttp-configs/signed`) while `RelayHostRoot` (Slipstream) fetches the
+  host's root, so the relay can tell those clients apart by the URL they fetch.
 - **Trace ids.** `X-Client-Trace-Id` (`ClientTrace`) links the relay's and the gateway's view of a
-  request; send it only in debug builds, never by default.
+  request; send it only in debug builds, never by default, and only on the post (no key fetch
+  lists it). Its format differs per `TracePolicy`, so a trace id also names the platform.
 
 ## 5. Errors
 

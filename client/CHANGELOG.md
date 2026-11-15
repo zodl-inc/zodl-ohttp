@@ -22,6 +22,15 @@ each change.
 - `Client` speaks `https://` only on the wire: a relay post or key fetch to any other scheme fails
   before anything is sent, so no redirect or bypass can reach a plain-HTTP server.
 
+- **Wire change at the relay:** every `OuterHeaders` preset is now the same (`ANDROID`, `IOS`
+  and `SLIPSTREAM` are `LIBRARY`), so the headers no longer tell the relay which client sent a
+  request. The exact lists and what changes per preset are under "Changed".
+- `OuterHeaders` has a new field `accept_language: Option<&'static str>` and
+  `key_fetch_accept` is a `bool` (the `Accept` value follows from the endpoint); code that
+  builds an `OuterHeaders` literal must set them. Use the presets.
+- `OuterHeaders::key_fetch` is the fetch of the signed envelope; the new `key_fetch_signed` is
+  the same and `key_fetch_plain` is the fetch of the unsigned `/ohttp-configs` document.
+
 ### Added
 
 - `Client::for_network(&OhttpNetworks, Network, SignedConfigUrlRule)`: a client posting to the
@@ -34,6 +43,26 @@ each change.
 
 ### Changed
 
+- Every preset sends the relay the same headers, in this order.
+  Post: `Content-Type: message/ohttp-chunked-req`, `Accept: message/ohttp-chunked-res`,
+  `Accept-Encoding: identity`, `Accept-Language: en`, `User-Agent: zodl-ohttp/1`, and
+  `X-Client-Trace-Id` when the caller passes one. Signed key-configuration fetch
+  (`key_fetch_signed`, `key_fetch`): `Accept: application/json`, `Accept-Encoding: identity`,
+  `Accept-Language: en`, `User-Agent: zodl-ohttp/1`, never a trace id. Unsigned document
+  (`key_fetch_plain`): the same with `Accept: application/ohttp-keys`. For the presets this
+  changes: `LIBRARY` fetch (gains `Accept: application/json` and `Accept-Encoding: identity`),
+  `ANDROID` fetch (gains `Accept-Encoding: identity`), `IOS` fetch (`Accept:
+  application/ohttp-keys` becomes `application/json`, the type the signed endpoint serves; gains
+  `Accept-Encoding: identity`; no longer carries the trace id), and every post and fetch (gains
+  `Accept-Language: en`). The gateway reads none of these headers. New constants
+  `RELAY_ACCEPT_LANGUAGE`, `SIGNED_CONFIG_MEDIA_TYPE`, `KEY_CONFIG_MEDIA_TYPE`.
+- What identical headers do not hide, now documented: the HTTP stack's TLS and HTTP/2 behaviour
+  (and header order and compression), connection reuse, timing, the format of a debug build's
+  trace ids, and the key-configuration URL itself where a preset's `SignedConfigUrlRule` derives
+  another one (Slipstream fetches `/ohttp-configs/signed` at the relay host's root; the others
+  replace a final `/relay`), which matters when the relay URL has a path other than `/relay`.
+  The 1.1.0 note that the fixed `User-Agent` keeps the relay from telling clients apart "by their
+  HTTP stack" claimed more than a header can do.
 - The crate-level example builds its client with `Client::for_network` (the signed source). It
   used `KeyConfigSource::Plain` on the relay host, which lets the relay substitute its own key.
 - `Client::send` and `Client::send_stream` no longer panic on a timeout too long to add to the

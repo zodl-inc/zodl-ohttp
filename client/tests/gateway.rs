@@ -29,7 +29,7 @@ use std::time::Duration;
 
 use axum::body::Bytes;
 use axum::extract::State;
-use axum::http::{header, StatusCode};
+use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response as AxumResponse};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -40,7 +40,9 @@ use ohttp_gateway::hpke::KeyState;
 use ohttp_gateway::ohttp::{self as gateway, InnerResponse};
 use ohttp_gateway::ohttp_chunked::decapsulate_chunked_request;
 use ohttp_gateway::signing::SigningState;
-use zodl_ohttp_client::{Client, Error, KeyConfig, KeyConfigSource, Network, Request};
+use zodl_ohttp_client::{
+    Client, Error, KeyConfig, KeyConfigSource, Network, OuterHeaders, Request,
+};
 
 const TIMEOUT: Duration = Duration::from_secs(10);
 const NETWORK: &str = "testnet";
@@ -125,6 +127,8 @@ struct TestGateway {
     /// How many of the next opened requests the gateway refuses as stale (inner 400,
     /// `ohttp-freshness: rejected`).
     refuse_stale: Mutex<usize>,
+    /// The request headers of every key-configuration fetch and post, with the route.
+    seen_headers: Mutex<Vec<(&'static str, HeaderMap)>>,
 }
 
 impl TestGateway {
@@ -140,8 +144,9 @@ impl TestGateway {
     }
 }
 
-async fn configs(State(gw): State<Arc<TestGateway>>) -> AxumResponse {
+async fn configs(State(gw): State<Arc<TestGateway>>, headers: HeaderMap) -> AxumResponse {
     gw.config_fetches.fetch_add(1, Ordering::SeqCst);
+    gw.seen_headers.lock().unwrap().push(("configs", headers));
     let document = gw.advertises.lock().unwrap().public_config();
     let cache_control = *gw.cache_control.lock().unwrap();
     let mut response =
@@ -154,16 +159,22 @@ async fn configs(State(gw): State<Arc<TestGateway>>) -> AxumResponse {
     response
 }
 
-async fn signed_configs(State(gw): State<Arc<TestGateway>>) -> AxumResponse {
+async fn signed_configs(State(gw): State<Arc<TestGateway>>, headers: HeaderMap) -> AxumResponse {
     gw.config_fetches.fetch_add(1, Ordering::SeqCst);
+    gw.seen_headers.lock().unwrap().push(("signed", headers));
     let document = gw.advertises.lock().unwrap().public_config();
     Json(gw.signing.get_signed_config(&document)).into_response()
 }
 
 /// The gateway's handling of a sealed request, as its `/gateway` route does it: an unknown
 /// key id is `422`, any other failure to open `400`; the inner request goes to `echo`.
-async fn relay(State(gw): State<Arc<TestGateway>>, body: Bytes) -> AxumResponse {
+async fn relay(
+    State(gw): State<Arc<TestGateway>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> AxumResponse {
     gw.posts.fetch_add(1, Ordering::SeqCst);
+    gw.seen_headers.lock().unwrap().push(("relay", headers));
     if let Some(status) = *gw.refuse_with.lock().unwrap() {
         return status.into_response();
     }
@@ -255,6 +266,7 @@ async fn spawn() -> (String, Arc<TestGateway>) {
         config_fetches: AtomicUsize::new(0),
         posts: AtomicUsize::new(0),
         refuse_stale: Mutex::new(0),
+        seen_headers: Mutex::new(Vec::new()),
     });
     let app = Router::new()
         .route("/ohttp-configs", get(configs))
@@ -361,6 +373,53 @@ async fn a_client_refuses_plain_http() {
     }
     assert_eq!(gw.config_fetches.load(Ordering::SeqCst), 0);
     assert_eq!(gw.posts.load(Ordering::SeqCst), 0);
+}
+
+/// What the relay sees of `Client`: exactly the headers of `OuterHeaders::LIBRARY` (the set
+/// every preset shares) on the post and the signed fetch, beside those the HTTP stack adds for
+/// the connection and the body; `Accept: application/ohttp-keys` on the unsigned fetch.
+#[tokio::test]
+async fn the_relay_sees_the_presets_headers_and_nothing_more() {
+    let (base, gw) = spawn().await;
+    let signed = Client::insecure_for_local_testing(
+        format!("{base}/relay"),
+        KeyConfigSource::Signed {
+            url: format!("{base}/ohttp-configs/signed"),
+            network: Network::Testnet,
+            signer: gw.signer(),
+        },
+    )
+    .unwrap();
+    signed.send(&json_post(), TIMEOUT).await.unwrap();
+    plain_client(&base)
+        .send(&json_post(), TIMEOUT)
+        .await
+        .unwrap();
+    let expected = |pairs: Vec<(&'static str, String)>| -> Vec<(String, String)> {
+        let mut pairs: Vec<_> = pairs
+            .into_iter()
+            .map(|(k, v)| (k.to_ascii_lowercase(), v))
+            .collect();
+        pairs.sort();
+        pairs
+    };
+    let seen = gw.seen_headers.lock().unwrap();
+    let routes: Vec<_> = seen.iter().map(|(route, _)| *route).collect();
+    assert_eq!(routes, ["signed", "relay", "configs", "relay"]);
+    for (route, headers) in seen.iter() {
+        let mut got: Vec<(String, String)> = headers
+            .iter()
+            .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap().to_string()))
+            .filter(|(k, _)| !matches!(k.as_str(), "host" | "content-length"))
+            .collect();
+        got.sort();
+        let want = match *route {
+            "relay" => expected(OuterHeaders::LIBRARY.relay_post(None)),
+            "signed" => expected(OuterHeaders::LIBRARY.key_fetch_signed(None)),
+            _ => expected(OuterHeaders::LIBRARY.key_fetch_plain(None)),
+        };
+        assert_eq!(got, want, "{route}");
+    }
 }
 
 #[tokio::test]

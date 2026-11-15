@@ -369,8 +369,13 @@ impl Client {
     }
 
     async fn fetch(&self, timeout: Duration) -> Result<Fetched, Error> {
+        let headers = match &self.keys {
+            #[cfg(feature = "insecure-plain-key-config")]
+            KeyConfigSource::Plain { .. } => OuterHeaders::LIBRARY.key_fetch_plain(None),
+            KeyConfigSource::Signed { .. } => OuterHeaders::LIBRARY.key_fetch_signed(None),
+        };
         let mut get = self.http.get(self.keys.url());
-        for (name, value) in OuterHeaders::LIBRARY.key_fetch(None) {
+        for (name, value) in headers {
             get = get.header(name, value);
         }
         let resp = get.timeout(timeout).send().await?.error_for_status()?;

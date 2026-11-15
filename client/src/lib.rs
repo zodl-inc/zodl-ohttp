@@ -127,8 +127,9 @@ pub use outer::{
     check_size, classify_outer_response, retry_after_delay, signed_config_url, unsigned_cache_secs,
     CachePolicy, Limits, OuterHeaders, OuterOutcome, OuterPolicy, OuterResponse, RelayBackoff,
     SignedConfigUrlRule, SizeGuard, SuccessStatus, GATEWAY_MAX_ENCAPSULATED_REQUEST_BYTES,
-    GATEWAY_MAX_SEALED_RESPONSE_BYTES, GATEWAY_MAX_UPSTREAM_RESPONSE_BYTES, MAX_KEY_CONFIG_BYTES,
-    MAX_RETRY_AFTER, RELAY_USER_AGENT, UNSIGNED_DEFAULT_CACHE_SECS,
+    GATEWAY_MAX_SEALED_RESPONSE_BYTES, GATEWAY_MAX_UPSTREAM_RESPONSE_BYTES, KEY_CONFIG_MEDIA_TYPE,
+    MAX_KEY_CONFIG_BYTES, MAX_RETRY_AFTER, RELAY_ACCEPT_LANGUAGE, RELAY_USER_AGENT,
+    SIGNED_CONFIG_MEDIA_TYPE, UNSIGNED_DEFAULT_CACHE_SECS,
 };
 pub use profile::ClientProfile;
 pub use signed::{
