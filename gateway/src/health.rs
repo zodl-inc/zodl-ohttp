@@ -515,6 +515,7 @@ pub fn init_metrics() {
         &*OHTTP_LWD_TIMEOUTS_TOTAL,
         &*OHTTP_LWD_POOL_RESETS_TOTAL,
         &*OHTTP_LWD_READ_RETRIES_TOTAL,
+        &*OHTTP_REPLAY_WAIT_SATURATED_TOTAL,
     ] {
         REGISTRY.register(Box::new(c.clone())).ok();
     }
@@ -2241,5 +2242,42 @@ mod multi_origin_tests {
         assert!(find("ohttp_replay_class_total")
             .iter()
             .any(|(l, v)| *v == 1 && l.contains(&("class".to_string(), "read".to_string()))));
+    }
+}
+
+lazy_static::lazy_static! {
+    static ref OHTTP_REPLAY_WAIT_SATURATED_TOTAL: IntCounterVec = IntCounterVec::new(
+        Opts::new("ohttp_replay_wait_saturated_total", "WRITE replay nonces whose replica wait found every dedicated WAIT connection of the store busy for the whole wait budget (REPLAY_WAIT_CONNS): decided as a short acknowledgement after a SET XX found the nonce. store: local | peer"),
+        &["network", "store"]
+    )
+    .unwrap();
+}
+
+/// `store`: local | peer.
+pub fn record_replay_wait_saturated(network: &str, store: &str) {
+    OHTTP_REPLAY_WAIT_SATURATED_TOTAL
+        .with_label_values(&[network, store])
+        .inc();
+}
+/// How often one kind of store warning (`warn_due`) is logged per network and process.
+pub const STORE_WARN_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
+
+lazy_static::lazy_static! {
+    static ref STORE_WARN_LAST: parking_lot::Mutex<std::collections::HashMap<(String, &'static str), std::time::Instant>> =
+        parking_lot::Mutex::new(std::collections::HashMap::new());
+}
+
+/// Whether a warning of `kind` for `network` is due: true for the first one and then at most
+/// once per `STORE_WARN_EVERY`, so a store outage logs one line per minute and kind instead of one
+/// per request (the outcomes are counted in metrics either way).
+pub fn warn_due(network: &str, kind: &'static str) -> bool {
+    let now = std::time::Instant::now();
+    let mut last = STORE_WARN_LAST.lock();
+    match last.get(&(network.to_string(), kind)) {
+        Some(t) if now.duration_since(*t) < STORE_WARN_EVERY => false,
+        _ => {
+            last.insert((network.to_string(), kind), now);
+            true
+        }
     }
 }

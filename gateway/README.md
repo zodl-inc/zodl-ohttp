@@ -233,6 +233,7 @@ trace ids are never labels. `network` is `NETWORK`.
 | `ohttp_replay_unavailable_fallback` | `network, target` | 1 for the store the unavailable fallback replaces on this gateway (`local`, `standby`, `local_replicas`); all 0 when off, and on an `async-reads` origin with `REPLAY_PEER_FAIL_CLOSED_WRITES=0`, where only its own store is replaced (`ohttp_replay_local_fallback`). |
 | `ohttp_replay_write_back_total` | `network, result` | Nonces admitted through the peers rewritten to the local store: `written` (acknowledged by its replicas) or `expired`. |
 | `ohttp_replay_write_back_pending` | `network` | Such nonces still waiting for the local replicas. |
+| `ohttp_replay_wait_saturated_total` | `network, store` | WRITE nonces whose replica wait found every dedicated `WAIT` connection of the store (`local`, or a `peer`) busy for the whole wait budget (`REPLAY_WAIT_CONNS`); decided as a short acknowledgement once a `SET XX` found the nonce. Rises while the store's replicas resync. |
 | `ohttp_key_config_info` | `network, fingerprint, signing_key_id` | Always 1: first 16 hex of SHA-256 of `/ohttp-configs` and the signing key id. |
 | `ohttp_origin_info` | `network, origin` | Always 1: `ORIGIN_ID`. |
 | `ohttp_replay_peers_configured` | `network` | Number of `REPLAY_PEER_URLS`. |

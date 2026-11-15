@@ -148,6 +148,24 @@ struct Store {
     /// The next `SET ... NX` is applied and answered only after this many ms (a reply that
     /// arrives after the client gave up).
     set_nx_delay_once_ms: AtomicU64,
+    /// WAIT blocks its connection for its whole timeout before answering, as a real store does
+    /// while its replicas do not acknowledge.
+    wait_blocks: AtomicBool,
+    /// Every connection is a session with a number; the commands of each, in arrival order:
+    /// (session, "SET XX <key>" | "WAIT" | other command name).
+    sessions: AtomicU64,
+    session_log: Mutex<Vec<(u64, String)>>,
+    /// The next `SET ... XX` is applied, then its connection closed without an answer.
+    close_after_set_xx_once: AtomicBool,
+    /// Every WAIT waits this long before answering (a slow store or a long way to it).
+    wait_delay_ms: AtomicU64,
+    /// Hold each `SET ... XX` reply until the next command of its session has arrived; count
+    /// those not followed by a WAIT within a second.
+    hold_set_xx_until_wait: AtomicBool,
+    set_xx_unpipelined: AtomicU64,
+    /// Blocking WAITs in progress, and the most at once.
+    waits_inflight: AtomicU64,
+    waits_max: AtomicU64,
 }
 
 impl Default for Store {
@@ -158,6 +176,15 @@ impl Default for Store {
             acks: AtomicI64::new(1),
             wait_hangs: AtomicBool::new(false),
             set_nx_delay_once_ms: AtomicU64::new(0),
+            wait_blocks: AtomicBool::new(false),
+            sessions: AtomicU64::new(0),
+            session_log: Mutex::default(),
+            close_after_set_xx_once: AtomicBool::new(false),
+            wait_delay_ms: AtomicU64::new(0),
+            hold_set_xx_until_wait: AtomicBool::new(false),
+            set_xx_unpipelined: AtomicU64::new(0),
+            waits_inflight: AtomicU64::new(0),
+            waits_max: AtomicU64::new(0),
         }
     }
 }
@@ -188,23 +215,107 @@ impl Store {
         self.acks.store(n, Ordering::SeqCst);
     }
 
+    /// The commands of `session`, in order.
+    fn session_commands(&self, session: u64) -> Vec<String> {
+        self.session_log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(s, _)| *s == session)
+            .map(|(_, c)| c.clone())
+            .collect()
+    }
+
+    /// The sessions in which `SET XX key` arrived.
+    fn set_xx_sessions(&self, key: &str) -> Vec<u64> {
+        let entry = format!("SET XX {key}");
+        self.session_log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, c)| *c == entry)
+            .map(|(s, _)| *s)
+            .collect()
+    }
+
     async fn serve(self: Arc<Self>, sock: TcpStream) {
+        let session = self.sessions.fetch_add(1, Ordering::SeqCst);
         let (r, mut w) = sock.into_split();
         let mut r = BufReader::new(r);
-        while let Some(args) = read_command(&mut r).await {
-            if args.first().is_some_and(|c| c.eq_ignore_ascii_case("SET"))
-                && args.iter().skip(3).any(|a| a.eq_ignore_ascii_case("NX"))
-            {
+        // A command read ahead (`hold_set_xx_until_wait`), handled next.
+        let mut next: Option<Vec<String>> = None;
+        loop {
+            let args = match next.take() {
+                Some(a) => a,
+                None => match read_command(&mut r).await {
+                    Some(a) => a,
+                    None => return,
+                },
+            };
+            let name = args
+                .first()
+                .map(|a| a.to_ascii_uppercase())
+                .unwrap_or_default();
+            let is = |c: &str| args.first().is_some_and(|a| a.eq_ignore_ascii_case(c));
+            let xx = is("SET") && args.iter().skip(3).any(|a| a.eq_ignore_ascii_case("XX"));
+            self.session_log.lock().unwrap().push((
+                session,
+                if xx {
+                    format!("SET XX {}", args[1])
+                } else {
+                    name.clone()
+                },
+            ));
+            if xx && self.close_after_set_xx_once.swap(false, Ordering::SeqCst) {
+                let _ = self.answer(&args);
+                return;
+            }
+            // The SET XX reply is held back until the WAIT after it has arrived: a client that
+            // sends the two as one pipeline gets both; one that waits for the SET XX reply
+            // before sending the WAIT gets it only after a second (counted as unpipelined).
+            if xx && self.hold_set_xx_until_wait.load(Ordering::SeqCst) {
+                let answer = self.answer(&args);
+                match tokio::time::timeout(Duration::from_secs(1), read_command(&mut r)).await {
+                    Ok(Some(after)) => {
+                        if !after
+                            .first()
+                            .is_some_and(|a| a.eq_ignore_ascii_case("WAIT"))
+                        {
+                            self.set_xx_unpipelined.fetch_add(1, Ordering::SeqCst);
+                        }
+                        next = Some(after);
+                    }
+                    Ok(None) => return,
+                    Err(_) => {
+                        self.set_xx_unpipelined.fetch_add(1, Ordering::SeqCst);
+                    }
+                }
+                if w.write_all(answer.as_bytes()).await.is_err() {
+                    return;
+                }
+                continue;
+            }
+            if is("SET") && args.iter().skip(3).any(|a| a.eq_ignore_ascii_case("NX")) {
                 let ms = self.set_nx_delay_once_ms.swap(0, Ordering::SeqCst);
                 if ms > 0 {
                     tokio::time::sleep(Duration::from_millis(ms)).await;
                 }
             }
-            if args.first().is_some_and(|c| c.eq_ignore_ascii_case("WAIT"))
-                && self.wait_hangs.load(Ordering::SeqCst)
-            {
+            if is("WAIT") && self.wait_hangs.load(Ordering::SeqCst) {
                 // Never answered: every later reply on this connection waits behind it.
                 std::future::pending::<()>().await;
+            }
+            let delay = self.wait_delay_ms.load(Ordering::SeqCst);
+            if is("WAIT") && (delay > 0 || self.wait_blocks.load(Ordering::SeqCst)) {
+                let ms = if delay > 0 {
+                    delay
+                } else {
+                    args.get(2).and_then(|t| t.parse::<u64>().ok()).unwrap_or(0)
+                };
+                let now = self.waits_inflight.fetch_add(1, Ordering::SeqCst) + 1;
+                self.waits_max.fetch_max(now, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(ms)).await;
+                self.waits_inflight.fetch_sub(1, Ordering::SeqCst);
             }
             if w.write_all(self.answer(&args).as_bytes()).await.is_err() {
                 return;
@@ -325,6 +436,29 @@ async fn cache_store() -> String {
 /// A primary-region gateway: `failover` mode, its own store `primary` (with the replica wait),
 /// the fallback store `fallback` as its peer.
 async fn primary_origin(network: &str, primary: &str, fallback: &str, on: bool) -> ResponseCache {
+    primary_origin_conns(network, primary, fallback, on, 4).await
+}
+
+/// `primary_origin` with `conns` dedicated `WAIT` connections (`REPLAY_WAIT_CONNS`).
+async fn primary_origin_conns(
+    network: &str,
+    primary: &str,
+    fallback: &str,
+    on: bool,
+    conns: usize,
+) -> ResponseCache {
+    primary_origin_wait(network, primary, fallback, on, conns, WAIT).await
+}
+
+/// `primary_origin_conns` with its own local `WAIT` settings.
+async fn primary_origin_wait(
+    network: &str,
+    primary: &str,
+    fallback: &str,
+    on: bool,
+    conns: usize,
+    wait: WriteWaitConfig,
+) -> ResponseCache {
     ohttp_gateway::health::init_metrics();
     let c = ResponseCache::connect(
         &cache_store().await,
@@ -343,7 +477,7 @@ async fn primary_origin(network: &str, primary: &str, fallback: &str, on: bool) 
         .with_wait(Some(WAIT));
     c.with_replay_peers(peers)
         .with_async_replication(replication(network, ReplayPeerMode::Failover))
-        .with_write_wait(primary, WAIT)
+        .with_write_wait_conns(primary, wait, conns)
         .await
         .unwrap()
         .with_unavailable_fallback(on)
@@ -1588,6 +1722,384 @@ async fn a_strict_write_retries_a_peer_set_nx_that_timed_out() {
     w.f.put(&key(net, &other));
     w.f.set_nx_delay_once_ms.store(400, Ordering::SeqCst);
     assert!(!admit_strict(&primary, &other, RouteClass::Write)
+        .await
+        .unwrap());
+}
+
+// ---------------------------------------------------------------------------------------------
+// The replica wait itself: `SET XX` + `WAIT` as one pipeline, and a small pool of dedicated
+// `WAIT` connections per store (`REPLAY_WAIT_CONNS`).
+
+fn saturated(network: &str, store: &str) -> f64 {
+    counter(
+        "ohttp_replay_wait_saturated_total",
+        &[("network", network), ("store", store)],
+    )
+}
+
+#[tokio::test]
+async fn the_local_wait_rewrites_and_waits_in_one_pipeline() {
+    let net = "testnet-wait-pipeline";
+    let w = World::new().await;
+    let primary = primary_origin(net, &addr_url(w.p_addr), &addr_url(w.f_addr), false).await;
+    // The store answers a SET XX only once the WAIT of the same session has arrived: sent as two
+    // commands, the WAIT would only follow the SET XX reply.
+    w.p.hold_set_xx_until_wait.store(true, Ordering::SeqCst);
+    // Each SET XX is followed by its WAIT on the same session: a reconnect between the two
+    // would have the WAIT count the replicas of another session.
+    for i in 0..5 {
+        let write = request(&format!("pipelined wait {i}"));
+        assert!(admit_strict(&primary, &write, RouteClass::Write)
+            .await
+            .unwrap());
+        let k = key(net, &write);
+        let sessions = w.p.set_xx_sessions(&k);
+        assert_eq!(sessions.len(), 1, "{sessions:?}");
+        let cmds = w.p.session_commands(sessions[0]);
+        let at = cmds
+            .iter()
+            .position(|c| *c == format!("SET XX {k}"))
+            .unwrap();
+        assert_eq!(
+            cmds.get(at + 1).map(String::as_str),
+            Some("WAIT"),
+            "{cmds:?}"
+        );
+    }
+    // The connection breaks after the SET XX: the retry sends both again, on a new session.
+    w.p.close_after_set_xx_once.store(true, Ordering::SeqCst);
+    let write = request("pipelined wait, connection lost");
+    assert!(admit_strict(&primary, &write, RouteClass::Write)
+        .await
+        .unwrap());
+    let k = key(net, &write);
+    let sessions = w.p.set_xx_sessions(&k);
+    assert_eq!(sessions.len(), 2, "{sessions:?}");
+    assert_ne!(sessions[0], sessions[1]);
+    let first = w.p.session_commands(sessions[0]);
+    assert_eq!(
+        first.last(),
+        Some(&format!("SET XX {k}")),
+        "closed after it"
+    );
+    let retry = w.p.session_commands(sessions[1]);
+    let at = retry
+        .iter()
+        .position(|c| *c == format!("SET XX {k}"))
+        .unwrap();
+    assert_eq!(
+        retry.get(at + 1).map(String::as_str),
+        Some("WAIT"),
+        "{retry:?}"
+    );
+    assert_eq!(w.p.set_xx_unpipelined.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn concurrent_writes_wait_on_separate_connections() {
+    let net = "testnet-wait-pool";
+    let w = World::new().await;
+    let primary =
+        primary_origin_conns(net, &addr_url(w.p_addr), &addr_url(w.f_addr), false, 4).await;
+    w.p.wait_blocks.store(true, Ordering::SeqCst);
+    let writes: Vec<Vec<u8>> = (0..8).map(|i| request(&format!("pool {i}"))).collect();
+    let results = futures_util::future::join_all(
+        writes
+            .iter()
+            .map(|h| admit_strict(&primary, h, RouteClass::Write)),
+    )
+    .await;
+    for r in results {
+        assert!(r.unwrap());
+    }
+    let max = w.p.waits_max.load(Ordering::SeqCst);
+    assert!((2..=4).contains(&max), "WAITs in flight at once: {max}");
+}
+
+/// While the replicas resync every `WAIT` takes its whole timeout. WRITEs beyond what the
+/// connections can wait for are decided as short acknowledgements (the nonce checked on the
+/// security connection) instead of running out of time and failing closed.
+#[tokio::test]
+async fn writes_beyond_the_wait_connections_are_short_acknowledgements() {
+    let net = "testnet-wait-saturated";
+    let w = World::new().await;
+    // One WAIT connection, and the unavailable fallback off: an outer timeout would fail closed.
+    let primary =
+        primary_origin_conns(net, &addr_url(w.p_addr), &addr_url(w.f_addr), false, 1).await;
+    w.p.set_acks(0);
+    w.p.wait_blocks.store(true, Ordering::SeqCst);
+    // The first short acknowledgement switches the pool to exclusive leasing.
+    assert!(
+        admit_strict(&primary, &request("resync starts"), RouteClass::Write)
+            .await
+            .unwrap()
+    );
+    assert!(primary.local_wait_exclusive());
+    let writes: Vec<Vec<u8>> = (0..20).map(|i| request(&format!("resync {i}"))).collect();
+    let results = futures_util::future::join_all(
+        writes
+            .iter()
+            .map(|h| admit_strict(&primary, h, RouteClass::Write)),
+    )
+    .await;
+    for (i, r) in results.into_iter().enumerate() {
+        assert!(r.unwrap(), "write {i}");
+    }
+    assert!(saturated(net, "local") >= 1.0);
+    assert_eq!(fallback(net, "short_ack", "accepted"), 21.0);
+    assert_eq!(fallback(net, "local_unavailable", "accepted"), 0.0);
+    for h in &writes {
+        assert!(w.f.has(&key(net, h)), "confirmed at the peer");
+    }
+}
+
+/// The same at a peer: a read origin whose hub resyncs, with one `WAIT` connection to it.
+#[tokio::test]
+async fn writes_beyond_the_peer_wait_connections_are_short_acknowledgements() {
+    let net = "testnet-wait-saturated-peer";
+    let w = World::new().await;
+    ohttp_gateway::health::init_metrics();
+    let (local, l_addr) = Store::start().await;
+    std::mem::forget(local);
+    let c = ResponseCache::connect(
+        &cache_store().await,
+        Some(&addr_url(l_addr)),
+        net.to_string(),
+        "lwd.example.com:9067".to_string(),
+        250,
+        100,
+        &HashMap::new(),
+    )
+    .await
+    .unwrap();
+    let peers = ReplayPeers::connect(&[addr_url(w.p_addr)], net.to_string(), 250, false)
+        .await
+        .with_mode(ReplayPeerMode::AsyncReads, true)
+        .with_wait_conns(Some(WAIT), 1);
+    let standby = ReplayPeers::connect_standby(&[addr_url(w.f_addr)], net.to_string(), 250, 1)
+        .await
+        .with_wait(Some(WAIT));
+    let reader = c
+        .with_replay_peers(peers)
+        .with_async_replication(replication(net, ReplayPeerMode::AsyncReads))
+        .with_standby_replication(standby, replication(net, ReplayPeerMode::Failover));
+    until("standby store connected", Duration::from_secs(10), || {
+        gauge("ohttp_replay_standby_connected", net)
+    })
+    .await;
+    w.p.set_acks(0);
+    w.p.wait_blocks.store(true, Ordering::SeqCst);
+    // The first short acknowledgement switches the peer's pool to exclusive leasing.
+    assert!(
+        admit_strict(&reader, &request("hub resync starts"), RouteClass::Write)
+            .await
+            .unwrap()
+    );
+    let writes: Vec<Vec<u8>> = (0..10)
+        .map(|i| request(&format!("hub resync {i}")))
+        .collect();
+    let results = futures_util::future::join_all(
+        writes
+            .iter()
+            .map(|h| admit_strict(&reader, h, RouteClass::Write)),
+    )
+    .await;
+    for (i, r) in results.into_iter().enumerate() {
+        assert!(r.unwrap(), "write {i}");
+    }
+    assert!(saturated(net, "peer") >= 1.0);
+    assert_eq!(fallback(net, "hub_short_ack", "accepted"), 11.0);
+}
+// ---------------------------------------------------------------------------------------------
+// The adaptive WAIT pool: shared while WAITs are fast, exclusive while they are slow.
+
+/// A link with a fixed one-way delay that keeps pipelining: every chunk is delivered `delay`
+/// after it was read, without waiting for the ones before it to be answered.
+async fn slow_link(target: SocketAddr, delay: Duration) -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        while let Ok((inbound, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let Ok(upstream) = TcpStream::connect(target).await else {
+                    return;
+                };
+                let (ri, wi) = inbound.into_split();
+                let (ru, wu) = upstream.into_split();
+                tokio::spawn(delayed_pump(ri, wu, delay));
+                tokio::spawn(delayed_pump(ru, wi, delay));
+            });
+        }
+    });
+    port
+}
+
+async fn delayed_pump(
+    mut from: tokio::net::tcp::OwnedReadHalf,
+    mut to: tokio::net::tcp::OwnedWriteHalf,
+    delay: Duration,
+) {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(tokio::time::Instant, Vec<u8>)>();
+    tokio::spawn(async move {
+        while let Some((at, data)) = rx.recv().await {
+            tokio::time::sleep_until(at).await;
+            if to.write_all(&data).await.is_err() {
+                return;
+            }
+        }
+    });
+    let mut buf = vec![0u8; 16 * 1024];
+    loop {
+        let n = match from.read(&mut buf).await {
+            Ok(0) | Err(_) => return,
+            Ok(n) => n,
+        };
+        if tx
+            .send((tokio::time::Instant::now() + delay, buf[..n].to_vec()))
+            .is_err()
+        {
+            return;
+        }
+    }
+}
+
+/// 200 WRITEs at once to a local store 100 ms away whose replicas acknowledge at once: shared
+/// connections, no WRITE waits for a connection.
+#[tokio::test]
+async fn fast_waits_share_the_connections_without_a_cap() {
+    let net = "testnet-wait-shared";
+    let w = World::new().await;
+    let port = slow_link(w.p_addr, Duration::from_millis(50)).await;
+    let wait = WriteWaitConfig {
+        replicas: 1,
+        timeout_ms: 200,
+    };
+    let primary = primary_origin_wait(net, &url(port), &addr_url(w.f_addr), false, 8, wait).await;
+    for i in 0..3 {
+        assert!(
+            admit_strict(&primary, &request(&format!("warm {i}")), RouteClass::Write)
+                .await
+                .unwrap()
+        );
+    }
+    assert!(!primary.local_wait_exclusive());
+    let writes: Vec<Vec<u8>> = (0..200).map(|i| request(&format!("burst {i}"))).collect();
+    let started = Instant::now();
+    let results = futures_util::future::join_all(
+        writes
+            .iter()
+            .map(|h| admit_strict(&primary, h, RouteClass::Write)),
+    )
+    .await;
+    for (i, r) in results.into_iter().enumerate() {
+        assert!(r.unwrap(), "write {i}");
+    }
+    // Exclusive leasing would admit 8 per round trip: 25 round trips, past every budget.
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(saturated(net, "local"), 0.0);
+    assert_eq!(fallback(net, "short_ack", "accepted"), 0.0);
+    assert!(!primary.local_wait_exclusive());
+    // A WAIT that takes much longer than the round trip: exclusive from now on.
+    w.p.wait_delay_ms.store(400, Ordering::SeqCst);
+    assert!(
+        admit_strict(&primary, &request("slow replicas"), RouteClass::Write)
+            .await
+            .unwrap()
+    );
+    assert!(primary.local_wait_exclusive());
+}
+
+/// A connection given back just after the last moment a WAIT still fits in the budget is not
+/// used for one that would run out of time: that WRITE takes the saturated path instead.
+#[tokio::test]
+async fn a_lease_freed_too_late_for_a_whole_wait_is_not_taken() {
+    let net = "testnet-wait-cutoff";
+    let w = World::new().await;
+    // Budget 400 + 4 x 250 = 1400 ms; a lease needs 400 + 2 x 250 = 900 ms of it left, so it is
+    // taken at most 500 ms after the WRITE started.
+    let wait = WriteWaitConfig {
+        replicas: 1,
+        timeout_ms: 400,
+    };
+    let primary = primary_origin_wait(
+        net,
+        &addr_url(w.p_addr),
+        &addr_url(w.f_addr),
+        false,
+        1,
+        wait,
+    )
+    .await;
+    w.p.set_acks(0);
+    assert!(
+        admit_strict(&primary, &request("exclusive"), RouteClass::Write)
+            .await
+            .unwrap()
+    );
+    assert!(primary.local_wait_exclusive());
+    w.p.set_acks(1);
+    // The one connection is busy for 700 ms: freed 200 ms after the other WRITE's cutoff, and
+    // 200 ms before the time a lease would leave no room for a WAIT at all: taking it then
+    // would run out of time (700 + 700 > 1400).
+    w.p.wait_delay_ms.store(700, Ordering::SeqCst);
+    let (a, b) = (request("holds the connection"), request("waits for it"));
+    let (ra, rb) = tokio::join!(admit_strict(&primary, &a, RouteClass::Write), async {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        admit_strict(&primary, &b, RouteClass::Write).await
+    });
+    assert!(ra.unwrap());
+    assert!(
+        rb.unwrap(),
+        "decided as a short acknowledgement, not timed out"
+    );
+    assert_eq!(saturated(net, "local"), 1.0);
+    assert_eq!(fallback(net, "short_ack", "accepted"), 2.0);
+}
+
+/// WRITEs given up by their callers while their WAITs run (cancelled under load) keep their
+/// connections until those WAITs are answered.
+#[tokio::test]
+async fn cancelled_writes_keep_their_wait_connections_until_answered() {
+    let net = "testnet-wait-cancel";
+    let w = World::new().await;
+    let primary =
+        primary_origin_conns(net, &addr_url(w.p_addr), &addr_url(w.f_addr), false, 2).await;
+    w.p.set_acks(0);
+    assert!(
+        admit_strict(&primary, &request("exclusive"), RouteClass::Write)
+            .await
+            .unwrap()
+    );
+    w.p.set_acks(1);
+    w.p.wait_delay_ms.store(300, Ordering::SeqCst);
+    let writes: Vec<Vec<u8>> = (0..10)
+        .map(|i| request(&format!("cancelled {i}")))
+        .collect();
+    let cancelled = futures_util::future::join_all(writes.iter().map(|h| {
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            admit_strict(&primary, h, RouteClass::Write),
+        )
+    }))
+    .await;
+    assert!(cancelled.iter().all(|r| r.is_err()), "all given up");
+    assert_eq!(
+        primary.local_wait_idle(),
+        0,
+        "both still busy with their WAITs"
+    );
+    until("WAITs answered", Duration::from_secs(5), || {
+        primary.local_wait_idle() == 2
+    })
+    .await;
+    let max = w.p.waits_max.load(Ordering::SeqCst);
+    assert!(max <= 2, "never more WAITs at once than connections: {max}");
+    w.p.wait_delay_ms.store(0, Ordering::SeqCst);
+    assert!(admit_strict(&primary, &request("after"), RouteClass::Write)
         .await
         .unwrap());
 }

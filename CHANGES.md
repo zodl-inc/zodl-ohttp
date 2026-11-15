@@ -62,6 +62,10 @@ keeps its own log in [client/CHANGELOG.md](client/CHANGELOG.md).
 
 ### Gateway
 
+- A replay peer's `WAIT` or retry connection reset while its reopen finished is opened again by
+  that reopen (it was left closed until the next request or housekeeping round). A command on a
+  `WAIT` or retry connection whose task panics replaces that connection before its slot goes
+  back to the pool.
 - `confirm_write_nonce` refuses a `PeerCheck` whose peer stage found a replay (fail-closed),
   whatever the caller did with that verdict.
 - **New `REPLAY_ONE_SIDED_WRITE_ROUTES` (default empty); WRITEs that are not on it no longer run
@@ -86,13 +90,55 @@ keeps its own log in [client/CHANGELOG.md](client/CHANGELOG.md).
   unreachable must list those routes before it upgrades, or those WRITEs fail closed during such
   an outage. READs are not affected. A `failover`-mode origin without the peer fallback consults
   no second store and is unchanged.
-  A both-stores WRITE whose peer or standby `SET NX` timed out (on the check and the fallbacks)
-  asks that store once more, at once (`SET key value NX GET` with the request's own value):
-  **needs Redis >= 7.0 at those stores; older ones answer an error and the WRITE fails closed as
-  before.** The admission API takes the local check's result (`LocalCheck`, from
-  `check_replay_detailed`) in every later step, and the peer stage's result (`PeerCheck`, no
-  public constructor, bound to the request's nonce) in the steps after it, so what a check saw
-  can neither be dropped nor forged nor used for another request.
+  A both-stores WRITE whose peer or standby `SET NX` timed out (on the check, the fallbacks and
+  the `sync`-mode peer check) asks that store once more, at once, over another connection (one
+  of its `WAIT` connections, or, only with `REPLAY_PEER_WAIT_REPLICAS=0`, one retry connection of
+  its own per peer and standby store, kept warm by housekeeping)
+  (`SET key value NX GET` with the request's own value): **needs Redis >= 7.0 at those stores;
+  older ones answer an error and the WRITE fails closed as before.** With
+  `REPLAY_PEER_FAIL_CLOSED=1` a `sync`-mode peer whose `SET NX` only timed out is asked again
+  the same way once the request is classified (READs too) before the request fails closed. The
+  admission API takes the local check's result (`LocalCheck`, from `check_replay_detailed`) in
+  every later step, and the peer stage's result (`PeerCheck`, no public constructor, bound to
+  the request's nonce) in the steps after it, so what a check saw can neither be dropped nor
+  forged nor used for another request.
+- The local replica wait of a WRITE sends `SET XX` and `WAIT` as one pipeline on one
+  connection (the peer wait already did). Sent as two commands, a reconnect of the connection
+  between them had the `WAIT` count the replicas of a new session, possibly on another node
+  where the nonce never was. The retry after a failover signal sends both again, so the nonce
+  is looked up again on the node the connection now reaches.
+- New `REPLAY_WAIT_CONNS` (default 8, 1 to 32): every store (the local security Redis, each
+  peer, each standby store) gets a fixed pool of dedicated `WAIT` connections instead of one.
+  `WAIT` blocks its connection, so during a resync, when every `WAIT` takes its whole timeout,
+  concurrent WRITEs queued on the single connection and the later ones ran out of time, which
+  counted as "no answer" and failed closed instead of taking the short-acknowledgement fallback.
+  While a store's `WAIT`s are fast the pool is shared (many `WAIT`s in flight per connection,
+  round robin, no cap on the WRITE rate, as with one connection before); for 10 s after one took
+  longer than its round trip plus half its timeout, came back short or timed out, each
+  connection serves one WRITE at a time, which caps the WRITEs waiting for that store at
+  `REPLAY_WAIT_CONNS / (round trip + WAIT time)` per second (40 per second per pod for a store
+  100 ms away with a 100 ms `WAIT`). A WRITE that cannot get a connection while its whole `WAIT`
+  still fits in its budget is decided as a short acknowledgement once a `SET XX` on the main
+  (primary-checked) connection found its nonce (`ohttp_replay_wait_saturated_total`), and fails
+  closed as before when no fallback can confirm it. A connection stays with its WRITE until its
+  `WAIT` is answered, also when the request gave up (a reply that never comes replaces the
+  connection after 5 s more), so no WRITE queues behind another's `WAIT` there. Connections per
+  gateway: up to `REPLAY_WAIT_CONNS - 1` (7 by default) more per store than before. A peer's
+  `WAIT` connections are opened and reopened in the background (jittered backoff); confirming a
+  WRITE at a peer runs under one deadline for both attempts and waits for a connection to open
+  only while none of that peer's pool is open, instead of up to 2 s per attempt. An I/O error or
+  timeout on a peer `WAIT` connection no longer drops the peer's main connection; only a signal
+  that the node is no longer the primary does.
+  A connection is leased only once no shared `WAIT` is left on it, never used shared while
+  leased, and every command keeps its connection until answered. Only an open connection that
+  reaches the primary is handed out; a request waits for one to be released or (re)opened until
+  the last moment its whole `WAIT` still fits, then takes the saturated path if every open one
+  was busy, or fails closed if none was open. A `WAIT` without an answer in its budget replaces
+  that one connection (only if it is still the current one, never its replacement); a second
+  connection of the store doing so within 5 s replaces all of them. A timeout of a connection
+  or a pool replaced since its command went out is ignored. A command is never sent once its
+  request's deadline has passed, and the task that owns it records its outcome (the pool's mode,
+  the connection's timeout) also when the request went away meanwhile.
 - A read origin with a confirming standby store (`REPLAY_STANDBY_URLS` with
   `REPLAY_PEER_WAIT_REPLICAS`) asks the standby store about a WRITE's nonce (`SET NX`) at the same
   time as the hub (`SET NX`, then the hub's replica wait), instead of after the hub answered. A

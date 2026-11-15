@@ -398,7 +398,10 @@ async fn main() -> anyhow::Result<()> {
                         origin.replay_peer_mode,
                         origin.replay_peer_fail_closed_writes,
                     )
-                    .with_wait(cache::WriteWaitConfig::peer_from_env()?);
+                    .with_wait_conns(
+                        cache::WriteWaitConfig::peer_from_env()?,
+                        cache::wait_conns_from_env()?,
+                    );
                     info!(
                         network = %network,
                         peers = peers.len(),
@@ -437,7 +440,10 @@ async fn main() -> anyhow::Result<()> {
                         origin.replay_peer_urls.len(),
                     )
                     .await
-                    .with_wait(cache::WriteWaitConfig::peer_from_env()?);
+                    .with_wait_conns(
+                        cache::WriteWaitConfig::peer_from_env()?,
+                        cache::wait_conns_from_env()?,
+                    );
                     info!(
                         network = %network,
                         stores = standby.len(),
@@ -464,11 +470,15 @@ async fn main() -> anyhow::Result<()> {
                 let c = match cache::WriteWaitConfig::from_env()? {
                     None => c,
                     Some(ww) => {
-                        let c = c.with_write_wait(&config.redis_security_url, ww).await?;
+                        let conns = cache::wait_conns_from_env()?;
+                        let c = c
+                            .with_write_wait_conns(&config.redis_security_url, ww, conns)
+                            .await?;
                         info!(
                             network = %network,
                             replicas = ww.replicas,
                             timeout_ms = ww.timeout_ms,
+                            wait_conns = conns,
                             "WRITE replay nonces wait for replica acknowledgement (fail-closed)"
                         );
                         c

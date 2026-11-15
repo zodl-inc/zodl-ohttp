@@ -34,7 +34,7 @@
 //!
 //! Callers report every outcome (`observe_*`); nothing here retries a command.
 
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -92,6 +92,175 @@ pub fn is_failover_signal(e: &RedisError, role: Role) -> bool {
     }
 }
 
+/// `e` as text without network addresses: a URL, an IP address (with or without a port) or a
+/// `host:port` becomes `<addr>`. For log lines of store errors, which can name the endpoint.
+pub fn redact_addrs(e: &impl std::fmt::Display) -> String {
+    let text = e.to_string();
+    let mut out = String::with_capacity(text.len());
+    let mut token = String::new();
+    let flush = |token: &mut String, out: &mut String| {
+        if token.is_empty() {
+            return;
+        }
+        let lead: &[char] = &['(', '{', '<', '\'', '"'];
+        let trail: &[char] = &[')', ']', '}', '>', ',', ';', '\'', '"', '.', ':'];
+        let core = token.trim_start_matches(lead).trim_end_matches(trail);
+        if !core.is_empty()
+            && (looks_like_addr(core) || looks_like_addr(core.trim_matches(['[', ']'])))
+        {
+            out.push_str(&token.replacen(core, "<addr>", 1));
+        } else {
+            out.push_str(token);
+        }
+        token.clear();
+    };
+    for c in text.chars() {
+        if c.is_whitespace() {
+            flush(&mut token, &mut out);
+            out.push(c);
+        } else {
+            token.push(c);
+        }
+    }
+    flush(&mut token, &mut out);
+    out
+}
+
+/// Server error codes a log line may carry (`store_error`); any other code is logged as
+/// `server error`. Never the detail after the code: a server can put anything there (an
+/// address, a key, a value).
+const LOGGED_CODES: &[&str] = &[
+    "ERR",
+    "READONLY",
+    "MOVED",
+    "ASK",
+    "LOADING",
+    "MASTERDOWN",
+    "NOREPLICAS",
+    "UNBLOCKED",
+    "NOAUTH",
+    "WRONGPASS",
+    "NOPERM",
+    "OOM",
+    "BUSY",
+    "BUSYKEY",
+    "CLUSTERDOWN",
+    "TRYAGAIN",
+    "CROSSSLOT",
+    "EXECABORT",
+    "NOSCRIPT",
+    "WRONGTYPE",
+    "MISCONF",
+    "NOPROTO",
+];
+
+/// A store error for a log line: its I/O kind (never its text, which can name the endpoint),
+/// or its server code if listed in `LOGGED_CODES`, or the client's error category; never any
+/// detail. The one function every store error goes through before it is logged.
+pub fn store_error(e: &RedisError) -> String {
+    if e.is_io_error() {
+        return if e.is_timeout() {
+            "I/O error: timed out".to_string()
+        } else if e.is_connection_refusal() {
+            "I/O error: connection refused".to_string()
+        } else if e.is_connection_dropped() {
+            "I/O error: connection dropped".to_string()
+        } else {
+            "I/O error".to_string()
+        };
+    }
+    match e.code() {
+        Some(code) if LOGGED_CODES.contains(&code) => code.to_string(),
+        Some(_) => "server error".to_string(),
+        None => format!("{:?}", e.kind()),
+    }
+}
+
+/// Messages of this module's own connection checks that a log line may carry (`error_summary`).
+const LOGGED_MESSAGES: &[&str] = &["ROLE timed out", "the endpoint still reaches a replica"];
+
+/// `store_error` for an error from opening a store connection: the store error in it, an I/O
+/// error's kind, a timeout, or one of `LOGGED_MESSAGES`; anything else is `connection failed`.
+pub fn error_summary(e: &anyhow::Error) -> String {
+    for cause in e.chain() {
+        if let Some(r) = cause.downcast_ref::<RedisError>() {
+            return store_error(r);
+        }
+        if let Some(io) = cause.downcast_ref::<std::io::Error>() {
+            return format!("I/O error: {:?}", io.kind());
+        }
+        if cause
+            .downcast_ref::<tokio::time::error::Elapsed>()
+            .is_some()
+        {
+            return "timed out".to_string();
+        }
+    }
+    let root = e.root_cause().to_string();
+    if LOGGED_MESSAGES.contains(&root.as_str()) || root.starts_with("connect timed out after ") {
+        root
+    } else {
+        "connection failed".to_string()
+    }
+}
+
+fn looks_like_addr(s: &str) -> bool {
+    // `endpoint=host:port`, `addr:192.0.2.1:6379` and the like: the part after the separator.
+    if let Some((_, value)) = s.rsplit_once('=') {
+        if !value.is_empty() && looks_like_addr(value) {
+            return true;
+        }
+    }
+    if s.contains("://") || s.parse::<std::net::IpAddr>().is_ok() {
+        return true;
+    }
+    if looks_like_hostname(s) {
+        return true;
+    }
+    if s.parse::<std::net::SocketAddr>().is_ok() {
+        return true;
+    }
+    if let Some((host, port)) = s.rsplit_once(':') {
+        let host_ok = !host.is_empty()
+            && host
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-');
+        if host_ok && !port.is_empty() && port.chars().all(|c| c.is_ascii_digit()) {
+            return true;
+        }
+    }
+    false
+}
+
+/// A bare host name: dot-separated labels of letters, digits and `-`, at least two, the last of
+/// two or more letters (`store.example.com`, `node-1.cache.internal`). Version numbers and
+/// decimals have a numeric last label.
+fn looks_like_hostname(s: &str) -> bool {
+    let labels: Vec<&str> = s.split('.').collect();
+    labels.len() >= 2
+        && labels
+            .iter()
+            .all(|l| !l.is_empty() && l.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'))
+        && labels
+            .last()
+            .is_some_and(|l| l.len() >= 2 && l.chars().all(|c| c.is_ascii_alphabetic()))
+}
+
+/// Whether `e` says something about the node rather than about one connection: it is no longer
+/// the primary (`READONLY`, `MOVED`, `MASTERDOWN`, an unblocked `WAIT`, `WAIT` refused on a
+/// replica). Every connection to that endpoint is then affected; an I/O error or a timeout on one
+/// connection says nothing about the others.
+pub fn is_role_signal(e: &RedisError) -> bool {
+    if e.code() == Some("UNBLOCKED") {
+        return true;
+    }
+    match e.kind() {
+        ErrorKind::ReadOnly | ErrorKind::Moved | ErrorKind::MasterDown => true,
+        ErrorKind::ResponseError => e.detail().is_some_and(|d| d.contains("replica")),
+        _ => false,
+    }
+}
+
 /// The metric label of a failover signal.
 pub fn signal_reason(e: &RedisError) -> &'static str {
     match e.kind() {
@@ -127,13 +296,27 @@ pub struct StoreConn {
     conn: ArcSwap<ConnectionManager>,
     /// Incremented on every replacement; `wait_for_reconnect` watches it.
     generation: watch::Sender<u64>,
-    reconnecting: AtomicBool,
+    /// The running replacement and its cause, in one value so that starting one and saying why
+    /// are a single step: `IDLE`, `RECONNECT_FAILOVER` (a failover signal: counted in
+    /// `failover_generation`), `RECONNECT_QUIET` (one stuck connection, `retire_quietly`).
+    reconnecting: AtomicU8,
     consecutive_timeouts: AtomicU32,
     epoch: Instant,
     /// Milliseconds since `epoch` of the last replacement / `ROLE` check (0 = never).
     last_swap_ms: AtomicU64,
     last_role_check_ms: AtomicU64,
+    /// Milliseconds since `epoch` when the running reconnect started (0 = none).
+    reconnect_since_ms: AtomicU64,
+    /// Replacements caused by a failover signal (not by `retire_quietly`): what a change of the
+    /// store means for the WRITE fallback's window.
+    failover_generation: AtomicU64,
+    /// Woken once a replacement is in place (a `WAIT` pool waiting for an open connection).
+    replaced: std::sync::OnceLock<Arc<tokio::sync::Notify>>,
 }
+
+const IDLE: u8 = 0;
+const RECONNECT_FAILOVER: u8 = 1;
+const RECONNECT_QUIET: u8 = 2;
 
 impl StoreConn {
     /// Open the first connection; an error fails, like `ConnectionManager::new`.
@@ -168,11 +351,14 @@ impl StoreConn {
             },
             conn: ArcSwap::from_pointee(conn),
             generation,
-            reconnecting: AtomicBool::new(false),
+            reconnecting: AtomicU8::new(IDLE),
             consecutive_timeouts: AtomicU32::new(0),
             epoch: Instant::now(),
             last_swap_ms: AtomicU64::new(0),
             last_role_check_ms: AtomicU64::new(0),
+            reconnect_since_ms: AtomicU64::new(0),
+            failover_generation: AtomicU64::new(0),
+            replaced: std::sync::OnceLock::new(),
         })
     }
 
@@ -184,6 +370,18 @@ impl StoreConn {
     /// How many times the connection was replaced.
     pub fn generation(&self) -> u64 {
         *self.generation.borrow()
+    }
+
+    /// How many times the connection was replaced after a failover signal (not counting
+    /// `retire_quietly`).
+    pub fn failover_generation(&self) -> u64 {
+        self.failover_generation.load(Ordering::Relaxed)
+    }
+
+    /// Whether no replacement of the connection is running (choosing a connection for a
+    /// command).
+    pub fn usable_now(&self) -> bool {
+        self.reconnecting.load(Ordering::Acquire) == IDLE
     }
 
     pub fn observe_ok(&self) {
@@ -274,7 +472,9 @@ impl StoreConn {
         )
         .await;
         match answer {
-            Ok(Ok(v)) if parse_role(&v) == Some(false) => self.trigger("role"),
+            Ok(Ok(v)) if parse_role(&v) == Some(false) => {
+                self.trigger("role");
+            }
             Ok(Err(e)) => self.observe_error(&e),
             _ => {}
         }
@@ -287,20 +487,77 @@ impl StoreConn {
         self.trigger(reason);
     }
 
-    /// Start a reconnect unless one is running or the connection was just replaced.
-    fn trigger(self: &Arc<Self>, reason: &'static str) {
+    /// Woken once a replacement of this connection is in place (set once).
+    pub fn set_replaced_notify(&self, notify: Arc<tokio::sync::Notify>) {
+        let _ = self.replaced.set(notify);
+    }
+
+    /// Replace this connection only (it timed out; a `WAIT` connection of a pool), and only if
+    /// it is still the one of `generation` (never its replacement): unlike a failover signal,
+    /// `failover_generation` does not change, so nothing treats it as a change of the store.
+    /// Whether a replacement was started.
+    pub fn retire_quietly(self: &Arc<Self>, reason: &'static str, generation: u64) -> bool {
+        self.start_reconnect(reason, RECONNECT_QUIET, Some(generation))
+    }
+
+    /// Start a reconnect for a failover signal unless one is running or the connection was just
+    /// replaced. Whether one was started. A quiet one that is running is turned into a
+    /// failover one (its replacement then counts as a change of the store).
+    fn trigger(self: &Arc<Self>, reason: &'static str) -> bool {
+        self.start_reconnect(reason, RECONNECT_FAILOVER, None)
+    }
+
+    /// Give up a quiet replacement just claimed (its connection was replaced meanwhile): back to
+    /// idle, unless a failover signal turned it into a failover one meanwhile, whose reconnect
+    /// must then run (false).
+    fn abandon_quiet(&self) -> bool {
+        self.reconnecting
+            .compare_exchange(RECONNECT_QUIET, IDLE, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    fn start_reconnect(
+        self: &Arc<Self>,
+        reason: &'static str,
+        cause: u8,
+        only_generation: Option<u64>,
+    ) -> bool {
         let last = self.last_swap_ms.load(Ordering::Relaxed);
         if last != 0 && self.now_ms().saturating_sub(last) < SIGNAL_HOLDOFF.as_millis() as u64 {
-            return;
+            return false;
         }
-        if self
-            .reconnecting
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
-            .is_err()
+        if let Err(running) =
+            self.reconnecting
+                .compare_exchange(IDLE, cause, Ordering::AcqRel, Ordering::Acquire)
         {
-            return;
+            if cause == RECONNECT_FAILOVER
+                && running == RECONNECT_QUIET
+                && self
+                    .reconnecting
+                    .compare_exchange(
+                        RECONNECT_QUIET,
+                        RECONNECT_FAILOVER,
+                        Ordering::AcqRel,
+                        Ordering::Relaxed,
+                    )
+                    .is_ok()
+            {
+                // The running replacement now stands for this failover signal: counted under
+                // its reason (the quiet one was counted as a timeout).
+                crate::health::record_store_reconnect(&self.network, self.store, reason);
+            }
+            return false;
         }
-        warn!(network = %self.network, store = self.store, reason, "Store connection failover signal: reconnecting");
+        // The generation only changes while a replacement runs, and none ran from here on: if
+        // it is still `only_generation`, the connection to replace is the current one.
+        if only_generation.is_some_and(|g| g != self.generation()) && self.abandon_quiet() {
+            return false;
+        }
+        self.reconnect_since_ms
+            .store(self.now_ms(), Ordering::Relaxed);
+        if crate::health::warn_due(&self.network, "store_reconnect") {
+            warn!(network = %self.network, store = self.store, reason, "Store connection failover signal: reconnecting");
+        }
         crate::health::record_store_reconnect(&self.network, self.store, reason);
         let this = self.clone();
         tokio::spawn(async move {
@@ -314,8 +571,22 @@ impl StoreConn {
                         this.conn.store(Arc::new(conn));
                         this.consecutive_timeouts.store(0, Ordering::Relaxed);
                         this.last_swap_ms.store(this.now_ms(), Ordering::Relaxed);
+                        // Counted before the generation moves (its watchers read it then).
+                        let cause = this.reconnecting.load(Ordering::Acquire);
+                        if cause != RECONNECT_QUIET {
+                            this.failover_generation.fetch_add(1, Ordering::Relaxed);
+                        }
                         this.generation.send_modify(|g| *g += 1);
-                        this.reconnecting.store(false, Ordering::Release);
+                        this.reconnect_since_ms.store(0, Ordering::Relaxed);
+                        // A failover signal that turned this quiet replacement into a failover
+                        // one meanwhile is counted too.
+                        let ended = this.reconnecting.swap(IDLE, Ordering::AcqRel);
+                        if cause == RECONNECT_QUIET && ended != RECONNECT_QUIET {
+                            this.failover_generation.fetch_add(1, Ordering::Relaxed);
+                        }
+                        if let Some(n) = this.replaced.get() {
+                            n.notify_waiters();
+                        }
                         crate::health::record_store_reconnect(
                             &this.network,
                             this.store,
@@ -331,13 +602,16 @@ impl StoreConn {
                         return;
                     }
                     Err(e) => {
-                        warn!(network = %this.network, store = this.store, attempts, error = %e, "Store reconnect attempt failed");
+                        if crate::health::warn_due(&this.network, "store_reconnect_attempt") {
+                            warn!(network = %this.network, store = this.store, attempts, error = %redact_addrs(&e), "Store reconnect attempt failed");
+                        }
                         tokio::time::sleep(backoff).await;
                         backoff = (backoff * 2).min(RECONNECT_MAX_BACKOFF);
                     }
                 }
             }
         });
+        true
     }
 
     /// A new connection (new name resolution), accepted for a primary store only once its node
@@ -432,6 +706,15 @@ mod tests {
         let io: RedisError =
             std::io::Error::new(std::io::ErrorKind::ConnectionReset, "reset").into();
         assert!(is_failover_signal(&io, Role::Any));
+        // Only signals about the node are role signals; a broken connection is not.
+        assert!(is_role_signal(&readonly));
+        assert!(is_role_signal(&moved));
+        assert!(is_role_signal(&wait));
+        assert!(is_role_signal(&unblocked));
+        assert!(!is_role_signal(&io));
+        assert!(!is_role_signal(&server_error(
+            "LOADING Redis is loading the dataset in memory"
+        )));
         // Ordinary command errors are not.
         let wrongtype =
             server_error("WRONGTYPE Operation against a key holding the wrong kind of value");
@@ -440,6 +723,84 @@ mod tests {
             &server_error("ERR unknown command 'ROLE'"),
             Role::Primary
         ));
+    }
+
+    #[test]
+    fn store_errors_are_logged_without_addresses() {
+        for (raw, want) in [
+            (
+                "Connection refused (os error 111) to 192.0.2.7:6379",
+                "Connection refused (os error 111) to <addr>",
+            ),
+            (
+                "failed to connect to [2001:db8::1]:6380.",
+                "failed to connect to <addr>.",
+            ),
+            ("peer [::1] refused", "peer <addr>] refused"),
+            (
+                "dns error for store.example.com:6379: no record",
+                "dns error for <addr>: no record",
+            ),
+            (
+                "bad url redis://user:pw@store.example.com/2",
+                "bad url <addr>",
+            ),
+            (
+                "READONLY You can't write against a read only replica.",
+                "READONLY You can't write against a read only replica.",
+            ),
+            ("timed out after 250ms", "timed out after 250ms"),
+            ("MOVED 3999 192.0.2.5:6381", "MOVED 3999 <addr>"),
+            ("ASK 12 node-2.cache.internal:6379", "ASK 12 <addr>"),
+            ("no route to store.example.com", "no route to <addr>"),
+            (
+                "failed (endpoint=store.example.com:6380)",
+                "failed (<addr>)",
+            ),
+            ("addr=192.0.2.9:6379 lost", "<addr> lost"),
+            ("needs Redis 7.0 or later", "needs Redis 7.0 or later"),
+        ] {
+            assert_eq!(redact_addrs(&raw), want, "{raw}");
+        }
+        // Store errors: only a listed code (never its detail), an I/O error without its text.
+        for (line, want) in [
+            ("MOVED 3999 192.0.2.5:6381", "MOVED"),
+            ("ASK 12 [2001:db8::7]:6379", "ASK"),
+            (
+                "READONLY You can't write against a read only replica.",
+                "READONLY",
+            ),
+            ("ERR connect to 'cachehost:6379' failed", "ERR"),
+            ("ERR endpoint=\"store-1.internal:6380\",retry", "ERR"),
+            ("NOAUTH node=192.0.2.9:6379 wants a password", "NOAUTH"),
+            ("CUSTOMCODE leaked store.example.com secret", "server error"),
+        ] {
+            assert_eq!(store_error(&server_error(line)), want, "{line}");
+        }
+        let io: RedisError = std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            "connect to store.example.com:6379 refused",
+        )
+        .into();
+        assert_eq!(store_error(&io), "I/O error: connection refused");
+        // Errors of opening a connection: the store or I/O error in them, our own messages,
+        // nothing else.
+        let refused = anyhow::Error::from(std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            "connect to [2001:db8::1]:6379 refused",
+        ));
+        assert_eq!(error_summary(&refused), "I/O error: ConnectionRefused");
+        let server = anyhow::Error::from(server_error("ERR dial 'cachehost:6379'"))
+            .context("opening store.example.com:6379");
+        assert_eq!(error_summary(&server), "ERR");
+        assert_eq!(
+            error_summary(&anyhow::anyhow!("the endpoint still reaches a replica")),
+            "the endpoint still reaches a replica"
+        );
+        assert_eq!(
+            error_summary(&anyhow::anyhow!("dial cachehost:6379 (192.0.2.3) failed")),
+            "connection failed"
+        );
     }
 
     #[test]

@@ -314,7 +314,12 @@ pub fn spawn_window_watch(fb: Arc<WriteFallback>, conn: Arc<StoreConn>) {
     tokio::spawn(async move {
         loop {
             let g = conn.generation();
-            if conn.wait_for_reconnect(g, Duration::from_secs(3600)).await {
+            let failovers = conn.failover_generation();
+            // A replacement of one stuck `WAIT` connection (`StoreConn::retire_quietly`) is not
+            // a change of the store.
+            if conn.wait_for_reconnect(g, Duration::from_secs(3600)).await
+                && conn.failover_generation() != failovers
+            {
                 fb.open_window();
             }
         }
@@ -373,7 +378,7 @@ impl WriteBackSink for LocalWriteBack {
                         wait.replicas
                     ))
                 }
-                Ok(Err(e)) => WriteBackResult::Failed(e.to_string()),
+                Ok(Err(e)) => WriteBackResult::Failed(crate::store_conn::store_error(&e)),
                 Err(_) => {
                     WriteBackResult::Failed(format!("timed out after {}ms", budget.as_millis()))
                 }
