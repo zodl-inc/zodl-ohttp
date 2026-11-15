@@ -273,8 +273,10 @@ fn fields_latin1(fields: &[Field]) -> Vec<(String, String)> {
 
 /// `request` as a known-length Binary HTTP message (RFC 9292 §3.1, framing indicator 0):
 /// control data, header section, content and trailer section (always empty), each
-/// length-prefixed, then zero padding (RFC 9292 §3.8) up to a fixed size, so that the relay and
-/// the network see only a few request sizes:
+/// length-prefixed, then zero padding (RFC 9292 §3.8) up to a fixed size class, so that the
+/// relay and the network do not see which of the small calls a request is nor the exact size of
+/// a transaction (for typical light-wallet traffic a request in the `SendTransaction` classes is
+/// still very likely a broadcast; `docs/architecture.md`, "Request padding"):
 ///
 /// - a lightwalletd `SendTransaction` (path
 ///   `/cash.z.wallet.sdk.rpc.CompactTxStreamer/SendTransaction`) is padded to 16 KiB, a larger

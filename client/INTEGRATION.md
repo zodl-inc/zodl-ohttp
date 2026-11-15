@@ -212,7 +212,17 @@ Rules that matter for privacy and correctness:
   zero padding after the trailer section (RFC 9292 §3.8): a `SendTransaction` to 16 KiB, 32 KiB
   if larger and then the next multiple of 32 KiB; every other request to the next multiple of
   4 KiB; never past what fits under the 10 MiB sealed-request cap. Seal the encoded bytes as they
-  are; do not trim them.
+  are; do not trim them. The classes hide which of the small calls a request is and the exact
+  size of a transaction. For typical light-wallet traffic they leave a strong statistical
+  fingerprint of a broadcast: a request in the 16 KiB class or above is very likely a `SendTransaction` (calls to
+  third-party APIs through the gateway are padded the same way and can land in the same classes
+  or others), so the relay learns that the client's address very likely sent a transaction at
+  that moment, and by matching the time against transactions arriving in the mempool it can link
+  the address to a transaction id with a probability that depends on how many arrive in that
+  window (a rejected transaction never arrives). The relay also sees the timing and number of all
+  requests and the size of each response to within a chunk. Only a transport that hides the
+  address from the relay (Tor) removes that link
+  (`../docs/architecture.md`, "Request padding").
 - **Seal every attempt afresh.** Never resend a sealed body: the gateway refuses a repeated
   ciphertext as a replay (409). Each sealing returns its own `ChunkedResponseOpener` (neither
   `Clone` nor `Copy`); keep one sealing per post, the type does not enforce it. A transport error before an answer is just another iteration.
