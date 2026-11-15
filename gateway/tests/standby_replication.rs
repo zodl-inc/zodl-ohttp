@@ -39,14 +39,14 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use ohttp_gateway::cache::{ReplayPeers, ResponseCache, REPLAY_TTL_SECS};
+use ohttp_gateway::cache::{
+    LocalReplayCheck, PeerOutcome, ReplayPeers, ResponseCache, WritePolicy, REPLAY_TTL_SECS,
+};
 use ohttp_gateway::origin::{ReplayPeerMode, RouteClass};
 use ohttp_gateway::replication::ReplicationConfig;
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
-
-const NETWORK: &str = "testnet-standby";
 
 // ---------------------------------------------------------------------------------------------
 // A link that can be lost: a TCP proxy. `lose` kills the open connections (at their next
@@ -224,12 +224,13 @@ fn request(tag: &str) -> Vec<u8> {
     Sha256::digest(format!("{tag} {nanos} {}", std::process::id())).to_vec()
 }
 
-fn key(hash: &[u8]) -> String {
-    format!("replay:{NETWORK}:{}", hex::encode(hash))
+/// The replay key of `hash` on network `net`.
+fn key(net: &str, hash: &[u8]) -> String {
+    format!("replay:{net}:{}", hex::encode(hash))
 }
 
-fn replication(mode: ReplayPeerMode) -> ReplicationConfig {
-    let mut c = ReplicationConfig::new(NETWORK, mode, 1000, 1, 250, REPLAY_TTL_SECS, 3);
+fn replication(net: &str, mode: ReplayPeerMode) -> ReplicationConfig {
+    let mut c = ReplicationConfig::new(net, mode, 1000, 1, 250, REPLAY_TTL_SECS, 3);
     c.batch_interval = Duration::from_millis(20);
     c.probe_interval = Duration::from_millis(100);
     c
@@ -238,6 +239,7 @@ fn replication(mode: ReplayPeerMode) -> ReplicationConfig {
 /// An origin in `async-reads` whose security store is `security`, checking at the peer `hub`,
 /// replicating admitted WRITEs to `standby` (REPLAY_STANDBY_URLS) when given.
 async fn origin(
+    net: &str,
     cache: &str,
     security: &str,
     hub: &str,
@@ -247,7 +249,7 @@ async fn origin(
     let c = ResponseCache::connect(
         cache,
         Some(security),
-        NETWORK.to_string(),
+        net.to_string(),
         "lwd.example.com:9067".to_string(),
         250,
         100,
@@ -255,18 +257,17 @@ async fn origin(
     )
     .await
     .unwrap();
-    let peers = ReplayPeers::connect(&[hub.to_string()], NETWORK.to_string(), 250, false)
+    let peers = ReplayPeers::connect(&[hub.to_string()], net.to_string(), 250, false)
         .await
         .with_mode(ReplayPeerMode::AsyncReads, fail_closed_writes);
     let c = c
         .with_replay_peers(peers)
-        .with_async_replication(replication(ReplayPeerMode::AsyncReads));
+        .with_async_replication(replication(net, ReplayPeerMode::AsyncReads));
     match standby {
         None => c,
         Some(u) => {
-            let s =
-                ReplayPeers::connect_standby(&[u.to_string()], NETWORK.to_string(), 250, 1).await;
-            c.with_standby_replication(s, replication(ReplayPeerMode::Failover))
+            let s = ReplayPeers::connect_standby(&[u.to_string()], net.to_string(), 250, 1).await;
+            c.with_standby_replication(s, replication(net, ReplayPeerMode::Failover))
         }
     }
 }
@@ -275,20 +276,27 @@ async fn origin(
 /// for an admitted WRITE the hand-off to the standby stores. Ok(true) = it runs; Ok(false) =
 /// refused as a replay; Err = fail-closed.
 async fn admit(c: &ResponseCache, hash: &[u8], class: RouteClass) -> anyhow::Result<bool> {
-    if c.check_replay(hash).await? {
-        return Ok(false);
+    let local = c.check_replay_detailed(hash).await?;
+    match local.verdict() {
+        LocalReplayCheck::Replay => return Ok(false),
+        LocalReplayCheck::Unavailable => anyhow::bail!("no verdict from the local store"),
+        _ => {}
     }
-    if c.replicate_nonce(hash, class).await? {
+    let check = c
+        .replicate_nonce_checked(&local, class, WritePolicy::ONE_SIDED)
+        .await?;
+    if check.replay() {
         return Ok(false);
     }
     if class == RouteClass::Write {
-        c.replicate_write_to_standby(hash);
+        c.replicate_write_to_standby(&local, check);
     }
     Ok(true)
 }
 
-/// The value of `name{network=NETWORK, peer}`, None when the series does not exist.
-fn gauge(name: &str, peer: &str) -> Option<f64> {
+/// The value of `name{network=net, peer}`, None when the series does not exist. Each test has
+/// a network of its own: the gauges are process-wide, and tests run concurrently.
+fn gauge(net: &str, name: &str, peer: &str) -> Option<f64> {
     ohttp_gateway::health::REGISTRY
         .gather()
         .iter()
@@ -298,7 +306,7 @@ fn gauge(name: &str, peer: &str) -> Option<f64> {
         .find(|m| {
             let l = m.get_label();
             l.iter()
-                .any(|l| l.get_name() == "network" && l.get_value() == NETWORK)
+                .any(|l| l.get_name() == "network" && l.get_value() == net)
                 && l.iter()
                     .any(|l| l.get_name() == "peer" && l.get_value() == peer)
         })
@@ -314,6 +322,7 @@ async fn until(what: &str, max: Duration, f: impl Fn() -> bool) {
 }
 
 struct World {
+    net: &'static str,
     hub: Arc<Store>,
     standby_store: Arc<Store>,
     hub_link: Arc<Link>,
@@ -321,7 +330,13 @@ struct World {
     standby: ResponseCache,
 }
 
-async fn world(read_origin_replicates_to_standby: bool) -> World {
+impl World {
+    fn key(&self, hash: &[u8]) -> String {
+        key(self.net, hash)
+    }
+}
+
+async fn world(net: &'static str, read_origin_replicates_to_standby: bool) -> World {
     ohttp_gateway::health::init_metrics();
     let (_cache, cache_addr) = Store::start().await;
     let (hub, hub_addr) = Store::start().await;
@@ -333,6 +348,7 @@ async fn world(read_origin_replicates_to_standby: bool) -> World {
     let (_e_link, e_port) = Link::start(e_addr).await;
     let cache = addr_url(cache_addr);
     let read_origin = origin(
+        net,
         &cache,
         &addr_url(l_addr),
         &url(hub_port),
@@ -342,8 +358,9 @@ async fn world(read_origin_replicates_to_standby: bool) -> World {
             .as_deref(),
     )
     .await;
-    let standby = origin(&cache, &addr_url(e_addr), &url(hub_port), false, None).await;
+    let standby = origin(net, &cache, &addr_url(e_addr), &url(hub_port), false, None).await;
     World {
+        net,
         hub,
         standby_store,
         hub_link,
@@ -354,24 +371,27 @@ async fn world(read_origin_replicates_to_standby: bool) -> World {
 
 #[tokio::test]
 async fn write_admitted_at_a_read_origin_is_refused_at_the_standby_after_the_hub_is_lost() {
-    let w = world(true).await;
+    let w = world("testnet-standby-refused", true).await;
     let write = request("write via the read origin");
     assert!(admit(&w.read_origin, &write, RouteClass::Write)
         .await
         .unwrap());
-    assert!(w.hub.has(&key(&write)), "checked at the hub synchronously");
+    assert!(
+        w.hub.has(&w.key(&write)),
+        "checked at the hub synchronously"
+    );
     until("nonce at the standby store", Duration::from_secs(2), || {
-        w.standby_store.has(&key(&write))
+        w.standby_store.has(&w.key(&write))
     })
     .await;
 
     // The standby store's connectivity has a gauge of its own: watchdogs read
     // ohttp_replay_peer_connected as "the hub is reachable", so it must only ever carry peer 0.
     until("standby store connected", Duration::from_secs(5), || {
-        gauge("ohttp_replay_standby_connected", "1") == Some(1.0)
+        gauge(w.net, "ohttp_replay_standby_connected", "1") == Some(1.0)
     })
     .await;
-    assert_eq!(gauge("ohttp_replay_peer_connected", "1"), None);
+    assert_eq!(gauge(w.net, "ohttp_replay_peer_connected", "1"), None);
 
     // The hub is lost. The standby admits WRITEs on its own store now ...
     w.hub_link.lose();
@@ -393,26 +413,26 @@ async fn write_admitted_at_a_read_origin_is_refused_at_the_standby_after_the_hub
         .await
         .is_err());
     tokio::time::sleep(Duration::from_millis(300)).await;
-    assert!(!w.standby_store.has(&key(&refused)));
+    assert!(!w.standby_store.has(&w.key(&refused)));
     // READs go on at the read origin; they are not replicated to the standby store.
     let read = request("read at the read origin, hub lost");
     assert!(admit(&w.read_origin, &read, RouteClass::Read)
         .await
         .unwrap());
     tokio::time::sleep(Duration::from_millis(300)).await;
-    assert!(!w.standby_store.has(&key(&read)));
+    assert!(!w.standby_store.has(&w.key(&read)));
 }
 
 #[tokio::test]
 async fn without_standby_replication_the_replay_is_admitted_at_the_standby() {
     // The gap REPLAY_STANDBY_URLS closes, shown with the same setup minus the setting.
-    let w = world(false).await;
+    let w = world("testnet-standby-without", false).await;
     let write = request("write via the read origin, no standby replication");
     assert!(admit(&w.read_origin, &write, RouteClass::Write)
         .await
         .unwrap());
     tokio::time::sleep(Duration::from_millis(300)).await;
-    assert!(!w.standby_store.has(&key(&write)));
+    assert!(!w.standby_store.has(&w.key(&write)));
     w.hub_link.lose();
     assert!(
         admit(&w.standby, &write, RouteClass::Write).await.unwrap(),
@@ -422,44 +442,75 @@ async fn without_standby_replication_the_replay_is_admitted_at_the_standby() {
 
 #[tokio::test]
 async fn write_admitted_at_the_standby_while_the_hub_is_lost_reaches_the_hub_when_it_is_back() {
-    let w = world(true).await;
+    let w = world("testnet-standby-back", true).await;
     w.hub_link.lose();
     let write = request("write at the standby, hub lost");
     assert!(admit(&w.standby, &write, RouteClass::Write).await.unwrap());
-    assert!(!w.hub.has(&key(&write)));
+    assert!(!w.hub.has(&w.key(&write)));
 
     // The hub is back: the standby's queue delivers the nonce (reconnect backoff <= 5 s).
     w.hub_link.restore();
     until(
         "nonce at the hub after its return",
         Duration::from_secs(15),
-        || w.hub.has(&key(&write)),
+        || w.hub.has(&w.key(&write)),
     )
     .await;
 
     // A replay at the read origin, which checks WRITEs at the hub again, is refused. Its own
     // connection to the hub died with the link, so the first attempt may fail closed; the
-    // nonce is then in its local store already and the hub check is retried on its own.
-    match admit(&w.read_origin, &write, RouteClass::Write).await {
-        Ok(true) => panic!("replay of a WRITE the standby ran was admitted after the switch back"),
-        Ok(false) => {}
-        Err(_) => {
-            let started = Instant::now();
-            loop {
-                tokio::time::sleep(Duration::from_millis(200)).await;
-                match w
-                    .read_origin
-                    .replicate_nonce(&write, RouteClass::Write)
-                    .await
-                {
-                    Ok(true) => break,
-                    Ok(false) => panic!("the hub admitted the replay"),
-                    Err(_) => assert!(
-                        started.elapsed() < Duration::from_secs(15),
-                        "the read origin never reached the hub again"
-                    ),
-                }
+    // nonce is then in its local store already, and every later attempt is refused locally.
+    // The whole recovery is bounded by one deadline (also a call that hangs).
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let recovery = async {
+        match admit(&w.read_origin, &write, RouteClass::Write).await {
+            Ok(true) => {
+                panic!("replay of a WRITE the standby ran was admitted after the switch back")
             }
+            Ok(false) => {}
+            Err(_) => assert!(
+                !matches!(
+                    admit(&w.read_origin, &write, RouteClass::Write).await,
+                    Ok(true)
+                ),
+                "replay of a WRITE the standby ran was admitted after the switch back"
+            ),
         }
-    }
+        // The read origin reaches the hub again, which holds the nonce too ...
+        let peers = w.read_origin.replay_peers().expect("the hub is a peer");
+        loop {
+            match peers.write_nonce(&w.key(&write), 60).await.as_slice() {
+                [PeerOutcome::Replay] => break,
+                [PeerOutcome::Fresh] => panic!("the hub admitted the replay"),
+                _ => assert!(
+                    Instant::now() < deadline,
+                    "the read origin never reached the hub again"
+                ),
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        // ... and a new WRITE admitted there is checked at the hub again (a new request per
+        // attempt: one that failed closed is held locally from then on).
+        let mut attempt = 0;
+        let fresh = loop {
+            attempt += 1;
+            let fresh = request(&format!(
+                "write at the read origin after the switch back {attempt}"
+            ));
+            match admit(&w.read_origin, &fresh, RouteClass::Write).await {
+                Ok(true) => break fresh,
+                Ok(false) => panic!("a new WRITE was refused as a replay"),
+                Err(_) => assert!(
+                    Instant::now() < deadline,
+                    "no WRITE admitted after the switch back"
+                ),
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        };
+        fresh
+    };
+    let fresh = tokio::time::timeout_at(deadline.into(), recovery)
+        .await
+        .expect("the recovery after the switch back did not finish within 15 s");
+    assert!(w.hub.has(&w.key(&fresh)), "the new WRITE reached the hub");
 }

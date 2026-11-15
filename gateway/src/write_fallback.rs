@@ -51,8 +51,9 @@
 //! **Check at the fallback store.** Every WRITE whose local wait succeeded is also `SET NX` at
 //! the fallback store synchronously (the peers in `failover` mode, the confirming standby stores
 //! of a read origin), and a store that holds the nonce refuses it. An unreachable fallback store
-//! there keeps the first verdict (the check never fails a request closed); the nonce then
-//! reaches it asynchronously. A replay of a WRITE admitted through the fallback store (here, at
+//! there fails the WRITE closed, unless its route is on `REPLAY_ONE_SIDED_WRITE_ROUTES` ("Partition
+//! tolerance" below): such a WRITE keeps the first verdict and its nonce reaches the fallback
+//! store asynchronously. A replay of a WRITE admitted through the fallback store (here, at
 //! another gateway of the same store, or at an origin that could not reach the primary store)
 //! is then refused even if the primary store never got or lost its copy. This used to happen
 //! only inside the window; it runs on every WRITE because an origin may admit WRITEs at the
@@ -63,7 +64,10 @@
 //! decides gives no verdict at all (no connection, a timeout, an error), the request is decided
 //! at the fallback store instead of failing closed, with the rules above: new and acknowledged
 //! there = runs, held there = replay, anything else = fail-closed; the nonce is written back to
-//! the store that gave no verdict once it answers.
+//! the store that gave no verdict once it answers. Only one store decides then, so this applies
+//! to READs and to WRITEs on `REPLAY_ONE_SIDED_WRITE_ROUTES`; every other WRITE fails closed
+//! ("Partition tolerance" below), except where the deciding store took the nonce and only its
+//! `WAIT` got no answer (`local_unavailable` after a local `SET NX`, like a short acknowledgement).
 //!
 //! - `failover` mode, the local store: the outer check cannot tell READ from WRITE, so the
 //!   request is decapsulated and classified first (`LocalReplayCheck::Unavailable`), then
@@ -83,23 +87,52 @@
 //!   healthy while every peer answered its last housekeeping PING
 //!   (`ResponseCache::serves_without_local_store`, gauge `ohttp_replay_serving_via_fallback`),
 //!   so a load balancer keeps sending it the requests the peers can decide. With no peer
-//!   answering it fails, as before.
+//!   answering it fails, as before, and also once the WRITEs decided there keep failing closed
+//!   although the peers answer (`REPLAY_FALLBACK_HEALTH_FAILURES` in a row: a peer short of
+//!   replicas, a full write-back queue, a broken peer `WAIT` connection;
+//!   `cache::FallbackHealth`).
 //!
-//! Safety (two gateways never both run the same WRITE): a WRITE runs only after a `SET NX`
-//! that found its nonce new at the primary store, at the fallback store, or at both, and every
-//! store reached is asked. With both reachable both are asked (the check above); without the
-//! primary only the fallback store; without the fallback store only the primary store (as
-//! before). `SET NX` on one store is decided once per key, so two admissions of one nonce need
-//! two disjoint sets of stores: one gateway that reached only the primary store and another that
-//! reached only the fallback store at the same time. That needs two failures at once (and is
-//! the case an origin with `REPLAY_PEER_FAIL_CLOSED_WRITES=0` already had). An `async-reads`
-//! origin whose own store is the fallback store and gives no verdict reaches only the primary
-//! store; every other origin keeps the primary store's verdict while the fallback store is silent
-//! and asks both while it answers, so this is the same residual class, not a new one. A nonce admitted at
-//! one store only is copied to the other (write-back, asynchronous hand-off) as soon as it is
-//! reachable. The guarantee needs the check above on every gateway that asks the primary store
-//! (`ResponseCache::checks_writes_at_fallback_store`, gauge `ohttp_replay_fallback_check`):
-//! turn the fallback on only once all of them report it. READ nonces decided at the fallback
+//! **Partition tolerance** (`REPLAY_ONE_SIDED_WRITE_ROUTES`, `cache::WritePolicy`). `SET NX` on
+//! one store admits a key once, so two gateways that asked the same store cannot both find one
+//! nonce new there: two admissions of one WRITE need two gateways that each ran it on the
+//! verdict of a store the other did not ask. That takes no second failure. One network partition
+//! between the primary store's region and the fallback store's region is enough: a `failover`-mode
+//! gateway next to the primary store gets no answer from its peer and would keep its local verdict
+//! (the check above), while an `async-reads` origin next to the fallback store gets none from the
+//! hub and would decide on its own store (`REPLAY_PEER_FAIL_CLOSED_WRITES=0`, or the unavailable
+//! fallback with its own replicas). The same sealed bytes delivered to both sides (a relay that
+//! sends them twice) would run at both.
+//!
+//! So a WRITE runs only once both stores took its nonce as new: the store that decides (the local
+//! store in `sync` and `failover` mode, the hub in `async-reads`) and the second store this
+//! gateway consults synchronously (the peers in `sync` mode and in `failover` mode with this
+//! fallback, the confirming standby stores of a read origin, the own store of an `async-reads`
+//! origin with its own replica wait). Every path that would let it run on one of them alone fails
+//! it closed instead (`result="one_sided_refused"`): a peer that gave no verdict and was tolerated
+//! (`REPLAY_PEER_FAIL_CLOSED=0` in `sync` mode, `REPLAY_PEER_FAIL_CLOSED_WRITES=0`:
+//! `path="peer_tolerated"`), a fallback store that did not answer the check of every WRITE
+//! (`check`, `window`, `hub_check`, `hub_window`), and the unavailable fallback (`local_unavailable`
+//! when the local `SET NX` gave no verdict, `hub_unavailable`). Two admissions under this rule
+//! both asked both stores, so at least one of them found the nonce held. The
+//! short-acknowledgement paths stay open (`short_ack`, `hub_short_ack`, and `local_unavailable`
+//! after a local `SET NX` that took the nonce): both stores took it as new there, and the one
+//! whose replicas acknowledged it keeps it through a failover of the other, which gets it back
+//! by the write-back.
+//!
+//! A route on `REPLAY_ONE_SIDED_WRITE_ROUTES` keeps every one-sided path above, for its
+//! availability while one store or the link to it fails. Only routes whose upstream refuses a
+//! second copy of the same request belong there (lightwalletd `SendTransaction`: the chain never
+//! takes one transaction twice): for them one partition between the two stores can run the
+//! request once at each side, and nothing worse. The default list is empty. A `failover`-mode
+//! origin without this fallback (no `REPLAY_PEER_WAIT_REPLICAS` or no `REPLAY_WRITE_WAIT_REPLICAS`)
+//! consults no second store synchronously and is unchanged: its peers are only replicated to,
+//! for an active/passive pair whose load balancer never sends one request to both.
+//!
+//! A nonce admitted while one store did not answer (a one-sided route, or a short acknowledgement)
+//! is copied to it (write-back, asynchronous hand-off) as soon as it is reachable. The check of
+//! every WRITE must run on every gateway that asks the primary store
+//! (`ResponseCache::checks_writes_at_fallback_store`, gauge `ohttp_replay_fallback_check`): turn the
+//! unavailable fallback on only once all of them report it. READ nonces decided at the fallback
 //! store are not written back (a replayed READ changes nothing). A nonce stored by a request
 //! that then failed closed stays held for those exact bytes; clients seal every attempt afresh.
 //!
@@ -109,14 +142,22 @@
 //! stores (`REPLAY_STANDBY_URLS`, with `REPLAY_PEER_WAIT_REPLICAS`): `SET NX` + `WAIT` there,
 //! with the same rules (new + acknowledged = runs, held = replay, anything else fails closed),
 //! and a window after startup or a hub disruption in which every WRITE is also `SET NX` at the
-//! standby stores. An origin with its own replica wait (`REPLAY_WRITE_WAIT_REPLICAS`, the
+//! standby stores. A read origin with a confirming standby store sends that `SET NX` at the
+//! same time as the hub's `SET NX` and replica wait, and every path that can let the WRITE run
+//! uses its answer (the check, both fallbacks) instead of asking again: the standby `SET NX` no
+//! longer adds a round trip after the hub's (the fallbacks' `WAIT` there still does). A nonce it
+//! stored for a request the hub then refuses stays held for those exact bytes, as for any
+//! request that fails closed; two copies of one request at two origins within a round trip may
+//! both be refused, never both run. An origin with its own replica wait
+//! (`REPLAY_WRITE_WAIT_REPLICAS`, the
 //! standby origin and its spoke) uses its own store: the WRITE runs only once the local replicas
 //! acknowledge it (no window: these origins always check both stores). Either way the nonce is
 //! written back to the hub until the hub's replicas have it.
 //!
 //! Metrics: `ohttp_replay_write_fallback_total{network,path,result}` (path `short_ack` |
 //! `local_unavailable` | `window` | `check` | `hub_short_ack` | `hub_unavailable` | `hub_window` |
-//! `hub_check`; result `accepted` | `replay` | `unavailable` | `unacknowledged` | `overflow`),
+//! `hub_check` | `peer_tolerated`; result `accepted` | `replay` | `unavailable` | `unacknowledged` |
+//! `overflow` | `one_sided_refused`),
 //! `ohttp_replay_read_fallback_total{network,result}`,
 //! `ohttp_replay_write_back_total{network,result}` (`written` | `expired`) and
 //! `ohttp_replay_unavailable_fallback{network,target}`.
@@ -276,7 +317,12 @@ pub fn spawn_window_watch(fb: Arc<WriteFallback>, conn: Arc<StoreConn>) {
     tokio::spawn(async move {
         loop {
             let g = conn.generation();
-            if conn.wait_for_reconnect(g, Duration::from_secs(3600)).await {
+            let failovers = conn.failover_generation();
+            // A replacement of one stuck `WAIT` connection (`StoreConn::retire_quietly`) is not
+            // a change of the store.
+            if conn.wait_for_reconnect(g, Duration::from_secs(3600)).await
+                && conn.failover_generation() != failovers
+            {
                 fb.open_window();
             }
         }
@@ -335,7 +381,7 @@ impl WriteBackSink for LocalWriteBack {
                         wait.replicas
                     ))
                 }
-                Ok(Err(e)) => WriteBackResult::Failed(e.to_string()),
+                Ok(Err(e)) => WriteBackResult::Failed(crate::store_conn::store_error(&e)),
                 Err(_) => {
                     WriteBackResult::Failed(format!("timed out after {}ms", budget.as_millis()))
                 }

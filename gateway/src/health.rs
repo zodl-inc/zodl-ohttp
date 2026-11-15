@@ -515,6 +515,8 @@ pub fn init_metrics() {
         &*OHTTP_LWD_TIMEOUTS_TOTAL,
         &*OHTTP_LWD_POOL_RESETS_TOTAL,
         &*OHTTP_LWD_READ_RETRIES_TOTAL,
+        &*OHTTP_REPLAY_WAIT_SATURATED_TOTAL,
+        &*OHTTP_EPOCH_BUMP_SEEN_AT_PEER_TOTAL,
     ] {
         REGISTRY.register(Box::new(c.clone())).ok();
     }
@@ -541,6 +543,8 @@ pub fn init_metrics() {
         &*OHTTP_REPLAY_STANDBY_CONNECTED,
         &*OHTTP_REPLAY_PEER_CONNECTED,
         &*OHTTP_REPLAY_WRITE_BACK_PENDING,
+        &*OHTTP_REPLAY_FALLBACK_WRITES_FAILING,
+        &*OHTTP_REPLAY_STORES_PENDING,
     ] {
         REGISTRY.register(Box::new(g.clone())).ok();
     }
@@ -1259,7 +1263,7 @@ lazy_static::lazy_static! {
     )
     .unwrap();
     static ref OHTTP_REPLAY_WRITE_FALLBACK_TOTAL: IntCounterVec = IntCounterVec::new(
-        Opts::new("ohttp_replay_write_fallback_total", "WRITE replay nonces decided at a second store (write_fallback.rs). path: short_ack (the local replica acknowledgement was short, e.g. a resync after a failover of the local store), local_unavailable (the local store gave no verdict, REPLAY_UNAVAILABLE_FALLBACK), hub_short_ack / hub_unavailable (the same for the hub of an async-reads origin), window / hub_window (the check of every WRITE at the fallback store, inside the window after startup or a disruption), check / hub_check (the same check outside the window). result: accepted (the WRITE runs), replay (a store held the nonce: refused), unavailable (a store did not answer: the fallbacks fail closed, the checks keep the first verdict), unacknowledged (the store's own replicas did not confirm: fail-closed), overflow (write-back queue full: fail-closed)"),
+        Opts::new("ohttp_replay_write_fallback_total", "WRITE replay nonces decided at a second store (write_fallback.rs). path: short_ack (the local replica acknowledgement was short, e.g. a resync after a failover of the local store), local_unavailable (the local store gave no verdict, REPLAY_UNAVAILABLE_FALLBACK), hub_short_ack / hub_unavailable (the same for the hub of an async-reads origin), window / hub_window (the check of every WRITE at the fallback store, inside the window after startup or a disruption), check / hub_check (the same check outside the window), peer_tolerated (a peer that gave no verdict was tolerated: REPLAY_PEER_FAIL_CLOSED=0 in sync mode, REPLAY_PEER_FAIL_CLOSED_WRITES=0). result: accepted (the WRITE runs), replay (a store held the nonce: refused), unavailable (a store did not answer: the fallbacks fail closed, the checks keep the first verdict of a route on REPLAY_ONE_SIDED_WRITE_ROUTES), unacknowledged (the store's own replicas did not confirm: fail-closed), overflow (write-back queue full: fail-closed), one_sided_refused (only one store took the nonce and the route is not on REPLAY_ONE_SIDED_WRITE_ROUTES: fail-closed)"),
         &["network", "path", "result"]
     )
     .unwrap();
@@ -1427,7 +1431,8 @@ pub fn record_lwd_pool_reset(network: &str) {
 }
 
 /// `path`: short_ack | local_unavailable | hub_short_ack | hub_unavailable | window | check |
-/// hub_window | hub_check; `result`: accepted | replay | unavailable | unacknowledged | overflow.
+/// hub_window | hub_check | peer_tolerated; `result`: accepted | replay | unavailable |
+/// unacknowledged | overflow | one_sided_refused.
 pub fn record_replay_write_fallback(network: &str, path: &str, result: &str) {
     OHTTP_REPLAY_WRITE_FALLBACK_TOTAL
         .with_label_values(&[network, path, result])
@@ -2241,4 +2246,81 @@ mod multi_origin_tests {
             .iter()
             .any(|(l, v)| *v == 1 && l.contains(&("class".to_string(), "read".to_string()))));
     }
+}
+
+lazy_static::lazy_static! {
+    static ref OHTTP_REPLAY_STORES_PENDING: IntGaugeVec = IntGaugeVec::new(
+        Opts::new("ohttp_replay_stores_pending", "1 while the gateway waits at startup for its replay peers and standby stores to connect (REPLAY_STARTUP_STORES_WAIT_SECS): /healthz answers 503 meanwhile"),
+        &["network"]
+    )
+    .unwrap();
+    static ref OHTTP_REPLAY_FALLBACK_WRITES_FAILING: IntGaugeVec = IntGaugeVec::new(
+        Opts::new("ohttp_replay_fallback_writes_failing", "1 while the last REPLAY_FALLBACK_HEALTH_FAILURES WRITEs decided at the peer stores for an unreachable local store all failed closed (unacknowledged, unavailable or overflow), the last within REPLAY_FALLBACK_HEALTH_WINDOW_SECS: /healthz then no longer stays healthy through the fallback"),
+        &["network"]
+    )
+    .unwrap();
+    static ref OHTTP_EPOCH_BUMP_SEEN_AT_PEER_TOTAL: IntCounterVec = IntCounterVec::new(
+        Opts::new("ohttp_epoch_bump_seen_at_peer_total", "Times the shared cache epoch of a replay peer changed while the security store gave no answer: the epoch here moved to a fresh value (cache entries of the old epoch no longer served)"),
+        &["network"]
+    )
+    .unwrap();
+    static ref OHTTP_REPLAY_WAIT_SATURATED_TOTAL: IntCounterVec = IntCounterVec::new(
+        Opts::new("ohttp_replay_wait_saturated_total", "WRITE replay nonces whose replica wait found every dedicated WAIT connection of the store busy for the whole wait budget (REPLAY_WAIT_CONNS): decided as a short acknowledgement after a SET XX found the nonce. store: local | peer"),
+        &["network", "store"]
+    )
+    .unwrap();
+}
+
+/// `store`: local | peer.
+pub fn record_replay_wait_saturated(network: &str, store: &str) {
+    OHTTP_REPLAY_WAIT_SATURATED_TOTAL
+        .with_label_values(&[network, store])
+        .inc();
+}
+/// How often one kind of store warning (`warn_due`) is logged per network and process.
+pub const STORE_WARN_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
+
+lazy_static::lazy_static! {
+    static ref STORE_WARN_LAST: parking_lot::Mutex<std::collections::HashMap<(String, &'static str), std::time::Instant>> =
+        parking_lot::Mutex::new(std::collections::HashMap::new());
+}
+
+/// Whether a warning of `kind` for `network` is due: true for the first one and then at most
+/// once per `STORE_WARN_EVERY`, so a store outage logs one line per minute and kind instead of one
+/// per request (the outcomes are counted in metrics either way).
+pub fn warn_due(network: &str, kind: &'static str) -> bool {
+    let now = std::time::Instant::now();
+    let mut last = STORE_WARN_LAST.lock();
+    match last.get(&(network.to_string(), kind)) {
+        Some(t) if now.duration_since(*t) < STORE_WARN_EVERY => false,
+        _ => {
+            last.insert((network.to_string(), kind), now);
+            true
+        }
+    }
+}
+
+pub fn record_replay_fallback_writes_failing(network: &str, failing: bool) {
+    OHTTP_REPLAY_FALLBACK_WRITES_FAILING
+        .with_label_values(&[network])
+        .set(i64::from(failing));
+}
+pub fn record_replay_stores_pending(network: &str, pending: bool) {
+    OHTTP_REPLAY_STORES_PENDING
+        .with_label_values(&[network])
+        .set(i64::from(pending));
+}
+
+/// False while the startup gate waits for the replay stores (`ohttp_replay_stores_pending`).
+pub fn is_replay_stores_ready(network: &str) -> bool {
+    OHTTP_REPLAY_STORES_PENDING
+        .with_label_values(&[network])
+        .get()
+        == 0
+}
+
+pub fn record_epoch_bump_seen_at_peer(network: &str) {
+    OHTTP_EPOCH_BUMP_SEEN_AT_PEER_TOTAL
+        .with_label_values(&[network])
+        .inc();
 }

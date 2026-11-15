@@ -19,8 +19,8 @@ Public listener (`PORT`, default 8080):
 | `/gateway` | POST | An Encapsulated Request, `Content-Type: message/ohttp-chunked-req`, with `X-Relay-Secret`. Answers `message/ohttp-chunked-res`. |
 | `/ohttp-configs` | GET | The key configuration, `application/ohttp-keys` (RFC 9458 §3), `Cache-Control: max-age=300`. |
 | `/ohttp-configs/signed` | GET | The signed key configuration envelope (JSON, below), `Cache-Control: max-age=300`. 503 without `CONFIGS_SIGNING_SEED_HEX`. |
-| `/healthz` | GET | `200 ok` while replay protection works, lightwalletd is reachable and recent lightwalletd calls did not fail too often (`HEALTHZ_LWD_ERROR_RATIO`), else `503 unavailable`. Replay protection works while the security Redis answers, or, with `REPLAY_UNAVAILABLE_FALLBACK` (`failover` mode, or `async-reads` whose own store is the fallback store: `ohttp_replay_local_fallback` 1), while it does not but every peer store answers and decides in its place (`ohttp_replay_serving_via_fallback`). Unauthenticated, no I/O, no details in the body: a monitor path for a load balancer. |
-| `/health/startup` | GET | `200` once the process is listening. Does not depend on lightwalletd. |
+| `/healthz` | GET | `200 ok` while replay protection works, lightwalletd is reachable and recent lightwalletd calls did not fail too often (`HEALTHZ_LWD_ERROR_RATIO`), else `503 unavailable`. Replay protection works while the security Redis answers and its connection reaches a primary (not while its last `ROLE` said replica, or a reconnect after a failover signal has been pending for more than 2 s), or, with `REPLAY_UNAVAILABLE_FALLBACK` (`failover` mode, or `async-reads` whose own store is the fallback store: `ohttp_replay_local_fallback` 1), while it does not but every peer store answers and decides in its place (`ohttp_replay_serving_via_fallback`) and the WRITEs decided there do not keep failing (`REPLAY_FALLBACK_HEALTH_FAILURES`). At startup it also waits (`REPLAY_STARTUP_STORES_WAIT_SECS`, default 10 s) until the replay peers and standby stores are connected, each with an open `WAIT` connection where its replica acknowledgement is required, and the local `WAIT` pool has a usable connection. Unauthenticated, no I/O, no details in the body: a monitor path for a load balancer. |
+| `/health/startup` | GET | `200` once the process is listening and the startup gate of the replay stores is open (`503 starting` while it waits, as for `/healthz`, at most `REPLAY_STARTUP_STORES_WAIT_SECS`). Does not depend on lightwalletd. |
 
 Any other method on these paths, and any other path in `ohttp` mode, answers `426`. With
 `RELAY_SECRET_ON_KEY_CONFIG=require` the two key-configuration GETs need `X-Relay-Secret` too.
@@ -141,7 +141,12 @@ chain state:
 - `GetMempoolStream` subscribers share one upstream stream per process; identical upstream calls
   in flight are coalesced; `SendTransaction` is never cached or coalesced.
 - A shared epoch counter in the security Redis is part of every cache key: incrementing it
-  flushes every cached answer at once.
+  flushes every cached answer at once. Each security store keeps its own counter, so a flush of
+  several origins is one increment per store. While the security Redis gives no answer (the peer
+  stores decide in its place) a change of a replay peer's counter against the value last seen
+  for that store (or a peer never seen) is taken as such a flush and the gateway moves to a
+  fresh random epoch (`ohttp_epoch_bump_seen_at_peer_total`); once its own store answers again,
+  that store's counter applies again, so increment it too.
 - Third-party answers are cached only for the routes in `THIRD_PARTY_CACHE_ROUTES`.
 
 ## Timeouts and relays
@@ -225,7 +230,7 @@ trace ids are never labels. `network` is `NETWORK`.
 | `ohttp_replay_rejected_total` | `network` | Requests refused as replays. |
 | `ohttp_replay_write_wait_total` | `network, result` | WRITE nonces checked for replica acknowledgement (`REPLAY_WRITE_WAIT_REPLICAS`). |
 | `ohttp_replay_write_wait_seconds` | `network` | Time to that acknowledgement (histogram). |
-| `ohttp_replay_write_fallback_total` | `network, path, result` | WRITE nonces decided at a second store. `path`: `short_ack` (the local acknowledgement was short), `local_unavailable` (the local store gave no verdict, `REPLAY_UNAVAILABLE_FALLBACK`), `hub_short_ack` / `hub_unavailable` (the same for the hub of an `async-reads` origin), `check` / `window` (`failover` mode: the check of every WRITE at the peers, `window` within one nonce TTL after startup or a local store failover), `hub_check` / `hub_window` (the same at the standby stores of an `async-reads` origin). `result`: `accepted`, `replay`, `unavailable`, `unacknowledged`, `overflow`. |
+| `ohttp_replay_write_fallback_total` | `network, path, result` | WRITE nonces decided at a second store. `path`: `short_ack` (the local acknowledgement was short), `local_unavailable` (the local store gave no verdict, `REPLAY_UNAVAILABLE_FALLBACK`), `hub_short_ack` / `hub_unavailable` (the same for the hub of an `async-reads` origin), `check` / `window` (`failover` mode: the check of every WRITE at the peers, `window` within one nonce TTL after startup or a local store failover), `hub_check` / `hub_window` (the same at the standby stores of an `async-reads` origin), `peer_tolerated` (a peer that gave no verdict was tolerated: `REPLAY_PEER_FAIL_CLOSED=0` in `sync` mode, `REPLAY_PEER_FAIL_CLOSED_WRITES=0`). `result`: `accepted`, `replay`, `unavailable`, `unacknowledged`, `overflow`, `one_sided_refused` (only one store took the nonce and the route is not on `REPLAY_ONE_SIDED_WRITE_ROUTES`: fail-closed). |
 | `ohttp_replay_read_fallback_total` | `network, result` | READ nonces decided at the peers (the hub, for an `async-reads` origin) because the local store gave no verdict (`REPLAY_UNAVAILABLE_FALLBACK`). |
 | `ohttp_replay_fallback_check` | `network` | 1 when every WRITE this gateway admits is also checked at a fallback store synchronously; `REPLAY_UNAVAILABLE_FALLBACK` is safe only while every gateway with peers reports 1. |
 | `ohttp_replay_serving_via_fallback` | `network` | 1 while the security Redis does not answer and this gateway keeps serving (`/healthz` healthy) because the peer stores decide its requests: `REPLAY_UNAVAILABLE_FALLBACK` with `ohttp_replay_local_fallback` 1, the check of every WRITE on, and every peer answering its last housekeeping PING (every 10 s). 0 when the security Redis answers, or when nothing can decide (then `/healthz` fails). WRITEs beyond the write-back capacity still fail closed (`ohttp_replay_write_fallback_total{result="overflow"}`). |
@@ -233,6 +238,8 @@ trace ids are never labels. `network` is `NETWORK`.
 | `ohttp_replay_unavailable_fallback` | `network, target` | 1 for the store the unavailable fallback replaces on this gateway (`local`, `standby`, `local_replicas`); all 0 when off, and on an `async-reads` origin with `REPLAY_PEER_FAIL_CLOSED_WRITES=0`, where only its own store is replaced (`ohttp_replay_local_fallback`). |
 | `ohttp_replay_write_back_total` | `network, result` | Nonces admitted through the peers rewritten to the local store: `written` (acknowledged by its replicas) or `expired`. |
 | `ohttp_replay_write_back_pending` | `network` | Such nonces still waiting for the local replicas. |
+| `ohttp_replay_fallback_writes_failing` | `network` | 1 while the last `REPLAY_FALLBACK_HEALTH_FAILURES` WRITEs decided at the peer stores for an unreachable security Redis all failed closed; `/healthz` then no longer stays 200 through the fallback. |
+| `ohttp_replay_wait_saturated_total` | `network, store` | WRITE nonces whose replica wait found every dedicated `WAIT` connection of the store (`local`, or a `peer`) busy for the whole wait budget (`REPLAY_WAIT_CONNS`); decided as a short acknowledgement once a `SET XX` found the nonce. Rises while the store's replicas resync. |
 | `ohttp_key_config_info` | `network, fingerprint, signing_key_id` | Always 1: first 16 hex of SHA-256 of `/ohttp-configs` and the signing key id. |
 | `ohttp_origin_info` | `network, origin` | Always 1: `ORIGIN_ID`. |
 | `ohttp_replay_peers_configured` | `network` | Number of `REPLAY_PEER_URLS`. |

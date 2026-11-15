@@ -35,7 +35,10 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use ohttp_gateway::cache::{ResponseCache, WriteWaitConfig};
+use ohttp_gateway::cache::{
+    LocalReplayCheck, ResponseCache, WriteAdmission, WritePolicy, WriteWaitConfig,
+};
+use ohttp_gateway::origin::RouteClass;
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
@@ -256,11 +259,14 @@ async fn gateway(cache_url: &str, security_url: &str, wait_ms: u64) -> ResponseC
 /// The gateway's WRITE admission: the replay check, then the replica acknowledgement.
 /// Ok(true) = the WRITE may run; Ok(false) = refused as a replay; Err = fail-closed.
 async fn admit_write(c: &ResponseCache, hash: &[u8]) -> anyhow::Result<bool> {
-    if c.check_replay(hash).await? {
+    let local = c.check_replay_detailed(hash).await?;
+    if local.verdict() == LocalReplayCheck::Replay {
         return Ok(false);
     }
-    c.confirm_nonce_replicated(hash).await?;
-    Ok(true)
+    let check = c
+        .replicate_nonce_checked(&local, RouteClass::Write, WritePolicy::BOTH_STORES)
+        .await?;
+    Ok(c.confirm_write_nonce(&local, &check).await? == WriteAdmission::Run)
 }
 
 /// Promote `new`: it takes over the keys the old primary replicated, the old one turns into a
@@ -390,10 +396,15 @@ async fn nonce_lost_in_the_failover_is_not_confirmed() {
     // replicated: the WAIT connection meets READONLY, moves to the new primary, and must not
     // confirm a nonce that is not there.
     let h = nonce_hash("lost", 0);
-    assert!(!c.check_replay(&h).await.unwrap());
+    let local = c.check_replay_detailed(&h).await.unwrap();
+    assert_eq!(local.verdict(), LocalReplayCheck::New);
     failover(&a, &b, &proxy, b_addr, false, false);
+    let check = c
+        .replicate_nonce_checked(&local, RouteClass::Write, WritePolicy::BOTH_STORES)
+        .await
+        .unwrap();
     let err = c
-        .confirm_nonce_replicated(&h)
+        .confirm_write_nonce(&local, &check)
         .await
         .unwrap_err()
         .to_string();
