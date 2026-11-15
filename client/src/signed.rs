@@ -467,8 +467,9 @@ fn top_level_keys(json: &[u8]) -> Result<Vec<String>, serde_json::Error> {
 mod tests {
     use super::*;
 
-    /// `docs/signed-configs-test-vector.json`.
-    const VECTOR: &str = include_str!("../../docs/signed-configs-test-vector.json");
+    /// `docs/signed-configs-test-vector.json`, as the crate ships it (`tests/workspace.rs` checks
+    /// that the two are the same).
+    const VECTOR: &str = include_str!("../testdata/signed-configs-test-vector.json");
 
     #[derive(Deserialize)]
     struct Vector {

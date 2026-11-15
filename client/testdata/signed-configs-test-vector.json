@@ -1,0 +1,11 @@
+{
+  "description": "Deterministic test vector for SDK verification",
+  "seed_hex": "2222222222222222222222222222222222222222222222222222222222222222",
+  "public_key_hex": "a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f0",
+  "key_id": "1325b850",
+  "network": "testnet",
+  "configs_bytes_base64": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKg==",
+  "not_before": 1700000000,
+  "not_after": 1700021600,
+  "signature_base64": "eaavjMihe2EGm3giQq5NArYVD+G1A5AxVzQxXwvGz8C8qKRIEXl/T0TpOZe2bL+OkNmSAIX95uYgA4zGQGXbCg=="
+}

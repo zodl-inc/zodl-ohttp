@@ -524,7 +524,7 @@ mod tests {
             signature_base64: String,
         }
         let v: Vector =
-            serde_json::from_str(include_str!("../../docs/signed-configs-test-vector.json"))
+            serde_json::from_str(include_str!("../testdata/signed-configs-test-vector.json"))
                 .unwrap();
         let envelope = serde_json::json!({
             "v": 1,

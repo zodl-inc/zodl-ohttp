@@ -12,6 +12,15 @@ documentation = "https://docs.rs/zodl-ohttp-client"
 readme = "README.md"
 keywords = ["ohttp", "rfc9458", "privacy", "zcash", "hpke"]
 categories = ["cryptography", "network-programming"]
+# The tests that run against the gateway's own code need the repository around the crate (the
+# path-only dev-dependency `ohttp-gateway`, stripped on publishing, and `../docs`): they run in
+# the repository's CI and are not shipped, so that `cargo test` passes on the published crate.
+exclude = [
+    "tests/chunked.rs",
+    "tests/gateway.rs",
+    "tests/gateway_core.rs",
+    "tests/workspace.rs",
+]
 
 [lib]
 name = "zodl_ohttp_client"

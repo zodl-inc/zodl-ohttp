@@ -103,6 +103,12 @@ each change.
   Before, a relay or resolver could put up to 64 KiB of text, newlines included, into the error
   and so into a wallet's logs. `Error::MediaType` holds at most 64 characters of the
   `Content-Type`, non-printable characters replaced by `?`.
+- The published crate's tests pass on their own: the tests that need the gateway's code or the
+  repository's `docs/` (`tests/gateway.rs`, `tests/gateway_core.rs`, `tests/chunked.rs`, the new
+  `tests/workspace.rs`) are excluded from the package and run in the repository's CI, the unit
+  tests no longer use the gateway, and the signed-configuration test vector ships in `testdata/`
+  (checked to be the documented one). Before, `cargo test` on the published crate failed to
+  build.
 - The crate-level example builds its client with `Client::for_network` (the signed source). It
   used `KeyConfigSource::Plain` on the relay host, which lets the relay substitute its own key.
 - `Client::send` and `Client::send_stream` no longer panic on a timeout too long to add to the

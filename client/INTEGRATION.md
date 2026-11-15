@@ -284,7 +284,8 @@ What may be logged and what may not:
 
 ## 6. Testing an integration
 
-The crate's own tests run against the gateway's code (`tests/gateway.rs`,
-`tests/gateway_core.rs`) and need no network; they use example configurations (`*.example`
-names, RFC 2606) of their own. Against a running deployment, `e2e-client/` and
+The crate's own tests need no network and use example configurations (`*.example` names,
+RFC 2606) of their own. Those that run against the gateway's code (`tests/gateway.rs`,
+`tests/gateway_core.rs`, `tests/chunked.rs`, `tests/workspace.rs`) need the repository and are
+not in the published crate; the rest run with `cargo test` on the published crate too. Against a running deployment, `e2e-client/` and
 `scripts/test-e2e.sh` perform real exchanges (`../docs/testing.md`).
