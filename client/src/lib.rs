@@ -56,16 +56,29 @@
 //!
 //! ```no_run
 //! # #[cfg(feature = "client")]
-//! # async fn demo() -> Result<(), zodl_ohttp_client::Error> {
+//! # async fn demo(signing_pubkey_hex: &str) -> Result<(), Box<dyn std::error::Error>> {
 //! use std::time::Duration;
-//! use zodl_ohttp_client::{Client, KeyConfigSource, Request};
+//! use zodl_ohttp_client::{
+//!     Client, Network, OhttpConfig, OhttpConfigParams, OhttpNetworks, Request,
+//!     SignedConfigUrlRule,
+//! };
 //!
-//! let client = Client::new(
-//!     "https://relay.example/relay",
-//!     KeyConfigSource::Plain {
-//!         url: "https://relay.example/ohttp-configs".into(),
-//!     },
-//! );
+//! // The application's configuration of the network (placeholder values).
+//! let config = OhttpConfig::new(OhttpConfigParams {
+//!     gateway_host: "ohttp-gateway.example",
+//!     relay_url: "https://relay.example/relay",
+//!     keys_dns_name: "ohttp-keys.example",
+//!     signing_pubkey: signing_pubkey_hex,
+//! })?;
+//! let networks = OhttpNetworks::new(Some(config), None)?;
+//! // Seals to the key of the gateway's signed envelope, fetched through the relay
+//! // (`.../relay` becomes `.../ohttp-configs/signed`) and used only once it checks out
+//! // against the configured signing key.
+//! let client = Client::for_network(
+//!     &networks,
+//!     Network::Mainnet,
+//!     SignedConfigUrlRule::ReplaceRelaySuffix,
+//! )?;
 //! let response = client
 //!     .send(
 //!         &Request::new("GET", "backend.example", "/v1/info"),
@@ -146,6 +159,16 @@ pub enum Error {
     Refused {
         /// The outer HTTP status.
         status: u16,
+    },
+    /// A `Client` constructor refused its arguments: the `what` (`relay URL`,
+    /// `key-configuration URL`, `key configuration source`) breaks the `rule`. Names neither
+    /// value.
+    #[error("client setup: the {what} {rule}")]
+    Setup {
+        /// What was refused.
+        what: &'static str,
+        /// The rule it breaks.
+        rule: &'static str,
     },
     /// The relay answered something other than a sealed response.
     #[error("the relay answered {0:?}, not {RESPONSE_MEDIA_TYPE}")]

@@ -123,19 +123,13 @@ The network of a gateway host comes from the configuration
 
 ```rust
 use std::time::Duration;
-use zodl_ohttp_client::{signed_config_url, Client, KeyConfigSource, Network, Request, SignedConfigUrlRule};
+use zodl_ohttp_client::{Client, NetworkRule, Request, SignedConfigUrlRule};
 
 // `networks` as in section 1; `host` is the light client server host.
-let network = zodl_ohttp_client::NetworkRule::KnownHosts.network_for(&networks, host)?;
-let config = networks.get(network).expect("a known host has a configuration");
-let client = Client::new(
-    config.relay_url(),
-    KeyConfigSource::Signed {
-        url: signed_config_url(config.relay_url(), SignedConfigUrlRule::ReplaceRelaySuffix)?,
-        network: network.as_str().into(),
-        signer: *config.signing_pubkey(),
-    },
-);
+let network = NetworkRule::KnownHosts.network_for(&networks, host)?;
+// The configured relay, and the gateway's signed envelope fetched through it and checked
+// against the configured signing key (`.../relay` becomes `.../ohttp-configs/signed`).
+let client = Client::for_network(&networks, network, SignedConfigUrlRule::ReplaceRelaySuffix)?;
 let request = Request::new("POST", host, "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetLatestBlock")
     .header("content-type", "application/grpc")
     .header("te", "trailers")
@@ -156,7 +150,24 @@ let response = client.send(&request, Duration::from_secs(30)).await?;
   cap;
 - holds every request through a relay while a `Retry-After` from an outer 429 runs
   (`Error::Backoff`);
-- follows no redirect.
+- follows no redirect;
+- speaks `https://` only.
+
+The signed envelope must be served where the `SignedConfigUrlRule` derives it from the relay URL
+(`ReplaceRelaySuffix`: `https://relay.example/relay` gives
+`https://relay.example/ohttp-configs/signed`; `RelayHostRoot`: `/ohttp-configs/signed` on the
+relay's host). For a relay that serves it elsewhere, build the client with
+`Client::new(relay_url, KeyConfigSource::Signed { url, network, signer })` (`network` a `Network`).
+
+`Client::new` refuses (`Error::Setup`, naming the URL and the rule, never the value) a relay or
+envelope URL that is not `https://` with a host and a relay URL with userinfo, query or
+fragment; it does not know the gateway host, so a relay on the gateway's own host is refused
+only through `OhttpConfig::new` (`Client::for_network`). The unsigned `KeyConfigSource::Plain`
+exists only with the cargo feature `insecure-plain-key-config` and is accepted only by
+`Client::insecure_for_local_testing`, which exists only with that feature too and also allows
+`http://`: for tests against a local gateway, never in a wallet. `KeyConfigSource::Signed` names
+its network as a `Network`. No constructor panics: a TLS backend that cannot be initialized is
+`Error::Setup`.
 
 ## 4. The sans-IO loop
 

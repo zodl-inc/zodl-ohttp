@@ -17,6 +17,10 @@
 //! The client against the gateway's own key configuration, signed envelopes, chunked
 //! decapsulation and streaming response encapsulation (`ohttp-gateway`'s library), served
 //! in-process as relay and gateway in one, in front of an echo backend.
+//!
+//! The test server speaks plain HTTP on the loopback interface, so every client here is built
+//! with `Client::insecure_for_local_testing`; most use the unsigned source (feature
+//! `insecure-plain-key-config`) to exercise the cache rules of `/ohttp-configs`.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -36,7 +40,7 @@ use ohttp_gateway::hpke::KeyState;
 use ohttp_gateway::ohttp::{self as gateway, InnerResponse};
 use ohttp_gateway::ohttp_chunked::decapsulate_chunked_request;
 use ohttp_gateway::signing::SigningState;
-use zodl_ohttp_client::{Client, Error, KeyConfig, KeyConfigSource, Request};
+use zodl_ohttp_client::{Client, Error, KeyConfig, KeyConfigSource, Network, Request};
 
 const TIMEOUT: Duration = Duration::from_secs(10);
 const NETWORK: &str = "testnet";
@@ -265,12 +269,13 @@ async fn spawn() -> (String, Arc<TestGateway>) {
 }
 
 fn plain_client(base: &str) -> Client {
-    Client::new(
+    Client::insecure_for_local_testing(
         format!("{base}/relay"),
         KeyConfigSource::Plain {
             url: format!("{base}/ohttp-configs"),
         },
     )
+    .unwrap()
 }
 
 fn json_post() -> Request {
@@ -335,6 +340,29 @@ async fn a_freshness_refusal_is_sent_once_more_and_only_once() {
     )]);
 }
 
+/// `Client::new` refuses plain-HTTP URLs and the unsigned source before anything is sent.
+#[tokio::test]
+async fn a_client_refuses_plain_http() {
+    let (base, gw) = spawn().await;
+    let sources = [
+        KeyConfigSource::Plain {
+            url: format!("{base}/ohttp-configs"),
+        },
+        KeyConfigSource::Signed {
+            url: format!("{base}/ohttp-configs/signed"),
+            network: Network::Testnet,
+            signer: gw.signer(),
+        },
+    ];
+    for keys in sources {
+        let Err(Error::Setup { .. }) = Client::new(format!("{base}/relay"), keys) else {
+            panic!("a plain-HTTP client was built");
+        };
+    }
+    assert_eq!(gw.config_fetches.load(Ordering::SeqCst), 0);
+    assert_eq!(gw.posts.load(Ordering::SeqCst), 0);
+}
+
 #[tokio::test]
 async fn a_backend_error_is_an_answer() {
     let (base, _gw) = spawn().await;
@@ -347,14 +375,15 @@ async fn a_backend_error_is_an_answer() {
 async fn a_signed_configuration_is_checked_against_the_pinned_key() {
     let (base, gw) = spawn().await;
     let signed = |signer| {
-        Client::new(
+        Client::insecure_for_local_testing(
             format!("{base}/relay"),
             KeyConfigSource::Signed {
                 url: format!("{base}/ohttp-configs/signed"),
-                network: NETWORK.to_string(),
+                network: Network::Testnet,
                 signer,
             },
         )
+        .unwrap()
     };
     let response = signed(gw.signer())
         .send(&json_post(), TIMEOUT)
@@ -453,12 +482,13 @@ async fn a_rate_limited_relay_is_not_posted_to_until_its_pause_has_run() {
     // Its own relay path: the pause lives in the process-wide table, keyed by relay URL, and
     // outlives this test, while a later test may get the same ephemeral port.
     let rate_limited_client = || {
-        Client::new(
+        Client::insecure_for_local_testing(
             format!("{base}/relay-rate-limited"),
             KeyConfigSource::Plain {
                 url: format!("{base}/ohttp-configs"),
             },
         )
+        .unwrap()
     };
     let client = rate_limited_client();
     *gw.refuse_once.lock().unwrap() = Some((StatusCode::TOO_MANY_REQUESTS, Vec::new()));

@@ -2,6 +2,44 @@
 
 [Keep a Changelog](https://keepachangelog.com).
 
+## 2.0.0 (unreleased)
+
+A breaking release: the client refuses configurations and sources that let the relay read
+requests or tell clients apart. The migration list comes first; the sections after it describe
+each change.
+
+### Breaking changes / migration
+
+- `Client::new(relay_url, keys)` returns `Result<Client, Error>` and refuses (new
+  `Error::Setup { what, rule }`) a relay or envelope URL that is not `https://` with a host, a
+  relay URL with userinfo, query or fragment, and the unsigned source. Add `?`. A wallet builds
+  its client with the new `Client::for_network(&networks, network, url_rule)` instead.
+- `KeyConfigSource::Plain` exists only with the new cargo feature `insecure-plain-key-config`
+  and only `Client::insecure_for_local_testing` accepts it. `KeyConfigSource` is
+  `#[non_exhaustive]`. Code that used the unsigned source in production must switch to
+  `KeyConfigSource::Signed` (or `Client::for_network`); tests enable the feature and use
+  `Client::insecure_for_local_testing`, which also allows `http://`.
+- `Client` speaks `https://` only on the wire: a relay post or key fetch to any other scheme fails
+  before anything is sent, so no redirect or bypass can reach a plain-HTTP server.
+
+### Added
+
+- `Client::for_network(&OhttpNetworks, Network, SignedConfigUrlRule)`: a client posting to the
+  configured relay URL and sealing to the key of the gateway's signed envelope, fetched where the
+  rule derives it from the relay URL and checked against the signing key configured for that
+  network. The network and its configuration come from the same place, so they cannot disagree.
+- `Client::insecure_for_local_testing`: no checks, `http://` allowed, the unsigned source with
+  the feature; for tests against a local gateway.
+- `Error::Setup`, naming what a `Client` constructor refused and the rule, never the value.
+
+### Changed
+
+- The crate-level example builds its client with `Client::for_network` (the signed source). It
+  used `KeyConfigSource::Plain` on the relay host, which lets the relay substitute its own key.
+- `Client::send` and `Client::send_stream` no longer panic on a timeout too long to add to the
+  clock (`Duration::MAX`, as a binding may pass for "no timeout"): a timeout of more than a year
+  is a year.
+
 ## 1.1.0
 
 ### Changed

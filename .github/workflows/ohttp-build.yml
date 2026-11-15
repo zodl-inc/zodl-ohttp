@@ -92,7 +92,10 @@ jobs:
           cargo fmt --check
           cargo clippy --locked --all-targets -- -D warnings
           cargo clippy --locked --no-default-features --all-targets -- -D warnings
+          cargo clippy --locked --all-features --all-targets -- -D warnings
           cargo test --locked
+          # The tests against a local gateway use the unsigned source (insecure-plain-key-config).
+          cargo test --locked --all-features
 
       - name: Build and test e2e-client
         working-directory: e2e-client
