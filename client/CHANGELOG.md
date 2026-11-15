@@ -31,6 +31,19 @@ each change.
 - `OuterHeaders::key_fetch` is the fetch of the signed envelope; the new `key_fetch_signed` is
   the same and `key_fetch_plain` is the fetch of the unsigned `/ohttp-configs` document.
 
+- `OhttpConfig::new` (and `Client::new` for its relay URL) refuses more relay URLs
+  (`ConfigError::Invalid`, field `relay_url`): a relay on the gateway host (it would hand the
+  gateway the client's address; a security fix, so there is no opt-out), non-ASCII text (write a
+  host in its `xn--` form), an encoded `/` or `\` (`%2F`, `%5C`), an empty path segment (`//`),
+  and hosts the URL standard does not read (`[:]` passed the old character check).
+  `OhttpNetworks::new` refuses a network's relay on the other network's gateway host. Check the
+  shipped configurations.
+- `OhttpConfig::relay_url()` returns the canonical form instead of the value as given: one
+  trailing `/` removed (a configuration ending in `/relay/` keeps working and no longer derives
+  `.../relay//ohttp-configs/signed`), the host in lower case, an IPv4 address in dotted decimal
+  whatever form it was written in, an IPv6 address in its standard form, no `:443`, dot segments
+  resolved and percent-encoding normalized. Requests go to that URL.
+
 ### Added
 
 - `Client::for_network(&OhttpNetworks, Network, SignedConfigUrlRule)`: a client posting to the
@@ -63,6 +76,11 @@ each change.
   replace a final `/relay`), which matters when the relay URL has a path other than `/relay`.
   The 1.1.0 note that the fixed `User-Agent` keeps the relay from telling clients apart "by their
   HTTP stack" claimed more than a header can do.
+- Relay URLs are parsed with the URL standard's parser and compared by canonical host
+  (an IPv4-mapped IPv6 address as its IPv4 address), port (443 when absent) and path (ignoring
+  ASCII case, as before): `https://h/relay`, `https://h:443/relay/` and `https://h/a/../relay`
+  are one relay, and so are `https://192.0.2.1/relay`, `https://0xc0000201/relay` and
+  `https://[::ffff:192.0.2.1]/relay`.
 - The crate-level example builds its client with `Client::for_network` (the signed source). It
   used `KeyConfigSource::Plain` on the relay host, which lets the relay substitute its own key.
 - `Client::send` and `Client::send_stream` no longer panic on a timeout too long to add to the

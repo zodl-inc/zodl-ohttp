@@ -46,7 +46,7 @@ fn config(host: &str, seed: [u8; 32]) -> OhttpConfig {
     let key = ed25519_dalek::SigningKey::from_bytes(&seed).verifying_key();
     OhttpConfig::new(OhttpConfigParams {
         gateway_host: host,
-        relay_url: &format!("https://{host}/relay"),
+        relay_url: &format!("https://relay.{host}/relay"),
         keys_dns_name: &format!("keys.{host}"),
         signing_pubkey: &hex::encode(key.as_bytes()),
     })

@@ -596,26 +596,43 @@ pub enum SignedConfigUrlRule {
 }
 
 /// The URL of the signed key configuration of the relay at `relay_url`, under `rule`.
+///
+/// The relay URL is split into its origin (scheme and authority) and its path, and only the
+/// path is rewritten: a final `/relay` segment is replaced, so `https://relay` (a single-label
+/// host, empty path) gives `https://relay/ohttp-configs/signed`, never another host.
+///
+/// `relay_url` is taken as text, not parsed: pass the canonical form
+/// ([`crate::OhttpConfig::relay_url`] or [`crate::canonical_relay_url`]). For other text the
+/// rule applies to it as written, so a trailing `/`, a default `:443` or a dot segment gives a
+/// URL other than the canonical form's (`https://relay.example/relay/` under
+/// [`SignedConfigUrlRule::ReplaceRelaySuffix`] gives `.../relay//ohttp-configs/signed`).
 pub fn signed_config_url(relay_url: &str, rule: SignedConfigUrlRule) -> Result<String, Error> {
     const SIGNED: &str = "/ohttp-configs/signed";
-    let replace = |base: &str| match base.strip_suffix("/relay") {
-        Some(root) => format!("{root}{SIGNED}"),
-        None => format!("{base}{SIGNED}"),
+    // The origin ends where the path (or a query or fragment) starts after `scheme://`; a value
+    // without `://` is all path.
+    let (origin, path) = match relay_url.find("://") {
+        Some(scheme_end) => {
+            let rest = &relay_url[scheme_end + 3..];
+            let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+            relay_url.split_at(scheme_end + 3 + end)
+        }
+        None => ("", relay_url),
+    };
+    let replace = |path: &str| match path.strip_suffix("/relay") {
+        Some(root) => format!("{origin}{root}{SIGNED}"),
+        None => format!("{origin}{path}{SIGNED}"),
     };
     match rule {
-        SignedConfigUrlRule::TrimThenReplaceRelaySuffix => {
-            Ok(replace(relay_url.trim_end_matches('/')))
-        }
-        SignedConfigUrlRule::ReplaceRelaySuffix => Ok(replace(relay_url)),
+        SignedConfigUrlRule::TrimThenReplaceRelaySuffix => Ok(replace(path.trim_end_matches('/'))),
+        SignedConfigUrlRule::ReplaceRelaySuffix => Ok(replace(path)),
         SignedConfigUrlRule::RelayHostRoot => {
-            let rest = relay_url
+            let authority = origin
                 .strip_prefix("https://")
                 .ok_or_else(|| Error::KeyConfig("relay URL must be https".into()))?;
-            let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
             if authority.is_empty() {
                 return Err(Error::KeyConfig("relay URL without host".into()));
             }
-            Ok(format!("https://{authority}{SIGNED}"))
+            Ok(format!("{origin}{SIGNED}"))
         }
     }
 }
@@ -960,6 +977,78 @@ mod tests {
             SignedConfigUrlRule::RelayHostRoot
         )
         .is_err());
+    }
+
+    /// Only the path is rewritten: a single-label host at the root keeps its host.
+    #[test]
+    fn the_signed_url_rewrites_the_path_only() {
+        for rule in [
+            SignedConfigUrlRule::TrimThenReplaceRelaySuffix,
+            SignedConfigUrlRule::ReplaceRelaySuffix,
+            SignedConfigUrlRule::RelayHostRoot,
+        ] {
+            for relay in ["https://relay", "https://relay/", "https://relay/relay"] {
+                let url = signed_config_url(relay, rule).unwrap();
+                if rule == SignedConfigUrlRule::ReplaceRelaySuffix && relay == "https://relay/" {
+                    assert_eq!(url, "https://relay//ohttp-configs/signed");
+                } else {
+                    assert_eq!(
+                        url, "https://relay/ohttp-configs/signed",
+                        "{relay} {rule:?}"
+                    );
+                }
+            }
+            assert_eq!(
+                signed_config_url("https://relay:8443", rule).unwrap(),
+                "https://relay:8443/ohttp-configs/signed"
+            );
+        }
+    }
+
+    /// The shapes a configured relay URL takes (`OhttpConfig::relay_url` is canonical: no
+    /// trailing `/`), under every rule.
+    #[test]
+    fn the_signed_url_of_each_shipped_shape() {
+        use SignedConfigUrlRule::*;
+        for (relay, replaced, root) in [
+            (
+                "https://relay.example/relay",
+                "https://relay.example/ohttp-configs/signed",
+                "https://relay.example/ohttp-configs/signed",
+            ),
+            (
+                "https://relay.example/testnet",
+                "https://relay.example/testnet/ohttp-configs/signed",
+                "https://relay.example/ohttp-configs/signed",
+            ),
+            (
+                "https://relay.example/testnet/relay",
+                "https://relay.example/testnet/ohttp-configs/signed",
+                "https://relay.example/ohttp-configs/signed",
+            ),
+            (
+                "https://relay.example",
+                "https://relay.example/ohttp-configs/signed",
+                "https://relay.example/ohttp-configs/signed",
+            ),
+            (
+                "https://relay.example:8443/mainnet/relay",
+                "https://relay.example:8443/mainnet/ohttp-configs/signed",
+                "https://relay.example:8443/ohttp-configs/signed",
+            ),
+        ] {
+            for (rule, want) in [
+                (TrimThenReplaceRelaySuffix, replaced),
+                (ReplaceRelaySuffix, replaced),
+                (RelayHostRoot, root),
+            ] {
+                assert_eq!(
+                    signed_config_url(relay, rule).unwrap(),
+                    want,
+                    "{relay} {rule:?}"
+                );
+            }
+        }
     }
 
     #[test]

@@ -118,12 +118,19 @@ impl Client {
     /// A client posting to the relay at `relay_url`, sealing to the key of the signed envelope
     /// at the `KeyConfigSource::Signed` URL.
     ///
-    /// Refused with [`Error::Setup`]: a relay or envelope URL that is not `https://` with a
-    /// host (no userinfo, query or fragment on the relay URL), and the unsigned source. The
-    /// client also speaks `https://` only on the wire, so no redirect or later change of scheme
-    /// can reach a plain-HTTP server. This constructor does not know the gateway host, so it
-    /// cannot refuse a relay on the gateway's own host; [`Client::for_network`] (through
-    /// [`crate::OhttpConfig::new`]) does.
+    /// Refused with [`Error::Setup`]:
+    ///
+    /// - a relay URL that breaks the syntax rules of
+    ///   [`crate::OhttpConfigParams::relay_url`] (the client posts to its canonical form, as
+    ///   [`crate::OhttpConfig::relay_url`] describes it);
+    /// - an envelope URL that is not `https://` with a non-empty host, or that has userinfo
+    ///   (an empty one included), a backslash, whitespace or a control character;
+    /// - the unsigned source.
+    ///
+    /// The client also speaks `https://` only on the wire, so no redirect or later change of
+    /// scheme can reach a plain-HTTP server. This constructor does not know the gateway host,
+    /// so it does not apply the gateway-host rule: a relay on the gateway's own host is refused
+    /// only by [`crate::OhttpConfig::new`], and so through [`Client::for_network`].
     ///
     /// Use it for a relay that serves the signed envelope at a URL none of the
     /// [`SignedConfigUrlRule`]s derives; otherwise use [`Client::for_network`].
@@ -181,7 +188,13 @@ impl Client {
         keys: KeyConfigSource,
         builder: reqwest::ClientBuilder,
     ) -> Result<Self, Error> {
-        check_https_url(&relay_url, "relay URL", true)?;
+        // The relay URL under the rules of `OhttpConfig::new`, in its canonical form.
+        let relay_url = crate::config::parse_relay_url(&relay_url)
+            .map_err(|rule| Error::Setup {
+                what: "relay URL",
+                rule,
+            })?
+            .url;
         match &keys {
             #[cfg(feature = "insecure-plain-key-config")]
             KeyConfigSource::Plain { .. } => {
@@ -191,7 +204,7 @@ impl Client {
                 })
             }
             KeyConfigSource::Signed { url, .. } => {
-                check_https_url(url, "key-configuration URL", false)?;
+                check_https_url(url, "key-configuration URL")?;
             }
         }
         Self::assemble(relay_url, keys, builder, true)
@@ -463,11 +476,10 @@ async fn read_limited(mut resp: reqwest::Response, mut guard: SizeGuard) -> Resu
     Ok(body)
 }
 
-/// Checks that `value`, the `what` of a client, is an `https://` URL with a host and without
-/// userinfo (not even an empty one, `https://@host/`, which the URL parser drops); with `bare`,
-/// also without query or fragment. The scheme must be written in lower case, as
-/// [`crate::OhttpConfig::new`] requires of a relay URL.
-fn check_https_url(value: &str, what: &'static str, bare: bool) -> Result<(), Error> {
+/// Checks that `value`, the `what` of a client, is an `https://` URL (the scheme written in
+/// lower case) with a host and without userinfo (not even an empty one, `https://@host/`, which
+/// the URL parser drops).
+fn check_https_url(value: &str, what: &'static str) -> Result<(), Error> {
     let refused = |rule| Err(Error::Setup { what, rule });
     let Some(after_scheme) = value.strip_prefix("https://") else {
         return refused("must be an https:// URL");
@@ -502,9 +514,6 @@ fn check_https_url(value: &str, what: &'static str, bare: bool) -> Result<(), Er
     }
     if !url.username().is_empty() || url.password().is_some() {
         return refused("must not contain userinfo");
-    }
-    if bare && (url.query().is_some() || url.fragment().is_some()) {
-        return refused("must not contain a query or fragment");
     }
     Ok(())
 }
@@ -660,6 +669,10 @@ mod tests {
         );
         Client::new("https://relay.example/relay", signed(good_keys)).unwrap();
         Client::new("https://[2001:db8::1]:8443/relay", signed(good_keys)).unwrap();
+        // The relay URL is used in its canonical form.
+        let client =
+            Client::new("https://Relay.Example:443/a/../relay/", signed(good_keys)).unwrap();
+        assert_eq!(client.relay_url, "https://relay.example/relay");
     }
 
     #[cfg(feature = "insecure-plain-key-config")]
