@@ -37,8 +37,11 @@ use std::time::{Duration, Instant};
 use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
-/// How long an idle connection to a third-party HTTPS backend is kept for reuse.
-const BACKEND_POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+/// How long an idle connection to a third-party HTTPS backend is kept for reuse: 30 s, well
+/// below the 60 s idle timeout common for servers and load balancers, so the gateway drops an
+/// idle connection before the server closes it. With equal timeouts a request could be written
+/// to a connection the server is closing at that moment and fail.
+const BACKEND_POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 /// Idle connections kept per third-party backend host.
 const BACKEND_POOL_MAX_IDLE_PER_HOST: usize = 16;
 

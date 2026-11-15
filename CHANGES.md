@@ -62,6 +62,9 @@ keeps its own log in [client/CHANGELOG.md](client/CHANGELOG.md).
 
 ### Gateway
 
+- Pooled third-party HTTPS connections are kept idle for 30 s instead of 60 s, below the 60 s
+  idle timeout common for servers and load balancers: with equal timeouts a request could be
+  written to a connection the server was closing at that moment and fail.
 - Tip-scoped `GetLatestTreeState` answers are cached and served only when their height and hash
   are the tip of their key, `GetLightdInfo` answers only when their `blockHeight` is at least
   the tip height (it carries no hash: this catches an instance that is behind, not one on
@@ -412,7 +415,7 @@ keeps its own log in [client/CHANGELOG.md](client/CHANGELOG.md).
   that already sets it is unaffected; one that does not must set it to the gateway's own host
   names before upgrading.
 - Third-party backend calls (`BACKENDS`, `https://`) reuse pooled HTTPS connections (idle
-  60 s, at most 16 idle per host) instead of a new connection per request, which saves the TCP
+  30 s, at most 16 idle per host) instead of a new connection per request, which saves the TCP
   and TLS handshake on every call after the first. Same TLS connector, roots and HTTP/1.1 as
   before; headers, credentials and timeouts stay per request, and a response body that is not
   read to its end (an event stream cut at its timeout) closes its connection instead of
