@@ -509,7 +509,9 @@ async fn main() -> anyhow::Result<()> {
 
                 // REPLAY_UNAVAILABLE_FALLBACK: decide at the fallback store when the deciding
                 // store gives no verdict (write_fallback.rs, "Unavailable store").
-                let c = c.with_unavailable_fallback(origin.replay_unavailable_fallback);
+                let c = c
+                    .with_unavailable_fallback(origin.replay_unavailable_fallback)
+                    .with_fallback_health(cache::FallbackHealth::from_env()?);
                 let target = c.unavailable_fallback_target();
                 health::record_replay_unavailable_fallback(&network, target);
                 let checks = c.checks_writes_at_fallback_store();
@@ -781,6 +783,16 @@ async fn main() -> anyhow::Result<()> {
         "Global in-flight OHTTP request limit"
     );
 
+    // REPLAY_STARTUP_STORES_WAIT_SECS: /healthz stays 503 until the replay peers and standby
+    // stores are connected (connected in the background), or the bound has passed.
+    if let Some(c) = &cache_state {
+        let bound = cache::startup_stores_wait_from_env()?;
+        if !c.replay_stores_connected() {
+            info!(network = %config.network, bound_secs = bound.as_secs(), "Waiting for the replay peers and standby stores before reporting ready");
+        }
+        cache::spawn_replay_stores_gate(c.clone(), bound);
+    }
+
     let app_state = Arc::new(AppState {
         config: config.clone(),
         origin: origin.clone(),
@@ -878,9 +890,13 @@ async fn main() -> anyhow::Result<()> {
 
     /// GET /healthz — the public, unauthenticated probe for a load balancer in front of several
     /// origins (load balancer health monitor). 200 "ok" while this origin can answer OHTTP requests:
-    /// replay protection works (the security Redis answered the last PING, or it did not and the
-    /// peer stores decide in its place: `ohttp_replay_serving_via_fallback`), lightwalletd is
-    /// reachable and recent lightwalletd calls did not fail too often (`health::LwdErrorPolicy`);
+    /// replay protection works (the security Redis answered the last PING and its connection
+    /// reaches a primary: its last ROLE said master and no reconnect after a failover signal has
+    /// been pending for more than 2 s; or it did not and the peer stores decide in its place:
+    /// `ohttp_replay_serving_via_fallback`), lightwalletd is
+    /// reachable and recent lightwalletd calls did not fail too often (`health::LwdErrorPolicy`),
+    /// and the startup wait for the replay peers and standby stores (and their WAIT channels) is
+    /// over (`REPLAY_STARTUP_STORES_WAIT_SECS`);
     /// else 503 "unavailable". Reads gauges, no I/O, no mode/network/origin in the body.
     async fn healthz_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         let ok = health::healthz_ok(
@@ -888,7 +904,7 @@ async fn main() -> anyhow::Result<()> {
             health::is_replay_serving_via_fallback(&state.config.network),
             health::is_lwd_healthy(&state.config.network),
             health::lwd_errors_ok(&state.config.network),
-        );
+        ) && health::is_replay_stores_ready(&state.config.network);
         let status = if ok {
             StatusCode::OK
         } else {
@@ -906,11 +922,18 @@ async fn main() -> anyhow::Result<()> {
     }
 
     /// Process-level startup readiness (NO LWD dependency).
-    /// Returns 200 once the gateway process is configured and listening.
+    /// Returns 200 once the gateway process is configured and listening and the startup gate
+    /// of the replay stores is open (503 `starting` while it waits for the replay peers and
+    /// standby stores and their WAIT channels, at most REPLAY_STARTUP_STORES_WAIT_SECS).
     /// This is for readiness probes: an LWD outage should NOT mark the process unready,
     /// since the gateway still serves mapped backend aliases and cached LWD requests.
     /// LWD reachability is tracked by the `ohttp_lwd_reachable` gauge.
     async fn health_startup_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+        // Not ready while the startup gate waits for the replay stores
+        // (REPLAY_STARTUP_STORES_WAIT_SECS, bounded).
+        if !health::is_replay_stores_ready(&state.config.network) {
+            return (StatusCode::SERVICE_UNAVAILABLE, "starting".to_string()).into_response();
+        }
         let status = format!("ready mode={}", state.config.mode);
         (StatusCode::OK, status).into_response()
     }
@@ -939,8 +962,9 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Split into two servers:
-    // - Public server (PORT): /gateway, /ohttp-configs, /ohttp-configs/signed, /health/startup,
-    //   /healthz (process-level only)
+    // - Public server (PORT): /gateway, /ohttp-configs, /ohttp-configs/signed, /health/startup
+    //   (process up and the replay-store startup gate open), /healthz (replay protection and
+    //   lightwalletd; a security-store reconnect counts only after a 2 s grace)
     // - Internal server (9090): /metrics, /health/live, /health/ready (observability only)
     let public_app = Router::new()
         .route(
@@ -3366,7 +3390,15 @@ mod handler_tests {
         let cache = base_cache(&config, &origin, peer_wait).await;
         if peer_wait.is_some() {
             // The peer WAIT connections open in the background.
-            tokio::time::sleep(Duration::from_millis(500)).await;
+            let peers = cache.replay_peers().unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while peers.wait_conns_open().iter().any(|n| *n == 0) {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "peer WAIT connections"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
         }
         let state = app_state(config, origin, cache);
         let nonce = Uuid::new_v4().to_string();

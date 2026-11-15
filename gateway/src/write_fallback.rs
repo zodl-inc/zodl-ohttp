@@ -87,7 +87,10 @@
 //!   healthy while every peer answered its last housekeeping PING
 //!   (`ResponseCache::serves_without_local_store`, gauge `ohttp_replay_serving_via_fallback`),
 //!   so a load balancer keeps sending it the requests the peers can decide. With no peer
-//!   answering it fails, as before.
+//!   answering it fails, as before, and also once the WRITEs decided there keep failing closed
+//!   although the peers answer (`REPLAY_FALLBACK_HEALTH_FAILURES` in a row: a peer short of
+//!   replicas, a full write-back queue, a broken peer `WAIT` connection;
+//!   `cache::FallbackHealth`).
 //!
 //! **Partition tolerance** (`REPLAY_ONE_SIDED_WRITE_ROUTES`, `cache::WritePolicy`). `SET NX` on
 //! one store admits a key once, so two gateways that asked the same store cannot both find one

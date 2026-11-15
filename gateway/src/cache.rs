@@ -57,7 +57,8 @@ use crate::replication::{AsyncReplicator, Effective, PeerSink, ReplicationConfig
 use crate::rpc_cache::{self, grpc_message, BlockId, TreeStateHead};
 use crate::store::{CacheStore, PermanentStore, TipCell};
 use crate::store_conn::{
-    error_summary, is_failover_signal, is_role_signal, redact_addrs, store_error, Role, StoreConn,
+    error_summary, is_failover_signal, is_role_signal, redact_addrs, reopen_pause, store_error,
+    Role, StoreConn, ROLE_CHECK_TIMEOUT,
 };
 use crate::write_fallback::{LocalWriteBack, WriteBackResult, WriteBackSink, WriteFallback};
 
@@ -79,6 +80,9 @@ const KEY_VERSION: u32 = 4;
 const EPOCH_REFRESH_SECS: u64 = 2;
 /// How often the housekeeping task syncs the epoch and pings Redis.
 const HOUSEKEEPING_SECS: u64 = 10;
+/// Bound of one housekeeping round's peer and standby checks, which run concurrently: a peer
+/// that has not answered by then counts as not answering.
+const HOUSEKEEPING_DEADLINE: Duration = Duration::from_secs(5);
 /// Replay nonce lifetime (ZIP "Replay protection": reference implementation 600 s).
 pub const REPLAY_TTL_SECS: u64 = 600;
 /// Consecutive failed housekeeping PINGs after which a replay peer connection is dropped and
@@ -149,6 +153,137 @@ pub struct ResponseCache {
     /// REPLAY_UNAVAILABLE_FALLBACK: confirm at the fallback store when the store that normally
     /// decides gives no verdict at all (write_fallback.rs, "Unavailable store").
     unavailable_fallback: bool,
+    /// Consecutive WRITEs the peers could not confirm while the local store gave no verdict
+    /// (`REPLAY_FALLBACK_HEALTH_FAILURES`): `/healthz` stops counting on the fallback then.
+    fallback_health: Arc<FallbackHealth>,
+}
+
+/// `REPLAY_FALLBACK_HEALTH_FAILURES` default: consecutive WRITEs decided at the peer stores for an
+/// unreachable local store that failed closed (`path="local_unavailable"`, result
+/// `unacknowledged`, `unavailable` or `overflow`) after which `/healthz` fails although every peer
+/// answers its PING.
+pub const DEFAULT_REPLAY_FALLBACK_HEALTH_FAILURES: u32 = 20;
+/// `REPLAY_FALLBACK_HEALTH_WINDOW_SECS` default: such failures count as consecutive while the
+/// last one is at most this old; the next accepted WRITE or a quiet window clears them.
+pub const DEFAULT_REPLAY_FALLBACK_HEALTH_WINDOW_SECS: u64 = 60;
+
+/// Whether serving through the peer stores still works for WRITEs (`serves_without_local_store`).
+/// The peers answering their PINGs says nothing about a peer that is short of replicas (every
+/// WRITE unacknowledged), a full write-back queue (every WRITE overflows) or a broken `WAIT`
+/// connection: `/healthz` stayed 200 while every WRITE failed closed.
+///
+/// `threshold` failures in a row (the last within `window` of the one before) withdraw the
+/// gateway (`failing`), and it stays withdrawn until the local store answers again
+/// (`local_answered`) or a WRITE decided through the fallback runs (`accepted`): a load balancer
+/// that took it out of rotation sends it nothing that could tell, so returning on a timer alone
+/// would only send traffic back to fail again. The state is one mutex-guarded value, so
+/// concurrent requests never see half an update.
+pub struct FallbackHealth {
+    /// 0 = off.
+    threshold: u32,
+    window: Duration,
+    base: std::time::Instant,
+    state: parking_lot::Mutex<FallbackHealthState>,
+}
+
+#[derive(Default)]
+struct FallbackHealthState {
+    failures: u32,
+    /// Milliseconds since `base` of the last counted failure (0 = none).
+    last_failure_ms: u64,
+    withdrawn: bool,
+}
+
+impl FallbackHealth {
+    pub fn new(threshold: u32, window: Duration) -> Self {
+        Self {
+            threshold,
+            window,
+            base: std::time::Instant::now(),
+            state: parking_lot::Mutex::new(FallbackHealthState::default()),
+        }
+    }
+
+    fn now_ms(&self) -> u64 {
+        self.base.elapsed().as_millis() as u64 + 1
+    }
+
+    /// `REPLAY_FALLBACK_HEALTH_FAILURES` / `REPLAY_FALLBACK_HEALTH_WINDOW_SECS`.
+    pub fn from_env() -> anyhow::Result<Self> {
+        Self::parse(
+            std::env::var("REPLAY_FALLBACK_HEALTH_FAILURES")
+                .ok()
+                .as_deref(),
+            std::env::var("REPLAY_FALLBACK_HEALTH_WINDOW_SECS")
+                .ok()
+                .as_deref(),
+        )
+    }
+
+    pub fn parse(failures: Option<&str>, window_secs: Option<&str>) -> anyhow::Result<Self> {
+        let threshold = match failures.map(str::trim).filter(|s| !s.is_empty()) {
+            None => DEFAULT_REPLAY_FALLBACK_HEALTH_FAILURES,
+            Some(v) => v.parse::<u32>().map_err(|_| {
+                anyhow::anyhow!(
+                    "REPLAY_FALLBACK_HEALTH_FAILURES must be a non-negative integer, got '{v}'"
+                )
+            })?,
+        };
+        let window = match window_secs.map(str::trim).filter(|s| !s.is_empty()) {
+            None => DEFAULT_REPLAY_FALLBACK_HEALTH_WINDOW_SECS,
+            Some(v) => match v.parse::<u64>() {
+                Ok(n) if n > 0 => n,
+                _ => anyhow::bail!(
+                    "REPLAY_FALLBACK_HEALTH_WINDOW_SECS must be a positive integer, got '{v}'"
+                ),
+            },
+        };
+        Ok(Self::new(threshold, Duration::from_secs(window)))
+    }
+
+    /// A WRITE that only the fallback could decide (the local store gave no verdict) failed
+    /// closed.
+    pub fn failed(&self) {
+        let now = self.now_ms();
+        let mut st = self.state.lock();
+        if st.last_failure_ms == 0
+            || now.saturating_sub(st.last_failure_ms) > self.window.as_millis() as u64
+        {
+            st.failures = 1;
+        } else {
+            st.failures = st.failures.saturating_add(1);
+        }
+        st.last_failure_ms = now;
+        if self.threshold > 0 && st.failures >= self.threshold {
+            st.withdrawn = true;
+        }
+    }
+
+    /// Such a WRITE ran: the fallback works.
+    pub fn accepted(&self) {
+        *self.state.lock() = FallbackHealthState::default();
+    }
+
+    /// The local store answers again: the fallback is not needed. Whether the gateway was
+    /// withdrawn until now.
+    pub fn local_answered(&self) -> bool {
+        let mut st = self.state.lock();
+        let was_withdrawn = st.withdrawn;
+        if st.withdrawn || st.failures != 0 {
+            *st = FallbackHealthState::default();
+        }
+        was_withdrawn
+    }
+
+    /// Whether the gateway is withdrawn (`threshold` failures in a row, no recovery since).
+    pub fn failing(&self) -> bool {
+        self.state.lock().withdrawn
+    }
+
+    /// The failures in a row so far (diagnostics, tests).
+    pub fn consecutive_failures(&self) -> u32 {
+        self.state.lock().failures
+    }
 }
 
 /// What the peer stage said about one request's nonce (`replicate_nonce_checked`,
@@ -453,6 +588,8 @@ struct LeasePool {
     changed: Arc<tokio::sync::Notify>,
     n: usize,
     next: AtomicU64,
+    /// The turn of the housekeeping checks (`take_idle_for_check`).
+    next_check: AtomicU64,
     base: std::time::Instant,
     /// Shared mode while `now_ms() >= exclusive_until_ms`.
     exclusive_until_ms: AtomicU64,
@@ -563,6 +700,7 @@ impl LeasePool {
             changed,
             n,
             next: AtomicU64::new(0),
+            next_check: AtomicU64::new(0),
             base: std::time::Instant::now(),
             exclusive_until_ms: AtomicU64::new(0),
             floor: parking_lot::Mutex::new(WaitFloor {
@@ -703,19 +841,40 @@ impl LeasePool {
         }
     }
 
-    /// Connection `i` leased to the caller if no request holds it right now (housekeeping
-    /// checks: a busy connection is skipped, and a checked one is not handed to a request
-    /// until the check's command is answered).
-    fn take_idle(self: &Arc<Self>, i: usize) -> Option<WaitSlot> {
+    /// One connection no request holds, leased to a housekeeping check (a busy one is never
+    /// taken, and the checked one goes to no request until the check is answered). Staggered:
+    /// one per call, in turn, leased only while another connection of the pool stays idle too,
+    /// so a WRITE never waits behind a check; the last idle connection (also of a pool of one)
+    /// is checked as shared work, in shared mode only.
+    ///
+    /// Only an `eligible` connection (open and usable now) counts as idle: a closed one is
+    /// neither checked nor counted as the one left free.
+    fn take_idle_for_check(self: &Arc<Self>, eligible: impl Fn(usize) -> bool) -> Option<WaitSlot> {
         let mut st = self.state.lock();
-        if *st.get(i)? != (false, 0) {
+        let idle: Vec<usize> = (0..self.n)
+            .filter(|i| st[*i] == (false, 0) && eligible(*i))
+            .collect();
+        if idle.is_empty() {
             return None;
         }
-        st[i].0 = true;
+        // The last idle connection (or the only one of a pool of one) is checked as shared
+        // work, which a WRITE in shared mode still uses meanwhile, and not while the pool hands
+        // its connections out exclusively (a lease would wait for the check).
+        let leased = idle.len() >= 2;
+        if !leased && self.exclusive() {
+            return None;
+        }
+        let turn = self.next_check.fetch_add(1, Ordering::Relaxed) as usize;
+        let i = idle[turn % idle.len()];
+        if leased {
+            st[i].0 = true;
+        } else {
+            st[i].1 += 1;
+        }
         Some(WaitSlot {
             pool: self.clone(),
             index: i,
-            leased: true,
+            leased,
         })
     }
 
@@ -1220,6 +1379,7 @@ fn spawn_wait_reopen(network: String, index: usize, url: String, slot: Arc<PeerW
     }
     tokio::spawn(async move {
         let mut backoff = Duration::from_millis(200);
+        let mut loading = 0u32;
         loop {
             match ReplayPeer::open(&url).await {
                 Ok(c) => {
@@ -1230,13 +1390,14 @@ fn spawn_wait_reopen(network: String, index: usize, url: String, slot: Arc<PeerW
                     if slot.reopen_done() {
                         // A new reopen after a success: its backoff starts over.
                         backoff = Duration::from_millis(200);
+                        loading = 0;
                         continue;
                     }
                     return;
                 }
                 Err(e) => {
                     debug!(network = %network, peer = index, error = %error_summary(&e), "Replay peer WAIT connection attempt failed");
-                    tokio::time::sleep(jittered(backoff)).await;
+                    tokio::time::sleep(reopen_pause(&e, jittered(backoff), &mut loading)).await;
                     backoff =
                         (backoff * 2).min(Duration::from_secs(PEER_RECONNECT_MAX_BACKOFF_SECS));
                 }
@@ -1886,6 +2047,25 @@ impl ReplayPeers {
         self.peers.iter().any(|p| p.conn.load().is_some())
     }
 
+    /// Whether every peer has a connection right now (at least one peer).
+    pub fn all_connected(&self) -> bool {
+        !self.peers.is_empty() && self.peers.iter().all(|p| p.conn.load().is_some())
+    }
+
+    /// `all_connected`, and where their replica acknowledgement is required
+    /// (`REPLAY_PEER_WAIT_REPLICAS`), every peer with at least one open `WAIT` connection.
+    pub fn all_ready(&self) -> bool {
+        self.all_connected()
+            && (self.wait.is_none() || self.peers.iter().all(|p| p.wait.any_connected()))
+    }
+
+    /// Whether at least one peer answered its last housekeeping PING.
+    pub fn any_answering(&self) -> bool {
+        self.peers
+            .iter()
+            .any(|p| p.answered.load(Ordering::Relaxed))
+    }
+
     /// Whether every peer answered its last housekeeping PING: a request that the local store
     /// cannot decide needs all of them (`admit_without_local`).
     pub fn all_answering(&self) -> bool {
@@ -2121,46 +2301,177 @@ impl ReplayPeers {
 
     /// PING every peer for the `ohttp_replay_peer_connected` gauge (housekeeping). A connection
     /// that fails PEER_PING_FAILURES_RECONNECT PINGs in a row is dropped and reopened in the
-    /// background (a hung connection never errors, so ConnectionManager would keep it).
+    /// background (a hung connection never errors, so ConnectionManager would keep it). A peer
+    /// that answers is also asked its `ROLE`: a PING succeeds on a demoted primary, and an idle
+    /// gateway sends nothing that would be refused with `READONLY`. The idle `WAIT` connections
+    /// are PINGed too, so that one a middlebox reset while idle is reopened here, in the
+    /// background, rather than found by the next WRITE.
     pub async fn ping_all(&self) {
-        for p in &self.peers {
-            let ok = match p.conn.load_full() {
-                // A reconnect task is running.
-                None => false,
-                Some(conn) => {
-                    let mut conn = (*conn).clone();
-                    let ok = matches!(
-                        timeout(
-                            self.timeout,
-                            redis::cmd("PING").query_async::<_, String>(&mut conn)
-                        )
-                        .await,
-                        Ok(Ok(pong)) if pong == "PONG"
-                    );
-                    if ok {
-                        p.ping_failures.store(0, Ordering::Relaxed);
-                    } else if p.ping_failures.fetch_add(1, Ordering::Relaxed) + 1
-                        >= PEER_PING_FAILURES_RECONNECT
-                    {
-                        p.ping_failures.store(0, Ordering::Relaxed);
-                        warn!(network = %self.network, peer = p.index, "Replay peer failed {PEER_PING_FAILURES_RECONNECT} PINGs in a row: reopening the connection");
-                        p.conn.store(None);
-                        for slot in &p.wait.slots {
-                            if let Some(c) = slot.conn.load_full() {
-                                drop_wait_conn(&self.network, p.index, &p.url, slot, &c);
-                            }
-                        }
-                        spawn_peer_reconnect_task(self.network.clone(), p.links());
-                    }
-                    ok
+        self.ping_all_until(tokio::time::Instant::now() + HOUSEKEEPING_DEADLINE)
+            .await
+    }
+
+    /// `ping_all`, every peer at once; a peer whose checks are not done by `deadline` counts as
+    /// not answering this round.
+    pub async fn ping_all_until(&self, deadline: tokio::time::Instant) {
+        let checks = self.peers.iter().map(|p| async move {
+            // Whether the peer answers is its main connection's verdict, recorded as soon as it
+            // is known: a slow check of its WAIT connections after it does not change it.
+            // Its WAIT (or retry) connections are checked at the same time.
+            let main = async {
+                let ok = tokio::time::timeout_at(deadline, self.ping_main(p))
+                    .await
+                    .unwrap_or(false);
+                if !ok {
+                    self.disruptions.fetch_add(1, Ordering::Relaxed);
                 }
+                p.answered.store(ok, Ordering::Relaxed);
+                record_peer_connected(&self.network, p.index, p.standby, ok);
             };
-            if !ok {
-                self.disruptions.fetch_add(1, Ordering::Relaxed);
+            let extra = async {
+                let _ = tokio::time::timeout_at(deadline, self.ping_wait_conns(p)).await;
+            };
+            tokio::join!(main, extra);
+        });
+        futures_util::future::join_all(checks).await;
+    }
+
+    /// PING (and ROLE) of a peer's main connection: whether it answered and reaches a primary.
+    async fn ping_main(&self, p: &ReplayPeer) -> bool {
+        let ok = match p.conn.load_full() {
+            // A reconnect task is running.
+            None => false,
+            Some(used) => {
+                let mut conn = (*used).clone();
+                let ok = matches!(
+                    timeout(
+                        self.timeout,
+                        redis::cmd("PING").query_async::<_, String>(&mut conn)
+                    )
+                    .await,
+                    Ok(Ok(pong)) if pong == "PONG"
+                );
+                if ok {
+                    p.ping_failures.store(0, Ordering::Relaxed);
+                    // A replica there: the connection was dropped, the peer is not usable this
+                    // round.
+                    if !self.check_peer_role(p, &used).await {
+                        return false;
+                    }
+                } else if p.ping_failures.fetch_add(1, Ordering::Relaxed) + 1
+                    >= PEER_PING_FAILURES_RECONNECT
+                {
+                    p.ping_failures.store(0, Ordering::Relaxed);
+                    if crate::health::warn_due(&self.network, "peer_ping_failures") {
+                        warn!(network = %self.network, peer = p.index, "Replay peer failed {PEER_PING_FAILURES_RECONNECT} PINGs in a row: reopening the connection");
+                    }
+                    p.links()
+                        .drop_all(&self.network, &used, "timeout", "PING failures");
+                }
+                ok
             }
-            p.answered.store(ok, Ordering::Relaxed);
-            record_peer_connected(&self.network, p.index, p.standby, ok);
+        };
+        ok
+    }
+
+    /// `ROLE` of a peer whose main connection answered a PING: a replica there (the endpoint
+    /// still reaches a demoted primary) drops the connection and reconnects (false). No answer,
+    /// or a store that does not allow `ROLE`, changes nothing (true).
+    async fn check_peer_role(&self, p: &ReplayPeer, used: &Arc<ConnectionManager>) -> bool {
+        let mut conn = (**used).clone();
+        let answer = timeout(
+            self.timeout,
+            redis::cmd("ROLE").query_async::<_, redis::Value>(&mut conn),
+        )
+        .await;
+        if let Ok(Ok(v)) = answer {
+            if crate::store_conn::parse_role(&v) == Some(false) {
+                self.disruptions.fetch_add(1, Ordering::Relaxed);
+                p.links()
+                    .drop_all(&self.network, used, "role", "ROLE is not master");
+                return false;
+            }
         }
+        true
+    }
+
+    /// Housekeeping of the extra connections of `p`: its `WAIT` pool, or its retry connection
+    /// without one. A closed connection is reopened in the background; one connection that no
+    /// request holds is PINGed (`take_idle_for_check`), and replaced if it does not answer.
+    async fn ping_wait_conns(&self, p: &ReplayPeer) {
+        let (pool, budget) = match self.wait {
+            // A request may lease the connection meanwhile: its WAIT can delay the PING's answer.
+            Some(WriteWaitConfig { timeout_ms, .. }) => {
+                (&p.wait, self.timeout + Duration::from_millis(timeout_ms))
+            }
+            None => (&p.retry, self.timeout),
+        };
+        pool.reopen_closed(&self.network, p.index, &p.url);
+        let Some(held) = pool.pool.take_idle_for_check(|i| pool.connected(i)) else {
+            return;
+        };
+        let slot = pool.slots[held.index()].clone();
+        let Some(used) = slot.conn.load_full() else {
+            return;
+        };
+        let mut conn = (*used).clone();
+        let command = async move { redis::cmd("PING").query_async::<_, String>(&mut conn).await };
+        let retire = {
+            let (network, index, url, slot, used) = (
+                self.network.clone(),
+                p.index,
+                p.url.clone(),
+                slot.clone(),
+                used.clone(),
+            );
+            move || {
+                drop_wait_conn(&network, index, &url, &slot, &used);
+            }
+        };
+        // No answer in time: replaced by the command's task (only if still the slot's).
+        let on_timeout = {
+            let (network, index, url, slot, used) = (
+                self.network.clone(),
+                p.index,
+                p.url.clone(),
+                slot.clone(),
+                used.clone(),
+            );
+            move || {
+                drop_wait_conn(&network, index, &url, &slot, &used);
+            }
+        };
+        let hooks = SlotHooks {
+            answered: Box::new(|_, _| {}),
+            timed_out: Box::new(on_timeout),
+            stuck: Box::new(retire),
+        };
+        let r = run_on_slot_with(
+            held,
+            tokio::time::Instant::now() + budget,
+            budget + WAIT_DRAIN_EXTRA,
+            command,
+            hooks,
+        )
+        .await;
+        if matches!(r, Ok(Ok(ref pong)) if pong != "PONG") || matches!(r, Ok(Err(_))) {
+            debug!(network = %self.network, peer = p.index, "Replay peer WAIT connection failed its PING: reopening it in the background");
+            drop_wait_conn(&self.network, p.index, &p.url, &slot, &used);
+        }
+    }
+
+    /// How many `WAIT` connections of each peer are open (tests, diagnostics).
+    pub fn wait_conns_open(&self) -> Vec<usize> {
+        self.peers
+            .iter()
+            .map(|p| {
+                p.wait
+                    .slots
+                    .iter()
+                    .filter(|s| s.conn.load().is_some())
+                    .count()
+            })
+            .collect()
     }
 }
 
@@ -2402,6 +2713,7 @@ fn spawn_peer_reconnect_task(network: String, links: PeerLinks) {
     tokio::spawn(async move {
         let mut backoff = Duration::from_millis(200);
         let mut pause = jittered(backoff);
+        let mut loading = 0u32;
         loop {
             tokio::time::sleep(pause).await;
             match ReplayPeer::open(&url).await {
@@ -2419,7 +2731,7 @@ fn spawn_peer_reconnect_task(network: String, links: PeerLinks) {
                     }
                     backoff =
                         (backoff * 2).min(Duration::from_secs(PEER_RECONNECT_MAX_BACKOFF_SECS));
-                    pause = jittered(backoff);
+                    pause = reopen_pause(&e, jittered(backoff), &mut loading);
                 }
             }
         }
@@ -2546,6 +2858,10 @@ impl ResponseCache {
             write_fallback: None,
             hub_fallback: None,
             unavailable_fallback: false,
+            fallback_health: Arc::new(FallbackHealth::new(
+                DEFAULT_REPLAY_FALLBACK_HEALTH_FAILURES,
+                Duration::from_secs(DEFAULT_REPLAY_FALLBACK_HEALTH_WINDOW_SECS),
+            )),
         };
 
         if cache.cache_conn.load().is_none() {
@@ -3045,7 +3361,9 @@ impl ResponseCache {
                 LocalWait::Acked => match self.hub_fallback.as_ref() {
                     Some(fb) if fb.push_write_back(key.clone()) => {
                         record("accepted");
-                        warn!(network = %self.network, path, "WRITE replay nonce confirmed by the local replicas (no acknowledged verdict from the hub); written back to the hub later");
+                        if crate::health::warn_due(&self.network, "hub_local_ack") {
+                            warn!(network = %self.network, path, "WRITE replay nonce confirmed by the local replicas (no acknowledged verdict from the hub); written back to the hub later");
+                        }
                         self.after_local_ack(&key, check).await
                     }
                     Some(_) => {
@@ -3159,8 +3477,12 @@ impl ResponseCache {
         if peers.mode() == ReplayPeerMode::Sync {
             return Err(e);
         }
-        let record =
-            |result: &str| crate::health::record_replay_write_fallback(&self.network, path, result);
+        let record = |result: &str| {
+            if path == "local_unavailable" {
+                self.note_local_unavailable(result);
+            }
+            crate::health::record_replay_write_fallback(&self.network, path, result)
+        };
         if !fb.has_room() {
             record("overflow");
             return Err(e.context("write-back queue full, no peer fallback"));
@@ -3194,12 +3516,14 @@ impl ResponseCache {
             return Err(e.context("write-back queue full, no peer fallback"));
         }
         record("accepted");
-        warn!(
-            network = %self.network,
-            path,
-            reason = %redact_addrs(&e),
-            "WRITE replay nonce confirmed at the peer stores (no acknowledged local verdict); written back locally later"
-        );
+        if crate::health::warn_due(&self.network, "short_ack_fallback") {
+            warn!(
+                network = %self.network,
+                path,
+                reason = %redact_addrs(&e),
+                "WRITE replay nonce confirmed at the peer stores (no acknowledged local verdict); written back locally later"
+            );
+        }
         Ok(WriteAdmission::Run)
     }
 
@@ -3209,6 +3533,28 @@ impl ResponseCache {
     pub fn with_unavailable_fallback(mut self, on: bool) -> Self {
         self.unavailable_fallback = on;
         self
+    }
+
+    /// `REPLAY_FALLBACK_HEALTH_FAILURES` / `REPLAY_FALLBACK_HEALTH_WINDOW_SECS` (`FallbackHealth`).
+    pub fn with_fallback_health(mut self, health: FallbackHealth) -> Self {
+        self.fallback_health = Arc::new(health);
+        self
+    }
+
+    /// Whether WRITEs decided at the peers for an unreachable local store keep failing closed
+    /// (`FallbackHealth::failing`): `/healthz` no longer counts on the fallback then.
+    pub fn fallback_writes_failing(&self) -> bool {
+        self.fallback_health.failing()
+    }
+
+    /// Count the outcome of a WRITE decided at the peers because the local store gave no
+    /// verdict (`path="local_unavailable"`) for `FallbackHealth`.
+    fn note_local_unavailable(&self, result: &str) {
+        match result {
+            "accepted" => self.fallback_health.accepted(),
+            "unacknowledged" | "unavailable" | "overflow" => self.fallback_health.failed(),
+            _ => {}
+        }
     }
 
     /// Where the unavailable fallback confirms a WRITE on this origin, for the startup log and
@@ -3302,6 +3648,11 @@ impl ResponseCache {
     /// the fallback store while the local store answers, and every peer answered its last
     /// housekeeping PING. `/healthz` stays healthy on this alone
     /// (`ohttp_replay_serving_via_fallback`); with no peer answering it fails, as before.
+    ///
+    /// Also not while the WRITEs decided that way keep failing closed although the peers answer
+    /// their PINGs (`FallbackHealth`: a peer short of replicas, a full write-back queue, a broken
+    /// peer `WAIT` connection): a load balancer then sends the requests elsewhere. READs that
+    /// still reach this gateway are decided at the peers as before.
     pub fn serves_without_local_store(&self) -> bool {
         self.decides_at_peers_without_local()
             && self.checks_writes_at_fallback_store()
@@ -3309,6 +3660,7 @@ impl ResponseCache {
                 .replay_peers
                 .as_ref()
                 .is_some_and(|p| p.all_answering())
+            && !self.fallback_health.failing()
     }
 
     /// The local store gave no verdict on this request's nonce (`LocalReplayCheck::Unavailable`):
@@ -3382,11 +3734,15 @@ impl ResponseCache {
             };
         }
         if !policy.one_sided {
+            // The local store gave no verdict: the fallback cannot serve this WRITE, which
+            // counts toward withdrawing the gateway (`FallbackHealth`).
+            self.fallback_health.failed();
             return Err(
                 self.refuse_one_sided("local_unavailable", "no verdict from the local store")
             );
         }
         let record = |result: &str| {
+            self.note_local_unavailable(result);
             crate::health::record_replay_write_fallback(&self.network, "local_unavailable", result)
         };
         if !fb.has_room() {
@@ -3414,7 +3770,9 @@ impl ResponseCache {
             anyhow::bail!("Replay protection unavailable: no verdict from the local store, write-back queue full (fail-closed)");
         }
         record("accepted");
-        warn!(network = %self.network, "WRITE replay nonce confirmed at the peer stores (no verdict from the local store); written back locally later");
+        if crate::health::warn_due(&self.network, "local_unavailable_fallback") {
+            warn!(network = %self.network, "WRITE replay nonce confirmed at the peer stores (no verdict from the local store); written back locally later");
+        }
         Ok(WriteAdmission::Run)
     }
 
@@ -3872,124 +4230,284 @@ impl ResponseCache {
     /// `ohttp_replay_serving_via_fallback`. Run by the housekeeping task every
     /// `HOUSEKEEPING_SECS`; public so tests can run one round.
     pub async fn ping_redis(&self) -> bool {
-        let cache_ok = if let Some(cache_conn) = self.cache_conn.load_full() {
+        self.ping_redis_until(tokio::time::Instant::now() + HOUSEKEEPING_DEADLINE)
+            .await
+    }
+
+    /// One housekeeping round (`spawn_redis_housekeeping`): the epoch sync and every check of
+    /// `ping_redis`, all at once, under one deadline (`HOUSEKEEPING_DEADLINE`).
+    pub async fn housekeeping_round(&self) -> bool {
+        let deadline = tokio::time::Instant::now() + HOUSEKEEPING_DEADLINE;
+        let epoch = async {
+            if tokio::time::timeout_at(deadline, self.get_shared_epoch())
+                .await
+                .is_err()
+                && crate::health::warn_due(&self.network, "epoch_sync")
+            {
+                warn!(network = %self.network, "Shared epoch sync did not finish within the housekeeping deadline");
+            }
+        };
+        let ((), ok) = tokio::join!(epoch, self.ping_redis_until(deadline));
+        ok
+    }
+
+    /// `ping_redis` under `deadline`: a check not done by then counts as failed.
+    async fn ping_redis_until(&self, deadline: tokio::time::Instant) -> bool {
+        // Started together with every other check of the round (below).
+        let cache = async {
+            let Some(cache_conn) = self.cache_conn.load_full() else {
+                return false;
+            };
             let mut cache_conn = (*cache_conn).clone();
-            match timeout(
-                self.redis_timeout,
+            let bound = deadline.min(tokio::time::Instant::now() + self.redis_timeout);
+            match tokio::time::timeout_at(
+                bound,
                 redis::cmd("PING").query_async::<_, String>(&mut cache_conn),
             )
             .await
             {
                 Ok(Ok(resp)) if resp == "PONG" => true,
                 Ok(Ok(_)) => {
-                    warn!("Redis PING returned unexpected response");
+                    if crate::health::warn_due(&self.network, "cache_ping") {
+                        warn!(network = %self.network, "Redis PING returned unexpected response");
+                    }
                     false
                 }
                 Ok(Err(e)) => {
-                    warn!("Redis PING failed: {}", e);
+                    if crate::health::warn_due(&self.network, "cache_ping") {
+                        warn!(network = %self.network, error = %store_error(&e), "Redis PING failed");
+                    }
                     false
                 }
                 Err(_) => {
-                    warn!("Redis PING timeout");
+                    if crate::health::warn_due(&self.network, "cache_ping") {
+                        warn!(network = %self.network, "Redis PING timeout");
+                    }
                     false
                 }
             }
-        } else {
-            false
         };
-        crate::health::record_cache_redis_connected(&self.network, cache_ok);
-        if cache_ok {
-            self.cache_ping_failures.store(0, Ordering::Relaxed);
-        } else if self.cache_conn.load().is_some()
-            && self.cache_ping_failures.fetch_add(1, Ordering::Relaxed) + 1
-                >= CACHE_PING_FAILURES_RECONNECT
-        {
-            self.cache_ping_failures.store(0, Ordering::Relaxed);
-            warn!(network = %self.network, "Cache Redis failed {CACHE_PING_FAILURES_RECONNECT} PINGs in a row: reopening the connection");
-            crate::health::record_store_reconnect(&self.network, "cache", "timeout");
-            self.cache_conn.store(None);
-            spawn_cache_reconnect_task(self.clone());
-        }
+        // Keep the WRITE-wait connections warm: a PING after a failover takes the broken
+        // connection's error here instead of in the next user's WRITE. A PING also succeeds on
+        // a demoted primary, so these connections (and the security one) also check that their
+        // node is still the primary (`ROLE`): an idle gateway sees no READONLY to react to.
+        // A WAIT connection is checked only while no request holds it, one per round in turn
+        // while another stays idle, and it stays out of the requests' use until its checks are
+        // answered (`LeasePool::take_idle_for_check`).
+        let write_wait = self.write_wait.iter().flat_map(|w| {
+            w.pool
+                .take_idle_for_check(|i| w.conns[i].usable_now())
+                .into_iter()
+                .filter_map(move |held| {
+                let conn = w.conns[held.index()].clone();
+                let generation = conn.generation();
+                let budget = self.redis_timeout + ROLE_CHECK_TIMEOUT;
+                Some(async move {
+                    // PING and ROLE without timeouts of their own: the slot is held until both
+                    // are answered (or the connection is replaced after the drain period), so
+                    // it never goes back to the requests with a command still on it.
+                    let c = conn.clone();
+                    let command = async move {
+                        let r = redis::cmd("PING")
+                            .query_async::<_, String>(&mut c.get())
+                            .await;
+                        c.observe(&r);
+                        if r.is_ok() {
+                            c.verify_primary_unbounded().await;
+                        }
+                        r
+                    };
+                    let retire = {
+                        let c = conn.clone();
+                        move || {
+                            c.retire_quietly("timeout", generation);
+                        }
+                    };
+                    // Only while the connection checked is still the installed one: a late
+                    // timeout of a replaced connection says nothing about its replacement.
+                    let on_timeout = {
+                        let c = conn.clone();
+                        move || {
+                            if c.generation() == generation {
+                                c.observe_timeout();
+                            }
+                        }
+                    };
+                    let hooks = SlotHooks {
+                        answered: Box::new(|_, _| {}),
+                        timed_out: Box::new(on_timeout),
+                        stuck: Box::new(retire),
+                    };
+                    let r = run_on_slot_with(
+                        held,
+                        deadline.min(tokio::time::Instant::now() + budget),
+                        budget + WAIT_DRAIN_EXTRA,
+                        command,
+                        hooks,
+                    )
+                    .await;
+                    if let Ok(Err(e)) = &r {
+                        if crate::health::warn_due(&self.network, "wait_conn_ping") {
+                            warn!(network = %self.network, error = %store_error(e), "Replay nonce WAIT connection PING failed (reconnecting)");
+                        }
+                    }
+                })
+            })
+        });
+        let cache = async {
+            let cache_ok = cache.await;
+            crate::health::record_cache_redis_connected(&self.network, cache_ok);
+            if cache_ok {
+                self.cache_ping_failures.store(0, Ordering::Relaxed);
+            } else if self.cache_conn.load().is_some()
+                && self.cache_ping_failures.fetch_add(1, Ordering::Relaxed) + 1
+                    >= CACHE_PING_FAILURES_RECONNECT
+            {
+                self.cache_ping_failures.store(0, Ordering::Relaxed);
+                warn!(network = %self.network, "Cache Redis failed {CACHE_PING_FAILURES_RECONNECT} PINGs in a row: reopening the connection");
+                crate::health::record_store_reconnect(&self.network, "cache", "timeout");
+                self.cache_conn.store(None);
+                spawn_cache_reconnect_task(self.clone());
+            }
+            cache_ok
+        };
 
-        // Keep the WRITE-wait connection warm: a PING after a failover takes the broken
-        // connection's error here instead of in the next user's WRITE.
-        // The same for the WAITAOF connection. A PING also succeeds on a demoted primary, so
-        // these connections (and the security one) also check that their node is still the
-        // primary (`ROLE`): an idle gateway sees no READONLY to react to.
-        let dedicated = self
-            .write_wait
-            .iter()
-            .flat_map(|w| w.conns.iter())
-            .chain(self.local_aof.as_ref().map(|l| &l.conn));
-        for conn in dedicated {
-            let r = timeout(
-                self.redis_timeout,
-                redis::cmd("PING").query_async::<_, String>(&mut conn.get()),
+        // The same for the WAITAOF connection.
+        // Every check runs at once (the cache store, the dedicated connections, the security
+        // store, each peer and standby store) under one deadline: one hung connection or peer
+        // costs its own budgets once instead of delaying every check after it.
+        let aof = self
+            .local_aof
+            .as_ref()
+            .map(|l| &l.conn)
+            .into_iter()
+            .map(|conn| async move {
+                let r = timeout(
+                    self.redis_timeout,
+                    redis::cmd("PING").query_async::<_, String>(&mut conn.get()),
+                )
+                .await;
+                conn.observe_timed(&r);
+                if let Ok(Err(e)) = &r {
+                    if crate::health::warn_due(&self.network, "wait_conn_ping") {
+                        warn!(network = %self.network, error = %store_error(e), "Replay nonce WAIT connection PING failed (reconnecting)");
+                    }
+                }
+                conn.verify_primary().await;
+            });
+        let peers = async {
+            if let Some(peers) = &self.replay_peers {
+                peers.ping_all_until(deadline).await;
+            }
+        };
+        let standby = async {
+            if let Some(peers) = &self.standby_peers {
+                peers.ping_all_until(deadline).await;
+            }
+        };
+        let dedicated = async {
+            let _ = tokio::time::timeout_at(
+                deadline,
+                futures_util::future::join(
+                    futures_util::future::join_all(write_wait),
+                    futures_util::future::join_all(aof),
+                ),
             )
             .await;
-            conn.observe_timed(&r);
-            if let Ok(Err(e)) = &r {
-                warn!(network = %self.network, error = %e, "Replay nonce WAIT connection PING failed (reconnecting)");
+        };
+        let cache = async {
+            match tokio::time::timeout_at(deadline, cache).await {
+                Ok(ok) => ok,
+                Err(_) => {
+                    crate::health::record_cache_redis_connected(&self.network, false);
+                    false
+                }
             }
-            conn.verify_primary().await;
-        }
-
-        if let Some(peers) = &self.replay_peers {
-            peers.ping_all().await;
-        }
-
-        let ok = self.ping_security(cache_ok).await;
-        // Standby stores last: an unreachable one (up to REPLAY_PEER_TIMEOUT_MS each) must not
-        // delay the security store's check above.
-        if let Some(peers) = &self.standby_peers {
-            peers.ping_all().await;
-        }
-        ok
+        };
+        // A security store whose check is not done by the deadline counts as down this round.
+        let probe = async {
+            match tokio::time::timeout_at(deadline, self.probe_security()).await {
+                Ok(p) => p,
+                Err(_) => self.security_conn.as_ref().map(|_| false),
+            }
+        };
+        let (cache_ok, (), (), probe, ()) = tokio::join!(cache, dedicated, peers, probe, standby);
+        // Evaluated once the peers' answers of this round are in.
+        self.evaluate_security(cache_ok, probe)
     }
 
-    async fn ping_security(&self, cache_ok: bool) -> bool {
-        if let Some(sec) = self.security_conn.as_ref() {
-            let ping = timeout(
-                self.redis_timeout,
-                redis::cmd("PING").query_async::<_, String>(&mut sec.get()),
-            )
-            .await;
-            sec.observe_timed(&ping);
-            sec.verify_primary().await;
-            let sec_ok = match ping {
-                Ok(Ok(resp)) if resp == "PONG" => true,
-                Ok(Ok(_)) => {
-                    warn!("Security Redis PING returned unexpected response");
-                    false
+    /// The security store's housekeeping PING and `ROLE` check: whether it answered and reaches
+    /// a primary (None: no security store).
+    async fn probe_security(&self) -> Option<bool> {
+        let sec = self.security_conn.as_ref()?;
+        let ping = timeout(
+            self.redis_timeout,
+            redis::cmd("PING").query_async::<_, String>(&mut sec.get()),
+        )
+        .await;
+        sec.observe_timed(&ping);
+        sec.verify_primary().await;
+        let ping_ok = match ping {
+            Ok(Ok(resp)) if resp == "PONG" => true,
+            Ok(Ok(_)) => {
+                if crate::health::warn_due(&self.network, "security_ping") {
+                    warn!(network = %self.network, "Security Redis PING returned unexpected response");
                 }
-                Ok(Err(e)) => {
-                    warn!("Security Redis PING failed: {}", e);
-                    false
-                }
-                Err(_) => {
-                    warn!("Security Redis PING timeout");
-                    false
-                }
-            };
-            crate::health::record_security_redis_connected(&self.network, sec_ok);
-            // The peers were PINGed just before (ping_redis), so their state is current.
-            let via_fallback = !sec_ok && self.serves_without_local_store();
-            if via_fallback != crate::health::is_replay_serving_via_fallback(&self.network) {
-                if via_fallback {
-                    warn!(network = %self.network, "Security Redis unreachable: serving through the peer stores (REPLAY_UNAVAILABLE_FALLBACK)");
-                } else if !sec_ok {
-                    warn!(network = %self.network, "Security Redis unreachable and the peer stores cannot decide: not serving");
-                } else {
-                    info!(network = %self.network, "Security Redis answers again: requests decided locally");
-                }
+                false
             }
-            crate::health::record_replay_serving_via_fallback(&self.network, via_fallback);
-            cache_ok && sec_ok
-        } else {
+            Ok(Err(e)) => {
+                if crate::health::warn_due(&self.network, "security_ping") {
+                    warn!(network = %self.network, error = %store_error(&e), "Security Redis PING failed");
+                }
+                false
+            }
+            Err(_) => {
+                if crate::health::warn_due(&self.network, "security_ping") {
+                    warn!(network = %self.network, "Security Redis PING timeout");
+                }
+                false
+            }
+        };
+        // A PING also succeeds on a demoted primary: while the connection waits for a node
+        // that says ROLE master (a reconnect is pending) or its last ROLE was not master,
+        // the store counts as down, so /healthz does not stay 200 on a store whose every
+        // replay write is refused.
+        let sec_ok = ping_ok && sec.usable();
+        if ping_ok && !sec_ok && crate::health::warn_due(&self.network, "security_not_primary") {
+            warn!(network = %self.network, "Security Redis answers PING but does not reach a primary (reconnecting): counted as down");
+        }
+        Some(sec_ok)
+    }
+
+    fn evaluate_security(&self, cache_ok: bool, probe: Option<bool>) -> bool {
+        let Some(sec_ok) = probe else {
             // No dedicated security Redis: replay checks fail closed, so the origin cannot serve.
             crate::health::record_security_redis_connected(&self.network, false);
-            cache_ok
+            return cache_ok;
+        };
+        crate::health::record_security_redis_connected(&self.network, sec_ok);
+        if sec_ok {
+            // Not needed any more: a later outage starts with the fallback trusted again.
+            self.fallback_health.local_answered();
         }
+        let via_fallback = !sec_ok && self.serves_without_local_store();
+        if via_fallback != crate::health::is_replay_serving_via_fallback(&self.network) {
+            if via_fallback {
+                warn!(network = %self.network, "Security Redis unreachable: serving through the peer stores (REPLAY_UNAVAILABLE_FALLBACK)");
+            } else if !sec_ok && self.fallback_health.failing() {
+                warn!(network = %self.network, "Security Redis unreachable and the WRITEs decided at the peer stores keep failing closed (REPLAY_FALLBACK_HEALTH_FAILURES): not serving");
+            } else if !sec_ok {
+                warn!(network = %self.network, "Security Redis unreachable and the peer stores cannot decide: not serving");
+            } else {
+                info!(network = %self.network, "Security Redis answers again: requests decided locally");
+            }
+        }
+        crate::health::record_replay_serving_via_fallback(&self.network, via_fallback);
+        crate::health::record_replay_fallback_writes_failing(
+            &self.network,
+            self.fallback_health.failing(),
+        );
+        cache_ok && sec_ok
     }
 
     /// Check if a request is a replay (body hash already seen). Returns Ok(true) if replay detected.
@@ -4070,6 +4588,11 @@ impl ResponseCache {
         // A failover signal (READONLY on a demoted primary, a hung or broken connection) replaces
         // the connection in the background; this request still fails closed below.
         sec.observe_timed(&local);
+        // The local store gave a verdict (new or replay): the fallback is trusted again at once,
+        // not only from the next housekeeping round on (`FallbackHealth`).
+        if matches!(local, Ok(Ok(_))) && self.fallback_health.local_answered() {
+            crate::health::record_replay_fallback_writes_failing(&self.network, false);
+        }
 
         let checked =
             |verdict: LocalReplayCheck, timed_out: Vec<usize>, unanswered: usize| LocalCheck {
@@ -4158,11 +4681,13 @@ impl ResponseCache {
                 )
             }
             PeerVerdict::Unavailable => {
-                warn!(
-                    network = %self.network,
-                    outcomes = ?outcomes,
-                    "Replay peer unavailable; proceeding on the local verdict"
-                );
+                if crate::health::warn_due(&self.network, "peer_tolerated") {
+                    warn!(
+                        network = %self.network,
+                        outcomes = ?outcomes,
+                        "Replay peer unavailable; proceeding on the local verdict"
+                    );
+                }
                 Ok(false)
             }
         }
@@ -4645,7 +5170,9 @@ impl ResponseCache {
                 anyhow::bail!("{} (write-back queue full, no fallback)", f.message);
             }
             record("accepted");
-            warn!(network = %self.network, reason = %f.message, "WRITE replay nonce confirmed at the standby stores (hub replica acknowledgement short); written back to the hub later");
+            if crate::health::warn_due(&self.network, "hub_short_standby") {
+                warn!(network = %self.network, reason = %f.message, "WRITE replay nonce confirmed at the standby stores (hub replica acknowledgement short); written back to the hub later");
+            }
             return Ok(HubFallback::AtStandby);
         }
         if self.write_wait.is_some() {
@@ -4732,7 +5259,9 @@ impl ResponseCache {
             anyhow::bail!("Replay check failed at a peer origin: {outcomes:?} (write-back queue full, no fallback)");
         }
         record("accepted");
-        warn!(network = %self.network, outcomes = ?outcomes, "WRITE replay nonce confirmed at the standby stores (no verdict from the hub); written back to the hub later");
+        if crate::health::warn_due(&self.network, "hub_unavailable_standby") {
+            warn!(network = %self.network, outcomes = ?outcomes, "WRITE replay nonce confirmed at the standby stores (no verdict from the hub); written back to the hub later");
+        }
         Ok(PeerCheck {
             at_standby: true,
             ..PeerCheck::blank()
@@ -4795,12 +5324,16 @@ impl ResponseCache {
                 fallback_epoch
             }
             Ok(Err(e)) => {
-                warn!(network = %self.network, error = %store_error(&e), "Failed to read shared epoch from Redis");
+                if crate::health::warn_due(&self.network, "epoch_read") {
+                    warn!(network = %self.network, error = %store_error(&e), "Failed to read shared epoch from Redis");
+                }
                 crate::health::record_cache_redis_timeout(&self.network, "epoch_error");
                 self.epoch.load(Ordering::Relaxed)
             }
             Err(_) => {
-                warn!(network = %self.network, timeout_ms = self.redis_timeout.as_millis(), "Epoch GET timeout");
+                if crate::health::warn_due(&self.network, "epoch_get_timeout") {
+                    warn!(network = %self.network, timeout_ms = self.redis_timeout.as_millis(), "Epoch GET timeout");
+                }
                 crate::health::record_cache_redis_timeout(&self.network, "epoch_timeout");
                 self.epoch.load(Ordering::Relaxed)
             }
@@ -5576,12 +6109,70 @@ pub fn spawn_permanent_housekeeping(store: PermanentRedis) {
     });
 }
 
+/// `REPLAY_STARTUP_STORES_WAIT_SECS` default.
+pub const DEFAULT_REPLAY_STARTUP_STORES_WAIT_SECS: u64 = 10;
+
+/// `REPLAY_STARTUP_STORES_WAIT_SECS` (default 10; 0 = do not wait).
+pub fn startup_stores_wait_from_env() -> anyhow::Result<Duration> {
+    match std::env::var("REPLAY_STARTUP_STORES_WAIT_SECS") {
+        Ok(v) if !v.trim().is_empty() => match v.trim().parse::<u64>() {
+            Ok(n) => Ok(Duration::from_secs(n)),
+            Err(_) => anyhow::bail!(
+                "REPLAY_STARTUP_STORES_WAIT_SECS must be a non-negative integer, got '{v}'"
+            ),
+        },
+        _ => Ok(Duration::from_secs(DEFAULT_REPLAY_STARTUP_STORES_WAIT_SECS)),
+    }
+}
+
+impl ResponseCache {
+    /// Whether every store a WRITE needs for both-store admission has a connection: every
+    /// replay peer (REPLAY_PEER_URLS) and every standby store (REPLAY_STANDBY_URLS), each with at
+    /// least one open `WAIT` connection where their replica acknowledgement is required, and the
+    /// local `WAIT` pool a usable connection. All are connected in the background at startup.
+    pub fn replay_stores_connected(&self) -> bool {
+        self.replay_peers.as_ref().is_none_or(|p| p.all_ready())
+            && self.standby_peers.as_ref().is_none_or(|p| p.all_ready())
+            && self
+                .write_wait
+                .as_ref()
+                .is_none_or(|w| w.conns.iter().any(|c| c.usable_now()))
+    }
+}
+
+/// Startup gate (`REPLAY_STARTUP_STORES_WAIT_SECS`): until every replay peer and standby store
+/// is connected, or `bound` has passed, `/healthz` answers 503 (`ohttp_replay_stores_pending`
+/// 1), so a load balancer does not send a pod WRITEs it would refuse because a second store is
+/// not connected yet. After `bound` the pod reports ready anyway, with a warning: a store that
+/// stays unreachable is an outage the WRITE policies handle, not a reason never to start.
+/// Returns whether every store connected in time.
+pub fn spawn_replay_stores_gate(
+    cache: ResponseCache,
+    bound: Duration,
+) -> tokio::task::JoinHandle<bool> {
+    let network = cache.network.clone();
+    let pending = !cache.replay_stores_connected();
+    crate::health::record_replay_stores_pending(&network, pending);
+    tokio::spawn(async move {
+        let deadline = tokio::time::Instant::now() + bound;
+        while !cache.replay_stores_connected() {
+            if tokio::time::Instant::now() >= deadline {
+                warn!(network = %network, bound_secs = bound.as_secs(), "Not every replay peer / standby store connected at startup within REPLAY_STARTUP_STORES_WAIT_SECS: reporting ready; WRITEs that need a store that is not connected fail closed");
+                crate::health::record_replay_stores_pending(&network, false);
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        crate::health::record_replay_stores_pending(&network, false);
+        true
+    })
+}
+
 /// Spawn the Redis housekeeping task: sync the shared epoch and PING both Redis roles every
 /// `HOUSEKEEPING_SECS`, updating `ohttp_redis_connected`. (The tip is the chain follower's.)
 pub fn spawn_redis_housekeeping(cache: ResponseCache) {
     tokio::spawn(async move {
-        cache.get_shared_epoch().await;
-        let redis_ok = cache.ping_redis().await;
+        let redis_ok = cache.housekeeping_round().await;
         crate::health::record_redis_connected(&cache.network, redis_ok);
         if redis_ok {
             info!(network = %cache.network, "Redis PING successful on startup");
@@ -5590,12 +6181,13 @@ pub fn spawn_redis_housekeeping(cache: ResponseCache) {
         }
         loop {
             tokio::time::sleep(Duration::from_secs(HOUSEKEEPING_SECS)).await;
-            let epoch = cache.get_shared_epoch().await;
-            debug!(network = %cache.network, epoch, "Synced shared cache epoch from Redis");
-            let redis_ok = cache.ping_redis().await;
+            let redis_ok = cache.housekeeping_round().await;
+            debug!(network = %cache.network, epoch = cache.current_epoch(), "Housekeeping round done");
             crate::health::record_redis_connected(&cache.network, redis_ok);
             if !redis_ok {
-                warn!(network = %cache.network, "Redis connectivity check failed, will retry");
+                if crate::health::warn_due(&cache.network, "housekeeping_failed") {
+                    warn!(network = %cache.network, "Redis connectivity check failed, will retry");
+                }
             }
         }
     });
@@ -6099,6 +6691,50 @@ mod lease_tests {
         assert!(slot.reopening.load(Ordering::Acquire));
     }
 
+    /// Housekeeping checks one idle connection at a time and always leaves another one idle;
+    /// a pool of one is checked as shared work.
+    #[tokio::test]
+    async fn housekeeping_checks_leave_a_connection_free() {
+        let pool = LeasePool::new(3, 100);
+        let a = pool.take_idle_for_check(|_| true).unwrap();
+        assert!(a.leased);
+        let b = pool.take_idle_for_check(|_| true).unwrap();
+        assert_ne!(a.index(), b.index());
+        // The last idle one is still checked, as shared work: a WRITE still gets it.
+        let c = pool.take_idle_for_check(|_| true).unwrap();
+        assert!(!c.leased);
+        assert_eq!(
+            pool.acquire(soon(50), |_| true)
+                .await
+                .slot()
+                .map(|s| s.index()),
+            Some(c.index()),
+            "the last one stays usable"
+        );
+        drop(c);
+        // Not while the pool hands out its connections exclusively.
+        pool.observe(WaitOutcome::Slow, Duration::ZERO);
+        assert!(pool.take_idle_for_check(|_| true).is_none());
+        drop((a, b));
+        let one = LeasePool::new(1, 100);
+        let check = one.take_idle_for_check(|_| true).unwrap();
+        assert!(!check.leased);
+        assert!(
+            one.acquire(soon(50), |_| true).await.slot().is_some(),
+            "still usable shared"
+        );
+        drop(check);
+        // A closed connection is neither checked nor counted as the one left free.
+        let pool = LeasePool::new(3, 100);
+        let open = |i: usize| i != 2;
+        let a = pool.take_idle_for_check(open).unwrap();
+        assert_ne!(a.index(), 2);
+        assert!(a.leased, "another open one is idle");
+        let b = pool.take_idle_for_check(open).unwrap();
+        assert!(!b.leased && b.index() != 2, "the last open one, shared");
+        drop((a, b));
+    }
+
     /// Samples from many threads, across resets of the floor (every sample is past the reset
     /// period here): the sampling state stays consistent (no lost or wrapped count).
     #[test]
@@ -6215,6 +6851,10 @@ mod tests {
             write_fallback: None,
             hub_fallback: None,
             unavailable_fallback: false,
+            fallback_health: Arc::new(FallbackHealth::new(
+                DEFAULT_REPLAY_FALLBACK_HEALTH_FAILURES,
+                Duration::from_secs(DEFAULT_REPLAY_FALLBACK_HEALTH_WINDOW_SECS),
+            )),
         }
     }
 
@@ -6257,8 +6897,14 @@ mod tests {
             }),
             2,
         );
-        // The WAIT connections open in the background.
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while peers.wait_conns_open() != vec![2] {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "WAIT connections not open"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
         let p = &peers.peers[0];
         let main = p.conn.load_full().unwrap();
         let readonly = redis::RedisError::from((
@@ -6285,6 +6931,71 @@ mod tests {
             .await
             .unwrap();
         assert!(!exists);
+    }
+
+    /// A failed command on a connection that was already replaced changes nothing; on the
+    /// installed one a signal about the node drops the peer's main and other connections too.
+    #[tokio::test]
+    async fn only_an_installed_connection_drops_the_others() {
+        if local_redis().await.is_none() {
+            assert!(std::env::var("CI").is_err(), "Redis not reachable in CI");
+            return;
+        }
+        let network = "testnet-failed-on-stale";
+        let peers = ReplayPeers::connect(
+            &["redis://127.0.0.1:6379/12".to_string()],
+            network.to_string(),
+            250,
+            true,
+        )
+        .await
+        .with_wait_conns(
+            Some(WriteWaitConfig {
+                replicas: 1,
+                timeout_ms: 50,
+            }),
+            2,
+        );
+        let open = |peers: &ReplayPeers| peers.wait_conns_open() == vec![2];
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !open(&peers) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "WAIT connections not open"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let p = &peers.peers[0];
+        let slot = p.wait.slots[0].clone();
+        let stale = slot.conn.load_full().unwrap();
+        // Replaced meanwhile.
+        drop_wait_conn(network, p.index, &p.url, &slot, &stale);
+        while !open(&peers) {
+            assert!(std::time::Instant::now() < deadline, "not reopened");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let readonly = redis::RedisError::from((
+            redis::ErrorKind::ReadOnly,
+            "READONLY",
+            "You can't write against a read only replica.".to_string(),
+        ));
+        p.links()
+            .command_failed(network, FailedOn::Extra(&slot, &stale), &readonly);
+        assert!(p.primary_usable(), "a stale connection drops nothing else");
+        assert!(open(&peers));
+        // A check of a main connection that is no longer installed replaces nothing either.
+        let stale_main = Arc::new((*p.conn.load_full().unwrap()).clone());
+        p.links()
+            .drop_all(network, &stale_main, "role", "ROLE is not master");
+        assert!(p.primary_usable());
+        assert!(open(&peers));
+        let installed = slot.conn.load_full().unwrap();
+        p.links()
+            .command_failed(network, FailedOn::Extra(&slot, &installed), &readonly);
+        assert!(
+            !p.primary_usable(),
+            "the installed one: the node is not the primary"
+        );
     }
 
     /// A `PeerCheck` is bound to the request it was built for: another request's, or one that

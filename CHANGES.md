@@ -62,6 +62,17 @@ keeps its own log in [client/CHANGELOG.md](client/CHANGELOG.md).
 
 ### Gateway
 
+- `REPLAY_WRITE_WAIT_MS` and `REPLAY_PEER_WAIT_MS` must stay below about 1.25 s (the budget of a
+  housekeeping check of a `WAIT` connection); a pool of one `WAIT` connection is not PINGed
+  while it hands out its connection exclusively. A reopen of a `WAIT` connection that starts
+  again after a success starts its backoff over.
+- A quiet replacement turned into a failover one by a failover signal is counted in
+  `ohttp_store_reconnect_total` under that signal's reason as well (it was only counted as a
+  timeout). A reopen error other than `LOADING` within a `LOADING` period keeps the backoff
+  step reached instead of starting it over.
+- Housekeeping also checks the last idle `WAIT` connection of a pool of several (it was never
+  checked while the others were busy), as shared work that a WRITE in shared mode still uses
+  meanwhile, and no shared check runs while the pool hands out its connections exclusively.
 - A replay peer's `WAIT` or retry connection reset while its reopen finished is opened again by
   that reopen (it was left closed until the next request or housekeeping round). A command on a
   `WAIT` or retry connection whose task panics replaces that connection before its slot goes
@@ -70,6 +81,27 @@ keeps its own log in [client/CHANGELOG.md](client/CHANGELOG.md).
   minute per kind, like the other per-request store warnings.
 - `confirm_write_nonce` refuses a `PeerCheck` whose peer stage found a replay (fail-closed),
   whatever the caller did with that verdict.
+- `WAIT` pool timeouts: the pool round of a timeout is checked under the lock it only moves
+  under; a `WAIT` that timed out queued on a shared connection replaces at most that connection
+  (only exclusive ones count toward replacing the whole pool). Housekeeping counts a closed
+  connection neither as checked nor as the one left free, and a late timeout of a replaced local
+  `WAIT` connection is not counted against its replacement. After a failover signal the retry
+  prefers the failed connection's replacement for at most one command timeout, then takes any
+  usable connection.
+- A quiet replacement of a `WAIT` connection that finds the connection already replaced gives
+  up only if no failover signal arrived meanwhile; one that did starts its reconnect instead of
+  being dropped. A reopen attempt that fails for another reason than `LOADING` starts the
+  `LOADING` backoff over.
+- A failed command on a replay peer's connection is handled in one place: the failing
+  connection is dropped, and the peer's other connections (main, `WAIT`, retry) only if it was
+  still the installed one and the error says the node is no longer the primary. The replicator's
+  batch path now also drops the `WAIT` and retry connections on such a signal. The PING-failure
+  and `ROLE` replica paths replace the peer's connections only if the main connection they
+  checked is still installed (its compare-and-swap succeeded), and only then its `WAIT` and
+  retry connections; whether a failed `WAIT` or retry connection was still installed is the
+  result of its own compare-and-swap. A main
+  connection that comes back wakes the requests waiting for a `WAIT` or retry connection, and
+  the main reconnect is jittered like the others.
 - **New `REPLAY_ONE_SIDED_WRITE_ROUTES` (default empty); WRITEs that are not on it no longer run
   on the verdict of one replay store.** One network partition between the region of the store
   that decides a WRITE and the region of the second store could run the same request twice: a
@@ -144,6 +176,51 @@ keeps its own log in [client/CHANGELOG.md](client/CHANGELOG.md).
 - Replay refusals ("Replay detected", "Replay detected at a peer origin") are no longer logged
   with the request's hash (`body_hash`, the replay nonce): it identifies one user request. The
   counts stay in `ohttp_replay_rejected_total`.
+- `/healthz` counts the security Redis as down while its connection is pinned to a demoted
+  primary: its last `ROLE` answer said replica, or a reconnect after a failover signal has been
+  pending for more than 2 s (the endpoint does not yet reach a node that says `ROLE master`; a
+  reconnect done within that does not count). `PING` still succeeds on such a node, so
+  `/healthz` stayed 200 while every replay write was refused there.
+- `/healthz` also fails while the peer stores decide for an unreachable security Redis
+  (`REPLAY_UNAVAILABLE_FALLBACK`) but the WRITEs decided there keep failing closed although every
+  peer answers its PING (a peer short of replicas, a full write-back queue, a broken peer `WAIT`
+  connection; and WRITEs refused for `REPLAY_ONE_SIDED_WRITE_ROUTES` because the own store gives
+  no verdict, not those a peer's silence refused): new `REPLAY_FALLBACK_HEALTH_FAILURES` (default
+  20 in a row, `0` = off) and `REPLAY_FALLBACK_HEALTH_WINDOW_SECS` (default 60: failures further
+  apart start a new count), gauge `ohttp_replay_fallback_writes_failing`. Once withdrawn the
+  gateway stays so until the security Redis answers again (a request's replay check or a
+  housekeeping PING) or a WRITE through the fallback runs.
+  READs that still arrive are decided at the peers as before.
+- New `REPLAY_STARTUP_STORES_WAIT_SECS` (default 10): at startup `/healthz` and `/health/startup`
+  answer 503 (`ohttp_replay_stores_pending` 1) until every replay peer and standby store is
+  connected, with an open `WAIT` connection where its replica acknowledgement is required, and
+  the local `WAIT` pool has a usable connection, at most that long, then report ready with a
+  warning. Without it a read origin that had just started saw its standby store disconnected
+  and refused the WRITEs that both stores must take.
+- Housekeeping PINGs the idle peer `WAIT` connections and replaces one that does not answer in
+  the background (a middlebox reset an idle connection), and asks every peer that answers its
+  PING for its `ROLE`: a peer whose endpoint still reaches a demoted primary is reconnected
+  (`ohttp_store_reconnect_total{store="replay_peer",reason="role"}`) instead of being found by
+  the next `READONLY`.
+- A store connection that keeps meeting a node that answers `LOADING` (restarted, reading its
+  data set) backs off between reconnects and between the attempts of one reconnect (0.5 s
+  doubling to 8 s, reset by the next successful command) instead of reconnecting every 0.5 s;
+  the reopen loops of a replay peer's main, `WAIT` and retry connections apply the same backoff
+  after a `LOADING` answer.
+  Housekeeping runs every check of a round (the
+  epoch sync, the cache store, the dedicated `WAIT` / `WAITAOF` connections, the security store,
+  each peer and standby store) concurrently under one 5 s deadline; a check not done by then
+  counts as failed; one `WAIT` connection per store is checked per round, in turn, only while
+  no request holds it and another one stays idle, and no request gets it until its check is
+  answered; a peer's main connection and its `WAIT` (or retry) connections are checked at the
+  same time. A peer whose node says it is no longer the primary (`ROLE` replica, `READONLY`)
+  loses its `WAIT` and retry connections too, and lends none until its main connection is
+  accepted on a primary again. Whether a peer answers is its main connection's verdict alone
+  (a slow check of its `WAIT` connections does not change it), and a peer whose `ROLE` says replica is not
+  usable for that round. `ROLE` checks have a 1 s budget (was 5 s). Any other failover signal
+  ends a `LOADING` backoff at once. Repeated store warnings are logged at most once a minute per
+  kind, and store errors in log lines carry only their I/O kind or a listed server code (never
+  the server's text after it, nor an address).
 - A read origin with a confirming standby store (`REPLAY_STANDBY_URLS` with
   `REPLAY_PEER_WAIT_REPLICAS`) asks the standby store about a WRITE's nonce (`SET NX`) at the same
   time as the hub (`SET NX`, then the hub's replica wait), instead of after the hub answered. A

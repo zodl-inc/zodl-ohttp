@@ -203,7 +203,8 @@ too (an unreachable hub is tolerated there for listed routes, an unreachable own
 
 Such a gateway also stays healthy for a load balancer: `/healthz` answers 200
 while its own store does not answer but every peer answered the last housekeeping PING (every
-10 s), and 503 once no store can decide. The state can lag by one round (up to 10 s plus the peer
+10 s), and 503 once no store can decide, or once the WRITEs decided at the peers keep failing
+closed (`REPLAY_FALLBACK_HEALTH_FAILURES` in a row). The state can lag by one round (up to 10 s plus the peer
 timeout) in either direction. WRITEs decided this way are queued for write-back to the local
 store; if that queue is full, further WRITEs fail closed (`result="overflow"`) while READs keep
 being served.

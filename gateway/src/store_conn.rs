@@ -34,7 +34,7 @@
 //!
 //! Callers report every outcome (`observe_*`); nothing here retries a command.
 
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -54,10 +54,73 @@ const RECONNECT_MAX_BACKOFF: Duration = Duration::from_secs(2);
 /// After a connection was replaced, signals are ignored for this long: they come from commands
 /// that were still running on the old connection.
 const SIGNAL_HOLDOFF: Duration = Duration::from_millis(500);
+/// A replacement that has been running this long counts the store as down (`usable`).
+const RECONNECT_GRACE: Duration = Duration::from_secs(2);
 /// At most one `ROLE` check per this interval (after a short `WAIT`, and in housekeeping).
 const ROLE_CHECK_INTERVAL: Duration = Duration::from_secs(1);
+/// Budget of one `ROLE` check of an open connection. `ROLE` answers at once; housekeeping checks
+/// several connections, and a hung one must not hold the others up for a connect timeout.
+pub const ROLE_CHECK_TIMEOUT: Duration = Duration::from_secs(1);
+/// A node that answers `LOADING` (it restarted and reads its data set) is reached again by every
+/// new connection. Each reconnect for `LOADING` doubles the hold-off before the next one, from
+/// `SIGNAL_HOLDOFF` up to `SIGNAL_HOLDOFF * 2^LOADING_BACKOFF_STEPS` (8 s), until a command
+/// succeeds.
+const LOADING_BACKOFF_STEPS: u32 = 4;
 /// `ConnectionManager`'s own retries of a refused connection (100 ms base, factor 2).
 const MANAGER_RETRIES: usize = 3;
+
+/// How long after a replacement a signal `reason` is ignored, after `loading_streak`
+/// reconnects for `LOADING` in a row.
+fn signal_holdoff(reason: &str, loading_streak: u32) -> Duration {
+    if reason == "LOADING" {
+        SIGNAL_HOLDOFF * (1u32 << loading_streak.min(LOADING_BACKOFF_STEPS))
+    } else {
+        SIGNAL_HOLDOFF
+    }
+}
+
+/// The hold-off for a signal `reason`. Any signal other than `LOADING` (a role change,
+/// `READONLY`, a broken connection) ends a `LOADING` streak first: its reconnect must not wait
+/// for the `LOADING` backoff.
+fn holdoff_after(reason: &str, loading_streak: &AtomicU32) -> Duration {
+    if reason != "LOADING" {
+        loading_streak.store(0, Ordering::Relaxed);
+    }
+    signal_holdoff(reason, loading_streak.load(Ordering::Relaxed))
+}
+
+/// Whether a failed reopen met a node that answers `LOADING`.
+fn is_loading(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| {
+        c.downcast_ref::<RedisError>()
+            .is_some_and(|r| r.kind() == redis::ErrorKind::BusyLoadingError)
+    }) || format!("{e:#}").contains("LOADING")
+}
+
+/// The pause before the next reopen attempt: `backoff`, or for a node that answers `LOADING`
+/// the `LOADING` backoff after `streak` such answers (`signal_holdoff`), whichever is longer.
+fn reopen_backoff(backoff: Duration, loading: bool, streak: u32) -> Duration {
+    if loading {
+        backoff.max(signal_holdoff("LOADING", streak))
+    } else {
+        backoff
+    }
+}
+
+/// The pause before the next attempt to open a store connection after the failed attempt `e`:
+/// `backoff`, or for a node that answers `LOADING` (`streak` such answers, counted here) at
+/// least the `LOADING` backoff (`signal_holdoff`). The one rule of every reopen loop: a
+/// `StoreConn` reconnect, and a replay peer's main, `WAIT` and retry connections.
+pub fn reopen_pause(e: &anyhow::Error, backoff: Duration, streak: &mut u32) -> Duration {
+    if is_loading(e) {
+        *streak = streak.saturating_add(1);
+        reopen_backoff(backoff, true, *streak)
+    } else {
+        // Another error in a LOADING period (a refused connection while the node restarts)
+        // keeps the step reached: only a success ends the period.
+        backoff
+    }
+}
 
 /// What the store must be for a connection to it to be usable.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -305,6 +368,11 @@ pub struct StoreConn {
     /// Milliseconds since `epoch` of the last replacement / `ROLE` check (0 = never).
     last_swap_ms: AtomicU64,
     last_role_check_ms: AtomicU64,
+    /// Whether the last `ROLE` answer on the current connection said primary (true until one
+    /// says otherwise, and again once a new connection is accepted).
+    role_primary: AtomicBool,
+    /// Reconnects for `LOADING` since the last successful command (`LOADING_BACKOFF_STEPS`).
+    loading_streak: AtomicU32,
     /// Milliseconds since `epoch` when the running reconnect started (0 = none).
     reconnect_since_ms: AtomicU64,
     /// Replacements caused by a failover signal (not by `retire_quietly`): what a change of the
@@ -356,6 +424,8 @@ impl StoreConn {
             epoch: Instant::now(),
             last_swap_ms: AtomicU64::new(0),
             last_role_check_ms: AtomicU64::new(0),
+            role_primary: AtomicBool::new(true),
+            loading_streak: AtomicU32::new(0),
             reconnect_since_ms: AtomicU64::new(0),
             failover_generation: AtomicU64::new(0),
             replaced: std::sync::OnceLock::new(),
@@ -378,16 +448,40 @@ impl StoreConn {
         self.failover_generation.load(Ordering::Relaxed)
     }
 
-    /// Whether no replacement of the connection is running (choosing a connection for a
-    /// command).
-    pub fn usable_now(&self) -> bool {
-        self.reconnecting.load(Ordering::Acquire) == IDLE
-    }
-
     pub fn observe_ok(&self) {
         if self.consecutive_timeouts.load(Ordering::Relaxed) != 0 {
             self.consecutive_timeouts.store(0, Ordering::Relaxed);
         }
+        if self.loading_streak.load(Ordering::Relaxed) != 0 {
+            self.loading_streak.store(0, Ordering::Relaxed);
+        }
+    }
+
+    /// Whether the connection can be trusted to reach the primary right now: no replacement is
+    /// running and the last `ROLE` answer said primary (choosing a connection for a command).
+    pub fn usable_now(&self) -> bool {
+        self.role != Role::Primary
+            || (self.reconnecting.load(Ordering::Acquire) == IDLE
+                && self.role_primary.load(Ordering::Relaxed))
+    }
+
+    /// `usable_now` for health (`/healthz`): a `PING` still succeeds on a demoted primary, so a
+    /// store whose last `ROLE` said replica counts as down, and so does one whose replacement
+    /// has been running for longer than `RECONNECT_GRACE` (a failover signal was seen and the
+    /// endpoint does not yet reach a node that says `ROLE master`). A replacement that is done
+    /// within the grace (most take milliseconds) does not count.
+    pub fn usable(&self) -> bool {
+        if self.role != Role::Primary {
+            return true;
+        }
+        if !self.role_primary.load(Ordering::Relaxed) {
+            return false;
+        }
+        if self.reconnecting.load(Ordering::Acquire) == IDLE {
+            return true;
+        }
+        let since = self.reconnect_since_ms.load(Ordering::Relaxed);
+        since == 0 || self.now_ms().saturating_sub(since) <= RECONNECT_GRACE.as_millis() as u64
     }
 
     pub fn observe_error(self: &Arc<Self>, e: &RedisError) {
@@ -441,6 +535,18 @@ impl StoreConn {
         }
     }
 
+    /// `verify_primary` without its own timeout, for a caller that bounds the command itself
+    /// and holds the connection until it is answered (a `WAIT` pool's housekeeping check:
+    /// dropping the `ROLE` at a timeout of its own would hand the connection back with the
+    /// command still on it).
+    pub async fn verify_primary_unbounded(self: &Arc<Self>) {
+        if self.role == Role::Primary && self.role_check_due() {
+            let mut conn = self.get();
+            let answer = redis::cmd("ROLE").query_async::<_, Value>(&mut conn).await;
+            self.apply_role(answer);
+        }
+    }
+
     /// Wait until the connection was replaced after `since` (a `generation()`), at most `max`.
     pub async fn wait_for_reconnect(&self, since: u64, max: Duration) -> bool {
         let mut rx = self.generation.subscribe();
@@ -467,16 +573,27 @@ impl StoreConn {
     async fn check_role(self: &Arc<Self>) {
         let mut conn = self.get();
         let answer = timeout(
-            STORE_CONNECT_TIMEOUT,
+            ROLE_CHECK_TIMEOUT,
             redis::cmd("ROLE").query_async::<_, Value>(&mut conn),
         )
         .await;
+        if let Ok(answer) = answer {
+            self.apply_role(answer);
+        }
+    }
+
+    /// What a `ROLE` answer means for the connection.
+    fn apply_role(self: &Arc<Self>, answer: redis::RedisResult<Value>) {
         match answer {
-            Ok(Ok(v)) if parse_role(&v) == Some(false) => {
-                self.trigger("role");
-            }
-            Ok(Err(e)) => self.observe_error(&e),
-            _ => {}
+            Ok(v) => match parse_role(&v) {
+                Some(false) => {
+                    self.role_primary.store(false, Ordering::Relaxed);
+                    self.trigger("role");
+                }
+                Some(true) => self.role_primary.store(true, Ordering::Relaxed),
+                None => {}
+            },
+            Err(e) => self.observe_error(&e),
         }
     }
 
@@ -523,7 +640,8 @@ impl StoreConn {
         only_generation: Option<u64>,
     ) -> bool {
         let last = self.last_swap_ms.load(Ordering::Relaxed);
-        if last != 0 && self.now_ms().saturating_sub(last) < SIGNAL_HOLDOFF.as_millis() as u64 {
+        let holdoff = holdoff_after(reason, &self.loading_streak);
+        if last != 0 && self.now_ms().saturating_sub(last) < holdoff.as_millis() as u64 {
             return false;
         }
         if let Err(running) =
@@ -555,6 +673,9 @@ impl StoreConn {
         }
         self.reconnect_since_ms
             .store(self.now_ms(), Ordering::Relaxed);
+        if reason == "LOADING" {
+            self.loading_streak.fetch_add(1, Ordering::Relaxed);
+        }
         if crate::health::warn_due(&self.network, "store_reconnect") {
             warn!(network = %self.network, store = self.store, reason, "Store connection failover signal: reconnecting");
         }
@@ -569,6 +690,9 @@ impl StoreConn {
                 match this.open_usable().await {
                     Ok(conn) => {
                         this.conn.store(Arc::new(conn));
+                        // open_usable accepted it on a node that says ROLE master (or knows no
+                        // ROLE).
+                        this.role_primary.store(true, Ordering::Relaxed);
                         this.consecutive_timeouts.store(0, Ordering::Relaxed);
                         this.last_swap_ms.store(this.now_ms(), Ordering::Relaxed);
                         // Counted before the generation moves (its watchers read it then).
@@ -603,9 +727,14 @@ impl StoreConn {
                     }
                     Err(e) => {
                         if crate::health::warn_due(&this.network, "store_reconnect_attempt") {
-                            warn!(network = %this.network, store = this.store, attempts, error = %redact_addrs(&e), "Store reconnect attempt failed");
+                            warn!(network = %this.network, store = this.store, attempts, error = %error_summary(&e), "Store reconnect attempt failed");
                         }
-                        tokio::time::sleep(backoff).await;
+                        // A node that answers LOADING (restarted, reading its data set) is
+                        // asked again after the LOADING backoff, not every RECONNECT_MIN_BACKOFF.
+                        let mut streak = this.loading_streak.load(Ordering::Relaxed);
+                        let pause = reopen_pause(&e, backoff, &mut streak);
+                        this.loading_streak.store(streak, Ordering::Relaxed);
+                        tokio::time::sleep(pause).await;
                         backoff = (backoff * 2).min(RECONNECT_MAX_BACKOFF);
                     }
                 }
@@ -668,6 +797,100 @@ pub async fn open(client: &redis::Client) -> anyhow::Result<ConnectionManager> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_loading_node_is_reopened_after_the_loading_backoff() {
+        let b = Duration::from_millis(100);
+        assert_eq!(reopen_backoff(b, false, 3), b);
+        assert_eq!(reopen_backoff(b, true, 1), SIGNAL_HOLDOFF * 2);
+        assert_eq!(
+            reopen_backoff(b, true, 10),
+            SIGNAL_HOLDOFF * (1 << LOADING_BACKOFF_STEPS)
+        );
+        let e = anyhow::Error::from(server_error(
+            "LOADING Redis is loading the dataset in memory",
+        ));
+        assert!(is_loading(&e));
+        assert!(!is_loading(&anyhow::anyhow!("connection refused")));
+        // The same rule for every reopen loop.
+        let mut streak = 0;
+        assert_eq!(reopen_pause(&e, b, &mut streak), SIGNAL_HOLDOFF * 2);
+        assert_eq!(reopen_pause(&e, b, &mut streak), SIGNAL_HOLDOFF * 4);
+        assert_eq!(
+            reopen_pause(&anyhow::anyhow!("connection refused"), b, &mut streak),
+            b
+        );
+        assert_eq!(streak, 2, "another error keeps the LOADING step");
+        assert_eq!(reopen_pause(&e, b, &mut streak), SIGNAL_HOLDOFF * 8);
+    }
+
+    /// A quiet retirement replaces only the connection of the generation it names (never a
+    /// replacement), and is not counted as a change of the store.
+    #[tokio::test]
+    async fn a_quiet_retirement_replaces_only_the_named_generation() {
+        let Ok(c) = StoreConn::connect(
+            "redis://127.0.0.1:6379",
+            "test",
+            "testnet-retire".to_string(),
+            Role::Primary,
+        )
+        .await
+        else {
+            assert!(std::env::var("CI").is_err(), "Redis not reachable in CI");
+            return;
+        };
+        let g = c.generation();
+        assert!(
+            !c.retire_quietly("timeout", g + 1),
+            "not the current connection"
+        );
+        assert!(c.usable_now(), "nothing started");
+        assert!(c.retire_quietly("timeout", g));
+        assert!(c.wait_for_reconnect(g, Duration::from_secs(5)).await);
+        assert_eq!(
+            c.failover_generation(),
+            0,
+            "quiet: not a change of the store"
+        );
+        assert!(c.usable_now());
+        // A quiet replacement given up for a stale generation goes back to idle, unless a
+        // failover signal upgraded it meanwhile: then it stays claimed and runs.
+        c.reconnecting.store(RECONNECT_QUIET, Ordering::Release);
+        assert!(c.abandon_quiet());
+        assert_eq!(c.reconnecting.load(Ordering::Acquire), IDLE);
+        c.reconnecting.store(RECONNECT_FAILOVER, Ordering::Release);
+        assert!(!c.abandon_quiet());
+        assert_eq!(c.reconnecting.load(Ordering::Acquire), RECONNECT_FAILOVER);
+        c.reconnecting.store(IDLE, Ordering::Release);
+        // A failover signal that upgrades a running quiet replacement is counted under its own
+        // reason.
+        crate::health::init_metrics();
+        let upgraded = || -> f64 {
+            crate::health::REGISTRY
+                .gather()
+                .iter()
+                .filter(|f| f.get_name() == "ohttp_store_reconnect_total")
+                .flat_map(|f| f.get_metric().iter())
+                .filter(|m| {
+                    let l = m.get_label();
+                    let has = |k: &str, v: &str| {
+                        l.iter().any(|p| p.get_name() == k && p.get_value() == v)
+                    };
+                    has("network", "testnet-retire")
+                        && has("store", "test")
+                        && has("reason", "READONLY")
+                })
+                .map(|m| m.get_counter().get_value())
+                .sum()
+        };
+        let before = upgraded();
+        c.reconnecting.store(RECONNECT_QUIET, Ordering::Release);
+        c.last_swap_ms.store(0, Ordering::Relaxed);
+        assert!(!c.trigger("READONLY"), "a replacement is running already");
+        assert_eq!(c.reconnecting.load(Ordering::Acquire), RECONNECT_FAILOVER);
+        assert_eq!(upgraded(), before + 1.0);
+        c.reconnecting.store(IDLE, Ordering::Release);
+    }
 
     fn server_error(line: &str) -> RedisError {
         // Parse a RESP error line the way the client does.
@@ -801,6 +1024,22 @@ mod tests {
             error_summary(&anyhow::anyhow!("dial cachehost:6379 (192.0.2.3) failed")),
             "connection failed"
         );
+    }
+
+    #[test]
+    fn loading_backs_off_and_other_signals_do_not() {
+        assert_eq!(signal_holdoff("READONLY", 7), SIGNAL_HOLDOFF);
+        assert_eq!(signal_holdoff("LOADING", 0), SIGNAL_HOLDOFF);
+        assert_eq!(signal_holdoff("LOADING", 1), SIGNAL_HOLDOFF * 2);
+        assert_eq!(signal_holdoff("LOADING", 3), SIGNAL_HOLDOFF * 8);
+        assert_eq!(signal_holdoff("LOADING", 4), Duration::from_secs(8));
+        assert_eq!(signal_holdoff("LOADING", 40), Duration::from_secs(8));
+        // A failover signal after a LOADING streak is not delayed, and ends the streak.
+        let streak = AtomicU32::new(4);
+        assert_eq!(holdoff_after("LOADING", &streak), Duration::from_secs(8));
+        assert_eq!(holdoff_after("READONLY", &streak), SIGNAL_HOLDOFF);
+        assert_eq!(streak.load(Ordering::Relaxed), 0);
+        assert_eq!(holdoff_after("LOADING", &streak), SIGNAL_HOLDOFF);
     }
 
     #[test]

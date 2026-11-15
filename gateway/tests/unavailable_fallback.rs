@@ -35,8 +35,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use ohttp_gateway::cache::{
-    LocalReplayCheck, ReplayPeers, ResponseCache, WriteAdmission, WritePolicy, WriteWaitConfig,
-    REPLAY_TTL_SECS,
+    FallbackHealth, LocalReplayCheck, ReplayPeers, ResponseCache, WriteAdmission, WritePolicy,
+    WriteWaitConfig, DEFAULT_REPLAY_WAIT_CONNS, REPLAY_TTL_SECS,
 };
 use ohttp_gateway::origin::{ReplayPeerMode, RouteClass};
 use ohttp_gateway::replication::ReplicationConfig;
@@ -166,6 +166,11 @@ struct Store {
     /// Blocking WAITs in progress, and the most at once.
     waits_inflight: AtomicU64,
     waits_max: AtomicU64,
+    /// `ROLE` says replica (a demoted primary that still answers PING).
+    replica: AtomicBool,
+    /// The next WAIT closes its connection instead of answering (a reset of that one
+    /// connection).
+    close_on_wait_once: AtomicBool,
 }
 
 impl Default for Store {
@@ -185,6 +190,8 @@ impl Default for Store {
             set_xx_unpipelined: AtomicU64::new(0),
             waits_inflight: AtomicU64::new(0),
             waits_max: AtomicU64::new(0),
+            replica: AtomicBool::new(false),
+            close_on_wait_once: AtomicBool::new(false),
         }
     }
 }
@@ -301,6 +308,9 @@ impl Store {
                     tokio::time::sleep(Duration::from_millis(ms)).await;
                 }
             }
+            if is("WAIT") && self.close_on_wait_once.swap(false, Ordering::SeqCst) {
+                return;
+            }
             if is("WAIT") && self.wait_hangs.load(Ordering::SeqCst) {
                 // Never answered: every later reply on this connection waits behind it.
                 std::future::pending::<()>().await;
@@ -330,6 +340,7 @@ impl Store {
             .unwrap_or_default();
         match cmd.as_str() {
             "PING" => "+PONG\r\n".into(),
+            "ROLE" if self.replica.load(Ordering::SeqCst) => "*1\r\n$5\r\nslave\r\n".into(),
             "ROLE" => "*3\r\n$6\r\nmaster\r\n:0\r\n*0\r\n".into(),
             "SET" => {
                 let key = args[1].clone();
@@ -2102,4 +2113,457 @@ async fn cancelled_writes_keep_their_wait_connections_until_answered() {
     assert!(admit_strict(&primary, &request("after"), RouteClass::Write)
         .await
         .unwrap());
+}
+
+// ---------------------------------------------------------------------------------------------
+// Connections and health: the peers' WAIT connections, a security connection pinned to a
+// demoted primary, and WRITEs that keep failing while the peers decide.
+
+fn reconnects(network: &str, store: &str, reason: &str) -> f64 {
+    counter(
+        "ohttp_store_reconnect_total",
+        &[("network", network), ("store", store), ("reason", reason)],
+    )
+}
+
+fn healthz(network: &str) -> bool {
+    use ohttp_gateway::health::{
+        healthz_ok, is_replay_serving_via_fallback, is_security_redis_connected,
+    };
+    healthz_ok(
+        is_security_redis_connected(network),
+        is_replay_serving_via_fallback(network),
+        true,
+        true,
+    )
+}
+
+async fn all_wait_conns_open(c: &ResponseCache, n: usize) {
+    until(
+        "peer WAIT connections open",
+        Duration::from_secs(10),
+        || c.replay_peers().unwrap().wait_conns_open() == vec![n],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_broken_peer_wait_connection_leaves_the_main_connection() {
+    let net = "testnet-conn-wait-io";
+    let w = World::new().await;
+    let primary = primary_origin(net, &addr_url(w.p_addr), &addr_url(w.f_addr), false).await;
+    all_wait_conns_open(&primary, DEFAULT_REPLAY_WAIT_CONNS).await;
+    // The local replicas resync: the WRITE is confirmed at the peer, whose first WAIT
+    // connection breaks.
+    w.p.set_acks(0);
+    w.f.close_on_wait_once.store(true, Ordering::SeqCst);
+    let write = request("peer WAIT connection reset");
+    assert!(admit_strict(&primary, &write, RouteClass::Write)
+        .await
+        .unwrap());
+    assert_eq!(fallback(net, "short_ack", "accepted"), 1.0);
+    assert!(primary.replay_peers().unwrap().any_connected());
+    assert_eq!(reconnects(net, "replay_peer", "error"), 0.0);
+    // The broken one is reopened in the background.
+    all_wait_conns_open(&primary, DEFAULT_REPLAY_WAIT_CONNS).await;
+}
+
+#[tokio::test]
+async fn housekeeping_replaces_peer_wait_connections_reset_while_idle() {
+    let net = "testnet-conn-wait-idle";
+    let w = World::new().await;
+    let (f_link, f_url) = w.to_f().await;
+    let primary = primary_origin(net, &addr_url(w.p_addr), &f_url, false).await;
+    all_wait_conns_open(&primary, DEFAULT_REPLAY_WAIT_CONNS).await;
+    // Every open connection to the peer dies (a middlebox dropped them while idle).
+    f_link.lose();
+    f_link.restore();
+    // Housekeeping finds and replaces them without any WRITE.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        primary.ping_redis().await;
+        if primary.replay_peers().unwrap().all_answering() {
+            break;
+        }
+        assert!(Instant::now() < deadline, "peer not answering again");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    all_wait_conns_open(&primary, DEFAULT_REPLAY_WAIT_CONNS).await;
+    // The next WRITE through the peer's WAIT needs no retry.
+    w.p.set_acks(0);
+    let write = request("after housekeeping");
+    assert!(admit_strict(&primary, &write, RouteClass::Write)
+        .await
+        .unwrap());
+    assert_eq!(
+        counter(
+            "ohttp_replay_peer_total",
+            &[("network", net), ("result", "wait_retry")]
+        ),
+        0.0
+    );
+}
+
+#[tokio::test]
+async fn housekeeping_leaves_a_peer_that_became_a_replica() {
+    let net = "testnet-conn-peer-role";
+    let w = World::new().await;
+    let primary = primary_origin(net, &addr_url(w.p_addr), &addr_url(w.f_addr), false).await;
+    primary.ping_redis().await;
+    assert!(primary.replay_peers().unwrap().any_connected());
+    // The peer's endpoint still reaches the demoted node, which answers PING.
+    w.f.replica.store(true, Ordering::SeqCst);
+    primary.ping_redis().await;
+    assert_eq!(reconnects(net, "replay_peer", "role"), 1.0);
+    assert!(!primary.replay_peers().unwrap().any_connected());
+    w.f.replica.store(false, Ordering::SeqCst);
+    until("peer reconnected", Duration::from_secs(10), || {
+        primary.replay_peers().unwrap().any_connected()
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn healthz_fails_while_the_security_connection_waits_for_a_primary() {
+    use ohttp_gateway::health::is_security_redis_connected;
+    let net = "testnet-conn-demoted";
+    let w = World::new().await;
+    let primary = primary_origin(net, &addr_url(w.p_addr), &addr_url(w.f_addr), false).await;
+    primary.ping_redis().await;
+    assert!(is_security_redis_connected(net) && healthz(net));
+    // Demoted: PING still answers, ROLE says replica, and no node of the endpoint is a primary.
+    w.p.replica.store(true, Ordering::SeqCst);
+    // At most one ROLE check per second and connection.
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    primary.ping_redis().await;
+    assert!(!is_security_redis_connected(net));
+    assert!(!healthz(net));
+    // A primary again: the reconnect succeeds and the store counts as up.
+    w.p.replica.store(false, Ordering::SeqCst);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        primary.ping_redis().await;
+        if is_security_redis_connected(net) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "security store not back");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(healthz(net));
+}
+
+#[tokio::test]
+async fn healthz_fails_when_every_write_decided_at_the_peer_fails() {
+    use ohttp_gateway::health::is_replay_serving_via_fallback;
+    let net = "testnet-conn-fallback-health";
+    let w = World::new().await;
+    let (p_link, p_url) = w.to_p().await;
+    let primary = primary_origin(net, &p_url, &addr_url(w.f_addr), true)
+        .await
+        .with_fallback_health(FallbackHealth::new(3, Duration::from_secs(60)));
+    p_link.hang();
+    primary.ping_redis().await;
+    assert!(is_replay_serving_via_fallback(net) && healthz(net));
+    // The peer answers its PINGs but cannot acknowledge on its replicas: every WRITE decided
+    // there fails closed.
+    w.f.set_acks(0);
+    for i in 0..3 {
+        let write = request(&format!("peer without replica {i}"));
+        assert!(admit(&primary, &write, RouteClass::Write).await.is_err());
+    }
+    assert_eq!(fallback(net, "local_unavailable", "unacknowledged"), 3.0);
+    assert!(primary.fallback_writes_failing());
+    primary.ping_redis().await;
+    assert!(!is_replay_serving_via_fallback(net));
+    assert!(!healthz(net));
+    // READs that still arrive are decided at the peer.
+    assert!(
+        admit(&primary, &request("read while unhealthy"), RouteClass::Read)
+            .await
+            .unwrap()
+    );
+    // The peer acknowledges again: the next WRITE runs and the gateway is healthy again.
+    w.f.set_acks(1);
+    assert!(admit(&primary, &request("peer back"), RouteClass::Write)
+        .await
+        .unwrap());
+    assert!(!primary.fallback_writes_failing());
+    primary.ping_redis().await;
+    assert!(is_replay_serving_via_fallback(net) && healthz(net));
+}
+
+/// A withdrawn gateway is trusted again as soon as a request's local check gets an answer, not
+/// only from the next housekeeping round on.
+#[tokio::test]
+async fn a_local_answer_ends_the_withdrawal_between_housekeeping_rounds() {
+    let net = "testnet-conn-fallback-recovery";
+    let w = World::new().await;
+    let (p_link, p_url) = w.to_p().await;
+    let primary = primary_origin(net, &p_url, &addr_url(w.f_addr), true)
+        .await
+        .with_fallback_health(FallbackHealth::new(2, Duration::from_secs(60)));
+    p_link.hang();
+    primary.ping_redis().await;
+    w.f.set_acks(0);
+    for i in 0..2 {
+        let write = request(&format!("recovery peer without replica {i}"));
+        assert!(admit(&primary, &write, RouteClass::Write).await.is_err());
+    }
+    assert!(primary.fallback_writes_failing());
+    // The security store answers again; no housekeeping round runs from here on.
+    p_link.restore();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut i = 0;
+    while primary.fallback_writes_failing() {
+        assert!(Instant::now() < deadline, "still withdrawn");
+        i += 1;
+        let _ = primary
+            .check_replay_detailed(&request(&format!("recovery read {i}")))
+            .await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+#[test]
+fn fallback_health_withdraws_after_consecutive_failures_until_a_recovery() {
+    let h = FallbackHealth::new(2, Duration::from_millis(100));
+    assert!(!h.failing());
+    h.failed();
+    assert!(!h.failing());
+    h.failed();
+    assert!(h.failing());
+    // Withdrawn stays withdrawn: no return on a timer alone.
+    std::thread::sleep(Duration::from_millis(250));
+    assert!(h.failing());
+    // A WRITE through the fallback ran: back.
+    h.accepted();
+    assert!(!h.failing());
+    assert_eq!(h.consecutive_failures(), 0);
+    // Failures further apart than the window do not add up.
+    h.failed();
+    std::thread::sleep(Duration::from_millis(250));
+    h.failed();
+    assert_eq!(h.consecutive_failures(), 1);
+    assert!(!h.failing());
+    h.failed();
+    assert!(h.failing());
+    // The local store answers again: back.
+    h.local_answered();
+    assert!(!h.failing());
+    let off = FallbackHealth::new(0, Duration::from_secs(60));
+    for _ in 0..100 {
+        off.failed();
+    }
+    assert!(!off.failing());
+    assert!(FallbackHealth::parse(Some("x"), None).is_err());
+    assert!(FallbackHealth::parse(None, Some("0")).is_err());
+    assert!(FallbackHealth::parse(Some("0"), Some("10")).is_ok());
+}
+
+#[test]
+fn fallback_health_is_consistent_under_concurrent_updates() {
+    let h = Arc::new(FallbackHealth::new(1000, Duration::from_secs(60)));
+    let threads: Vec<_> = (0..8)
+        .map(|_| {
+            let h = h.clone();
+            std::thread::spawn(move || {
+                for _ in 0..500 {
+                    h.failed();
+                }
+            })
+        })
+        .collect();
+    for t in threads {
+        t.join().unwrap();
+    }
+    assert_eq!(h.consecutive_failures(), 4000, "no update lost");
+    assert!(h.failing());
+    // Failures and recoveries racing: whatever the order, the state is one of the two.
+    let h = Arc::new(FallbackHealth::new(3, Duration::from_secs(60)));
+    let threads: Vec<_> = (0..8)
+        .map(|i| {
+            let h = h.clone();
+            std::thread::spawn(move || {
+                for _ in 0..500 {
+                    if i % 2 == 0 {
+                        h.failed();
+                    } else {
+                        h.accepted();
+                    }
+                    let (failing, n) = (h.failing(), h.consecutive_failures());
+                    assert!(n <= 4000);
+                    let _ = failing;
+                }
+            })
+        })
+        .collect();
+    for t in threads {
+        t.join().unwrap();
+    }
+    h.accepted();
+    assert!(!h.failing() && h.consecutive_failures() == 0);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Startup: /healthz waits for the stores both-store admission needs.
+
+async fn reader_with_standby_at(network: &str, hub: &str, standby: &str) -> ResponseCache {
+    ohttp_gateway::health::init_metrics();
+    let c = ResponseCache::connect(
+        &cache_store().await,
+        Some(&cache_store().await),
+        network.to_string(),
+        "lwd.example.com:9067".to_string(),
+        250,
+        100,
+        &HashMap::new(),
+    )
+    .await
+    .unwrap();
+    let peers = ReplayPeers::connect(&[hub.to_string()], network.to_string(), 250, false)
+        .await
+        .with_mode(ReplayPeerMode::AsyncReads, true)
+        .with_wait(Some(WAIT));
+    let standby = ReplayPeers::connect_standby(&[standby.to_string()], network.to_string(), 250, 1)
+        .await
+        .with_wait(Some(WAIT));
+    c.with_replay_peers(peers)
+        .with_async_replication(replication(network, ReplayPeerMode::AsyncReads))
+        .with_standby_replication(standby, replication(network, ReplayPeerMode::Failover))
+}
+
+#[tokio::test]
+async fn a_read_origin_reports_ready_once_its_standby_store_is_connected() {
+    use ohttp_gateway::health::is_replay_stores_ready;
+    let net = "testnet-ready-standby";
+    let w = World::new().await;
+    let (f_link, f_url) = w.to_f().await;
+    f_link.lose();
+    let reader = reader_with_standby_at(net, &addr_url(w.p_addr), &f_url).await;
+    let gate =
+        ohttp_gateway::cache::spawn_replay_stores_gate(reader.clone(), Duration::from_secs(10));
+    assert!(
+        !is_replay_stores_ready(net),
+        "not ready without the standby store"
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!is_replay_stores_ready(net));
+    f_link.restore();
+    assert!(
+        gate.await.unwrap(),
+        "every store connected within the bound"
+    );
+    assert!(is_replay_stores_ready(net));
+    // A WRITE that both stores must take runs at once.
+    assert!(
+        admit_strict(&reader, &request("after startup"), RouteClass::Write)
+            .await
+            .unwrap()
+    );
+}
+
+#[tokio::test]
+async fn a_read_origin_reports_ready_after_the_bound_without_its_standby_store() {
+    use ohttp_gateway::health::is_replay_stores_ready;
+    let net = "testnet-ready-bound";
+    let w = World::new().await;
+    let (f_link, f_url) = w.to_f().await;
+    f_link.lose();
+    let reader = reader_with_standby_at(net, &addr_url(w.p_addr), &f_url).await;
+    let started = Instant::now();
+    let gate =
+        ohttp_gateway::cache::spawn_replay_stores_gate(reader.clone(), Duration::from_millis(500));
+    assert!(!is_replay_stores_ready(net));
+    assert!(!gate.await.unwrap(), "the standby store never connected");
+    assert!(started.elapsed() >= Duration::from_millis(450));
+    assert!(is_replay_stores_ready(net), "ready after the bound");
+}
+
+/// Refusals of WRITEs that are not on `REPLAY_ONE_SIDED_WRITE_ROUTES` withdraw a gateway only
+/// when its own store gave no verdict, not when a peer did not answer.
+#[tokio::test]
+async fn one_sided_refusals_count_toward_withdrawal_only_for_the_local_store() {
+    let net = "testnet-conn-refusal-health";
+    let w = World::new().await;
+    let (p_link, p_url) = w.to_p().await;
+    let (f_link, f_url) = w.to_f().await;
+    let primary = primary_origin(net, &p_url, &f_url, true)
+        .await
+        .with_fallback_health(FallbackHealth::new(3, Duration::from_secs(60)));
+    f_link.hang();
+    for i in 0..5 {
+        let write = request(&format!("peer silent {i}"));
+        assert!(admit_strict(&primary, &write, RouteClass::Write)
+            .await
+            .is_err());
+    }
+    assert!(
+        !primary.fallback_writes_failing(),
+        "a peer's silence does not count"
+    );
+    f_link.restore();
+    p_link.hang();
+    for i in 0..3 {
+        let write = request(&format!("own store silent {i}"));
+        assert!(admit_strict(&primary, &write, RouteClass::Write)
+            .await
+            .is_err());
+    }
+    assert!(primary.fallback_writes_failing());
+}
+
+/// Several peers that stop answering are checked at once: one housekeeping round costs about
+/// one peer's budget, not one per peer.
+#[tokio::test]
+async fn housekeeping_checks_hanging_peers_concurrently() {
+    let net = "testnet-conn-hanging-peers";
+    let w = World::new().await;
+    ohttp_gateway::health::init_metrics();
+    let mut links = Vec::new();
+    let mut urls = Vec::new();
+    for _ in 0..6 {
+        let (l, u) = w.to_f().await;
+        links.push(l);
+        urls.push(u);
+    }
+    let c = ResponseCache::connect(
+        &cache_store().await,
+        Some(&addr_url(w.p_addr)),
+        net.to_string(),
+        "lwd.example.com:9067".to_string(),
+        250,
+        100,
+        &HashMap::new(),
+    )
+    .await
+    .unwrap();
+    let peers = ReplayPeers::connect(&urls, net.to_string(), 250, false)
+        .await
+        .with_mode(ReplayPeerMode::Failover, true)
+        .with_wait(Some(WAIT));
+    let c = c.with_replay_peers(peers);
+    until(
+        "peer WAIT connections open",
+        Duration::from_secs(10),
+        || {
+            c.replay_peers()
+                .unwrap()
+                .wait_conns_open()
+                .iter()
+                .all(|n| *n > 0)
+        },
+    )
+    .await;
+    c.ping_redis().await;
+    assert!(c.replay_peers().unwrap().all_answering());
+    for l in &links {
+        l.hang();
+    }
+    let started = Instant::now();
+    c.ping_redis().await;
+    let took = started.elapsed();
+    assert!(!c.replay_peers().unwrap().any_answering());
+    // One peer: a PING (250 ms) and its WAIT connections' PINGs (300 ms). Six in a row: 3.3 s.
+    assert!(took < Duration::from_millis(2200), "{took:?}");
+    assert!(ohttp_gateway::health::is_security_redis_connected(net));
 }
