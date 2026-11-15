@@ -232,6 +232,27 @@ keeps its own log in [client/CHANGELOG.md](client/CHANGELOG.md).
   every primary-checked connection to it was refused: replay peer connections never connected,
   and after the first failover signal the security and `WAIT` connections never got a
   replacement, so every request failed closed until a restart. Granting `ROLE` keeps the check.
+- The pinned backfill no longer loses a height for good when the `INCR` that claimed it times
+  out after the store counted it (or a worker gives up on it): about every 10 minutes (jittered
+  by 10 %) a sweep checks the heights the shared cursor passed, from a shared mark
+  (`backfill_verified`, next to the cursor) up to a margin below the cursor (none once the range
+  is done), with pipelined `EXISTS` on the store the entries are written to, 500 at a time with a
+  short pause in between, and fills the missing ones (`ohttp_cache_requests_total{rpc=
+  "GetTreeState",result="pinned_sweep"|"pinned_sweep_failed"}`). Each batch is claimed for all
+  processes (`SET NX` with a TTL), so one process sweeps it. A height that cannot be filled is
+  kept in a set (`backfill_holes`) and retried by later passes; the mark only moves past a batch
+  whose every height is present or kept there. The first pass after an upgrade checks the whole
+  range already passed once.
+  Batches are aligned to their size, so every process claims the same heights under one key. A
+  claim carries a random token of its own, holds 120 s (less than the sweep interval), is
+  renewed before and during every fill (each bounded to 60 s) and released by compare-and-delete
+  on every way out of the batch, so one that expired and was taken over is never released by
+  its first holder; the mark is read again once a batch is claimed and moved only by the
+  claim's holder (a fenced script). The hole retries are claimed the same way; a hole that
+  failed 10 retries on which the upstream answered is dropped (`result="pinned_sweep_dropped"`;
+  passes during an upstream outage do not count), and each height is checked
+  again right before it is filled. The sweep of a bounded range ends only once a count of the
+  holes says 0.
 - A read origin with a confirming standby store (`REPLAY_STANDBY_URLS` with
   `REPLAY_PEER_WAIT_REPLICAS`) asks the standby store about a WRITE's nonce (`SET NX`) at the same
   time as the hub (`SET NX`, then the hub's replica wait), instead of after the hub answered. A

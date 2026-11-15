@@ -151,7 +151,7 @@ only, and `REPLAY_STANDBY_URLS`). See `docs/architecture.md`, "Multiple origins"
 | `REDIS_PINNED_URL` | unset | Optional Redis (no eviction) for `GetTreeState` answers by height. Needs `PINNED_TREESTATE_RANGE`. Only heights deeper than 100 blocks below a fresh tip are looked up there (only those are written). May be a read replica: the gateway asks its `ROLE` at startup and then writes nothing to it (and asks again every 5 minutes, and after a `READONLY` answer). |
 | `REDIS_PINNED_WRITE_URL` | unset | Where pinned entries are written instead of `REDIS_PINNED_URL`, for a `REDIS_PINNED_URL` that is a read replica: normally its primary, so that a height the replica misses is written once for every gateway reading a replica of it. Writes are off the request path; their timeout is at least 2 s. Unreachable at startup: entries are written to `REDIS_PINNED_URL` (nothing when that is a replica). |
 | `PINNED_TREESTATE_RANGE` | unset | Inclusive height range for the pinned tier, `start-end` or `start-` (open end); `start` at least 1. |
-| `PINNED_BACKFILL_WORKERS` | `0` | Background workers per process that fill the pinned range; `0`: write-through only. |
+| `PINNED_BACKFILL_WORKERS` | `0` | Background workers per process that fill the pinned range; `0`: write-through only. They share a cursor in the store; about every 10 minutes a sweep also checks the heights the cursor passed (from a shared mark on, one process per batch of 500) and fills any that are missing, such as a height whose claim was lost to a timeout (`ohttp_cache_requests_total{rpc="GetTreeState",result="pinned_sweep"}`); one it cannot fill is kept and retried by later sweeps. |
 
 ## `ohttp-gateway backfill`
 

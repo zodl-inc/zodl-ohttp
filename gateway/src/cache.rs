@@ -68,6 +68,29 @@ pub use crate::rpc_cache::{grpc_block_id, height_key, CacheLookup, CacheMiss, MA
 pub const FINALIZED_DEPTH: u64 = 100;
 /// How often a caught-up pinned backfill worker checks for newly final heights.
 pub const PINNED_FOLLOW_INTERVAL: Duration = Duration::from_secs(60);
+/// How often a gateway re-checks the pinned heights the backfill cursor already passed
+/// (`pinned_sweep_pass`): a claim whose `INCR` reply was lost, or a height a worker gave up on,
+/// is filled then.
+pub const PINNED_SWEEP_INTERVAL: Duration = Duration::from_secs(600);
+/// Heights per `EXISTS` pipeline of the sweep.
+const PINNED_SWEEP_BATCH: u64 = 500;
+/// Pause between two sweep batches, so a sweep never keeps the store busy.
+const PINNED_SWEEP_PAUSE: Duration = Duration::from_millis(50);
+/// Holes (heights a pass could not fill) retried per pass.
+const PINNED_SWEEP_HOLES_PER_PASS: u64 = 100;
+/// How long one process's claim of a sweep batch holds without a renewal (released when the
+/// batch is done; renewed before and during every fill). Shorter than PINNED_SWEEP_INTERVAL, so
+/// the claim of a process that died is free by the next pass.
+const PINNED_SWEEP_CLAIM_TTL: Duration = Duration::from_secs(120);
+/// Bound of one height's fill by the sweep (three fetch attempts and their pauses).
+const PINNED_SWEEP_FILL_TIMEOUT: Duration = Duration::from_secs(60);
+/// Retries of one hole with an upstream answer before the sweep drops it (logged,
+/// `result="pinned_sweep_dropped"`): a height that keeps failing is left to the write-through
+/// path. A retry without any answer (an upstream outage) does not count.
+const PINNED_SWEEP_HOLE_ATTEMPTS: u64 = 10;
+/// Heights just below the cursor that the sweep leaves to the workers that may still hold them
+/// (plus one per worker).
+const PINNED_SWEEP_MARGIN: u64 = 64;
 /// After the store pinned entries are written to answers as a read replica, writes are skipped
 /// for this long; then its `ROLE` is asked again before the next write.
 pub const PINNED_READ_ONLY_RECHECK: Duration = Duration::from_secs(300);
@@ -4037,6 +4060,47 @@ impl ResponseCache {
         )
     }
 
+    /// The next height the sweep checks (`pinned_sweep_pass`), shared by every gateway like
+    /// the cursor.
+    fn pinned_verified_key(&self) -> String {
+        format!(
+            "pinned:{}:{}:treestate:v1:backfill_verified",
+            self.network, self.backend_host
+        )
+    }
+
+    /// The heights the sweep could not fill (a set), retried by later passes.
+    fn pinned_holes_key(&self) -> String {
+        format!(
+            "pinned:{}:{}:treestate:v1:backfill_holes",
+            self.network, self.backend_host
+        )
+    }
+
+    /// One process's claim of the retries of the holes.
+    fn pinned_sweep_claim_key_holes(&self) -> String {
+        format!(
+            "pinned:{}:{}:treestate:v1:backfill_sweep:holes",
+            self.network, self.backend_host
+        )
+    }
+
+    /// The failed retries per hole (a hash), for PINNED_SWEEP_HOLE_ATTEMPTS.
+    fn pinned_hole_attempts_key(&self) -> String {
+        format!(
+            "pinned:{}:{}:treestate:v1:backfill_hole_attempts",
+            self.network, self.backend_host
+        )
+    }
+
+    /// One process's claim of the sweep batch that starts at `from` (`sweep_batch_of`).
+    fn pinned_sweep_claim_key(&self, from: u64) -> String {
+        format!(
+            "pinned:{}:{}:treestate:v1:backfill_sweep:{from}",
+            self.network, self.backend_host
+        )
+    }
+
     /// Height of a height-only GetTreeState request inside the pinned range, if any. Heights
     /// within FINALIZED_DEPTH of a fresh tip are left out: `pinned_put` never writes them, so
     /// a lookup could only miss (they are answered by the chain-validated cache). Without a
@@ -4146,6 +4210,17 @@ impl ResponseCache {
                 None
             }
         }
+    }
+
+    /// `pinned_exists` on `conn` (the store the entries are written to).
+    async fn pinned_exists_at(&self, conn: &Arc<StoreConn>, height: u64) -> bool {
+        let r = timeout(
+            self.redis_timeout,
+            conn.get().exists::<_, bool>(self.pinned_key(height)),
+        )
+        .await;
+        conn.observe_timed(&r);
+        matches!(r, Ok(Ok(true)))
     }
 
     async fn pinned_exists(&self, height: u64) -> bool {
@@ -6244,12 +6319,520 @@ fn spawn_cache_reconnect_task(cache: ResponseCache) {
     });
 }
 
+/// Fetch and store the pinned entry of `height`: three attempts, with a pause after each failed
+/// one. Whether it was stored.
+async fn pinned_fill<F, Fut>(cache: &ResponseCache, fetch: &F, height: u64) -> bool
+where
+    F: Fn(u64) -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<Vec<u8>>>,
+{
+    pinned_fill_outcome(cache, fetch, height).await == Fill::Stored
+}
+
+/// How a `pinned_fill` went.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Fill {
+    Stored,
+    /// The upstream answered, but no answer could be stored (a height that fails by itself).
+    Answered,
+    /// The upstream never answered (an outage: says nothing about the height).
+    NoAnswer,
+}
+
+async fn pinned_fill_outcome<F, Fut>(cache: &ResponseCache, fetch: &F, height: u64) -> Fill
+where
+    F: Fn(u64) -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<Vec<u8>>>,
+{
+    let mut answered = false;
+    for attempt in 0..3u64 {
+        match fetch(height).await {
+            Ok(resp) => {
+                answered = true;
+                if cache.pinned_put(height, &resp).await {
+                    return Fill::Stored;
+                }
+            }
+            Err(e) => {
+                debug!(network = %cache.network, height, error = %e, "pinned backfill fetch error");
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(1 + attempt * 2)).await;
+    }
+    if answered {
+        Fill::Answered
+    } else {
+        Fill::NoAnswer
+    }
+}
+
+/// One process's claim of a part of the sweep (a batch, or the hole retries): `SET NX` with a
+/// random token of its own and `PINNED_SWEEP_CLAIM_TTL`, renewed before every fill, released by
+/// compare-and-delete, so a claim that expired and was taken over by another process is never
+/// renewed or released by the first one.
+struct SweepClaim<'a> {
+    conn: &'a Arc<StoreConn>,
+    key: String,
+    token: String,
+    budget: Duration,
+}
+
+impl<'a> SweepClaim<'a> {
+    /// The claim, None when another process holds it (or the answer was lost: it expires).
+    async fn take(
+        conn: &'a Arc<StoreConn>,
+        key: String,
+        budget: Duration,
+    ) -> anyhow::Result<Option<SweepClaim<'a>>> {
+        let token = format!("{:016x}", rand::random::<u64>());
+        let r = timeout(
+            budget,
+            redis::cmd("SET")
+                .arg(&key)
+                .arg(&token)
+                .arg("NX")
+                .arg("PX")
+                .arg(PINNED_SWEEP_CLAIM_TTL.as_millis() as u64)
+                .query_async::<_, Option<String>>(&mut conn.get()),
+        )
+        .await;
+        conn.observe_timed(&r);
+        match r {
+            Ok(Ok(Some(_))) => Ok(Some(Self {
+                conn,
+                key,
+                token,
+                budget,
+            })),
+            Ok(Ok(None)) | Err(_) => Ok(None),
+            Ok(Err(e)) => anyhow::bail!("pinned sweep: claim failed: {}", store_error(&e)),
+        }
+    }
+
+    /// Extend the claim; false when it is no longer ours.
+    async fn renew(&self) -> bool {
+        let script = redis::Script::new(
+            r"if redis.call('GET', KEYS[1]) == ARGV[1] then
+                return redis.call('PEXPIRE', KEYS[1], ARGV[2])
+              end
+              return 0",
+        );
+        let r = timeout(
+            self.budget,
+            script
+                .key(&self.key)
+                .arg(&self.token)
+                .arg(PINNED_SWEEP_CLAIM_TTL.as_millis() as u64)
+                .invoke_async::<_, i64>(&mut self.conn.get()),
+        )
+        .await;
+        self.conn.observe_timed(&r);
+        matches!(r, Ok(Ok(1)))
+    }
+
+    /// `pinned_fill` of `height` while the claim is held: bounded by PINNED_SWEEP_FILL_TIMEOUT
+    /// and renewed during the fill. None when the claim was lost meanwhile (the fill is
+    /// abandoned; the other holder decides about the height).
+    async fn fill<F, Fut>(&self, cache: &ResponseCache, fetch: &F, height: u64) -> Option<Fill>
+    where
+        F: Fn(u64) -> Fut,
+        Fut: std::future::Future<Output = anyhow::Result<Vec<u8>>>,
+    {
+        if !self.renew().await {
+            return None;
+        }
+        let fill = timeout(
+            PINNED_SWEEP_FILL_TIMEOUT,
+            pinned_fill_outcome(cache, fetch, height),
+        );
+        tokio::pin!(fill);
+        let mut renewal = tokio::time::interval(PINNED_SWEEP_CLAIM_TTL / 4);
+        renewal.tick().await;
+        loop {
+            tokio::select! {
+                outcome = &mut fill => return Some(outcome.unwrap_or(Fill::NoAnswer)),
+                _ = renewal.tick() => {
+                    if !self.renew().await {
+                        return None;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Move the shared mark `backfill_verified` forward to `to` (never back), only while the
+    /// claim is ours: `Ok(Ok(false))` when it is not (nothing moved).
+    async fn advance_mark(
+        &self,
+        cache: &ResponseCache,
+        to: u64,
+    ) -> Result<redis::RedisResult<bool>, tokio::time::error::Elapsed> {
+        let script = redis::Script::new(
+            r"if redis.call('GET', KEYS[2]) ~= ARGV[2] then return 0 end
+              local cur = tonumber(redis.call('GET', KEYS[1]) or '0')
+              if cur < tonumber(ARGV[1]) then redis.call('SET', KEYS[1], ARGV[1]) end
+              return 1",
+        );
+        let r = timeout(
+            self.budget,
+            script
+                .key(cache.pinned_verified_key())
+                .key(&self.key)
+                .arg(to)
+                .arg(&self.token)
+                .invoke_async::<_, i64>(&mut self.conn.get()),
+        )
+        .await;
+        self.conn.observe_timed(&r);
+        r.map(|r| r.map(|moved| moved == 1))
+    }
+
+    /// Delete the claim if it is still ours.
+    async fn release(self) {
+        let script = redis::Script::new(
+            r"if redis.call('GET', KEYS[1]) == ARGV[1] then
+                return redis.call('DEL', KEYS[1])
+              end
+              return 0",
+        );
+        let r = timeout(
+            self.budget,
+            script
+                .key(&self.key)
+                .arg(&self.token)
+                .invoke_async::<_, i64>(&mut self.conn.get()),
+        )
+        .await;
+        self.conn.observe_timed(&r);
+        if let Ok(Err(e)) = &r {
+            warn!(error = %store_error(e), "pinned sweep: claim release script failed");
+        }
+    }
+}
+
+/// The first height of the sweep batch `height` belongs to (batches are aligned to
+/// PINNED_SWEEP_BATCH, so every process means the same heights by one batch).
+fn sweep_batch_of(height: u64) -> u64 {
+    height - height % PINNED_SWEEP_BATCH
+}
+
+/// What one sweep pass did (`pinned_sweep_pass`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SweepPass {
+    /// Heights filled (holes and newly found gaps).
+    filled: u64,
+    /// The next height to check (the shared mark after the pass).
+    next: u64,
+    /// Heights that still could not be filled (`backfill_holes`), retried by later passes
+    /// (None: the count could not be read).
+    holes: Option<u64>,
+}
+
+/// One pass of the sweep behind the backfill cursor. The workers claim heights with `INCR`; a
+/// claim whose reply is lost (a timeout) advanced the cursor without any worker knowing the
+/// height, which used to be skipped for good, and so is a height a worker gave up on.
+///
+/// - First the holes earlier passes could not fill (the set `backfill_holes`, at most
+///   PINNED_SWEEP_HOLES_PER_PASS of them) are tried again; one found present or filled leaves
+///   the set.
+/// - Then every height from the shared mark `backfill_verified` up to `margin` below the last
+///   claimed one (no margin once a worker has claimed past the range end, i.e. the range is
+///   done; never above the last final height) is checked with pipelined `EXISTS` on the store
+///   the entries are written to, PINNED_SWEEP_BATCH at a time with a short pause between
+///   batches. Batches are aligned to PINNED_SWEEP_BATCH, and each is first claimed for every
+///   process (`SweepClaim`: a token of its own, renewed during every fill, released when done):
+///   a batch another process sweeps ends this pass. The mark is read again once the batch is
+///   claimed, and only the claim's holder moves it (a fenced script). A hole that failed
+///   PINNED_SWEEP_HOLE_ATTEMPTS retries is dropped (`pinned_sweep_dropped`). A missing height is filled
+///   (`result="pinned_sweep"`); one that cannot be is added to the holes
+///   (`pinned_sweep_failed`). The mark moves past a batch only once every height of it is
+///   present or a hole, so it covers a contiguous, fully handled prefix.
+///
+/// `Err` on a store error: the next pass resumes from the mark.
+async fn pinned_sweep_pass<F, Fut>(
+    cache: &ResponseCache,
+    conn: &Arc<StoreConn>,
+    (start, end): (u64, u64),
+    margin: u64,
+    fetch: &F,
+) -> anyhow::Result<SweepPass>
+where
+    F: Fn(u64) -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<Vec<u8>>>,
+{
+    let budget = cache.redis_timeout * 4;
+    let store_err = |what: &str, e: &redis::RedisError| {
+        anyhow::anyhow!("pinned sweep: {what} failed: {}", store_error(e))
+    };
+    let mut filled = 0u64;
+    let mut record = |stored: bool| {
+        filled += u64::from(stored);
+        crate::health::record_cache_request(
+            &cache.network,
+            "GetTreeState",
+            if stored {
+                "pinned_sweep"
+            } else {
+                "pinned_sweep_failed"
+            },
+        );
+    };
+
+    // The holes of earlier passes, retried by one process at a time.
+    let holes_key = cache.pinned_holes_key();
+    let attempts_key = cache.pinned_hole_attempts_key();
+    if let Some(claim) =
+        SweepClaim::take(conn, cache.pinned_sweep_claim_key_holes(), budget).await?
+    {
+        let retried: anyhow::Result<()> = async {
+            let holes = timeout(
+                budget,
+                redis::cmd("SRANDMEMBER")
+                    .arg(&holes_key)
+                    .arg(PINNED_SWEEP_HOLES_PER_PASS)
+                    .query_async::<_, Vec<u64>>(&mut conn.get()),
+            )
+            .await;
+            conn.observe_timed(&holes);
+            let holes = holes
+                .map_err(|_| anyhow::anyhow!("pinned sweep: hole read timed out"))?
+                .map_err(|e| store_err("hole read", &e))?;
+            for h in holes {
+                let outcome = if cache.pinned_exists_at(conn, h).await {
+                    Fill::Stored
+                } else {
+                    let Some(outcome) = claim.fill(cache, fetch, h).await else {
+                        break;
+                    };
+                    record(outcome == Fill::Stored);
+                    outcome
+                };
+                // Filled (or there): out of the holes. Failed with an upstream answer: one more
+                // attempt counted, and after PINNED_SWEEP_HOLE_ATTEMPTS the hole is dropped. A
+                // pass during an upstream outage (no answer) counts nothing.
+                let drop_hole = if outcome == Fill::Stored {
+                    true
+                } else if outcome == Fill::NoAnswer {
+                    false
+                } else {
+                    let r = timeout(
+                        budget,
+                        redis::cmd("HINCRBY")
+                            .arg(&attempts_key)
+                            .arg(h)
+                            .arg(1)
+                            .query_async::<_, u64>(&mut conn.get()),
+                    )
+                    .await;
+                    conn.observe_timed(&r);
+                    let dropped = matches!(r, Ok(Ok(n)) if n >= PINNED_SWEEP_HOLE_ATTEMPTS);
+                    if dropped {
+                        crate::health::record_cache_request(
+                            &cache.network,
+                            "GetTreeState",
+                            "pinned_sweep_dropped",
+                        );
+                        if crate::health::warn_due(&cache.network, "pinned_hole_dropped") {
+                            warn!(network = %cache.network, height = h, "pinned sweep: a height kept failing and is left to the write-through path");
+                        }
+                    }
+                    dropped
+                };
+                if drop_hole {
+                    let r = timeout(
+                        budget,
+                        redis::pipe()
+                            .cmd("SREM")
+                            .arg(&holes_key)
+                            .arg(h)
+                            .ignore()
+                            .cmd("HDEL")
+                            .arg(&attempts_key)
+                            .arg(h)
+                            .ignore()
+                            .query_async::<_, ()>(&mut conn.get()),
+                    )
+                    .await;
+                    conn.observe_timed(&r);
+                }
+            }
+            Ok(())
+        }
+        .await;
+        claim.release().await;
+        retried?;
+    }
+
+    let marks = timeout(
+        budget,
+        redis::cmd("MGET")
+            .arg(cache.pinned_cursor_key())
+            .arg(cache.pinned_verified_key())
+            .query_async::<_, (Option<u64>, Option<u64>)>(&mut conn.get()),
+    )
+    .await;
+    conn.observe_timed(&marks);
+    let (cursor, verified) = marks
+        .map_err(|_| anyhow::anyhow!("pinned sweep: cursor read timed out"))?
+        .map_err(|e| store_err("cursor read", &e))?;
+    let mut next = verified.unwrap_or(start).max(start);
+    let claimed = cursor.unwrap_or(0);
+    let hi = if claimed == 0 {
+        None
+    } else {
+        let last_claimed = start.saturating_add(claimed - 1);
+        // A worker claimed past the end: the range is done and no claim is in flight any more.
+        let margin = if last_claimed > end { 0 } else { margin };
+        let last_final = cache.tip_height().saturating_sub(FINALIZED_DEPTH + 1);
+        last_claimed
+            .min(end)
+            .checked_sub(margin)
+            .map(|h| h.min(last_final))
+    };
+    while let Some(hi) = hi.filter(|hi| next <= *hi) {
+        // Batches have fixed identities (aligned to PINNED_SWEEP_BATCH): every process claims
+        // the same heights under the same key, whatever its own reading of the mark was.
+        let batch_lo = sweep_batch_of(next);
+        let batch_hi = hi.min(batch_lo.saturating_add(PINNED_SWEEP_BATCH - 1));
+        // One process per batch: swept by another process now (or the claim's reply was lost:
+        // it expires) ends this pass.
+        let Some(claim) =
+            SweepClaim::take(conn, cache.pinned_sweep_claim_key(batch_lo), budget).await?
+        else {
+            break;
+        };
+        // The mark again, now that the batch is ours: another process may have swept it since
+        // it was read.
+        let mark = timeout(
+            budget,
+            redis::cmd("GET")
+                .arg(cache.pinned_verified_key())
+                .query_async::<_, Option<u64>>(&mut conn.get()),
+        )
+        .await;
+        conn.observe_timed(&mark);
+        let mark = match mark {
+            Ok(Ok(m)) => m,
+            Ok(Err(e)) => {
+                claim.release().await;
+                return Err(store_err("mark read", &e));
+            }
+            Err(_) => {
+                claim.release().await;
+                anyhow::bail!("pinned sweep: mark read timed out");
+            }
+        };
+        next = next.max(mark.unwrap_or(0));
+        if next > batch_hi {
+            claim.release().await;
+            continue;
+        }
+        let swept: anyhow::Result<bool> = async {
+            let mut pipe = redis::pipe();
+            for h in next..=batch_hi {
+                pipe.cmd("EXISTS").arg(cache.pinned_key(h));
+            }
+            let present = timeout(budget, pipe.query_async::<_, Vec<bool>>(&mut conn.get())).await;
+            conn.observe_timed(&present);
+            let present = present
+                .map_err(|_| anyhow::anyhow!("pinned sweep: EXISTS timed out"))?
+                .map_err(|e| store_err("EXISTS", &e))?;
+            for (h, there) in (next..=batch_hi).zip(present) {
+                if there {
+                    continue;
+                }
+                // Still missing (a worker or the write-through path may have filled it
+                // meanwhile), then filled while the claim is held (renewed during the fill).
+                if cache.pinned_exists_at(conn, h).await {
+                    continue;
+                }
+                let Some(outcome) = claim.fill(cache, fetch, h).await else {
+                    return Ok(false);
+                };
+                let stored = outcome == Fill::Stored;
+                record(stored);
+                if !stored {
+                    let r = timeout(
+                        budget,
+                        redis::cmd("SADD")
+                            .arg(&holes_key)
+                            .arg(h)
+                            .query_async::<_, i64>(&mut conn.get()),
+                    )
+                    .await;
+                    conn.observe_timed(&r);
+                    match r {
+                        Ok(Ok(_)) => {}
+                        // Not recorded: the batch is checked again, the mark does not move past it.
+                        Ok(Err(e)) => return Err(store_err("hole record", &e)),
+                        Err(_) => anyhow::bail!("pinned sweep: hole record timed out"),
+                    }
+                }
+            }
+            Ok(true)
+        }
+        .await;
+        let done = match swept {
+            Ok(done) => done,
+            Err(e) => {
+                claim.release().await;
+                return Err(e);
+            }
+        };
+        if !done {
+            // The claim was lost (expired and taken over): the batch is the other process's.
+            // Released anyway (compare-and-delete: only a claim still ours goes).
+            claim.release().await;
+            break;
+        }
+        let r = claim.advance_mark(cache, batch_hi + 1).await;
+        let held = match &r {
+            Ok(Ok(true)) => true,
+            // The claim was lost before the mark moved: the other holder moves it.
+            Ok(Ok(false)) => false,
+            // A lost reply only means that a later pass checks this batch again.
+            Ok(Err(e)) => {
+                warn!(network = %cache.network, error = %store_error(e), "pinned sweep: mark update script failed");
+                true
+            }
+            Err(_) => {
+                warn!(network = %cache.network, "pinned sweep: mark update timed out");
+                true
+            }
+        };
+        claim.release().await;
+        if !held {
+            break;
+        }
+        next = batch_hi + 1;
+        tokio::time::sleep(PINNED_SWEEP_PAUSE).await;
+    }
+    // Only a successful count of 0 says there is no hole left.
+    let holes = timeout(
+        budget,
+        redis::cmd("SCARD")
+            .arg(&holes_key)
+            .query_async::<_, u64>(&mut conn.get()),
+    )
+    .await;
+    conn.observe_timed(&holes);
+    let holes = holes.ok().and_then(Result::ok);
+    Ok(SweepPass {
+        filled,
+        next,
+        holes,
+    })
+}
+
 /// Spawn `workers` tasks that fill the pinned tier for every height in PINNED_TREESTATE_RANGE.
 /// Heights are claimed with INCR on a cursor in the pinned Redis, so all gateway processes share
-/// one pass and a restart resumes where it stopped. A height that keeps failing is skipped (the
-/// write-through path fills it later). Stops at the range end; at tip - FINALIZED_DEPTH it gives
-/// the height back to the cursor and waits, then follows the tip as blocks become final, so the
-/// tier keeps up with the tip (origins that read it from a replica of that Redis stay current too).
+/// one pass and a restart resumes where it stopped. Stops at the range end; at tip -
+/// FINALIZED_DEPTH it gives the height back to the cursor and waits, then follows the tip as
+/// blocks become final, so the tier keeps up with the tip (origins that read it from a replica of
+/// that Redis stay current too). A height whose claim was lost (an `INCR` that timed out after
+/// the store counted it) or that kept failing is found by a sweep behind the cursor every
+/// PINNED_SWEEP_INTERVAL (`pinned_sweep_pass`) and filled then; one that still fails is left to
+/// the write-through path.
 pub fn spawn_pinned_backfill<F, Fut>(cache: ResponseCache, workers: usize, fetch: F)
 where
     F: Fn(u64) -> Fut + Clone + Send + Sync + 'static,
@@ -6266,6 +6849,38 @@ where
     if cache.pinned_read_only_until.load(Ordering::Relaxed) != 0 {
         warn!(network = %cache.network, "pinned backfill not started: the pinned store is a read replica");
         return;
+    }
+    {
+        let cache = cache.clone();
+        let fetch = fetch.clone();
+        let conn = conn.clone();
+        let margin = PINNED_SWEEP_MARGIN + workers as u64;
+        tokio::spawn(async move {
+            loop {
+                // Jittered (+-10 %), so processes started together do not sweep in step.
+                tokio::time::sleep(
+                    PINNED_SWEEP_INTERVAL.mul_f64(0.9 + rand::random::<f64>() * 0.2),
+                )
+                .await;
+                if !cache.is_tip_fresh() {
+                    continue;
+                }
+                match pinned_sweep_pass(&cache, &conn, (start, end), margin, &fetch).await {
+                    Ok(pass) => {
+                        if pass.filled > 0 {
+                            info!(network = %cache.network, filled = pass.filled, holes = ?pass.holes, "pinned sweep filled heights the backfill had skipped");
+                        }
+                        if pass.next > end && pass.holes == Some(0) {
+                            info!(network = %cache.network, "pinned sweep done");
+                            return;
+                        }
+                    }
+                    Err(e) => {
+                        warn!(network = %cache.network, error = %e, "pinned sweep failed, retrying at the next interval")
+                    }
+                }
+            }
+        });
     }
     for worker in 0..workers {
         let cache = cache.clone();
@@ -6296,7 +6911,7 @@ where
                         continue;
                     }
                     Ok(Err(e)) => {
-                        warn!(network = %cache.network, error = %e, "pinned backfill cursor error");
+                        warn!(network = %cache.network, error = %store_error(&e), "pinned backfill cursor error");
                         tokio::time::sleep(Duration::from_secs(10)).await;
                         continue;
                     }
@@ -6322,21 +6937,7 @@ where
                 if cache.pinned_exists(height).await {
                     continue;
                 }
-                let mut stored = false;
-                for attempt in 0..3u64 {
-                    match fetch(height).await {
-                        Ok(resp) => {
-                            if cache.pinned_put(height, &resp).await {
-                                stored = true;
-                                break;
-                            }
-                        }
-                        Err(e) => {
-                            debug!(network = %cache.network, height, error = %e, "pinned backfill fetch error");
-                        }
-                    }
-                    tokio::time::sleep(Duration::from_secs(1 + attempt * 2)).await;
-                }
+                let stored = pinned_fill(&cache, &fetch, height).await;
                 let result = if stored {
                     "pinned_backfill"
                 } else {
@@ -8373,6 +8974,361 @@ mod tests {
             height,
             hash: vec![1u8; 32],
         });
+    }
+
+    /// A pinned tier on the local test Redis for `pinned_sweep_pass`, heights `present`
+    /// stored, the cursor at `cursor`.
+    async fn sweep_fixture(
+        network: &str,
+        range: (u64, u64),
+        present: impl Iterator<Item = u64>,
+        cursor: u64,
+    ) -> Option<(ResponseCache, Arc<StoreConn>, ConnectionManager)> {
+        let conn = local_redis().await?;
+        let mut cache = test_cache(conn.clone(), None, network);
+        let pinned = StoreConn::from_parts(
+            redis::Client::open("redis://127.0.0.1:6379").unwrap(),
+            conn.clone(),
+            "pinned",
+            network.to_string(),
+            Role::Any,
+        );
+        cache.pinned_conn = Some(pinned.clone());
+        cache.pinned_range = Some(range);
+        tip_at(&cache, 1000);
+        let mut c = conn.clone();
+        for h in present {
+            let _: () = redis::cmd("SET")
+                .arg(cache.pinned_key(h))
+                .arg(tree_state_answer(h))
+                .query_async(&mut c)
+                .await
+                .unwrap();
+        }
+        let _: () = redis::cmd("SET")
+            .arg(cache.pinned_cursor_key())
+            .arg(cursor)
+            .query_async(&mut c)
+            .await
+            .unwrap();
+        Some((cache, pinned, c))
+    }
+
+    /// A fetch that records the heights asked and fails for those in `failing`.
+    fn sweep_fetch(
+        failing: Arc<parking_lot::Mutex<Vec<u64>>>,
+    ) -> (
+        Arc<parking_lot::Mutex<Vec<u64>>>,
+        impl Fn(
+            u64,
+        )
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<Vec<u8>>> + Send>>,
+    ) {
+        let fetched = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let f = fetched.clone();
+        let fetch = move |h: u64| {
+            let (f, failing) = (f.clone(), failing.clone());
+            Box::pin(async move {
+                f.lock().push(h);
+                if failing.lock().contains(&h) {
+                    anyhow::bail!("upstream down");
+                }
+                anyhow::Ok(tree_state_answer(h))
+            })
+                as std::pin::Pin<
+                    Box<dyn std::future::Future<Output = anyhow::Result<Vec<u8>>> + Send>,
+                >
+        };
+        (fetched, fetch)
+    }
+
+    #[tokio::test]
+    async fn pinned_sweep_fills_a_height_whose_claim_was_lost() {
+        let network = unique_network("pinned-sweep");
+        // The workers claimed 1..=50; the INCR that claimed 17 timed out after the store
+        // counted it, so nobody filled it.
+        let Some((cache, pinned, mut c)) =
+            sweep_fixture(&network, (1, 200), (1..=50u64).filter(|h| *h != 17), 50).await
+        else {
+            return;
+        };
+        let (fetched, fetch) = sweep_fetch(Arc::default());
+        let pass = pinned_sweep_pass(&cache, &pinned, (1, 200), 0, &fetch)
+            .await
+            .unwrap();
+        assert_eq!((pass.filled, pass.next, pass.holes), (1, 51, Some(0)));
+        assert_eq!(*fetched.lock(), vec![17]);
+        assert!(cache.pinned_exists(17).await);
+        // The mark is shared and moves on: nothing to fill again.
+        let pass = pinned_sweep_pass(&cache, &pinned, (1, 200), 0, &fetch)
+            .await
+            .unwrap();
+        assert_eq!((pass.filled, pass.next), (0, 51));
+        assert_eq!(fetched.lock().len(), 1);
+        // Heights within the margin below the cursor are left to the workers.
+        let _: () = redis::cmd("SET")
+            .arg(cache.pinned_cursor_key())
+            .arg(60)
+            .query_async(&mut c)
+            .await
+            .unwrap();
+        let pass = pinned_sweep_pass(&cache, &pinned, (1, 200), 5, &fetch)
+            .await
+            .unwrap();
+        assert_eq!(
+            pass.filled, 5,
+            "51..=55 are missing and claimed long enough"
+        );
+        assert_eq!(pass.next, 56);
+        assert_eq!(*fetched.lock(), vec![17, 51, 52, 53, 54, 55]);
+    }
+
+    /// A height whose fill fails is kept as a hole and retried by the next pass (also by
+    /// another process: a new cache on the same store), while the mark moves on.
+    #[tokio::test]
+    async fn pinned_sweep_retries_a_failed_fill_and_survives_a_restart() {
+        let network = unique_network("pinned-sweep-hole");
+        let Some((cache, pinned, _c)) =
+            sweep_fixture(&network, (1, 200), (1..=40u64).filter(|h| *h != 9), 40).await
+        else {
+            return;
+        };
+        let failing = Arc::new(parking_lot::Mutex::new(vec![9]));
+        let (fetched, fetch) = sweep_fetch(failing.clone());
+        let pass = pinned_sweep_pass(&cache, &pinned, (1, 200), 0, &fetch)
+            .await
+            .unwrap();
+        assert_eq!((pass.filled, pass.next, pass.holes), (0, 41, Some(1)));
+        assert!(!cache.pinned_exists(9).await);
+        // The upstream is back; a restarted process (its own cache) retries the hole.
+        failing.lock().clear();
+        let Some((restarted, pinned2, _)) =
+            sweep_fixture(&network, (1, 200), std::iter::empty(), 40).await
+        else {
+            return;
+        };
+        let pass = pinned_sweep_pass(&restarted, &pinned2, (1, 200), 0, &fetch)
+            .await
+            .unwrap();
+        assert_eq!((pass.filled, pass.next, pass.holes), (1, 41, Some(0)));
+        assert!(cache.pinned_exists(9).await);
+        // 1..=40 checked once: only the hole was fetched, twice.
+        assert_eq!(*fetched.lock(), vec![9, 9, 9, 9]);
+    }
+
+    /// The range is done (a worker claimed past its end): the margin no longer hides its last
+    /// heights, so a lost claim of the final height is found.
+    #[tokio::test]
+    async fn pinned_sweep_finds_a_lost_claim_of_the_final_height() {
+        let network = unique_network("pinned-sweep-tail");
+        let Some((cache, pinned, _c)) = sweep_fixture(&network, (1, 50), 1..=49u64, 51).await
+        else {
+            return;
+        };
+        let (fetched, fetch) = sweep_fetch(Arc::default());
+        let pass = pinned_sweep_pass(&cache, &pinned, (1, 50), 64, &fetch)
+            .await
+            .unwrap();
+        assert_eq!((pass.filled, pass.next), (1, 51));
+        assert_eq!(*fetched.lock(), vec![50]);
+    }
+
+    /// A batch another process is sweeping is left to it.
+    #[tokio::test]
+    async fn pinned_sweep_batches_are_swept_by_one_process() {
+        let network = unique_network("pinned-sweep-claim");
+        let Some((cache, pinned, mut c)) = sweep_fixture(&network, (1, 200), 2..=30u64, 30).await
+        else {
+            return;
+        };
+        let _: () = redis::cmd("SET")
+            .arg(cache.pinned_sweep_claim_key(sweep_batch_of(1)))
+            .arg("another process")
+            .arg("EX")
+            .arg(60)
+            .query_async(&mut c)
+            .await
+            .unwrap();
+        let (fetched, fetch) = sweep_fetch(Arc::default());
+        let pass = pinned_sweep_pass(&cache, &pinned, (1, 200), 0, &fetch)
+            .await
+            .unwrap();
+        assert_eq!((pass.filled, pass.next), (0, 1));
+        assert!(fetched.lock().is_empty());
+        let _: () = redis::cmd("DEL")
+            .arg(cache.pinned_sweep_claim_key(sweep_batch_of(1)))
+            .query_async(&mut c)
+            .await
+            .unwrap();
+        let pass = pinned_sweep_pass(&cache, &pinned, (1, 200), 0, &fetch)
+            .await
+            .unwrap();
+        assert_eq!((pass.filled, pass.next), (1, 31));
+        assert_eq!(*fetched.lock(), vec![1]);
+    }
+
+    /// A hole that keeps failing is dropped after PINNED_SWEEP_HOLE_ATTEMPTS retries.
+    #[tokio::test]
+    async fn pinned_sweep_drops_a_hole_that_keeps_failing() {
+        let network = unique_network("pinned-sweep-drop");
+        let Some((cache, pinned, mut c)) =
+            sweep_fixture(&network, (1, 200), (1..=40u64).filter(|h| *h != 9), 40).await
+        else {
+            return;
+        };
+        let _: () = redis::pipe()
+            .cmd("SADD")
+            .arg(cache.pinned_holes_key())
+            .arg(9)
+            .ignore()
+            .cmd("HSET")
+            .arg(cache.pinned_hole_attempts_key())
+            .arg(9)
+            .arg(PINNED_SWEEP_HOLE_ATTEMPTS - 1)
+            .ignore()
+            .cmd("SET")
+            .arg(cache.pinned_verified_key())
+            .arg(41)
+            .ignore()
+            .query_async(&mut c)
+            .await
+            .unwrap();
+        // The upstream is down: a pass counts no attempt.
+        let (fetched, fetch) = sweep_fetch(Arc::new(parking_lot::Mutex::new(vec![9])));
+        let pass = pinned_sweep_pass(&cache, &pinned, (1, 200), 0, &fetch)
+            .await
+            .unwrap();
+        assert_eq!(
+            pass.holes,
+            Some(1),
+            "kept: no answer says nothing about the height"
+        );
+        assert_eq!(*fetched.lock(), vec![9, 9, 9]);
+        // The upstream answers, but never with an entry for the height: the last attempt.
+        let wrong = |h: u64| {
+            Box::pin(async move { anyhow::Ok(tree_state_answer(h + 1)) })
+                as std::pin::Pin<
+                    Box<dyn std::future::Future<Output = anyhow::Result<Vec<u8>>> + Send>,
+                >
+        };
+        let pass = pinned_sweep_pass(&cache, &pinned, (1, 200), 0, &wrong)
+            .await
+            .unwrap();
+        assert_eq!(pass.holes, Some(0), "dropped after its last attempt");
+        let attempts: Option<u64> = redis::cmd("HGET")
+            .arg(cache.pinned_hole_attempts_key())
+            .arg(9)
+            .query_async(&mut c)
+            .await
+            .unwrap();
+        assert_eq!(attempts, None);
+    }
+
+    /// Only the holder of a batch's claim moves the shared mark, and only forward.
+    #[tokio::test]
+    async fn pinned_sweep_mark_moves_only_for_the_claim_holder() {
+        let network = unique_network("pinned-sweep-fence");
+        let Some((cache, pinned, mut c)) = sweep_fixture(&network, (1, 200), 1..=30u64, 30).await
+        else {
+            return;
+        };
+        let key = cache.pinned_sweep_claim_key(sweep_batch_of(1));
+        let claim = SweepClaim::take(&pinned, key.clone(), Duration::from_secs(5))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(claim.advance_mark(&cache, 20).await, Ok(Ok(true))));
+        assert!(matches!(claim.advance_mark(&cache, 10).await, Ok(Ok(true))));
+        let reader = c.clone();
+        let mark = || {
+            let mut c = reader.clone();
+            let key = cache.pinned_verified_key();
+            async move {
+                redis::cmd("GET")
+                    .arg(key)
+                    .query_async::<_, Option<u64>>(&mut c)
+                    .await
+                    .unwrap()
+            }
+        };
+        assert_eq!(mark().await, Some(20), "never back");
+        // Taken over by another process: the first holder moves nothing.
+        let _: () = redis::cmd("SET")
+            .arg(&key)
+            .arg("another process")
+            .query_async(&mut c)
+            .await
+            .unwrap();
+        assert!(matches!(
+            claim.advance_mark(&cache, 30).await,
+            Ok(Ok(false))
+        ));
+        assert_eq!(mark().await, Some(20));
+        claim.release().await;
+        let _: () = redis::cmd("DEL")
+            .arg(&key)
+            .query_async(&mut c)
+            .await
+            .unwrap();
+    }
+
+    /// A claim that expired is taken over; the first holder can then neither renew nor release
+    /// it, and the new holder releases it when its batch is done.
+    #[tokio::test]
+    async fn pinned_sweep_claims_are_taken_over_and_released_by_their_holder() {
+        let network = unique_network("pinned-sweep-takeover");
+        let Some((cache, pinned, mut c)) = sweep_fixture(&network, (1, 200), 2..=30u64, 30).await
+        else {
+            return;
+        };
+        let key = cache.pinned_sweep_claim_key(sweep_batch_of(1));
+        // Another process's claim, expiring now.
+        let _: () = redis::cmd("SET")
+            .arg(&key)
+            .arg("another process")
+            .arg("PX")
+            .arg(50)
+            .query_async(&mut c)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let (fetched, fetch) = sweep_fetch(Arc::default());
+        let pass = pinned_sweep_pass(&cache, &pinned, (1, 200), 0, &fetch)
+            .await
+            .unwrap();
+        assert_eq!((pass.filled, pass.next), (1, 31));
+        assert_eq!(*fetched.lock(), vec![1]);
+        let left: Option<String> = redis::cmd("GET")
+            .arg(&key)
+            .query_async(&mut c)
+            .await
+            .unwrap();
+        assert_eq!(left, None, "released when the batch was done");
+
+        // A holder whose claim expired and was taken over neither renews nor releases it.
+        let first = SweepClaim::take(&pinned, key.clone(), Duration::from_secs(5))
+            .await
+            .unwrap()
+            .unwrap();
+        let _: () = redis::cmd("SET")
+            .arg(&key)
+            .arg("the next holder")
+            .query_async(&mut c)
+            .await
+            .unwrap();
+        assert!(!first.renew().await);
+        first.release().await;
+        let left: Option<String> = redis::cmd("GET")
+            .arg(&key)
+            .query_async(&mut c)
+            .await
+            .unwrap();
+        assert_eq!(left.as_deref(), Some("the next holder"));
+        let _: () = redis::cmd("DEL")
+            .arg(&key)
+            .query_async(&mut c)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
