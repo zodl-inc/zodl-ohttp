@@ -19,6 +19,15 @@
 use prometheus::Histogram;
 use prometheus::{HistogramVec, IntCounter, IntCounterVec, IntGaugeVec, Opts, Registry};
 
+/// Buckets of `ohttp_request_duration_seconds` and `ohttp_upstream_request_duration_seconds`.
+/// Fine enough between 25 ms and 1.5 s that a quantile of a call crossing a long network path
+/// (one or a few round trips of 50 to 300 ms) is not an interpolation across a 0.5 s wide bucket.
+/// The old bounds (0.01, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5) are all kept, so a query over a range
+/// that spans an upgrade still finds every `le` it had before.
+const DURATION_BUCKETS: [f64; 16] = [
+    0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.15, 0.25, 0.35, 0.5, 0.75, 1.0, 1.5, 2.5, 5.0, 10.0,
+];
+
 lazy_static::lazy_static! {
     pub static ref REGISTRY: Registry = Registry::new();
 
@@ -30,7 +39,7 @@ lazy_static::lazy_static! {
 
     static ref OHTTP_REQUEST_DURATION_SECONDS: HistogramVec = HistogramVec::new(
         prometheus::HistogramOpts::new("ohttp_request_duration_seconds", "OHTTP request duration in seconds")
-            .buckets(vec![0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0]),
+            .buckets(DURATION_BUCKETS.to_vec()),
         &["network", "hop", "backend", "rpc"]
     )
     .unwrap();
@@ -55,7 +64,7 @@ lazy_static::lazy_static! {
 
     static ref OHTTP_UPSTREAM_REQUEST_DURATION_SECONDS: HistogramVec = HistogramVec::new(
         prometheus::HistogramOpts::new("ohttp_upstream_request_duration_seconds", "Upstream request duration in seconds")
-            .buckets(vec![0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0]),
+            .buckets(DURATION_BUCKETS.to_vec()),
         &["network", "backend", "rpc"]
     )
     .unwrap();
@@ -1904,6 +1913,65 @@ mod tests {
             let count = m.get_histogram().get_sample_count();
             assert_eq!(count, 1, "Expected 1 sample for rpc={}", rpc);
         }
+    }
+
+    #[test]
+    fn duration_histograms_use_the_fine_buckets_and_keep_the_old_bounds() {
+        init_metrics();
+        // A network label of its own: the registry is shared with the other tests.
+        record_duration("buckets-test", "ohttp", "lwd", "SendTransaction", 0.4);
+        OHTTP_UPSTREAM_REQUEST_DURATION_SECONDS
+            .with_label_values(&["buckets-test", "lwd", "SendTransaction"])
+            .observe(0.4);
+
+        let families = REGISTRY.gather();
+        for name in [
+            "ohttp_request_duration_seconds",
+            "ohttp_upstream_request_duration_seconds",
+        ] {
+            let family = families
+                .iter()
+                .find(|f| f.get_name() == name)
+                .unwrap_or_else(|| panic!("{name} not registered"));
+            let bounds: Vec<f64> = family.get_metric()[0]
+                .get_histogram()
+                .get_bucket()
+                .iter()
+                .map(|b| b.get_upper_bound())
+                .collect();
+            assert_eq!(bounds, DURATION_BUCKETS.to_vec(), "{name}");
+            for old in [0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0] {
+                assert!(bounds.contains(&old), "{name} lost the bound {old}");
+            }
+        }
+        assert!(DURATION_BUCKETS.windows(2).all(|w| w[0] < w[1]));
+
+        // 0.4 s falls between 0.35 and 0.5, not into a 0.25..0.5 bucket.
+        let family = families
+            .iter()
+            .find(|f| f.get_name() == "ohttp_request_duration_seconds")
+            .unwrap();
+        let m = family
+            .get_metric()
+            .iter()
+            .find(|m| {
+                m.get_label()
+                    .iter()
+                    .any(|l| l.get_name() == "rpc" && l.get_value() == "SendTransaction")
+                    && m.get_label()
+                        .iter()
+                        .any(|l| l.get_name() == "network" && l.get_value() == "buckets-test")
+            })
+            .unwrap();
+        let at = |le: f64| {
+            m.get_histogram()
+                .get_bucket()
+                .iter()
+                .find(|b| b.get_upper_bound() == le)
+                .unwrap()
+                .get_cumulative_count()
+        };
+        assert!(at(0.5) > at(0.35));
     }
 
     #[test]
