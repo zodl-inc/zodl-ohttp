@@ -6185,6 +6185,53 @@ impl CacheStore for ResponseCache {
         })
     }
 
+    fn set_max_u32(
+        &self,
+        key: String,
+        value: u32,
+        ttl_secs: u64,
+        epoch: u64,
+    ) -> BoxFuture<'_, Option<bool>> {
+        Box::pin(async move {
+            if !self.epoch_current(epoch).await? {
+                return Some(false);
+            }
+            let conn = self.cache_conn.load_full()?;
+            let mut conn = (*conn).clone();
+            // The stored value as a big-endian u32 (4 bytes; anything else is replaced).
+            let script = r#"
+                local cur = redis.call('GET', KEYS[1])
+                if cur and string.len(cur) == 4 then
+                    local a, b, c, d = string.byte(cur, 1, 4)
+                    if ((a * 256 + b) * 256 + c) * 256 + d >= tonumber(ARGV[2]) then
+                        return 0
+                    end
+                end
+                redis.call('SET', KEYS[1], ARGV[1], 'EX', ARGV[3])
+                return 1
+            "#;
+            let script = redis::Script::new(script);
+            let mut invocation = script.key(&key);
+            invocation
+                .arg(&value.to_be_bytes()[..])
+                .arg(value)
+                .arg(ttl_secs);
+            let fut = invocation.invoke_async::<_, i64>(&mut conn);
+            match timeout(self.redis_timeout, fut).await {
+                Ok(Ok(v)) => Some(v == 1),
+                Ok(Err(e)) => {
+                    warn!(network = %self.network, error = %store_error(&e), "cache max write error");
+                    crate::health::record_cache_redis_timeout(&self.network, "set_error");
+                    None
+                }
+                Err(_) => {
+                    crate::health::record_cache_redis_timeout(&self.network, "set_timeout");
+                    None
+                }
+            }
+        })
+    }
+
     fn epoch_current(&self, epoch: u64) -> BoxFuture<'_, Option<bool>> {
         Box::pin(async move {
             // Where the epoch lives, as in `write_if_epoch_current`: the security Redis, or the
@@ -9229,7 +9276,8 @@ mod tests {
         let response = bincode::serialize(&crate::ohttp::InnerResponse {
             status: 200,
             headers: vec![("grpc-status".to_string(), "0".to_string())],
-            body: b"lightd-info".to_vec(),
+            // LightdInfo { blockHeight: 100 }: an answer at the tip (tip-scoped answers must match it).
+            body: vec![0, 0, 0, 0, 2, 0x38, 100],
         })
         .unwrap();
         let sem = tokio::sync::Semaphore::new(4);
@@ -9696,6 +9744,50 @@ mod tests {
         assert_eq!(at(900), None);
         assert_eq!(at(1000), None);
         assert_eq!(at(1005), None);
+    }
+
+    /// The end marker's compare-and-set on a real store: concurrent writers keep the highest.
+    #[tokio::test]
+    async fn concurrent_max_writes_keep_the_highest_value() {
+        let Some(conn) = required_redis().await else {
+            return;
+        };
+        let network = unique_network("max-u32");
+        let cache = test_cache(conn.clone(), None, &network);
+        let epoch = cache.current_epoch();
+        let key = format!("{network}:end-marker");
+        let writes: Vec<_> = (1..=40u32)
+            .rev()
+            .chain(1..=40)
+            .map(|v| {
+                let cache = cache.clone();
+                let key = key.clone();
+                tokio::spawn(async move { cache.set_max_u32(key, v, 60, epoch).await })
+            })
+            .collect();
+        for w in writes {
+            assert!(w.await.unwrap().is_some());
+        }
+        let mut c = conn;
+        let stored: Vec<u8> = redis::cmd("GET")
+            .arg(&key)
+            .query_async(&mut c)
+            .await
+            .unwrap();
+        assert_eq!(stored, 40u32.to_be_bytes().to_vec());
+        assert_eq!(
+            cache.set_max_u32(key.clone(), 39, 60, epoch).await,
+            Some(false)
+        );
+        assert_eq!(
+            cache.set_max_u32(key.clone(), 41, 60, epoch).await,
+            Some(true)
+        );
+        let _: () = redis::cmd("DEL")
+            .arg(&key)
+            .query_async(&mut c)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

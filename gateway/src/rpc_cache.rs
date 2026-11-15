@@ -33,7 +33,12 @@
 //!   and `GetSubtreeRoots` requests `subtree_cache` cannot key) are keyed by the current tip
 //!   hash, so they are valid exactly until the next block, including after a reorg. Without a
 //!   known tip they bypass the cache. Keyable `GetSubtreeRoots` requests are assembled per
-//!   entry by `subtree_cache` instead.
+//!   entry by `subtree_cache` instead. An answer that names its own chain position is stored
+//!   and served only when it is at the tip of its key ([`matches_tip`]): a `GetLatestTreeState`
+//!   whose height and hash are the tip's, a `GetLightdInfo` whose `blockHeight` is at least the
+//!   tip height (it carries no hash, so this catches an instance that is behind, not one on
+//!   another fork at the same height). An entry that does not match (written by an older
+//!   gateway) is deleted on read and fetched again.
 //!
 //! Values are bincode `InnerResponse`s (validated ones behind a small header). The keys sit
 //! under the epoch/version/policy prefix, so an epoch bump or a policy change still flushes.
@@ -42,7 +47,7 @@
 
 use crate::block_cache::CompactBlockHead;
 use crate::ohttp::InnerResponse;
-use crate::store::{hash_is_current, index_key, CacheStore, Validity, INDEX_WINDOW};
+use crate::store::{hash_is_current, index_key, CacheStore, Tip, Validity, INDEX_WINDOW};
 use bytes::Bytes;
 use prost::Message;
 use sha2::{Digest, Sha256};
@@ -70,6 +75,13 @@ pub struct TreeStateHead {
     pub height: u64,
     #[prost(string, tag = "3")]
     pub hash: String,
+}
+
+/// LightdInfo (service.proto): blockHeight 7, the node's best chain height.
+#[derive(Clone, PartialEq, prost::Message)]
+struct LightdInfoHead {
+    #[prost(uint64, tag = "7")]
+    block_height: u64,
 }
 
 /// RawTransaction: data 1, height 2 (0 or u64::MAX for mempool transactions).
@@ -120,6 +132,8 @@ pub struct CacheMiss {
     pub rpc: String,
     /// Set by `cache::ResponseCache` when the request is inside the pinned tier's range.
     pub pinned_height: Option<u64>,
+    /// The tip a tip-scoped key belongs to: the answer must match it ([`matches_tip`]).
+    pub tip: Option<Tip>,
 }
 
 pub enum CacheLookup {
@@ -308,6 +322,68 @@ pub fn chain_position(source: HashSource, response: &InnerResponse) -> Option<(u
     }
 }
 
+/// Whether the tip-scoped answer `response` to `rpc` belongs to `tip`: `GetLightdInfo` when its
+/// `blockHeight` is at least the tip height (the node may be a block ahead of lightwalletd's
+/// own tip; a lower one is an instance behind), `GetLatestTreeState` when its height and hash
+/// are the tip's (either byte order). Other tip-scoped answers carry no chain position: true.
+/// An answer that does not decode: false.
+pub fn matches_tip(rpc: &str, response: &InnerResponse, tip: &Tip) -> bool {
+    match rpc {
+        "GetLightdInfo" => grpc_message(&response.body)
+            .and_then(|m| LightdInfoHead::decode(m).ok())
+            .is_some_and(|i| i.block_height >= tip.height),
+        "GetLatestTreeState" => {
+            let Some(t) = grpc_message(&response.body).and_then(|m| TreeStateHead::decode(m).ok())
+            else {
+                return false;
+            };
+            let Ok(hash) = hex::decode(t.hash.trim()) else {
+                return false;
+            };
+            let reversed: Vec<u8> = hash.iter().rev().copied().collect();
+            t.height == tip.height && (hash == tip.hash || reversed == tip.hash)
+        }
+        _ => true,
+    }
+}
+
+/// The RPCs whose tip-scoped answers [`matches_tip`] checks.
+fn checks_tip(rpc: &str) -> bool {
+    matches!(rpc, "GetLightdInfo" | "GetLatestTreeState")
+}
+
+/// Whether a stored tip-scoped entry `value` (bincode `InnerResponse`) of the RPC at `path` may
+/// be served for `tip`: always for answers without a chain position, else [`matches_tip`].
+pub fn tip_scoped_entry_matches(path: &str, value: &[u8], tip: &Tip) -> bool {
+    let rpc = path.rsplit('/').next().unwrap_or("");
+    !checks_tip(rpc)
+        || bincode::deserialize::<InnerResponse>(value).is_ok_and(|r| matches_tip(rpc, &r, tip))
+}
+
+/// How a stored validated entry (`encode_validated`) stands against the index and `tip`; None
+/// when it does not decode.
+pub async fn validated_entry_validity(
+    store: &dyn CacheStore,
+    value: &[u8],
+    tip: Option<&Tip>,
+) -> Option<Validity> {
+    let (height, hash, _) = decode_validated(value)?;
+    if hash.is_empty() {
+        // Stored as trusted (below the window at write time): still trusted below the window.
+        return Some(match tip {
+            Some(t) if height.saturating_add(INDEX_WINDOW) < t.height => Validity::Current,
+            _ => Validity::Unknown,
+        });
+    }
+    let index_hash = store
+        .mget(vec![index_key(&store.chain_prefix(), height)])
+        .await
+        .into_iter()
+        .next()
+        .flatten();
+    Some(hash_is_current(hash, height, index_hash.as_deref(), tip))
+}
+
 /// Look `method path body` up in `store`. Records `ohttp_cache_requests_total`.
 pub async fn lookup(
     store: &dyn CacheStore,
@@ -329,14 +405,14 @@ pub async fn lookup(
         body,
         tip.as_ref().map(|t| t.hash.as_slice()),
     );
-    let (key, ttl, validate) = match pol {
+    let (key, ttl, validate, key_tip) = match pol {
         Policy::Bypass => {
             crate::health::record_cache_request(network, &rpc, "bypass");
             return CacheLookup::Bypass;
         }
-        Policy::Validated { key, source } => (key, None, Some(source)),
-        Policy::Immutable { key } => (key, None, None),
-        Policy::TipScoped { key } => (key, Some(TIP_SCOPED_TTL_SECS), None),
+        Policy::Validated { key, source } => (key, None, Some(source), None),
+        Policy::Immutable { key } => (key, None, None, None),
+        Policy::TipScoped { key } => (key, Some(TIP_SCOPED_TTL_SECS), None, tip.clone()),
     };
     let is_grpc = path.starts_with(RPC_PREFIX);
     let miss = |result: &str| {
@@ -350,6 +426,7 @@ pub async fn lookup(
             path: path.to_string(),
             rpc: rpc.clone(),
             pinned_height: None,
+            tip: key_tip.clone(),
         })
     };
 
@@ -364,27 +441,23 @@ pub async fn lookup(
         return miss("miss");
     };
     let Some(source) = validate else {
+        if let Some(t) = &key_tip {
+            if !tip_scoped_entry_matches(path, &value, t) {
+                // Not at the tip of its key (left by an older gateway): fetched again.
+                store.del(vec![key.clone()]).await;
+                crate::health::record_cache_tip_mismatch(network, &rpc, "lookup");
+                return miss("miss");
+            }
+        }
         crate::health::record_cache_request(network, &rpc, "hit");
         return CacheLookup::Hit(value.to_vec());
     };
-    let Some((height, hash, payload)) = decode_validated(&value) else {
+    let Some(validity) = validated_entry_validity(store, &value, tip.as_ref()).await else {
         store.del(vec![key.clone()]).await;
         return miss("miss");
     };
-    let index_hash = store
-        .mget(vec![index_key(&store.chain_prefix(), height)])
-        .await
-        .into_iter()
-        .next()
-        .flatten();
-    let validity = if hash.is_empty() {
-        // Stored as trusted (below the window at write time): still trusted below the window.
-        match tip.as_ref() {
-            Some(t) if height.saturating_add(INDEX_WINDOW) < t.height => Validity::Current,
-            _ => Validity::Unknown,
-        }
-    } else {
-        hash_is_current(hash, height, index_hash.as_deref(), tip.as_ref())
+    let Some((height, _, payload)) = decode_validated(&value) else {
+        return miss("miss");
     };
     match validity {
         Validity::Current => {
@@ -409,6 +482,16 @@ pub async fn store(store: &dyn CacheStore, network: &str, miss: CacheMiss, respo
             network, "response not admitted to cache (non-success)"
         );
         return;
+    }
+    if let Some(tip) = &miss.tip {
+        if !tip_scoped_entry_matches(path, response, tip) {
+            debug!(
+                path,
+                network, "not cached: the answer is not at the tip of its key"
+            );
+            crate::health::record_cache_tip_mismatch(network, &miss.rpc, "store");
+            return;
+        }
     }
     let value: Vec<u8> = match miss.validate {
         None => response.to_vec(),
@@ -456,6 +539,29 @@ pub async fn store(store: &dyn CacheStore, network: &str, miss: CacheMiss, respo
         .set(miss.key, Bytes::from(value), miss.ttl, Some(miss.epoch))
         .await;
     debug!(path, epoch = miss.epoch, network, "cache write");
+}
+
+/// The vendored lightwalletd protocol files (`proto/lightwalletd`, see its README) and a
+/// textual lookup of field numbers, for tests that pin the hand-written messages to them.
+#[cfg(test)]
+pub(crate) mod vendored_proto {
+    pub const COMPACT_FORMATS: &str = include_str!("../proto/lightwalletd/compact_formats.proto");
+    pub const SERVICE: &str = include_str!("../proto/lightwalletd/service.proto");
+
+    /// The field number of `field` in `message` of `proto`.
+    pub fn field_number(proto: &str, message: &str, field: &str) -> Option<u32> {
+        let start = proto.find(&format!("message {message} {{"))?;
+        let body = &proto[start..];
+        let body = &body[..body.find("\n}")?];
+        body.lines().find_map(|line| {
+            let line = line.split("//").next()?.trim();
+            let (decl, number) = line.split_once('=')?;
+            if decl.split_whitespace().last()? != field {
+                return None;
+            }
+            number.trim().trim_end_matches(';').trim().parse().ok()
+        })
+    }
 }
 
 #[cfg(test)]
@@ -812,12 +918,124 @@ mod tests {
         s.tip.set(tip_a);
         assert_eq!(lookup_hit(&s, &p, &req).await, resp_a);
         // GetLightdInfo shares the mechanism.
+        let info = ok_response(frame(&LightdInfoHead { block_height: 100 }.encode_to_vec()));
         let miss = lookup_miss(&s, &path("GetLightdInfo"), &frame(&[])).await;
-        store(&*s, "testnet", miss, &ok_response(b"info".to_vec())).await;
+        store(&*s, "testnet", miss, &info).await;
         assert_eq!(
             lookup_hit(&s, &path("GetLightdInfo"), &frame(&[])).await,
-            ok_response(b"info".to_vec())
+            info
         );
+    }
+
+    #[test]
+    fn decoded_fields_match_the_vendored_service_proto() {
+        use super::vendored_proto::{field_number, SERVICE};
+        assert_eq!(field_number(SERVICE, "LightdInfo", "blockHeight"), Some(7));
+        assert_eq!(
+            LightdInfoHead { block_height: 1 }.encode_to_vec(),
+            vec![7 << 3, 1]
+        );
+        assert_eq!(field_number(SERVICE, "TreeState", "height"), Some(2));
+        assert_eq!(field_number(SERVICE, "TreeState", "hash"), Some(3));
+        let t = TreeStateHead {
+            height: 1,
+            hash: "a".to_string(),
+        }
+        .encode_to_vec();
+        assert_eq!(t, vec![2 << 3, 1, (3 << 3) | 2, 1, b'a']);
+    }
+
+    #[tokio::test]
+    async fn a_stored_tip_scoped_entry_of_another_tip_is_not_served() {
+        let s = Arc::new(MemStore::default());
+        s.tip.set(Tip {
+            height: 700,
+            hash: vec![0x11; 32],
+        });
+        let p = path("GetLightdInfo");
+        // An entry under the tip's key with the answer of an instance behind, as an older
+        // gateway (without the store check) wrote it.
+        let miss = lookup_miss(&s, &p, &frame(&[])).await;
+        let poisoned = ok_response(frame(&LightdInfoHead { block_height: 699 }.encode_to_vec()));
+        s.put(&miss.key, poisoned);
+        let before = crate::health::cache_tip_mismatches("testnet-read", "GetLightdInfo", "lookup");
+        match lookup(&*s, "testnet-read", "POST", CT, &p, &frame(&[])).await {
+            CacheLookup::Miss(m) => assert_eq!(m.key, miss.key),
+            _ => panic!("a mismatching entry is a miss"),
+        }
+        assert_eq!(s.get(&miss.key), None, "deleted");
+        assert_eq!(
+            crate::health::cache_tip_mismatches("testnet-read", "GetLightdInfo", "lookup"),
+            before + 1
+        );
+        // The right answer is stored and served again.
+        let miss = lookup_miss(&s, &p, &frame(&[])).await;
+        let info = ok_response(frame(&LightdInfoHead { block_height: 700 }.encode_to_vec()));
+        store(&*s, "testnet", miss, &info).await;
+        assert_eq!(lookup_hit(&s, &p, &frame(&[])).await, info);
+    }
+
+    #[tokio::test]
+    async fn a_tip_scoped_answer_of_another_tip_is_not_cached() {
+        let s = Arc::new(MemStore::default());
+        // A hash that differs from its reverse, to check both byte orders.
+        let hash: Vec<u8> = (0u8..32).collect();
+        s.tip.set(Tip {
+            height: 500,
+            hash: hash.clone(),
+        });
+        let info = |h: u64| ok_response(frame(&LightdInfoHead { block_height: h }.encode_to_vec()));
+        // An instance one block behind answers: not cached, the next request misses again.
+        let miss = lookup_miss(&s, &path("GetLightdInfo"), &frame(&[])).await;
+        assert_eq!(miss.tip.as_ref().map(|t| t.height), Some(500));
+        store(&*s, "testnet", miss, &info(499)).await;
+        let miss = lookup_miss(&s, &path("GetLightdInfo"), &frame(&[])).await;
+        store(
+            &*s,
+            "testnet",
+            miss,
+            &ok_response(b"not a LightdInfo".to_vec()),
+        )
+        .await;
+        let miss = lookup_miss(&s, &path("GetLightdInfo"), &frame(&[])).await;
+        store(&*s, "testnet", miss, &info(500)).await;
+        assert_eq!(
+            lookup_hit(&s, &path("GetLightdInfo"), &frame(&[])).await,
+            info(500)
+        );
+        // A node a block ahead of lightwalletd's tip: still the answer at this tip.
+        s.del(s.keys_with(":tip:")).await;
+        let miss = lookup_miss(&s, &path("GetLightdInfo"), &frame(&[])).await;
+        store(&*s, "testnet", miss, &info(501)).await;
+        assert_eq!(
+            lookup_hit(&s, &path("GetLightdInfo"), &frame(&[])).await,
+            info(501)
+        );
+
+        let tree = |h: u64, hash: &[u8]| {
+            ok_response(frame(
+                &TreeState {
+                    network: "test".to_string(),
+                    height: h,
+                    hash: hex::encode(hash),
+                    time: 0,
+                    sapling_tree: String::new(),
+                }
+                .encode_to_vec(),
+            ))
+        };
+        let p = path("GetLatestTreeState");
+        // Same height, another fork.
+        let miss = lookup_miss(&s, &p, &frame(&[])).await;
+        store(&*s, "testnet", miss, &tree(500, &[0xee; 32])).await;
+        // The tip's block one height lower.
+        let miss = lookup_miss(&s, &p, &frame(&[])).await;
+        store(&*s, "testnet", miss, &tree(499, &hash)).await;
+        let miss = lookup_miss(&s, &p, &frame(&[])).await;
+        // The tip, in RPC display order (reversed).
+        let display: Vec<u8> = hash.iter().rev().copied().collect();
+        store(&*s, "testnet", miss, &tree(500, &display)).await;
+        assert_eq!(lookup_hit(&s, &p, &frame(&[])).await, tree(500, &display));
     }
 
     #[tokio::test]

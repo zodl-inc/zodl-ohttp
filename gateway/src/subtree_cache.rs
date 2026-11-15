@@ -175,6 +175,18 @@ fn decode_index(bytes: &[u8]) -> Option<u32> {
     Some(u32::from_be_bytes(bytes.try_into().ok()?))
 }
 
+/// Store the end marker `end` under `key` (tip-scoped expiry, epoch-checked), unless the stored
+/// one is already as high: a marker never goes down for the same tip. The prefetch writes the
+/// count from the tip block's tree sizes, an upper bound of what any instance at that tip lists;
+/// a Client's fetch answered by an instance that is behind lists fewer roots, and lowering the
+/// marker to that would hide the roots above it from every request at this tip. One atomic
+/// compare-and-set on the store holding the marker; a store error writes nothing.
+pub async fn write_end_marker(store: &dyn CacheStore, key: String, end: u32, epoch: u64) {
+    store
+        .set_max_u32(key, end, crate::rpc_cache::TIP_SCOPED_TTL_SECS, epoch)
+        .await;
+}
+
 /// The keys the follower deletes when heights `from..=to` leave the chain: every pointer in the
 /// span and the non-final entry each one points to.
 pub async fn reorg_keys(store: &dyn CacheStore, prefix: &str, from: u64, to: u64) -> Vec<String> {
@@ -626,14 +638,7 @@ impl SubtreeRootsCache {
                 }
             }
             if let Some((key, end)) = end {
-                store
-                    .set(
-                        key,
-                        Bytes::copy_from_slice(&end.to_be_bytes()),
-                        Some(crate::rpc_cache::TIP_SCOPED_TTL_SECS),
-                        Some(epoch),
-                    )
-                    .await;
+                write_end_marker(&*store, key, end, epoch).await;
             }
         });
     }
@@ -1438,5 +1443,57 @@ mod tests {
             grpc_frame(&root_msg(0, 0, 1000, block_hash(1000, 0))).to_vec()
         );
         assert_eq!(trailers[0], ("grpc-status".to_string(), "14".to_string()));
+    }
+
+    #[tokio::test]
+    async fn concurrent_end_markers_keep_the_highest() {
+        let store = Arc::new(MemStore::default());
+        let key = subtree_end_key("p:", 1, &[0xcd; 32]);
+        let writes: Vec<_> = (1..=64u32)
+            .rev()
+            .chain(1..=64)
+            .map(|end| {
+                let store = store.clone();
+                let key = key.clone();
+                tokio::spawn(async move { write_end_marker(&*store, key, end, store.epoch).await })
+            })
+            .collect();
+        for w in writes {
+            w.await.unwrap();
+        }
+        assert_eq!(
+            store.get(&key),
+            Some(Bytes::copy_from_slice(&64u32.to_be_bytes()))
+        );
+        // A store that does not answer writes nothing (and so cannot lower it either).
+        store.down.store(true, std::sync::atomic::Ordering::SeqCst);
+        write_end_marker(&*store, key.clone(), 3, store.epoch).await;
+        store.down.store(false, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            store.get(&key),
+            Some(Bytes::copy_from_slice(&64u32.to_be_bytes()))
+        );
+    }
+
+    #[tokio::test]
+    async fn an_end_marker_never_goes_down_for_the_same_tip() {
+        let store = MemStore::default();
+        let key = subtree_end_key("p:", 0, &[0xab; 32]);
+        write_end_marker(&store, key.clone(), 10, store.epoch).await;
+        // A lagging instance's shorter list at the same tip.
+        write_end_marker(&store, key.clone(), 9, store.epoch).await;
+        assert_eq!(
+            store.get(&key),
+            Some(Bytes::copy_from_slice(&10u32.to_be_bytes()))
+        );
+        write_end_marker(&store, key.clone(), 11, store.epoch).await;
+        assert_eq!(
+            store.get(&key),
+            Some(Bytes::copy_from_slice(&11u32.to_be_bytes()))
+        );
+        assert_eq!(
+            store.ttl(&key),
+            Some(Some(crate::rpc_cache::TIP_SCOPED_TTL_SECS))
+        );
     }
 }

@@ -141,7 +141,10 @@ chain state:
   their hash matches the index; final blocks can live in the permanent tier
   (`PERMANENT_REDIS_URL`). `GetTreeState`, mined `GetTransaction` and `GetSubtreeRoots` entries
   are validated against the index the same way. Tip-scoped answers (`GetLightdInfo`,
-  `GetLatestTreeState`, `GetAddressUtxos*`) are keyed by the tip hash. `GetLatestBlock` is
+  `GetLatestTreeState`, `GetAddressUtxos*`) are keyed by the tip hash; a `GetLatestTreeState`
+  answer is stored and served only when its height and hash are that tip, a `GetLightdInfo`
+  answer only when its `blockHeight` is at least the tip height (no hash to compare: an
+  instance behind is caught, one on another fork at the same height is not). `GetLatestBlock` is
   answered from the follower's tip.
 - `GetMempoolStream` subscribers share one upstream stream per process; identical upstream calls
   in flight are coalesced; `SendTransaction` is never cached or coalesced.
@@ -221,7 +224,8 @@ trace ids are never labels. `network` is `NETWORK`.
 | `ohttp_cache_redis_connected` | `network` | Cache Redis connection. |
 | `ohttp_security_redis_connected` | `network` | Security Redis PING (0 also when not configured). |
 | `ohttp_redis_op_timeout_total` | `network, operation` | Redis operation timeouts. |
-| `ohttp_cache_requests_total` | `network, rpc, result` | Cache lookups by result. |
+| `ohttp_cache_requests_total` | `network, rpc, result` | Cache lookups by result. Also counts answers not stored: `not_positioned`, `not_indexed`. |
+| `ohttp_cache_tip_mismatch_total` | `network, rpc, phase` | Tip-scoped answers not at the tip of their key: `store` (not cached), `lookup` (a stored entry deleted and fetched again; the request counts as a miss above). |
 | `ohttp_cache_tip_height` | `network` | Tip height known to the cache. |
 | `ohttp_local_cache_total` | `network, result` | In-process LRU `hit`, `miss`, `oversized`. |
 | `ohttp_block_cache_hits_total`, `ohttp_block_cache_misses_total` | `network` | Per-block cache lookups for `GetBlockRange`. |

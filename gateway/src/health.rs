@@ -519,6 +519,7 @@ pub fn init_metrics() {
         &*OHTTP_EPOCH_BUMP_SEEN_AT_PEER_TOTAL,
         &*OHTTP_LWD_HEDGES_TOTAL,
         &*OHTTP_LWD_MEMPOOL_NO_HEAD_TOTAL,
+        &*OHTTP_CACHE_TIP_MISMATCH_TOTAL,
     ] {
         REGISTRY.register(Box::new(c.clone())).ok();
     }
@@ -1440,6 +1441,28 @@ lazy_static::lazy_static! {
         &["network"]
     )
     .unwrap();
+}
+
+lazy_static::lazy_static! {
+    static ref OHTTP_CACHE_TIP_MISMATCH_TOTAL: IntCounterVec = IntCounterVec::new(
+        Opts::new("ohttp_cache_tip_mismatch_total", "Tip-scoped answers (GetLightdInfo, GetLatestTreeState) not at the tip of their key: phase store (not cached), lookup (a stored entry deleted and fetched again; the request counts as a miss in ohttp_cache_requests_total)"),
+        &["network", "rpc", "phase"]
+    )
+    .unwrap();
+}
+
+/// `phase`: store | lookup.
+pub fn record_cache_tip_mismatch(network: &str, rpc: &str, phase: &str) {
+    OHTTP_CACHE_TIP_MISMATCH_TOTAL
+        .with_label_values(&[network, rpc, phase])
+        .inc();
+}
+
+#[cfg(test)]
+pub fn cache_tip_mismatches(network: &str, rpc: &str, phase: &str) -> u64 {
+    OHTTP_CACHE_TIP_MISMATCH_TOTAL
+        .with_label_values(&[network, rpc, phase])
+        .get()
 }
 
 pub fn record_lwd_mempool_no_head(network: &str) {

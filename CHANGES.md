@@ -62,6 +62,30 @@ keeps its own log in [client/CHANGELOG.md](client/CHANGELOG.md).
 
 ### Gateway
 
+- Tip-scoped `GetLatestTreeState` answers are cached and served only when their height and hash
+  are the tip of their key, `GetLightdInfo` answers only when their `blockHeight` is at least
+  the tip height (it carries no hash: this catches an instance that is behind, not one on
+  another fork at the same height), on the client path and in the prefetch. An instance one
+  block behind, or on a losing fork, could fill the entry of the new tip for its whole lifetime,
+  and the prefetch never corrected it. An answer that does not match is not cached; a stored
+  entry that does not match (written by an older gateway during a rolling upgrade) is deleted
+  on read, answered as a miss and fetched again. Both are counted in the new
+  `ohttp_cache_tip_mismatch_total{phase="store|lookup"}`; `ohttp_cache_requests_total` keeps one
+  result per request. In normal operation every instance answers at the tip, so the hit rate
+  does not change.
+- The prefetch fetches a `GetTreeState` or `GetTransaction` entry again when the stored one is
+  no longer current against the index (left from before a reorg), instead of treating any
+  stored value as present.
+- A `GetSubtreeRoots` end marker is never lowered for the same tip: a Client's fetch answered
+  by an instance that is behind no longer replaces the prefetch's count from the tip block with
+  a smaller one, which hid the roots above it from every request at that tip. The marker is
+  written by one compare-and-set script on the cache Redis (after the epoch check); a store
+  error writes nothing.
+- The lightwalletd protocol files the gateway's hand-written messages follow
+  (`compact_formats.proto`, `service.proto`) are vendored in `gateway/proto/lightwalletd` from a
+  pinned upstream tag, and tests check the field numbers the gateway decodes against them.
+- The prefetch's "one run at a time" flag is cleared however a run ends (a panic or a
+  cancelled task included), so one failed run no longer stops every later prefetch.
 - **Hedged lightwalletd reads** replace the retry at half of the head deadline: a read without
   a response head after `LWD_HEDGE_DELAY_MS` (new, default half of the head deadline, the old
   cut-off; `0` turns it off) is sent to a *different* `LWD_ENDPOINTS` instance as well, while the

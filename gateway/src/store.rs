@@ -208,6 +208,17 @@ pub trait CacheStore: Send + Sync {
     /// Whether the shared epoch still equals `epoch` (the check an epoch-checked `set` makes
     /// before its write): None on error.
     fn epoch_current(&self, epoch: u64) -> BoxFuture<'_, Option<bool>>;
+    /// Store the big-endian `value` under `key` with `ttl_secs`, only if the stored value is
+    /// lower (or absent, or not a 4-byte value), in one atomic step; the epoch is checked
+    /// before (as an epoch-checked `set`). Some(true) when written, Some(false) when the stored
+    /// value is as high or the epoch changed, None on error (nothing written).
+    fn set_max_u32(
+        &self,
+        key: String,
+        value: u32,
+        ttl_secs: u64,
+        epoch: u64,
+    ) -> BoxFuture<'_, Option<bool>>;
     /// Delete `key` only if it still holds `value` (one atomic script).
     fn release_lock(&self, key: String, value: String) -> BoxFuture<'_, Option<bool>>;
 }
@@ -534,6 +545,35 @@ pub(crate) mod test_support {
                 for k in keys {
                     data.remove(&k);
                 }
+                Some(true)
+            })
+        }
+        fn set_max_u32(
+            &self,
+            key: String,
+            value: u32,
+            ttl_secs: u64,
+            epoch: u64,
+        ) -> BoxFuture<'_, Option<bool>> {
+            Box::pin(async move {
+                if self.is_down() {
+                    return None;
+                }
+                if epoch != self.epoch {
+                    return Some(false);
+                }
+                let mut data = self.data.lock().unwrap();
+                let current = data
+                    .get(&key)
+                    .and_then(|(v, _)| <[u8; 4]>::try_from(&v[..]).ok())
+                    .map(u32::from_be_bytes);
+                if current.is_some_and(|c| c >= value) {
+                    return Some(false);
+                }
+                data.insert(
+                    key,
+                    (Bytes::copy_from_slice(&value.to_be_bytes()), Some(ttl_secs)),
+                );
                 Some(true)
             })
         }
