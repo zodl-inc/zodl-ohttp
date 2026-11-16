@@ -2,7 +2,7 @@
 
 [Keep a Changelog](https://keepachangelog.com).
 
-## Unreleased
+## 2.0.2
 
 No API or wire-format change.
 
