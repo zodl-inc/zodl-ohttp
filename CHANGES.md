@@ -466,6 +466,40 @@ keeps its own log in [client/CHANGELOG.md](client/CHANGELOG.md).
   Queries that selected these series with `rpc="other"` need `backend` (or the new values).
 - `GetTaddressTransactions` has its own `rpc` label value instead of `other`.
 
+### e2e client
+
+- The key-configuration source is explicit: `OHTTP_E2E_KEY_CONFIG_SOURCE=signed|plain` (any
+  other non-empty value fails the run). Unset, the old guess stays as a fallback: signed when
+  the config URL contains `/signed` or the answer is labelled `application/json`; such a run
+  prints a line saying the source was guessed. An explicit `plain` is never verified as signed,
+  whatever the answer is labelled.
+- `scripts/test-e2e.sh` always sets the source: `plain` unless the caller sets
+  `OHTTP_E2E_KEY_CONFIG_SOURCE`. A signed `CONFIGS_URL` therefore now needs
+  `OHTTP_E2E_KEY_CONFIG_SOURCE=signed` (it used to be recognised by its URL). For a relay
+  simulator the script sets `OHTTP_E2E_PLAIN_HTTP_RELAY=1`. It exports `NETWORK` (default
+  `testnet`), so the e2e client verifies a signed configuration for the network the script
+  announces; when the caller had not exported it the client used to fall back to mainnet.
+- A relay URL the configuration rules refuse fails the run before anything is sent, instead of
+  being posted to as given. Every `OHTTP_E2E_REPLAY_URLS` entry is checked and canonicalized the
+  same way, all of them before the first send; an error names the entry's position and the
+  rule, never the URL. An `http://` relay or replay URL (a relay or an origin checked over plain
+  HTTP in a test network) needs the new `OHTTP_E2E_PLAIN_HTTP_RELAY=1`, which applies the same
+  rules but the scheme; invocations that post to an `http://` relay URL must set it (the error
+  of a run without it names the variable). Any value other than `1` fails the run.
+- `OHTTP_E2E_KEY_CONFIG_SOURCE`, `NETWORK`, `OHTTP_E2E_PLAIN_HTTP_RELAY` and
+  `OHTTP_E2E_REPLAY_URLS`: an empty variable counts as unset, and a value that is not Unicode
+  fails the run, naming the variable, instead of being read as unset. An empty
+  `OHTTP_E2E_REPLAY_URLS` therefore runs the normal exchange (it used to send nothing), and
+  one that is set but names no URL (`,`) fails the run instead of sending nothing.
+- `NETWORK` is checked before the key configuration is fetched, for every run (an invalid
+  non-empty value used to be ignored when the configuration was unsigned), and only the
+  validated network name is printed.
+- The DNS-over-HTTPS query sends the library's fixed key-fetch headers (`Accept-Encoding`,
+  `Accept-Language`, `User-Agent`) next to `Accept: application/dns-json`, instead of `Accept`
+  alone.
+- The selected HPKE key id is no longer printed (`key selected: kem=... kdf=... aead=...`, and
+  `key selected` in the DNS mode).
+
 ## 1.1.0
 
 The gateway caches `GetSubtreeRoots` for the Ironwood pool and writes its subtree end markers before

@@ -33,10 +33,10 @@ variables per network (`<NET>` is `MAINNET` or `TESTNET`):
 A network is configured with all four or none (an empty variable counts as unset); the values
 are checked as `zodl_ohttp_client::OhttpConfig::new` checks them, and mainnet and testnet must
 not share one. Errors name the variable or field, never the value. Signed key configurations
-(`.../ohttp-configs/signed`) are verified against the configured signing key of `NETWORK`, and
-`--key-config-source dns <network>` reads the configured keys DNS name; without a configuration
-for that network both fail. Unsigned key configurations need none. The URLs and the authority
-of an exchange are always the command-line arguments.
+(`OHTTP_E2E_KEY_CONFIG_SOURCE=signed`, below) are verified against the configured signing key
+of `NETWORK`, and `--key-config-source dns <network>` reads the configured keys DNS name;
+without a configuration for that network both fail. Unsigned key configurations need none. The
+URLs and the authority of an exchange are always the command-line arguments.
 
 ```
 OHTTP_E2E_GATEWAY_HOST_TESTNET=ohttp-gateway-testnet.example \
@@ -49,18 +49,20 @@ OHTTP_E2E_SIGNING_PUBKEY_TESTNET=<64 hex digits> \
 Examples (placeholder hosts, RFC 2606):
 
 ```
-# testnet: GetLatestBlock via the testnet relay
-NETWORK=testnet ohttp-e2e https://relay-testnet.example/ohttp-configs/signed \
+# testnet: GetLatestBlock via the testnet relay, the signed key configuration verified
+# (needs the OHTTP_E2E_*_TESTNET variables above)
+NETWORK=testnet OHTTP_E2E_KEY_CONFIG_SOURCE=signed \
+  ohttp-e2e https://relay-testnet.example/ohttp-configs/signed \
   https://relay-testnet.example/relay \
   ohttp-gateway-testnet.example POST /cash.z.wallet.sdk.rpc.CompactTxStreamer/GetLatestBlock my-trace-1
 
 # mainnet: a third-party API through a gateway alias (credentials injected by the gateway)
-ohttp-e2e https://relay-mainnet.example/ohttp-configs \
+OHTTP_E2E_KEY_CONFIG_SOURCE=plain ohttp-e2e https://relay-mainnet.example/ohttp-configs \
   https://relay-mainnet.example/relay \
   prices.example GET /v1/key/info my-trace-2 http
 
 # negative: unknown inner authority must yield inner 403 "unknown authority"
-ohttp-e2e https://relay-testnet.example/ohttp-configs \
+OHTTP_E2E_KEY_CONFIG_SOURCE=plain ohttp-e2e https://relay-testnet.example/ohttp-configs \
   https://relay-testnet.example/relay \
   evil.example POST /cash.z.wallet.sdk.rpc.CompactTxStreamer/GetLatestBlock my-trace-3
 ```
@@ -73,10 +75,39 @@ its own, and the gateway always mints its own `request_id` regardless.
 
 Relay hardening knobs: `OHTTP_E2E_EXTRA_HEADERS="Name: value|Name2: value2"` adds arbitrary outer headers
 (spoofed `X-Relay-Secret`, `X-Forwarded-For`, a relay trace header, junk `X-Request-Id`…); `OHTTP_E2E_DUMP_HEADERS=1`
-prints every response header the relay returns. Expected for a conforming relay: the gateway logs only the relay's
-own ids/egress (nothing you injected), the request still succeeds, and no gateway/CDN-internal headers come back.
+prints the number of response headers the relay returns (names and values are not printed).
+Expected for a conforming relay: the gateway logs only the relay's own ids/egress (nothing you
+injected) and the request still succeeds; that no gateway/CDN-internal headers come back is
+checked with a tool that shows the headers, the count only tells whether their number changed.
+
+The relay URL must pass the relay URL rules of `zodl_ohttp_client::OhttpConfig::new` (the
+gateway-host rule aside); it is posted to in its canonical form, and a URL the rules refuse
+fails the run before anything is sent. `OHTTP_E2E_PLAIN_HTTP_RELAY=1` also accepts an `http://`
+relay URL (a relay or an origin checked over plain HTTP in a test network), under the same rules
+but the scheme; without it an `http://` URL is refused with an error naming the variable.
+
+The key configuration at `<config_url>` is read as `OHTTP_E2E_KEY_CONFIG_SOURCE` says: `signed`
+(the envelope, verified against the configured signing key of `NETWORK`) or `plain` (the
+unsigned `application/ohttp-keys` document). Unset, the tool guesses as older versions did:
+signed when `<config_url>` contains `/signed` or the answer is labelled `application/json`,
+plain otherwise, and the run prints a line saying that the source was guessed. Set it
+explicitly in scripts.
+
+`OHTTP_E2E_KEY_CONFIG_SOURCE`, `NETWORK`, `OHTTP_E2E_PLAIN_HTTP_RELAY` and
+`OHTTP_E2E_REPLAY_URLS` are read before anything is sent: an empty variable counts as unset, and
+a value that is not valid (or not Unicode) fails the run with an error naming the variable,
+never the value.
+
+What the output leaves out: the HPKE key id is never printed, `NETWORK` only once validated,
+and a relay or replay URL is never repeated in an error. It does print the `not_after` of a
+signed key configuration, the inner response and, with `OHTTP_E2E_DUMP_HEADERS=1`, the number
+of outer response headers.
 
 Other environment variables: `NETWORK` (`mainnet` default, or `testnet`: the network a signed
-key configuration must be bound to), `OHTTP_E2E_REPLAY=1` (post the same sealed request twice;
-the second must be refused as a replay), `OHTTP_E2E_EXPECT_OK=1` (exit non-zero unless the inner
-status is 200 and, for gRPC, `grpc-status` is 0; for scripted periodic checks).
+key configuration must be bound to; any other value fails the run), `OHTTP_E2E_REPLAY=1` (post
+the same sealed request twice; the second must be refused as a replay),
+`OHTTP_E2E_REPLAY_URLS=urlA,urlB,...` (post the same sealed request to each URL in order,
+`OHTTP_E2E_REPLAY_GAP_MS` apart; each URL is checked and canonicalized as the relay URL, all
+before the first send; a value that names no URL, such as `,`, fails the run),
+`OHTTP_E2E_EXPECT_OK=1` (exit non-zero unless the inner status is 200 and, for gRPC,
+`grpc-status` is 0; for scripted periodic checks).

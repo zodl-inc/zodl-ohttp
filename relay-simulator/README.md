@@ -43,7 +43,9 @@ front of real users (no rate limiting, no address rotation, no edge protection).
 GATEWAY_URL=http://localhost:8080/gateway RELAY_SECRET=<secret> NETWORK=testnet cargo run
 
 # one exchange through it with the e2e client
-cd ../e2e-client && cargo run --release -- \
+# (plain HTTP and the unsigned key configuration: local testing only)
+cd ../e2e-client && OHTTP_E2E_PLAIN_HTTP_RELAY=1 OHTTP_E2E_KEY_CONFIG_SOURCE=plain \
+  cargo run --release -- \
   http://localhost:8081/ohttp-configs http://localhost:8081/relay \
   ohttp-gateway.example POST /cash.z.wallet.sdk.rpc.CompactTxStreamer/GetLatestBlock local-1
 ```

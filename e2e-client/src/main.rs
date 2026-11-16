@@ -21,7 +21,7 @@ use anyhow::{bail, Result};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use zodl_ohttp_client::{
     canonical_relay_url, decode_bhttp_response, doh_query_url, encapsulate_chunked_request,
-    encode_request, envelope_from_doh_json, open_signed_config, verify_signed_config,
+    encode_request, envelope_from_doh_json, open_signed_config, verify_signed_config, ConfigError,
     DecodeOptions, KeyConfig, Network, OhttpConfig, OhttpConfigParams, OhttpNetworks, OuterHeaders,
     Request, SignedConfigPolicy, VerifyingKey, CONTENT_TYPE_CHUNKED_RES, DOH_RESOLVERS,
 };
@@ -100,10 +100,151 @@ fn signer(networks: &OhttpNetworks, network: Network) -> Result<VerifyingKey> {
     }
 }
 
+/// A setting read from the environment, `value` being what `std::env::var(name)` gave: not
+/// present or empty is unset (`None`); a value that is not Unicode is an error naming the
+/// variable, never the value (it is not silently read as unset).
+fn setting(name: &str, value: Result<String, std::env::VarError>) -> Result<Option<String>> {
+    match value {
+        Ok(value) if value.is_empty() => Ok(None),
+        Ok(value) => Ok(Some(value)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => bail!("{name} is not valid Unicode"),
+    }
+}
+
+/// [`setting`] of the process environment.
+fn env_setting(name: &str) -> Result<Option<String>> {
+    setting(name, std::env::var(name))
+}
+
+/// The network of a run, from the setting `NETWORK`: mainnet when unset, else the network it
+/// names; any other value is an error, which does not repeat it.
+fn network_setting(value: Option<&str>) -> Result<Network> {
+    match value {
+        None => Ok(Network::Mainnet),
+        Some(name) => {
+            network_named(name).map_err(|_| anyhow::anyhow!("NETWORK must be mainnet or testnet"))
+        }
+    }
+}
+
+/// Whether the setting `OHTTP_E2E_PLAIN_HTTP_RELAY` opts in to `http://` relay URLs: `1` does,
+/// unset does not, any other value is an error.
+fn plain_http_setting(value: Option<&str>) -> Result<bool> {
+    match value {
+        None => Ok(false),
+        Some("1") => Ok(true),
+        Some(_) => bail!("OHTTP_E2E_PLAIN_HTTP_RELAY must be 1 or unset"),
+    }
+}
+
+/// Where the key configuration of a run comes from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum KeySource {
+    /// The signed envelope (`application/json`), verified against the network's signing key.
+    Signed,
+    /// The unsigned `application/ohttp-keys` document, trusted as served.
+    Plain,
+}
+
+/// The key-configuration source: the setting `OHTTP_E2E_KEY_CONFIG_SOURCE` (`signed` or
+/// `plain`) when it is set; otherwise, for compatibility with older invocations, the guess this
+/// tool used to make: signed when the config URL contains `/signed`. The flag `guessed` is true
+/// for the guess ([`verified_as_signed`] then looks at the answer too).
+fn key_source(explicit: Option<&str>, config_url: &str) -> Result<(KeySource, bool)> {
+    match explicit {
+        Some("signed") => Ok((KeySource::Signed, false)),
+        Some("plain") => Ok((KeySource::Plain, false)),
+        Some(_) => bail!("OHTTP_E2E_KEY_CONFIG_SOURCE must be signed or plain"),
+        None if config_url.contains("/signed") => Ok((KeySource::Signed, true)),
+        None => Ok((KeySource::Plain, true)),
+    }
+}
+
+/// Whether the fetched key configuration is verified as a signed envelope: a signed source
+/// always, whatever the answer's `Content-Type`; a guessed source also when the answer is
+/// labelled `application/json` (the old guess); an explicit `plain` never.
+fn verified_as_signed(source: KeySource, guessed: bool, content_type: &str) -> bool {
+    source == KeySource::Signed || (guessed && content_type.contains("application/json"))
+}
+
+/// The relay URL `value` in its canonical form (`OhttpConfig::relay_url`), as a wallet posts to
+/// it; a URL the configuration rules refuse is an error naming `what` and the rule, never the
+/// value. With `plain_http` (`OHTTP_E2E_PLAIN_HTTP_RELAY=1`, for a relay or an origin checked
+/// over plain HTTP inside a test network) an `http://` URL is accepted too, under the same rules
+/// but the scheme, and canonical the same way (no `:80` instead of no `:443`). Without it an
+/// `http://` URL is refused with an error that names the variable.
+fn relay_url_arg(what: &str, value: &str, plain_http: bool) -> Result<String> {
+    let refused = |e: ConfigError| anyhow::anyhow!("{what}: {e}");
+    let Some(rest) = value.strip_prefix("http://") else {
+        return canonical_relay_url(value).map_err(refused);
+    };
+    if !plain_http {
+        bail!("{what}: an http:// URL needs OHTTP_E2E_PLAIN_HTTP_RELAY=1");
+    }
+    let canonical = canonical_relay_url(&format!("https://{rest}")).map_err(refused)?;
+    // The https:// form drops a `:443`, which is not the default port of http://.
+    let port_443 = url::Url::parse(value).ok().and_then(|url| url.port()) == Some(443);
+    let after = &canonical["https://".len()..];
+    let (authority, path) = after.split_at(after.find('/').unwrap_or(after.len()));
+    let authority = if port_443 {
+        format!("{authority}:443")
+    } else {
+        authority
+            .strip_suffix(":80")
+            .unwrap_or(authority)
+            .to_string()
+    };
+    Ok(format!("http://{authority}{path}"))
+}
+
+/// `OHTTP_E2E_REPLAY_URLS` (comma-separated, blanks around and empty entries ignored), each URL
+/// checked and canonical as [`relay_url_arg`] makes it; every entry is checked before anything
+/// is sent, and the first one refused fails the run, named by its position. A value without
+/// any URL (only commas and blanks) is an error too: the run would send nothing and succeed.
+fn replay_urls(value: &str, plain_http: bool) -> Result<Vec<String>> {
+    let urls: Vec<String> = value
+        .split(',')
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
+        .enumerate()
+        .map(|(i, url)| relay_url_arg(&format!("OHTTP_E2E_REPLAY_URLS entry {i}"), url, plain_http))
+        .collect::<Result<_>>()?;
+    if urls.is_empty() {
+        bail!("OHTTP_E2E_REPLAY_URLS names no URL");
+    }
+    Ok(urls)
+}
+
+/// The headers of a DNS-over-HTTPS query: those of the library's signed key-configuration fetch
+/// (`Accept-Encoding`, `Accept-Language`, `User-Agent`, all fixed), with `Accept` asking for
+/// `application/dns-json`.
+fn doh_headers(headers: &OuterHeaders) -> Vec<(&'static str, String)> {
+    let mut list: Vec<(&'static str, String)> = headers
+        .key_fetch_signed(None)
+        .into_iter()
+        .filter(|(name, _)| !name.eq_ignore_ascii_case("accept"))
+        .collect();
+    list.insert(0, ("Accept", "application/dns-json".to_string()));
+    list
+}
+
 fn usage() -> ! {
     eprintln!("usage: ohttp-e2e <config_url> <relay_url> <authority> <method> <path> [trace_id] [grpc|http] [body_hex]");
     eprintln!("       ohttp-e2e --key-config-source dns <network>");
-    eprintln!("  env: NETWORK=mainnet|testnet (for signed config verification)");
+    eprintln!(
+        "  <relay_url>: an https:// relay URL the configuration rules accept (others are refused)"
+    );
+    eprintln!("  env: OHTTP_E2E_PLAIN_HTTP_RELAY=1: accept http:// relay and replay URLs too");
+    eprintln!(
+        "  env: OHTTP_E2E_KEY_CONFIG_SOURCE=signed|plain: the key configuration at <config_url>;"
+    );
+    eprintln!(
+        "       unset: signed if <config_url> contains /signed or the answer is application/json"
+    );
+    eprintln!("  env: NETWORK=mainnet|testnet (for signed config verification, default mainnet)");
+    eprintln!("  empty counts as unset for: OHTTP_E2E_KEY_CONFIG_SOURCE, NETWORK,");
+    eprintln!("       OHTTP_E2E_PLAIN_HTTP_RELAY, OHTTP_E2E_REPLAY_URLS and OHTTP_E2E_*_<NET>");
     eprintln!("  env: OHTTP_E2E_{{GATEWAY_HOST,RELAY_URL,KEYS_DNS_NAME,SIGNING_PUBKEY}}_{{MAINNET,TESTNET}}:");
     eprintln!("       the OHTTP configuration of each network, needed for signed configs and DNS");
     eprintln!("  --key-config-source dns: fetch and verify envelope from DNS-over-HTTPS");
@@ -122,18 +263,29 @@ fn main() -> Result<()> {
         usage()
     }
     let (config_url, relay_arg, authority, method, path) = (&a[1], &a[2], &a[3], &a[4], &a[5]);
+    // The settings below are read and checked before anything is sent: an empty variable is
+    // unset, a bad or non-Unicode value fails the run.
+    // The opt-in to http:// relay and replay URLs.
+    let plain_http = plain_http_setting(env_setting("OHTTP_E2E_PLAIN_HTTP_RELAY")?.as_deref())?;
     // Posted to as a wallet would: the relay URL in its canonical form (`OhttpConfig::relay_url`).
-    // A URL the configuration rules refuse (a plain-HTTP origin checked directly) is used as
-    // given, saying which rule it breaks.
-    let relay_url = &match canonical_relay_url(relay_arg) {
-        Ok(canonical) => canonical,
-        Err(e) => {
-            println!("    relay URL used as given: {e}");
-            relay_arg.clone()
-        }
+    // A URL the configuration rules refuse fails the run.
+    let relay_url = &relay_url_arg("relay URL", relay_arg, plain_http)?;
+    let replay = match env_setting("OHTTP_E2E_REPLAY_URLS")? {
+        Some(urls) => Some(replay_urls(&urls, plain_http)?),
+        None => None,
     };
-    let signed_source = config_url.contains("/signed");
-    // The exact header sets of `zodl-ohttp-client` 2.0.0, as every wallet preset sends them.
+    let (source, guessed) = key_source(
+        env_setting("OHTTP_E2E_KEY_CONFIG_SOURCE")?.as_deref(),
+        config_url,
+    )?;
+    if guessed {
+        println!(
+            "    key configuration source guessed: OHTTP_E2E_KEY_CONFIG_SOURCE is not set \
+             (signed|plain)"
+        );
+    }
+    let network = network_setting(env_setting("NETWORK")?.as_deref())?;
+    // The exact header sets of `zodl-ohttp-client`, as every wallet preset sends them.
     let headers = OuterHeaders::LIBRARY;
     let trace_id = a.get(6).cloned().unwrap_or_default();
     let trace = (!trace_id.is_empty()).then_some(trace_id.as_str());
@@ -156,10 +308,9 @@ fn main() -> Result<()> {
     // OHTTP_E2E_EXTRA_HEADERS go on this GET too: an origin checked directly (no relay in front)
     // with RELAY_SECRET_ON_KEY_CONFIG=require wants X-Relay-Secret on the key configuration.
     let mut kb = http.get(config_url);
-    let fetch_headers = if signed_source {
-        headers.key_fetch_signed(None)
-    } else {
-        headers.key_fetch_plain(None)
+    let fetch_headers = match source {
+        KeySource::Signed => headers.key_fetch_signed(None),
+        KeySource::Plain => headers.key_fetch_plain(None),
     };
     for (k, v) in fetch_headers {
         kb = kb.header(k, v)
@@ -176,19 +327,16 @@ fn main() -> Result<()> {
         .to_string();
     let kc_raw = net(resp.bytes())?;
 
-    // If the config URL contains /signed or the content-type contains application/json, verify
-    // the signature
-    let kc = if signed_source || content_type.contains("application/json") {
-        let network = std::env::var("NETWORK").unwrap_or_else(|_| "mainnet".to_string());
+    let kc = if verified_as_signed(source, guessed, &content_type) {
         println!(
             "[1] signed config {} bytes in {:?} (network={})",
             kc_raw.len(),
             t.elapsed(),
-            network
+            network.as_str()
         );
         let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
-        let signer = signer(&networks()?, network_named(&network)?)?;
-        let keys = open_signed_config(&kc_raw, &network, &signer, now)?;
+        let signer = signer(&networks()?, network)?;
+        let keys = open_signed_config(&kc_raw, network.as_str(), &signer, now)?;
         println!("signed-configs: OK not_after={}", keys.not_after);
         keys.document
     } else {
@@ -196,10 +344,8 @@ fn main() -> Result<()> {
         kc_raw.to_vec()
     };
     let config = KeyConfig::select(&kc)?;
-    println!(
-        "    key_id={} kem=0x0020 kdf=0x0001 aead=0x0001",
-        config.key_id()
-    );
+    // The suite only: the key id would tell which of the gateway's keys this run used.
+    println!("    key selected: kem=0x0020 kdf=0x0001 aead=0x0001");
 
     // 2. BHTTP known-length request
     let mut request = Request::new(method.as_str(), authority.as_str(), path.as_str());
@@ -247,22 +393,18 @@ fn main() -> Result<()> {
     // bytes to each URL in order (same extra headers), printing the outer status and latency of
     // each. OHTTP_E2E_REPLAY_GAP_MS (default 0) sleeps between sends. The first send is expected 200,
     // every later one 409 when the origins share replay state.
-    if let Ok(urls) = std::env::var("OHTTP_E2E_REPLAY_URLS") {
+    // Each URL is canonicalized and checked like the relay URL, before the first send.
+    if let Some(urls) = replay {
         let gap: u64 = std::env::var("OHTTP_E2E_REPLAY_GAP_MS")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(0);
-        for (i, url) in urls
-            .split(',')
-            .map(str::trim)
-            .filter(|u| !u.is_empty())
-            .enumerate()
-        {
+        for (i, url) in urls.iter().enumerate() {
             if i > 0 && gap > 0 {
                 std::thread::sleep(std::time::Duration::from_millis(gap));
             }
             let replay_trace = trace.map(|t| format!("{t}-r{i}"));
-            let mut r = post(url, replay_trace.as_deref());
+            let mut r = post(url.as_str(), replay_trace.as_deref());
             for (k, v) in extra_headers() {
                 r = r.header(k, v)
             }
@@ -395,11 +537,11 @@ fn dns_key_config_test(network_str: &str) -> Result<()> {
         };
 
         let t = Instant::now();
-        let resp = match http
-            .get(&url)
-            .header("accept", "application/dns-json")
-            .send()
-        {
+        let mut query = http.get(&url);
+        for (k, v) in doh_headers(&OuterHeaders::LIBRARY) {
+            query = query.header(k, v)
+        }
+        let resp = match query.send() {
             Ok(r) => r,
             Err(e) => {
                 println!("    ERROR: {}", transport_failure(&e));
@@ -442,8 +584,8 @@ fn dns_key_config_test(network_str: &str) -> Result<()> {
                         println!("    not_after: {}", keys.not_after);
 
                         match KeyConfig::select(&keys.document) {
-                            Ok(config) => {
-                                println!("    key_id: {}", config.key_id());
+                            Ok(_) => {
+                                println!("    key selected");
                                 println!("    SUCCESS");
                                 return Ok(());
                             }
@@ -643,6 +785,240 @@ mod tests {
         assert!(!error.contains("elsewhere") && !error.contains("127.0.0.1"));
         // The redirect's target was never contacted.
         assert!(target.accept().is_err());
+    }
+
+    #[test]
+    fn the_key_source_is_explicit_or_guessed_as_documented() {
+        let signed_url = "https://keys.example/ohttp-configs/signed";
+        let plain_url = "https://keys.example/ohttp-configs";
+        assert_eq!(
+            key_source(Some("plain"), signed_url).unwrap(),
+            (KeySource::Plain, false)
+        );
+        assert_eq!(
+            key_source(Some("signed"), plain_url).unwrap(),
+            (KeySource::Signed, false)
+        );
+        assert_eq!(
+            key_source(None, signed_url).unwrap(),
+            (KeySource::Signed, true)
+        );
+        assert_eq!(
+            key_source(None, plain_url).unwrap(),
+            (KeySource::Plain, true)
+        );
+        for invalid in ["Signed", "dns", " signed"] {
+            let error = key_source(Some(invalid), signed_url)
+                .unwrap_err()
+                .to_string();
+            assert_eq!(error, "OHTTP_E2E_KEY_CONFIG_SOURCE must be signed or plain");
+        }
+    }
+
+    #[test]
+    fn a_setting_is_unset_when_absent_or_empty_and_refused_when_not_unicode() {
+        use std::env::VarError;
+        assert_eq!(setting("NETWORK", Err(VarError::NotPresent)).unwrap(), None);
+        assert_eq!(setting("NETWORK", Ok(String::new())).unwrap(), None);
+        assert_eq!(
+            setting("NETWORK", Ok("testnet".into())).unwrap().as_deref(),
+            Some("testnet")
+        );
+        for name in [
+            "NETWORK",
+            "OHTTP_E2E_KEY_CONFIG_SOURCE",
+            "OHTTP_E2E_PLAIN_HTTP_RELAY",
+            "OHTTP_E2E_REPLAY_URLS",
+        ] {
+            let error = setting(name, Err(VarError::NotUnicode("not-shown".into())))
+                .unwrap_err()
+                .to_string();
+            assert_eq!(error, format!("{name} is not valid Unicode"));
+        }
+    }
+
+    /// `NETWORK` and the key source through [`setting`], as `main` reads them.
+    #[test]
+    fn the_network_and_the_key_source_follow_their_settings() {
+        use std::env::VarError;
+        let url = "https://keys.example/ohttp-configs/signed";
+        let network = |value: Result<String, VarError>| -> Result<Network> {
+            network_setting(setting("NETWORK", value)?.as_deref())
+        };
+        let source = |value: Result<String, VarError>| -> Result<(KeySource, bool)> {
+            key_source(
+                setting("OHTTP_E2E_KEY_CONFIG_SOURCE", value)?.as_deref(),
+                url,
+            )
+        };
+        // Unset and empty: the default network, the guessed source.
+        for unset in [Err(VarError::NotPresent), Ok(String::new())] {
+            assert_eq!(network(unset.clone()).unwrap(), Network::Mainnet);
+            assert_eq!(source(unset).unwrap(), (KeySource::Signed, true));
+        }
+        // Valid.
+        assert_eq!(network(Ok("mainnet".into())).unwrap(), Network::Mainnet);
+        assert_eq!(network(Ok("testnet".into())).unwrap(), Network::Testnet);
+        assert_eq!(
+            source(Ok("plain".into())).unwrap(),
+            (KeySource::Plain, false)
+        );
+        assert_eq!(
+            source(Ok("signed".into())).unwrap(),
+            (KeySource::Signed, false)
+        );
+        // Invalid: an error without the value.
+        let error = network(Ok("regtest-not-shown".into()))
+            .unwrap_err()
+            .to_string();
+        assert_eq!(error, "NETWORK must be mainnet or testnet");
+        let error = source(Ok("not-shown".into())).unwrap_err().to_string();
+        assert_eq!(error, "OHTTP_E2E_KEY_CONFIG_SOURCE must be signed or plain");
+        // Not Unicode: an error, not the default.
+        let error = network(Err(VarError::NotUnicode("not-shown".into())))
+            .unwrap_err()
+            .to_string();
+        assert_eq!(error, "NETWORK is not valid Unicode");
+        let error = source(Err(VarError::NotUnicode("not-shown".into())))
+            .unwrap_err()
+            .to_string();
+        assert_eq!(error, "OHTTP_E2E_KEY_CONFIG_SOURCE is not valid Unicode");
+    }
+
+    #[test]
+    fn plain_http_is_opted_in_with_1_only() {
+        assert!(!plain_http_setting(None).unwrap());
+        assert!(plain_http_setting(Some("1")).unwrap());
+        for invalid in ["0", "true", "yes"] {
+            let error = plain_http_setting(Some(invalid)).unwrap_err().to_string();
+            assert_eq!(error, "OHTTP_E2E_PLAIN_HTTP_RELAY must be 1 or unset");
+        }
+    }
+
+    #[test]
+    fn only_a_signed_or_guessed_json_answer_is_verified_as_signed() {
+        let (json, keys) = ("application/json; charset=utf-8", "application/ohttp-keys");
+        // Explicit plain: never, whatever the answer is labelled.
+        assert!(!verified_as_signed(KeySource::Plain, false, json));
+        assert!(!verified_as_signed(KeySource::Plain, false, keys));
+        // Explicit signed: always.
+        for content_type in [json, keys, "", "text/html"] {
+            assert!(verified_as_signed(KeySource::Signed, false, content_type));
+            assert!(verified_as_signed(KeySource::Signed, true, content_type));
+        }
+        // Guessed plain: by the answer's label.
+        assert!(verified_as_signed(KeySource::Plain, true, json));
+        assert!(!verified_as_signed(KeySource::Plain, true, keys));
+        assert!(!verified_as_signed(KeySource::Plain, true, ""));
+    }
+
+    #[test]
+    fn relay_urls_are_canonical_or_refused_without_their_value() {
+        assert_eq!(
+            relay_url_arg("relay URL", "https://Relay.Example:443/relay/", false).unwrap(),
+            "https://relay.example/relay"
+        );
+        let error = relay_url_arg("relay URL", "ftp://relay.example/relay", false)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            error,
+            "relay URL: OHTTP configuration: relay_url must be an https:// URL"
+        );
+        // Plain HTTP without the opt-in: the error says how to proceed, without the URL.
+        let error = relay_url_arg("relay URL", "http://relay.example/relay", false)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            error,
+            "relay URL: an http:// URL needs OHTTP_E2E_PLAIN_HTTP_RELAY=1"
+        );
+        assert_eq!(
+            replay_urls(
+                " https://A.example/relay/ ,, https://b.example:443/x/../relay",
+                false,
+            )
+            .unwrap(),
+            ["https://a.example/relay", "https://b.example/relay"]
+        );
+        // Set, but naming no URL: an error, not a run that sends nothing.
+        for empty in ["", ",", " , ", ",,"] {
+            let error = replay_urls(empty, false).unwrap_err().to_string();
+            assert_eq!(error, "OHTTP_E2E_REPLAY_URLS names no URL");
+        }
+        let error = replay_urls("https://a.example/relay,https://b.example/r?x=1", false)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.starts_with("OHTTP_E2E_REPLAY_URLS entry 1: "),
+            "{error}"
+        );
+        assert!(!error.contains("b.example"), "{error}");
+        let error = replay_urls("https://a.example/relay,http://b.example/relay", false)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            error,
+            "OHTTP_E2E_REPLAY_URLS entry 1: an http:// URL needs OHTTP_E2E_PLAIN_HTTP_RELAY=1"
+        );
+    }
+
+    #[test]
+    fn a_plain_http_relay_url_needs_the_opt_in_and_the_same_rules() {
+        for (given, canonical) in [
+            ("http://Sim.Example/a/../relay/", "http://sim.example/relay"),
+            ("http://sim.example:80/relay", "http://sim.example/relay"),
+            (
+                "http://sim.example:443/relay",
+                "http://sim.example:443/relay",
+            ),
+            ("http://sim.example:8080", "http://sim.example:8080"),
+            ("http://sim.example:443", "http://sim.example:443"),
+            ("http://sim.example:443/", "http://sim.example:443"),
+            ("http://[::1]:80/relay", "http://[::1]/relay"),
+            ("http://[::1]:443", "http://[::1]:443"),
+            ("http://[::1]:8080/relay", "http://[::1]:8080/relay"),
+            (
+                "https://relay.example:443/relay",
+                "https://relay.example/relay",
+            ),
+        ] {
+            assert_eq!(relay_url_arg("relay URL", given, true).unwrap(), canonical);
+        }
+        for refused in [
+            "http://sim.example/relay?x=1",
+            "http://user@sim.example/relay",
+            "http://sim.example//relay",
+            "ftp://sim.example/relay",
+        ] {
+            let error = relay_url_arg("relay URL", refused, true)
+                .unwrap_err()
+                .to_string();
+            assert!(!error.contains("sim.example"), "{error}");
+        }
+        assert_eq!(
+            replay_urls("http://Sim.Example/relay", true).unwrap(),
+            ["http://sim.example/relay"]
+        );
+    }
+
+    #[test]
+    fn a_doh_query_sends_the_library_fetch_headers() {
+        let headers = OuterHeaders::LIBRARY;
+        let doh = doh_headers(&headers);
+        assert_eq!(doh[0], ("Accept", "application/dns-json".to_string()));
+        let mut expected: Vec<_> = headers
+            .key_fetch_signed(None)
+            .into_iter()
+            .filter(|(name, _)| *name != "Accept")
+            .collect();
+        expected.insert(0, ("Accept", "application/dns-json".to_string()));
+        assert_eq!(doh, expected);
+        let names: Vec<&str> = doh.iter().map(|(name, _)| *name).collect();
+        assert_eq!(
+            names,
+            ["Accept", "Accept-Encoding", "Accept-Language", "User-Agent"]
+        );
     }
 
     #[test]
