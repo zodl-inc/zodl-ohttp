@@ -84,6 +84,16 @@ const PINNED_SWEEP_HOLES_PER_PASS: u64 = 100;
 const PINNED_SWEEP_CLAIM_TTL: Duration = Duration::from_secs(120);
 /// Bound of one height's fill by the sweep (three fetch attempts and their pauses).
 const PINNED_SWEEP_FILL_TIMEOUT: Duration = Duration::from_secs(60);
+/// The unit of the pauses between the attempts of one fill (1, 3 and 5 units after the first,
+/// second and third failed attempt). Shorter in tests, which wait for them in real time.
+const PINNED_FILL_PAUSE: Duration = if cfg!(test) {
+    Duration::from_millis(20)
+} else {
+    Duration::from_secs(1)
+};
+/// How often a sweep fill in flight checks whether its store is still the one chosen (it is
+/// abandoned, and its claim released, once it is not).
+const PINNED_SWEEP_SUPERSEDED_CHECK: Duration = Duration::from_secs(1);
 /// Retries of one hole with an upstream answer before the sweep drops it (logged,
 /// `result="pinned_sweep_dropped"`): a height that keeps failing is left to the write-through
 /// path. A retry without any answer (an upstream outage) does not count.
@@ -171,8 +181,16 @@ pub struct ResponseCache {
     /// store found read-only or writable again): backfill workers bound to an older value go
     /// back to choosing their store.
     pinned_writer_gen: Arc<AtomicU64>,
+    /// Serializes the transitions of the pinned writer's state (the write connection, the
+    /// read-only pause and the generation, see `pinned_writer_bound`). Never held across an
+    /// await.
+    pinned_writer_lock: Arc<parking_lot::Mutex<()>>,
     /// Inclusive height range served from the pinned tier.
     pinned_range: Option<(u64, u64)>,
+    /// The lowest height the pinned backfill and sweep fill (`with_pinned`: the network's
+    /// Sapling activation; 0 = the range start). Below it the light wallet server has no tree
+    /// state to answer with, so those heights are never fetched, and holes there are dropped.
+    pinned_fill_from: u64,
     cache_redis_url: String,
     /// The other origins' security Redis (REPLAY_PEER_URLS); None in a single-origin deployment.
     replay_peers: Option<Arc<ReplayPeers>>,
@@ -2903,7 +2921,9 @@ impl ResponseCache {
             pinned_write_conn: Default::default(),
             pinned_read_only_until: Arc::new(AtomicU64::new(0)),
             pinned_writer_gen: Default::default(),
+            pinned_writer_lock: Default::default(),
             pinned_range: None,
+            pinned_fill_from: 0,
             cache_redis_url: redis_url.to_string(),
             replay_peers: None,
             replicator: None,
@@ -2963,6 +2983,9 @@ impl ResponseCache {
         self.pinned_conn =
             Some(StoreConn::connect(url, "pinned", self.network.clone(), Role::Any).await?);
         self.pinned_range = Some(range);
+        // No tree state exists below the Sapling activation (the light wallet server refuses
+        // those heights, and wallets never ask for them).
+        self.pinned_fill_from = crate::store::sapling_activation(&self.network);
         if let Some(write_url) = write_url {
             match StoreConn::connect(write_url, "pinned_write", self.network.clone(), Role::Any)
                 .await
@@ -2979,7 +3002,8 @@ impl ResponseCache {
             .load_full()
             .or_else(|| self.pinned_conn.clone())
         {
-            if !self.probe_pinned_writer(&writer).await {
+            let generation = self.pinned_writer_gen.load(Ordering::SeqCst);
+            if !self.probe_pinned_writer(&writer, generation).await {
                 info!(network = %self.network, "pinned store is a read replica, pinned entries are not written");
             }
         }
@@ -4174,9 +4198,7 @@ impl ResponseCache {
     /// about the pinned store, is lifted: the new store is asked (`ROLE`) on its next use, as
     /// after a pause.
     fn spawn_pinned_write_reconnect(&self, url: String) {
-        let slot = self.pinned_write_conn.clone();
-        let read_only_until = self.pinned_read_only_until.clone();
-        let generation = self.pinned_writer_gen.clone();
+        let cache = self.clone();
         let network = self.network.clone();
         tokio::spawn(async move {
             let mut backoff = Duration::from_secs(1);
@@ -4184,11 +4206,7 @@ impl ResponseCache {
                 tokio::time::sleep(backoff).await;
                 match StoreConn::connect(&url, "pinned_write", network.clone(), Role::Any).await {
                     Ok(c) => {
-                        slot.store(Some(c));
-                        // Asked on the next use (`pinned_writer` probes a store whose pause is
-                        // over).
-                        read_only_until.store(1, Ordering::Relaxed);
-                        generation.fetch_add(1, Ordering::Relaxed);
+                        cache.publish_pinned_write_conn(c);
                         info!(network = %network, "pinned write store connected");
                         return;
                     }
@@ -4201,46 +4219,100 @@ impl ResponseCache {
         });
     }
 
+    /// Make `conn` the store pinned entries are written to, asked (`ROLE`) on its next use
+    /// (`pinned_writer_bound` probes a store whose pause is over): the pause, the connection
+    /// and the generation change in one step (`pinned_writer_lock`), so no caller can use the
+    /// new store unasked, and a probe of the previous store that was in flight neither lifts
+    /// nor replaces the new store's pause.
+    fn publish_pinned_write_conn(&self, conn: Arc<StoreConn>) {
+        let _state = self.pinned_writer_lock.lock();
+        self.pinned_read_only_until.store(1, Ordering::SeqCst);
+        self.pinned_write_conn.store(Some(conn));
+        self.pinned_writer_gen.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// The store pinned entries are written to now, whatever its pause.
+    fn pinned_write_target(&self) -> Option<Arc<StoreConn>> {
+        self.pinned_write_conn
+            .load_full()
+            .or_else(|| self.pinned_conn.clone())
+    }
+
+    /// Whether `conn`, chosen in `generation`, is still the store pinned entries go to. Only
+    /// meaningful under `pinned_writer_lock`.
+    fn pinned_selection_is(&self, conn: &Arc<StoreConn>, generation: u64) -> bool {
+        self.pinned_writer_gen.load(Ordering::SeqCst) == generation
+            && self
+                .pinned_write_target()
+                .is_some_and(|now| Arc::ptr_eq(&now, conn))
+    }
+
     /// Skip pinned writes for PINNED_READ_ONLY_RECHECK. Returns true when they were not skipped
     /// before (the caller logs the change once).
+    #[cfg(test)]
     fn mark_pinned_read_only(&self) -> bool {
         self.mark_pinned_read_only_for(PINNED_READ_ONLY_RECHECK)
     }
 
     /// Skip pinned writes for `pause`, then ask the store again.
+    #[cfg(test)]
     fn mark_pinned_read_only_for(&self, pause: Duration) -> bool {
+        let _state = self.pinned_writer_lock.lock();
+        self.pause_pinned_writes(pause)
+    }
+
+    /// `mark_pinned_read_only_for` on behalf of `conn`, chosen in `generation` (a
+    /// `ROLE` probe of it, or a read-only answer to a write through it): only while it is still
+    /// the store pinned entries go to. An answer of a store that was replaced meanwhile says
+    /// nothing about the one chosen now, whose pause stays as it is.
+    fn mark_pinned_read_only_of(
+        &self,
+        conn: &Arc<StoreConn>,
+        generation: u64,
+        pause: Duration,
+    ) -> bool {
+        let _state = self.pinned_writer_lock.lock();
+        self.pinned_selection_is(conn, generation) && self.pause_pinned_writes(pause)
+    }
+
+    /// Under `pinned_writer_lock`: set the pause; the generation moves when writes were on.
+    fn pause_pinned_writes(&self, pause: Duration) -> bool {
         let until = Self::unix_ms() + pause.as_millis() as u64;
-        let changed = self.pinned_read_only_until.swap(until, Ordering::Relaxed) == 0;
+        let changed = self.pinned_read_only_until.swap(until, Ordering::SeqCst) == 0;
         if changed {
-            self.pinned_writer_gen.fetch_add(1, Ordering::Relaxed);
+            self.pinned_writer_gen.fetch_add(1, Ordering::SeqCst);
         }
         changed
     }
 
-    /// Ask `conn` for its `ROLE`. A primary, or a store without `ROLE` (an error answer), is
-    /// writable: true. A replica turns pinned writes off for PINNED_READ_ONLY_RECHECK; no
-    /// answer in time or a connection error for PINNED_PROBE_RETRY (asked again then): false.
-    async fn probe_pinned_writer(&self, conn: &Arc<StoreConn>) -> bool {
+    /// Ask `conn`, chosen in `generation`, for its `ROLE`. A primary, or a store without `ROLE`
+    /// (an error answer), is writable: true. A replica turns pinned writes off for
+    /// PINNED_READ_ONLY_RECHECK; no answer in time or a connection error for PINNED_PROBE_RETRY
+    /// (asked again then): false. The pause is set only while `conn` is still the store chosen
+    /// (`mark_pinned_read_only_of`).
+    async fn probe_pinned_writer(&self, conn: &Arc<StoreConn>, generation: u64) -> bool {
         let answer = timeout(
             self.pinned_write_timeout(),
             redis::cmd("ROLE").query_async::<_, redis::Value>(&mut conn.get()),
         )
         .await;
         conn.observe_timed(&answer);
+        #[cfg(test)]
+        test_hooks::probe_answered(&self.network).await;
         match answer {
             Ok(Ok(v)) if crate::store_conn::parse_role(&v) == Some(false) => {
-                self.mark_pinned_read_only();
+                self.mark_pinned_read_only_of(conn, generation, PINNED_READ_ONLY_RECHECK);
                 false
             }
             Ok(Ok(_)) => true,
             Ok(Err(e)) if e.kind() == redis::ErrorKind::ResponseError => true,
             Ok(Err(e)) => {
                 debug!(network = %self.network, error = %store_error(&e), "pinned store ROLE failed");
-                self.mark_pinned_read_only_for(PINNED_PROBE_RETRY);
+                self.mark_pinned_read_only_of(conn, generation, PINNED_PROBE_RETRY);
                 false
             }
             Err(_) => {
-                self.mark_pinned_read_only_for(PINNED_PROBE_RETRY);
+                self.mark_pinned_read_only_of(conn, generation, PINNED_PROBE_RETRY);
                 false
             }
         }
@@ -4250,34 +4322,69 @@ impl ResponseCache {
     /// pinned store. None while that store is known to be a read replica (or did not answer its
     /// `ROLE`): its writes would only fail. After the pause the store is asked again (`ROLE`),
     /// so a replica that was promoted is written to again.
+    #[cfg(test)]
     async fn pinned_writer(&self) -> Option<Arc<StoreConn>> {
-        self.pinned_writer_pair().await.map(|(c, _)| c)
+        self.pinned_writer_bound().await.map(|w| w.conn)
     }
 
-    /// [`Self::pinned_writer`] and the generation it belongs to (`pinned_writer_gen`).
-    async fn pinned_writer_pair(&self) -> Option<(Arc<StoreConn>, u64)> {
-        let conn = self
-            .pinned_write_conn
-            .load_full()
-            .or_else(|| self.pinned_conn.clone())?;
-        let until = self.pinned_read_only_until.load(Ordering::Relaxed);
-        if until != 0 {
-            if Self::unix_ms() < until || !self.probe_pinned_writer(&conn).await {
+    /// The store pinned entries are written to (REDIS_PINNED_WRITE_URL's when set, else the
+    /// pinned store), bound to the generation it was chosen in (`pinned_writer_gen`). None
+    /// while that store is known to be a read replica (or did not answer its `ROLE`): its
+    /// writes would only fail. After the pause the store is asked again (`ROLE`), so a replica
+    /// that was promoted is written to again.
+    ///
+    /// A `ROLE` probe acts only on the selection it was made for: its answer lifts the pause
+    /// (or sets one, see `probe_pinned_writer`) in one step with the check that the generation,
+    /// the store chosen and the pause are still those the probe started with
+    /// (`pinned_writer_lock`). The pause of a store connected meanwhile is neither lifted nor
+    /// replaced by a probe of the previous one. Callers that asked the same store at the same
+    /// time all get it: the first answer lifts the pause, and the others find the store they
+    /// asked chosen and writable.
+    async fn pinned_writer_bound(&self) -> Option<PinnedWriter> {
+        let (before, conn, until) = {
+            let _state = self.pinned_writer_lock.lock();
+            (
+                self.pinned_writer_gen.load(Ordering::SeqCst),
+                self.pinned_write_target()?,
+                self.pinned_read_only_until.load(Ordering::SeqCst),
+            )
+        };
+        if until != 0 && (Self::unix_ms() < until || !self.probe_pinned_writer(&conn, before).await)
+        {
+            return None;
+        }
+        let _state = self.pinned_writer_lock.lock();
+        if !self.pinned_selection_is(&conn, before) {
+            // The generation moved meanwhile. The store asked is still the one chosen and
+            // takes writes (another caller's probe of it lifted the pause): use it, in the
+            // generation of now. Another store, or a pause in place: not this time.
+            let still_chosen = self
+                .pinned_write_target()
+                .is_some_and(|now| Arc::ptr_eq(&now, &conn));
+            if !still_chosen || self.pinned_read_only_until.load(Ordering::SeqCst) != 0 {
                 return None;
             }
-            if self.pinned_read_only_until.swap(0, Ordering::Relaxed) != 0 {
-                self.pinned_writer_gen.fetch_add(1, Ordering::Relaxed);
-                info!(network = %self.network, "pinned store accepts writes again");
-            }
+            let generation = self.pinned_writer_gen.load(Ordering::SeqCst);
+            return Some(PinnedWriter { conn, generation });
         }
-        let generation = self.pinned_writer_gen.load(Ordering::Relaxed);
-        // The selection may have changed while it was made: use it only if it did not.
-        let now = self
-            .pinned_write_conn
-            .load_full()
-            .or_else(|| self.pinned_conn.clone())?;
-        (Arc::ptr_eq(&now, &conn) && self.pinned_read_only_until.load(Ordering::Relaxed) == 0)
-            .then_some((conn, generation))
+        if until != 0 {
+            if self.pinned_read_only_until.load(Ordering::SeqCst) != until {
+                return None;
+            }
+            // Between the checks above and the lift, under the lock (tests only).
+            #[cfg(test)]
+            test_hooks::pause_lift(&self.network);
+            self.pinned_read_only_until.store(0, Ordering::SeqCst);
+            self.pinned_writer_gen.fetch_add(1, Ordering::SeqCst);
+            info!(network = %self.network, "pinned store accepts writes again");
+        }
+        let generation = self.pinned_writer_gen.load(Ordering::SeqCst);
+        Some(PinnedWriter { conn, generation })
+    }
+
+    /// Whether `writer` is still the store pinned entries go to (its generation is current).
+    fn pinned_writer_current(&self, writer: &PinnedWriter) -> bool {
+        self.pinned_writer_gen.load(Ordering::SeqCst) == writer.generation
     }
 
     /// Operation timeout of pinned writes: at least PINNED_REMOTE_WRITE_TIMEOUT on a separate
@@ -4288,6 +4395,52 @@ impl ResponseCache {
         } else {
             self.redis_timeout
         }
+    }
+
+    /// Operation timeout of the backfill cursor and the sweep's commands, on the store the
+    /// entries are written to: four store timeouts, and at least the write timeout
+    /// (`pinned_write_timeout`) of a separate write store.
+    fn pinned_cursor_timeout(&self) -> Duration {
+        (self.redis_timeout * 4).max(self.pinned_write_timeout())
+    }
+
+    /// `INCR` or `DECR` of the backfill cursor on `conn`, bounded by `pinned_cursor_timeout`.
+    async fn pinned_cursor_step(
+        &self,
+        conn: &Arc<StoreConn>,
+        cmd: &'static str,
+    ) -> Result<redis::RedisResult<i64>, tokio::time::error::Elapsed> {
+        let r = timeout(
+            self.pinned_cursor_timeout(),
+            redis::cmd(cmd)
+                .arg(self.pinned_cursor_key())
+                .query_async::<_, i64>(&mut conn.get()),
+        )
+        .await;
+        conn.observe_timed(&r);
+        r
+    }
+
+    /// Move the backfill cursor up to `to` (never down) on `conn`: heights below
+    /// `pinned_fill_from` are skipped in one step instead of being claimed one by one. False
+    /// when the store did not confirm it: the worker then skips them one by one and tries the
+    /// step again before its next claim.
+    async fn pinned_cursor_skip_to(&self, conn: &Arc<StoreConn>, to: u64) -> bool {
+        let script = redis::Script::new(
+            r"local cur = tonumber(redis.call('GET', KEYS[1]) or '0')
+              if cur < tonumber(ARGV[1]) then redis.call('SET', KEYS[1], ARGV[1]) end
+              return 1",
+        );
+        let r = timeout(
+            self.pinned_cursor_timeout(),
+            script
+                .key(self.pinned_cursor_key())
+                .arg(to)
+                .invoke_async::<_, i64>(&mut conn.get()),
+        )
+        .await;
+        conn.observe_timed(&r);
+        matches!(r, Ok(Ok(_)))
     }
 
     async fn pinned_get(&self, height: u64) -> Option<Vec<u8>> {
@@ -4315,10 +4468,12 @@ impl ResponseCache {
         }
     }
 
-    /// `pinned_exists` on `conn` (the store the entries are written to).
+    /// `pinned_exists` on `conn` (the store the entries are written to), bounded like the
+    /// write it guards (`pinned_write_timeout`): a slow answer of a remote write store is not
+    /// taken for a missing entry.
     async fn pinned_exists_at(&self, conn: &Arc<StoreConn>, height: u64) -> bool {
         let r = timeout(
-            self.redis_timeout,
+            self.pinned_write_timeout(),
             conn.get().exists::<_, bool>(self.pinned_key(height)),
         )
         .await;
@@ -4326,6 +4481,7 @@ impl ResponseCache {
         matches!(r, Ok(Ok(true)))
     }
 
+    #[cfg(test)]
     async fn pinned_exists(&self, height: u64) -> bool {
         let Some(pinned) = self.pinned_conn.as_ref() else {
             return false;
@@ -4359,10 +4515,10 @@ impl ResponseCache {
         }
     }
 
-    /// Store a pinned entry. Only finalized heights (depth > FINALIZED_DEPTH against a fresh
-    /// tip) and only responses that decode to a TreeState for the same height. SET NX, no TTL.
-    /// Written to `pinned_writer`; nothing while that is a read replica.
-    async fn pinned_put(&self, height: u64, response: &[u8]) -> bool {
+    /// Whether `response` may be stored as the pinned entry of `height`: only finalized heights
+    /// (depth > FINALIZED_DEPTH against a fresh tip) and only responses that decode to a
+    /// TreeState for the same height.
+    fn pinned_admissible(&self, height: u64, response: &[u8]) -> bool {
         if self.pinned_conn.is_none() {
             return false;
         }
@@ -4370,12 +4526,48 @@ impl ResponseCache {
         if tip == 0 || tip.saturating_sub(height) <= FINALIZED_DEPTH {
             return false;
         }
-        if !Self::is_tree_state_for(response, height) {
+        Self::is_tree_state_for(response, height)
+    }
+
+    /// Store a pinned entry (see [`Self::pinned_admissible`]). SET NX, no TTL. Written to
+    /// `pinned_writer`; nothing while that is a read replica.
+    async fn pinned_put(&self, height: u64, response: &[u8]) -> bool {
+        if !self.pinned_admissible(height, response) {
             return false;
         }
-        let Some(pinned) = self.pinned_writer().await else {
+        let Some(writer) = self.pinned_writer_bound().await else {
             return false;
         };
+        self.pinned_set(&writer, height, response).await == Some(true)
+    }
+
+    /// [`Self::pinned_put`] through `writer`, the store the caller chose (the backfill and the
+    /// sweep, whose cursor and checks are on it): None, and nothing sent, once another store
+    /// was chosen since (its generation moved on).
+    async fn pinned_put_bound(
+        &self,
+        writer: &PinnedWriter,
+        height: u64,
+        response: &[u8],
+    ) -> Option<bool> {
+        if !self.pinned_admissible(height, response) {
+            return Some(false);
+        }
+        self.pinned_set(writer, height, response).await
+    }
+
+    /// The `SET NX` of a pinned entry on `writer`, only while its generation is current (None
+    /// otherwise, nothing sent); whether it is stored.
+    async fn pinned_set(
+        &self,
+        writer: &PinnedWriter,
+        height: u64,
+        response: &[u8],
+    ) -> Option<bool> {
+        if !self.pinned_writer_current(writer) {
+            return None;
+        }
+        let pinned = &writer.conn;
         let res = timeout(
             self.pinned_write_timeout(),
             redis::cmd("SET")
@@ -4386,10 +4578,14 @@ impl ResponseCache {
         )
         .await;
         pinned.observe_timed(&res);
-        match res {
+        Some(match res {
             Ok(Ok(_)) => true,
             Ok(Err(e)) if e.kind() == redis::ErrorKind::ReadOnly => {
-                if self.mark_pinned_read_only() {
+                if self.mark_pinned_read_only_of(
+                    &writer.conn,
+                    writer.generation,
+                    PINNED_READ_ONLY_RECHECK,
+                ) {
                     info!(network = %self.network, "pinned store is a read replica, pinned entries are not written");
                 }
                 false
@@ -4405,7 +4601,7 @@ impl ResponseCache {
                 crate::health::record_cache_redis_timeout(&self.network, "pinned_set_timeout");
                 false
             }
-        }
+        })
     }
 
     /// The follower's tip height, 0 when unknown or stale.
@@ -6737,14 +6933,17 @@ fn spawn_cache_reconnect_task(cache: ResponseCache) {
     });
 }
 
-/// Fetch and store the pinned entry of `height`: three attempts, with a pause after each failed
-/// one. Whether it was stored.
-async fn pinned_fill<F, Fut>(cache: &ResponseCache, fetch: &F, height: u64) -> bool
-where
-    F: Fn(u64) -> Fut,
-    Fut: std::future::Future<Output = anyhow::Result<Vec<u8>>>,
-{
-    pinned_fill_outcome(cache, fetch, height).await == Fill::Stored
+/// The store pinned entries are written to, bound to the generation of the choice
+/// (`pinned_writer_gen`, see `ResponseCache::pinned_writer_bound`). The backfill workers and
+/// the sweep claim, check and write through one such handle: a height claimed on one store's
+/// cursor is never written to another. The generation is checked in this process before a
+/// command is sent, not by the store: no entry, hole or mark is sent once another store was
+/// chosen, while a command already sent completes on the store it was bound to (for an entry
+/// an idempotent `SET NX` of a finalized height).
+#[derive(Clone)]
+struct PinnedWriter {
+    conn: Arc<StoreConn>,
+    generation: u64,
 }
 
 /// How a `pinned_fill` went.
@@ -6755,33 +6954,62 @@ enum Fill {
     Answered,
     /// The upstream never answered (an outage: says nothing about the height).
     NoAnswer,
+    /// Another store was chosen meanwhile (the writer's generation moved on): nothing was
+    /// written; the caller chooses its store again.
+    Superseded,
 }
 
-async fn pinned_fill_outcome<F, Fut>(cache: &ResponseCache, fetch: &F, height: u64) -> Fill
+/// Fetch and store the pinned entry of `height` through `writer`: three attempts, with a pause
+/// after each failed one. Stops at once, without a write, when `writer` is superseded. An
+/// error status of the upstream says nothing about the height (lightwalletd answers every
+/// failure of this call with the same status, an unreachable node included), so every failed
+/// height is retried the same way.
+async fn pinned_fill<F, Fut>(
+    cache: &ResponseCache,
+    fetch: &F,
+    height: u64,
+    writer: &PinnedWriter,
+) -> Fill
 where
     F: Fn(u64) -> Fut,
     Fut: std::future::Future<Output = anyhow::Result<Vec<u8>>>,
 {
     let mut answered = false;
     for attempt in 0..3u64 {
+        if !cache.pinned_writer_current(writer) {
+            return Fill::Superseded;
+        }
         match fetch(height).await {
             Ok(resp) => {
                 answered = true;
-                if cache.pinned_put(height, &resp).await {
-                    return Fill::Stored;
+                match cache.pinned_put_bound(writer, height, &resp).await {
+                    Some(true) => return Fill::Stored,
+                    Some(false) => {}
+                    None => return Fill::Superseded,
                 }
             }
             Err(e) => {
                 debug!(network = %cache.network, height, error = %e, "pinned backfill fetch error");
             }
         }
-        tokio::time::sleep(Duration::from_secs(1 + attempt * 2)).await;
+        tokio::time::sleep(PINNED_FILL_PAUSE * (1 + attempt as u32 * 2)).await;
     }
     if answered {
         Fill::Answered
     } else {
         Fill::NoAnswer
     }
+}
+
+/// How a fill under a sweep claim ended (`SweepClaim::fill`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SweepFill {
+    /// The fill ran to its end (never `Fill::Superseded`).
+    Done(Fill),
+    /// The claim expired and was taken over: abandoned, the other holder decides.
+    ClaimLost,
+    /// Another store was chosen meanwhile: abandoned, nothing written.
+    Superseded,
 }
 
 /// One process's claim of a part of the sweep (a batch, or the hole retries): `SET NX` with a
@@ -6829,6 +7057,8 @@ impl<'a> SweepClaim<'a> {
 
     /// Extend the claim; false when it is no longer ours.
     async fn renew(&self) -> bool {
+        #[cfg(test)]
+        test_hooks::sweep_renewal(&self.key).await;
         let script = redis::Script::new(
             r"if redis.call('GET', KEYS[1]) == ARGV[1] then
                 return redis.call('PEXPIRE', KEYS[1], ARGV[2])
@@ -6848,33 +7078,74 @@ impl<'a> SweepClaim<'a> {
         matches!(r, Ok(Ok(1)))
     }
 
-    /// `pinned_fill` of `height` while the claim is held: bounded by PINNED_SWEEP_FILL_TIMEOUT
-    /// and renewed during the fill. None when the claim was lost meanwhile (the fill is
-    /// abandoned; the other holder decides about the height).
-    async fn fill<F, Fut>(&self, cache: &ResponseCache, fetch: &F, height: u64) -> Option<Fill>
+    /// `pinned_fill` of `height` through `writer` while the claim is held: bounded by
+    /// PINNED_SWEEP_FILL_TIMEOUT and renewed during the fill. Abandoned when the claim was lost
+    /// meanwhile (the other holder decides about the height), and when
+    /// `writer` was superseded (nothing written; the next pass chooses its store again): that
+    /// is checked every PINNED_SWEEP_SUPERSEDED_CHECK while the fill runs, so a fill whose
+    /// upstream fetch hangs is abandoned (not renewed until the fill timeout) and the caller
+    /// releases the claim. The check does not run while a renewal of the claim waits for the
+    /// store, so the fill ends within PINNED_SWEEP_SUPERSEDED_CHECK plus the bound of one claim
+    /// command (`pinned_cursor_timeout`: four store timeouts, at least the write timeout on a
+    /// separate write store) of the change; the release of the claim that follows is one more
+    /// such command, checked by its token. A renewal that fails once the store was replaced
+    /// counts as superseded, not as a lost claim. The two reasons are told apart (`SweepFill`): only a superseded fill is
+    /// counted as one.
+    async fn fill<F, Fut>(
+        &self,
+        cache: &ResponseCache,
+        fetch: &F,
+        height: u64,
+        writer: &PinnedWriter,
+    ) -> SweepFill
     where
         F: Fn(u64) -> Fut,
         Fut: std::future::Future<Output = anyhow::Result<Vec<u8>>>,
     {
         if !self.renew().await {
-            return None;
+            return self.not_renewed(cache, writer);
         }
         let fill = timeout(
             PINNED_SWEEP_FILL_TIMEOUT,
-            pinned_fill_outcome(cache, fetch, height),
+            pinned_fill(cache, fetch, height, writer),
         );
         tokio::pin!(fill);
         let mut renewal = tokio::time::interval(PINNED_SWEEP_CLAIM_TTL / 4);
         renewal.tick().await;
+        let mut superseded = tokio::time::interval(PINNED_SWEEP_SUPERSEDED_CHECK);
+        superseded.tick().await;
         loop {
             tokio::select! {
-                outcome = &mut fill => return Some(outcome.unwrap_or(Fill::NoAnswer)),
+                outcome = &mut fill => {
+                    return match outcome.unwrap_or(Fill::NoAnswer) {
+                        Fill::Superseded => SweepFill::Superseded,
+                        outcome => SweepFill::Done(outcome),
+                    };
+                }
+                _ = superseded.tick() => {
+                    if !cache.pinned_writer_current(writer) {
+                        return SweepFill::Superseded;
+                    }
+                }
                 _ = renewal.tick() => {
+                    if !cache.pinned_writer_current(writer) {
+                        return SweepFill::Superseded;
+                    }
                     if !self.renew().await {
-                        return None;
+                        return self.not_renewed(cache, writer);
                     }
                 }
             }
+        }
+    }
+
+    /// Why a fill ends when the claim could not be renewed: the store was replaced meanwhile
+    /// (its answer, or silence, says nothing about the claim), or the claim was lost.
+    fn not_renewed(&self, cache: &ResponseCache, writer: &PinnedWriter) -> SweepFill {
+        if cache.pinned_writer_current(writer) {
+            SweepFill::ClaimLost
+        } else {
+            SweepFill::Superseded
         }
     }
 
@@ -6952,8 +7223,15 @@ struct SweepPass {
 ///
 /// - First the holes earlier passes could not fill (the set `backfill_holes`, at most
 ///   PINNED_SWEEP_HOLES_PER_PASS of them) are tried again; one found present or filled leaves
-///   the set.
-/// - Then every height from the shared mark `backfill_verified` up to `margin` below the last
+///   the set. A hole below the lowest height that is filled (`pinned_fill_from`, recorded by a
+///   version that asked for those heights, or left below the range start after the range was
+///   raised) is dropped without asking the upstream; it is counted (`pinned_sweep_dropped`)
+///   and logged (one line with their number at most once a minute) once the store has
+///   removed it. That means the removal command as a whole was acknowledged (the removal from
+///   the set together with the clean-up of its attempt count): if the store takes the first
+///   and rejects the second, the hole is gone and not counted.
+/// - Then every height from the shared mark `backfill_verified` (at least `pinned_fill_from`:
+///   no height below it is checked or fetched) up to `margin` below the last
 ///   claimed one (no margin once a worker has claimed past the range end, i.e. the range is
 ///   done; never above the last final height) is checked with pipelined `EXISTS` on the store
 ///   the entries are written to, PINNED_SWEEP_BATCH at a time with a short pause between
@@ -6966,10 +7244,16 @@ struct SweepPass {
 ///   (`pinned_sweep_failed`). The mark moves past a batch only once every height of it is
 ///   present or a hole, so it covers a contiguous, fully handled prefix.
 ///
+/// Everything goes through `writer` (the store the backfill uses, bound to the generation of
+/// that choice): once another store is chosen, the pass writes nothing more there (no claim,
+/// fill, hole or mark) and ends; the next pass chooses its store again. A fill in flight then
+/// is abandoned within a second plus the bound of one claim command (see `SweepClaim::fill`), counted
+/// (`pinned_sweep_superseded`; a fill whose claim was lost is not), and its claim released.
+///
 /// `Err` on a store error: the next pass resumes from the mark.
 async fn pinned_sweep_pass<F, Fut>(
     cache: &ResponseCache,
-    conn: &Arc<StoreConn>,
+    writer: &PinnedWriter,
     (start, end): (u64, u64),
     margin: u64,
     fetch: &F,
@@ -6978,10 +7262,16 @@ where
     F: Fn(u64) -> Fut,
     Fut: std::future::Future<Output = anyhow::Result<Vec<u8>>>,
 {
-    let budget = cache.redis_timeout * 4;
+    let conn = &writer.conn;
+    let current = || cache.pinned_writer_current(writer);
+    // Every command of the pass goes to the store the entries are written to: bounded at
+    // least like its writes.
+    let budget = cache.pinned_cursor_timeout();
     let store_err = |what: &str, e: &redis::RedisError| {
         anyhow::anyhow!("pinned sweep: {what} failed: {}", store_error(e))
     };
+    // Heights below it are never filled (no tree state exists there).
+    let floor = start.max(cache.pinned_fill_from);
     let mut filled = 0u64;
     let mut record = |stored: bool| {
         filled += u64::from(stored);
@@ -6995,13 +7285,26 @@ where
             },
         );
     };
+    // A fill abandoned because another store was chosen (not one whose claim was lost).
+    let record_superseded = || {
+        crate::health::record_cache_request(
+            &cache.network,
+            "GetTreeState",
+            "pinned_sweep_superseded",
+        )
+    };
+    // Holes below `floor` this pass removed (acknowledged by the store).
+    let mut below_floor = 0u64;
 
     // The holes of earlier passes, retried by one process at a time.
     let holes_key = cache.pinned_holes_key();
     let attempts_key = cache.pinned_hole_attempts_key();
-    if let Some(claim) =
+    let holes_claim = if current() {
         SweepClaim::take(conn, cache.pinned_sweep_claim_key_holes(), budget).await?
-    {
+    } else {
+        None
+    };
+    if let Some(claim) = holes_claim {
         let retried: anyhow::Result<()> = async {
             let holes = timeout(
                 budget,
@@ -7016,21 +7319,63 @@ where
                 .map_err(|_| anyhow::anyhow!("pinned sweep: hole read timed out"))?
                 .map_err(|e| store_err("hole read", &e))?;
             for h in holes {
-                let outcome = if cache.pinned_exists_at(conn, h).await {
-                    Fill::Stored
-                } else {
-                    let Some(outcome) = claim.fill(cache, fetch, h).await else {
+                // A hole below the heights that are filled (recorded by a version that asked
+                // for them): dropped without asking the upstream.
+                if h < floor {
+                    if !current() {
                         break;
-                    };
-                    record(outcome == Fill::Stored);
-                    outcome
+                    }
+                    // Counted (and logged) only once the store has removed it: a store that
+                    // refuses the removal keeps the hole, and a later pass drops it.
+                    let r = timeout(
+                        budget,
+                        redis::pipe()
+                            .cmd("SREM")
+                            .arg(&holes_key)
+                            .arg(h)
+                            .cmd("HDEL")
+                            .arg(&attempts_key)
+                            .arg(h)
+                            .ignore()
+                            .query_async::<_, (u64,)>(&mut conn.get()),
+                    )
+                    .await;
+                    conn.observe_timed(&r);
+                    if matches!(r, Ok(Ok((removed,))) if removed > 0) {
+                        below_floor += 1;
+                        crate::health::record_cache_request(
+                            &cache.network,
+                            "GetTreeState",
+                            "pinned_sweep_dropped",
+                        );
+                    }
+                    continue;
+                }
+                let outcome = if cache.pinned_exists_at(conn, h).await {
+                    Some(Fill::Stored)
+                } else {
+                    match claim.fill(cache, fetch, h, writer).await {
+                        SweepFill::Done(outcome) => {
+                            record(outcome == Fill::Stored);
+                            Some(outcome)
+                        }
+                        SweepFill::Superseded => {
+                            record_superseded();
+                            break;
+                        }
+                        SweepFill::ClaimLost => break,
+                    }
                 };
-                // Filled (or there): out of the holes. Failed with an upstream answer: one more
-                // attempt counted, and after PINNED_SWEEP_HOLE_ATTEMPTS the hole is dropped. A
-                // pass during an upstream outage (no answer) counts nothing.
-                let drop_hole = if outcome == Fill::Stored {
+                // Filled (or there): out of the holes. Failed with an upstream answer: one more attempt counted, and after
+                // PINNED_SWEEP_HOLE_ATTEMPTS the hole is dropped. A pass during an upstream
+                // outage (no answer) counts nothing. Nothing is recorded once another store was
+                // chosen.
+                if !current() {
+                    break;
+                }
+                let drop_hole = if outcome == Some(Fill::Stored) {
                     true
-                } else if outcome == Fill::NoAnswer {
+                } else if outcome == Some(Fill::NoAnswer) {
                     false
                 } else {
                     let r = timeout(
@@ -7078,6 +7423,9 @@ where
         }
         .await;
         claim.release().await;
+        if below_floor > 0 && crate::health::warn_due(&cache.network, "pinned_holes_below_floor") {
+            info!(network = %cache.network, dropped = below_floor, floor, "pinned sweep: dropped holes below the lowest height that is filled");
+        }
         retried?;
     }
 
@@ -7093,7 +7441,7 @@ where
     let (cursor, verified) = marks
         .map_err(|_| anyhow::anyhow!("pinned sweep: cursor read timed out"))?
         .map_err(|e| store_err("cursor read", &e))?;
-    let mut next = verified.unwrap_or(start).max(start);
+    let mut next = verified.unwrap_or(floor).max(floor);
     let claimed = cursor.unwrap_or(0);
     let hi = if claimed == 0 {
         None
@@ -7108,6 +7456,9 @@ where
             .map(|h| h.min(last_final))
     };
     while let Some(hi) = hi.filter(|hi| next <= *hi) {
+        if !current() {
+            break;
+        }
         // Batches have fixed identities (aligned to PINNED_SWEEP_BATCH): every process claims
         // the same heights under the same key, whatever its own reading of the mark was.
         let batch_lo = sweep_batch_of(next);
@@ -7164,12 +7515,20 @@ where
                 if cache.pinned_exists_at(conn, h).await {
                     continue;
                 }
-                let Some(outcome) = claim.fill(cache, fetch, h).await else {
-                    return Ok(false);
+                let outcome = match claim.fill(cache, fetch, h, writer).await {
+                    SweepFill::Done(outcome) => outcome,
+                    SweepFill::Superseded => {
+                        record_superseded();
+                        return Ok(false);
+                    }
+                    SweepFill::ClaimLost => return Ok(false),
                 };
                 let stored = outcome == Fill::Stored;
                 record(stored);
                 if !stored {
+                    if !current() {
+                        return Ok(false);
+                    }
                     let r = timeout(
                         budget,
                         redis::cmd("SADD")
@@ -7200,6 +7559,11 @@ where
         if !done {
             // The claim was lost (expired and taken over): the batch is the other process's.
             // Released anyway (compare-and-delete: only a claim still ours goes).
+            claim.release().await;
+            break;
+        }
+        if !current() {
+            // Another store was chosen: this one's mark stays (its batch is checked again).
             claim.release().await;
             break;
         }
@@ -7252,22 +7616,36 @@ where
 /// PINNED_SWEEP_INTERVAL (`pinned_sweep_pass`) and filled then; one that still fails is left to
 /// the write-through path.
 ///
+/// Heights below `pinned_fill_from` (the network's Sapling activation: no tree state exists
+/// below it) are not filled: the workers move the cursor past them in one step and the sweep
+/// starts its mark there. Lookups in the range are unchanged.
+///
 /// While the store the entries go to does not take writes (a read replica, no `ROLE` answer,
 /// or REDIS_PINNED_WRITE_URL not connected yet with a replica as pinned store), the workers wait
 /// and check again every [`PINNED_BACKFILL_RESUME_CHECK`] and the sweep skips its pass; they
 /// start once it takes writes, so a promoted replica or a write store that became reachable gets
-/// its backfill without a restart. The workers and the sweep use the store `pinned_writer_pair`
-/// chooses; when that changes (its generation), or a cursor command fails, they choose again.
-pub fn spawn_pinned_backfill<F, Fut>(cache: ResponseCache, workers: usize, fetch: F)
+/// its backfill without a restart. The workers and the sweep use the store `pinned_writer_bound`
+/// chooses, for the cursor, the existence checks and the writes alike; when that changes (its
+/// generation), or a cursor command fails, they choose again, and a fill in flight writes
+/// nothing to the store it no longer belongs to (the worker counts the height it had claimed,
+/// `pinned_backfill_superseded`).
+///
+/// Returns the handles of the tasks it spawned (the sweep, then the workers).
+pub fn spawn_pinned_backfill<F, Fut>(
+    cache: ResponseCache,
+    workers: usize,
+    fetch: F,
+) -> Vec<tokio::task::JoinHandle<()>>
 where
     F: Fn(u64) -> Fut + Clone + Send + Sync + 'static,
     Fut: std::future::Future<Output = anyhow::Result<Vec<u8>>> + Send + 'static,
 {
+    let mut tasks = Vec::new();
     let Some((start, end)) = cache.pinned_range else {
-        return;
+        return tasks;
     };
     if cache.pinned_conn.is_none() && cache.pinned_write_conn.load().is_none() {
-        return;
+        return tasks;
     }
     if cache.pinned_read_only_until.load(Ordering::Relaxed) != 0 {
         warn!(network = %cache.network, "pinned backfill paused: the pinned store is a read replica; it starts once the store takes writes");
@@ -7276,7 +7654,7 @@ where
         let cache = cache.clone();
         let fetch = fetch.clone();
         let margin = PINNED_SWEEP_MARGIN + workers as u64;
-        tokio::spawn(async move {
+        tasks.push(tokio::spawn(async move {
             loop {
                 // Jittered (+-10 %), so processes started together do not sweep in step.
                 tokio::time::sleep(
@@ -7287,10 +7665,10 @@ where
                     continue;
                 }
                 // The store the backfill uses now; none while it does not take writes.
-                let Some((conn, _)) = cache.pinned_writer_pair().await else {
+                let Some(writer) = cache.pinned_writer_bound().await else {
                     continue;
                 };
-                match pinned_sweep_pass(&cache, &conn, (start, end), margin, &fetch).await {
+                match pinned_sweep_pass(&cache, &writer, (start, end), margin, &fetch).await {
                     Ok(pass) => {
                         if pass.filled > 0 {
                             info!(network = %cache.network, filled = pass.filled, holes = ?pass.holes, "pinned sweep filled heights the backfill had skipped");
@@ -7305,22 +7683,23 @@ where
                     }
                 }
             }
-        });
+        }));
     }
     for worker in 0..workers {
         let cache = cache.clone();
         let fetch = fetch.clone();
-        tokio::spawn(async move {
+        tasks.push(tokio::spawn(async move {
             'resolve: loop {
                 // The cursor lives in the store the entries are written to: the one that takes
                 // writes, bound to its generation. Every worker chooses the same store, and all
                 // of them choose again when it changes.
-                let (conn, generation) = loop {
-                    if let Some(pair) = cache.pinned_writer_pair().await {
-                        break pair;
+                let writer = loop {
+                    if let Some(writer) = cache.pinned_writer_bound().await {
+                        break writer;
                     }
                     tokio::time::sleep(PINNED_BACKFILL_RESUME_CHECK).await;
                 };
+                let conn = writer.conn.clone();
                 #[cfg(test)]
                 test_hooks::backfill_resolved(&cache.network);
                 // Wait for a fresh tip so pinned_put's finality check can pass.
@@ -7328,25 +7707,36 @@ where
                     tokio::time::sleep(Duration::from_secs(5)).await;
                 }
                 info!(network = %cache.network, worker, start, end, "pinned backfill worker started");
+                // Heights below `pinned_fill_from` are not filled: the cursor moves past them
+                // in one step (the cursor value n claims height start + n - 1), tried again
+                // before every claim until the store confirmed it or a claim is past them.
+                let mut skipped = cache.pinned_fill_from <= start;
                 loop {
-                    if cache.pinned_writer_gen.load(Ordering::Relaxed) != generation {
+                    if !cache.pinned_writer_current(&writer) {
                         info!(network = %cache.network, worker, "pinned store changed: the backfill chooses its store again");
                         continue 'resolve;
                     }
+                    if !skipped {
+                        skipped = cache
+                            .pinned_cursor_skip_to(&conn, cache.pinned_fill_from - start)
+                            .await;
+                        if !skipped && crate::health::warn_due(&cache.network, "pinned_cursor_skip")
+                        {
+                            warn!(network = %cache.network, "pinned backfill: the cursor could not be moved past the heights that are not filled; they are skipped one by one meanwhile");
+                        }
+                    }
                     // Bounded, so that a hung connection is reported (and replaced) instead of
-                    // stopping the worker.
-                    let incr = timeout(
-                        cache.redis_timeout * 4,
-                        redis::cmd("INCR")
-                            .arg(cache.pinned_cursor_key())
-                            .query_async::<_, u64>(&mut conn.get()),
-                    )
-                    .await;
-                    conn.observe_timed(&incr);
+                    // stopping the worker (at least like the writes on a separate write store).
+                    let incr = cache.pinned_cursor_step(&conn, "INCR").await;
                     // A cursor error: back to choosing the store (and waiting while none takes
                     // writes); a read-only answer pauses every worker.
                     let n: u64 = match incr {
-                        Ok(Ok(n)) => n,
+                        Ok(Ok(n)) if n > 0 => n as u64,
+                        Ok(Ok(n)) => {
+                            warn!(network = %cache.network, value = n, "pinned backfill cursor out of range");
+                            tokio::time::sleep(Duration::from_secs(10)).await;
+                            continue 'resolve;
+                        }
                         Err(_) => {
                             warn!(network = %cache.network, "pinned backfill cursor timeout");
                             tokio::time::sleep(Duration::from_secs(10)).await;
@@ -7355,13 +7745,21 @@ where
                         Ok(Err(e)) => {
                             warn!(network = %cache.network, error = %store_error(&e), "pinned backfill cursor error");
                             if e.kind() == redis::ErrorKind::ReadOnly {
-                                cache.mark_pinned_read_only();
+                                cache.mark_pinned_read_only_of(
+                                    &conn,
+                                    writer.generation,
+                                    PINNED_READ_ONLY_RECHECK,
+                                );
                             }
                             tokio::time::sleep(Duration::from_secs(10)).await;
                             continue 'resolve;
                         }
                     };
                     let height = start.saturating_add(n - 1);
+                    if height >= cache.pinned_fill_from {
+                        // The cursor is past the lower heights: nothing left to skip.
+                        skipped = true;
+                    }
                     let limit = end.min(cache.tip_height().saturating_sub(FINALIZED_DEPTH + 1));
                     if height > end {
                         info!(network = %cache.network, worker, height, "pinned backfill done");
@@ -7369,20 +7767,32 @@ where
                     }
                     if height > limit {
                         // Caught up: hand the height back and wait for the next final block.
-                        let _ = timeout(
-                            cache.redis_timeout * 4,
-                            redis::cmd("DECR")
-                                .arg(cache.pinned_cursor_key())
-                                .query_async::<_, i64>(&mut conn.get()),
-                        )
-                        .await;
+                        let _ = cache.pinned_cursor_step(&conn, "DECR").await;
                         tokio::time::sleep(PINNED_FOLLOW_INTERVAL).await;
                         continue;
                     }
-                    if cache.pinned_exists(height).await {
+                    if height < cache.pinned_fill_from {
+                        // Below the heights that are filled (the skip above failed).
                         continue;
                     }
-                    let stored = pinned_fill(&cache, &fetch, height).await;
+                    // Checked and written on the store the height was claimed on.
+                    if cache.pinned_exists_at(&conn, height).await {
+                        continue;
+                    }
+                    let stored = match pinned_fill(&cache, &fetch, height, &writer).await {
+                        Fill::Superseded => {
+                            // The height was claimed on the store it no longer writes to:
+                            // counted (that store's sweep finds it if it is chosen again).
+                            crate::health::record_cache_request(
+                                &cache.network,
+                                "GetTreeState",
+                                "pinned_backfill_superseded",
+                            );
+                            info!(network = %cache.network, worker, "pinned store changed during a fill: the backfill chooses its store again");
+                            continue 'resolve;
+                        }
+                        fill => fill == Fill::Stored,
+                    };
                     let result = if stored {
                         "pinned_backfill"
                     } else {
@@ -7394,8 +7804,9 @@ where
                     }
                 }
             }
-        });
+        }));
     }
+    tasks
 }
 
 #[cfg(test)]
@@ -7861,6 +8272,126 @@ mod test_hooks {
             .or_default() += 1;
     }
 
+    /// A stop for the `ROLE` probes of one network: between the store's answer and what the
+    /// probe does with it.
+    pub struct ProbeGate {
+        pub reached: tokio::sync::Notify,
+        /// Probes stopped at the gate so far.
+        pub stopped: std::sync::atomic::AtomicUsize,
+        /// One permit lets one stopped probe go on.
+        pub release: tokio::sync::Semaphore,
+    }
+
+    impl Default for ProbeGate {
+        fn default() -> Self {
+            Self {
+                reached: tokio::sync::Notify::new(),
+                stopped: Default::default(),
+                release: tokio::sync::Semaphore::new(0),
+            }
+        }
+    }
+
+    static PROBE_GATES: Mutex<Option<HashMap<String, std::sync::Arc<ProbeGate>>>> =
+        Mutex::new(None);
+
+    /// Stop the next `ROLE` probes of `network` at their answer until released.
+    pub fn gate_probes(network: &str) -> std::sync::Arc<ProbeGate> {
+        let gate = std::sync::Arc::new(ProbeGate::default());
+        PROBE_GATES
+            .lock()
+            .unwrap()
+            .get_or_insert_with(HashMap::new)
+            .insert(network.to_string(), gate.clone());
+        gate
+    }
+
+    pub fn ungate_probes(network: &str) {
+        if let Some(gates) = PROBE_GATES.lock().unwrap().as_mut() {
+            gates.remove(network);
+        }
+    }
+
+    /// A `ROLE` probe of `network` got its answer (or none in time).
+    pub async fn probe_answered(network: &str) {
+        let gate = PROBE_GATES
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|gates| gates.get(network).cloned());
+        if let Some(gate) = gate {
+            gate.stopped
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            gate.reached.notify_one();
+            if let Ok(permit) = gate.release.acquire().await {
+                permit.forget();
+            }
+        }
+    }
+
+    type PauseLiftHook = Box<dyn FnOnce() + Send>;
+    static PAUSE_LIFT_HOOKS: Mutex<Option<HashMap<String, PauseLiftHook>>> = Mutex::new(None);
+
+    /// Run `hook` once, at the next lift of the pinned pause of `network`: after the checks of
+    /// the generation, the store and the pause, before the pause is lifted, with the writer
+    /// state lock held.
+    pub fn on_pause_lift(network: &str, hook: impl FnOnce() + Send + 'static) {
+        PAUSE_LIFT_HOOKS
+            .lock()
+            .unwrap()
+            .get_or_insert_with(HashMap::new)
+            .insert(network.to_string(), Box::new(hook));
+    }
+
+    /// The pinned pause of `network` is about to be lifted (see `on_pause_lift`).
+    pub fn pause_lift(network: &str) {
+        let hook = PAUSE_LIFT_HOOKS
+            .lock()
+            .unwrap()
+            .as_mut()
+            .and_then(|hooks| hooks.remove(network));
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    type RenewalHook =
+        Box<dyn FnMut() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send>;
+    static RENEWAL_HOOKS: Mutex<Option<HashMap<String, RenewalHook>>> = Mutex::new(None);
+
+    /// Run `hook` at the start of every renewal of the sweep claim `key`, before the store is
+    /// asked, and wait for what it returns.
+    pub fn on_sweep_renewal(
+        key: &str,
+        hook: impl FnMut() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+            + Send
+            + 'static,
+    ) {
+        RENEWAL_HOOKS
+            .lock()
+            .unwrap()
+            .get_or_insert_with(HashMap::new)
+            .insert(key.to_string(), Box::new(hook));
+    }
+
+    pub fn clear_sweep_renewal(key: &str) {
+        if let Some(hooks) = RENEWAL_HOOKS.lock().unwrap().as_mut() {
+            hooks.remove(key);
+        }
+    }
+
+    /// The sweep claim `key` is about to be renewed (see `on_sweep_renewal`).
+    pub async fn sweep_renewal(key: &str) {
+        let pending = RENEWAL_HOOKS
+            .lock()
+            .unwrap()
+            .as_mut()
+            .and_then(|hooks| hooks.get_mut(key).map(|hook| hook()));
+        if let Some(pending) = pending {
+            pending.await;
+        }
+    }
+
     pub fn backfill_resolutions(network: &str) -> usize {
         RESOLVED
             .lock()
@@ -7938,7 +8469,9 @@ mod tests {
             pinned_write_conn: Default::default(),
             pinned_read_only_until: Arc::new(AtomicU64::new(0)),
             pinned_writer_gen: Default::default(),
+            pinned_writer_lock: Default::default(),
             pinned_range: None,
+            pinned_fill_from: 0,
             cache_redis_url: "redis://127.0.0.1:6379".to_string(),
             replay_peers: None,
             replicator: None,
@@ -9488,6 +10021,16 @@ mod tests {
         .unwrap()
     }
 
+    /// A gRPC error answer with status `code` (HTTP 200, no message).
+    fn grpc_error_answer(code: u32) -> Vec<u8> {
+        bincode::serialize(&crate::ohttp::InnerResponse {
+            status: 200,
+            headers: vec![("grpc-status".to_string(), code.to_string())],
+            body: vec![],
+        })
+        .unwrap()
+    }
+
     fn unique_network(s: &str) -> String {
         String::from_utf8(unique(s)).unwrap().replace(' ', "-")
     }
@@ -9507,7 +10050,7 @@ mod tests {
         present: impl Iterator<Item = u64>,
         cursor: u64,
     ) -> Option<(ResponseCache, Arc<StoreConn>, ConnectionManager)> {
-        let conn = local_redis().await?;
+        let conn = required_redis().await?;
         let mut cache = test_cache(conn.clone(), None, network);
         let pinned = StoreConn::from_parts(
             redis::Client::open("redis://127.0.0.1:6379").unwrap(),
@@ -9535,6 +10078,14 @@ mod tests {
             .await
             .unwrap();
         Some((cache, pinned, c))
+    }
+
+    /// `conn` as the store pinned writes go to, in the current writer generation.
+    fn bound(cache: &ResponseCache, conn: &Arc<StoreConn>) -> PinnedWriter {
+        PinnedWriter {
+            conn: conn.clone(),
+            generation: cache.pinned_writer_gen.load(Ordering::SeqCst),
+        }
     }
 
     /// A fetch that records the heights asked and fails for those in `failing`.
@@ -9576,14 +10127,14 @@ mod tests {
             return;
         };
         let (fetched, fetch) = sweep_fetch(Arc::default());
-        let pass = pinned_sweep_pass(&cache, &pinned, (1, 200), 0, &fetch)
+        let pass = pinned_sweep_pass(&cache, &bound(&cache, &pinned), (1, 200), 0, &fetch)
             .await
             .unwrap();
         assert_eq!((pass.filled, pass.next, pass.holes), (1, 51, Some(0)));
         assert_eq!(*fetched.lock(), vec![17]);
         assert!(cache.pinned_exists(17).await);
         // The mark is shared and moves on: nothing to fill again.
-        let pass = pinned_sweep_pass(&cache, &pinned, (1, 200), 0, &fetch)
+        let pass = pinned_sweep_pass(&cache, &bound(&cache, &pinned), (1, 200), 0, &fetch)
             .await
             .unwrap();
         assert_eq!((pass.filled, pass.next), (0, 51));
@@ -9595,7 +10146,7 @@ mod tests {
             .query_async(&mut c)
             .await
             .unwrap();
-        let pass = pinned_sweep_pass(&cache, &pinned, (1, 200), 5, &fetch)
+        let pass = pinned_sweep_pass(&cache, &bound(&cache, &pinned), (1, 200), 5, &fetch)
             .await
             .unwrap();
         assert_eq!(
@@ -9618,7 +10169,7 @@ mod tests {
         };
         let failing = Arc::new(parking_lot::Mutex::new(vec![9]));
         let (fetched, fetch) = sweep_fetch(failing.clone());
-        let pass = pinned_sweep_pass(&cache, &pinned, (1, 200), 0, &fetch)
+        let pass = pinned_sweep_pass(&cache, &bound(&cache, &pinned), (1, 200), 0, &fetch)
             .await
             .unwrap();
         assert_eq!((pass.filled, pass.next, pass.holes), (0, 41, Some(1)));
@@ -9630,9 +10181,15 @@ mod tests {
         else {
             return;
         };
-        let pass = pinned_sweep_pass(&restarted, &pinned2, (1, 200), 0, &fetch)
-            .await
-            .unwrap();
+        let pass = pinned_sweep_pass(
+            &restarted,
+            &bound(&restarted, &pinned2),
+            (1, 200),
+            0,
+            &fetch,
+        )
+        .await
+        .unwrap();
         assert_eq!((pass.filled, pass.next, pass.holes), (1, 41, Some(0)));
         assert!(cache.pinned_exists(9).await);
         // 1..=40 checked once: only the hole was fetched, twice.
@@ -9649,7 +10206,7 @@ mod tests {
             return;
         };
         let (fetched, fetch) = sweep_fetch(Arc::default());
-        let pass = pinned_sweep_pass(&cache, &pinned, (1, 50), 64, &fetch)
+        let pass = pinned_sweep_pass(&cache, &bound(&cache, &pinned), (1, 50), 64, &fetch)
             .await
             .unwrap();
         assert_eq!((pass.filled, pass.next), (1, 51));
@@ -9673,7 +10230,7 @@ mod tests {
             .await
             .unwrap();
         let (fetched, fetch) = sweep_fetch(Arc::default());
-        let pass = pinned_sweep_pass(&cache, &pinned, (1, 200), 0, &fetch)
+        let pass = pinned_sweep_pass(&cache, &bound(&cache, &pinned), (1, 200), 0, &fetch)
             .await
             .unwrap();
         assert_eq!((pass.filled, pass.next), (0, 1));
@@ -9683,7 +10240,7 @@ mod tests {
             .query_async(&mut c)
             .await
             .unwrap();
-        let pass = pinned_sweep_pass(&cache, &pinned, (1, 200), 0, &fetch)
+        let pass = pinned_sweep_pass(&cache, &bound(&cache, &pinned), (1, 200), 0, &fetch)
             .await
             .unwrap();
         assert_eq!((pass.filled, pass.next), (1, 31));
@@ -9718,7 +10275,7 @@ mod tests {
             .unwrap();
         // The upstream is down: a pass counts no attempt.
         let (fetched, fetch) = sweep_fetch(Arc::new(parking_lot::Mutex::new(vec![9])));
-        let pass = pinned_sweep_pass(&cache, &pinned, (1, 200), 0, &fetch)
+        let pass = pinned_sweep_pass(&cache, &bound(&cache, &pinned), (1, 200), 0, &fetch)
             .await
             .unwrap();
         assert_eq!(
@@ -9734,7 +10291,7 @@ mod tests {
                     Box<dyn std::future::Future<Output = anyhow::Result<Vec<u8>>> + Send>,
                 >
         };
-        let pass = pinned_sweep_pass(&cache, &pinned, (1, 200), 0, &wrong)
+        let pass = pinned_sweep_pass(&cache, &bound(&cache, &pinned), (1, 200), 0, &wrong)
             .await
             .unwrap();
         assert_eq!(pass.holes, Some(0), "dropped after its last attempt");
@@ -9816,7 +10373,7 @@ mod tests {
             .unwrap();
         tokio::time::sleep(Duration::from_millis(150)).await;
         let (fetched, fetch) = sweep_fetch(Arc::default());
-        let pass = pinned_sweep_pass(&cache, &pinned, (1, 200), 0, &fetch)
+        let pass = pinned_sweep_pass(&cache, &bound(&cache, &pinned), (1, 200), 0, &fetch)
             .await
             .unwrap();
         assert_eq!((pass.filled, pass.next), (1, 31));
@@ -9987,7 +10544,7 @@ mod tests {
         assert!(cache.mark_pinned_read_only());
         let fetches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let counted = fetches.clone();
-        spawn_pinned_backfill(cache.clone(), 1, move |_height| {
+        let tasks = spawn_pinned_backfill(cache.clone(), 1, move |_height| {
             let counted = counted.clone();
             async move {
                 counted.fetch_add(1, Ordering::SeqCst);
@@ -10005,6 +10562,10 @@ mod tests {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        for task in tasks {
+            task.abort();
+            let _ = task.await;
         }
         assert!(started, "the backfill resumed once the store took writes");
         let mut c = conn;
@@ -10050,6 +10611,11 @@ mod tests {
 
     /// The length of the first complete RESP command in `buf` and whether it is `ROLE`.
     fn resp_command(buf: &[u8]) -> Option<(usize, bool)> {
+        resp_command_name(buf).map(|(len, name)| (len, name == b"ROLE"))
+    }
+
+    /// The length of the first complete RESP command in `buf` and its name in upper case.
+    fn resp_command_name(buf: &[u8]) -> Option<(usize, Vec<u8>)> {
         fn line(buf: &[u8], at: usize) -> Option<(&[u8], usize)> {
             let end = buf[at..].windows(2).position(|w| w == b"\r\n")? + at;
             Some((&buf[at..end], end + 2))
@@ -10072,7 +10638,7 @@ mod tests {
             first.get_or_insert_with(|| buf[next..next + len].to_ascii_uppercase());
             at = next + len + 2;
         }
-        Some((at, first.as_deref() == Some(b"ROLE".as_slice())))
+        Some((at, first.unwrap_or_default()))
     }
 
     /// A pinned store that does not answer its ROLE is not written to (asked again later).
@@ -10088,11 +10654,11 @@ mod tests {
         let store = StoreConn::connect(&url, "pinned", network.clone(), Role::Any)
             .await
             .unwrap();
+        cache.pinned_conn = Some(store.clone());
         let generation = cache.pinned_writer_gen.load(Ordering::Relaxed);
-        assert!(!cache.probe_pinned_writer(&store).await);
+        assert!(!cache.probe_pinned_writer(&store, generation).await);
         assert_ne!(cache.pinned_read_only_until.load(Ordering::Relaxed), 0);
         assert_ne!(cache.pinned_writer_gen.load(Ordering::Relaxed), generation);
-        cache.pinned_conn = Some(store);
         assert!(cache.pinned_writer().await.is_none(), "paused");
     }
 
@@ -10116,7 +10682,7 @@ mod tests {
         cache.pinned_conn = Some(pinned("pinned"));
         cache.pinned_range = Some((1, u64::MAX));
         tip_at(&cache, 1000);
-        spawn_pinned_backfill(cache.clone(), 2, move |_height| async move {
+        let tasks = spawn_pinned_backfill(cache.clone(), 2, move |_height| async move {
             Err::<Vec<u8>, _>(anyhow::anyhow!("not needed by the test"))
         });
         let wait_for = |n: usize| {
@@ -10135,8 +10701,1223 @@ mod tests {
         // The write store becomes available: every worker chooses again.
         cache.pinned_write_conn.store(Some(pinned("pinned_write")));
         cache.pinned_writer_gen.fetch_add(1, Ordering::Relaxed);
-        assert!(wait_for(4).await, "both workers chose the new store");
+        let chose_again = wait_for(4).await;
+        for task in tasks {
+            task.abort();
+            let _ = task.await;
+        }
+        assert!(chose_again, "both workers chose the new store");
         let mut c = conn;
+        let _: () = redis::cmd("DEL")
+            .arg(cache.pinned_cursor_key())
+            .query_async(&mut c)
+            .await
+            .unwrap();
+    }
+
+    /// A second pinned store: another database of the local test Redis (a keyspace of its own).
+    async fn second_pinned_store(network: &str) -> (Arc<StoreConn>, ConnectionManager) {
+        let client = redis::Client::open("redis://127.0.0.1:6379/13").unwrap();
+        let conn = ConnectionManager::new(client.clone()).await.unwrap();
+        let store = StoreConn::from_parts(
+            client,
+            conn.clone(),
+            "pinned_write",
+            network.to_string(),
+            Role::Any,
+        );
+        (store, conn)
+    }
+
+    async fn key_exists(conn: &ConnectionManager, key: &str) -> bool {
+        let mut c = conn.clone();
+        redis::cmd("EXISTS")
+            .arg(key)
+            .query_async::<_, bool>(&mut c)
+            .await
+            .unwrap()
+    }
+
+    /// A fetch that records the heights asked, makes `store` the write store (a change of the
+    /// store chosen while the fetch is in flight) and answers.
+    fn switching_fetch(
+        cache: &ResponseCache,
+        store: &Arc<StoreConn>,
+    ) -> (
+        Arc<parking_lot::Mutex<Vec<u64>>>,
+        impl Fn(
+            u64,
+        )
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<Vec<u8>>> + Send>>,
+    ) {
+        let fetched = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let (f, cache, store) = (fetched.clone(), cache.clone(), store.clone());
+        let fetch = move |h: u64| {
+            let (f, cache, store) = (f.clone(), cache.clone(), store.clone());
+            Box::pin(async move {
+                f.lock().push(h);
+                cache.pinned_write_conn.store(Some(store));
+                cache.pinned_writer_gen.fetch_add(1, Ordering::SeqCst);
+                anyhow::Ok(tree_state_answer(h))
+            })
+                as std::pin::Pin<
+                    Box<dyn std::future::Future<Output = anyhow::Result<Vec<u8>>> + Send>,
+                >
+        };
+        (fetched, fetch)
+    }
+
+    /// A backfill fill whose store is replaced while its upstream fetch is in flight writes
+    /// nothing, to neither store; through the store chosen now it writes there only.
+    #[tokio::test]
+    async fn a_pinned_fill_writes_nothing_once_another_store_was_chosen() {
+        let Some(conn) = required_redis().await else {
+            return;
+        };
+        let network = unique_network("pinned-fill-switch");
+        let mut cache = test_cache(conn.clone(), None, &network);
+        let first = StoreConn::from_parts(
+            redis::Client::open("redis://127.0.0.1:6379").unwrap(),
+            conn.clone(),
+            "pinned",
+            network.clone(),
+            Role::Any,
+        );
+        cache.pinned_conn = Some(first.clone());
+        cache.pinned_range = Some((1, u64::MAX));
+        tip_at(&cache, 1000);
+        let (second, second_conn) = second_pinned_store(&network).await;
+        let writer = cache.pinned_writer_bound().await.unwrap();
+        assert!(Arc::ptr_eq(&writer.conn, &first));
+        let (fetched, switching) = switching_fetch(&cache, &second);
+        assert_eq!(
+            pinned_fill(&cache, &switching, 500, &writer).await,
+            Fill::Superseded
+        );
+        assert_eq!(*fetched.lock(), vec![500], "no further attempt");
+        let key = cache.pinned_key(500);
+        assert!(!key_exists(&conn, &key).await);
+        assert!(!key_exists(&second_conn, &key).await);
+        // Nor through the write-through path's bound write with the old choice.
+        assert_eq!(
+            cache
+                .pinned_put_bound(&writer, 500, &tree_state_answer(500))
+                .await,
+            None
+        );
+        assert!(!key_exists(&second_conn, &key).await);
+
+        let now = cache.pinned_writer_bound().await.unwrap();
+        assert!(Arc::ptr_eq(&now.conn, &second));
+        let fetch = |h: u64| async move { anyhow::Ok(tree_state_answer(h)) };
+        assert_eq!(pinned_fill(&cache, &fetch, 500, &now).await, Fill::Stored);
+        assert!(key_exists(&second_conn, &key).await);
+        assert!(!key_exists(&conn, &key).await);
+        let mut c = second_conn;
+        let _: () = redis::cmd("DEL")
+            .arg(&key)
+            .query_async(&mut c)
+            .await
+            .unwrap();
+    }
+
+    /// A sweep whose store is replaced during a fill writes nothing more: no entry (on either
+    /// store), no hole and no mark.
+    #[tokio::test]
+    async fn a_pinned_sweep_writes_nothing_once_another_store_was_chosen() {
+        let network = unique_network("pinned-sweep-switch");
+        let Some((cache, pinned, c)) =
+            sweep_fixture(&network, (1, 200), (1..=50u64).filter(|h| *h != 17), 50).await
+        else {
+            return;
+        };
+        let (second, second_conn) = second_pinned_store(&network).await;
+        let writer = bound(&cache, &pinned);
+        let (fetched, switching) = switching_fetch(&cache, &second);
+        let pass = pinned_sweep_pass(&cache, &writer, (1, 200), 0, &switching)
+            .await
+            .unwrap();
+        assert_eq!(pass.filled, 0);
+        assert_eq!(*fetched.lock(), vec![17]);
+        let key = cache.pinned_key(17);
+        assert!(!key_exists(&c, &key).await);
+        assert!(!key_exists(&second_conn, &key).await);
+        assert!(!key_exists(&c, &cache.pinned_holes_key()).await, "no hole");
+        assert!(
+            !key_exists(&c, &cache.pinned_verified_key()).await,
+            "the mark did not move"
+        );
+        // A later pass through the old choice does nothing at all.
+        let (fetched, fetch) = sweep_fetch(Arc::default());
+        let pass = pinned_sweep_pass(&cache, &writer, (1, 200), 0, &fetch)
+            .await
+            .unwrap();
+        assert_eq!((pass.filled, pass.next), (0, 1));
+        assert!(fetched.lock().is_empty());
+        assert!(!key_exists(&c, &cache.pinned_verified_key()).await);
+    }
+
+    const ROLE_PRIMARY: &[u8] = b"*3\r\n$6\r\nmaster\r\n:0\r\n*0\r\n";
+    const ROLE_REPLICA: &[u8] =
+        b"*5\r\n$5\r\nslave\r\n$9\r\n127.0.0.1\r\n:6379\r\n$9\r\nconnected\r\n:0\r\n";
+
+    /// A Redis-protocol server that answers `ROLE` with `role`, `EXISTS`, `INCR` and `DECR`
+    /// with 1 after `exists_delay`, and `+OK` to every other command.
+    async fn scripted_store(role: &'static [u8], exists_delay: Duration) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    loop {
+                        let Ok(n) = stream.read(&mut chunk).await else {
+                            return;
+                        };
+                        if n == 0 {
+                            return;
+                        }
+                        buf.extend_from_slice(&chunk[..n]);
+                        while let Some((len, name)) = resp_command_name(&buf) {
+                            buf.drain(..len);
+                            let answer: &[u8] = match name.as_slice() {
+                                b"ROLE" => role,
+                                b"EXISTS" | b"INCR" | b"DECR" => {
+                                    tokio::time::sleep(exists_delay).await;
+                                    b":1\r\n"
+                                }
+                                _ => b"+OK\r\n",
+                            };
+                            if stream.write_all(answer).await.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        format!("redis://{addr}")
+    }
+
+    /// A cache whose pinned store is the one at `url`, its pause over (asked on its next use),
+    /// and a write store on the local test Redis that is not published yet.
+    async fn probe_race_fixture(name: &str, url: &str) -> Option<(ResponseCache, Arc<StoreConn>)> {
+        let conn = required_redis().await?;
+        let network = unique_network(name);
+        let mut cache = test_cache(conn.clone(), None, &network);
+        cache.redis_timeout = Duration::from_millis(300);
+        cache.pinned_conn = Some(
+            StoreConn::connect(url, "pinned", network.clone(), Role::Any)
+                .await
+                .unwrap(),
+        );
+        cache.pinned_range = Some((1, u64::MAX));
+        cache.pinned_read_only_until.store(1, Ordering::SeqCst);
+        let write = StoreConn::from_parts(
+            redis::Client::open("redis://127.0.0.1:6379").unwrap(),
+            conn,
+            "pinned_write",
+            network,
+            Role::Any,
+        );
+        Some((cache, write))
+    }
+
+    /// A `ROLE` probe of the pinned store is stopped at its answer; the write store is
+    /// published; the probe goes on. What the probe returned.
+    async fn publish_during_a_probe(cache: &ResponseCache, write: &Arc<StoreConn>) -> Option<u64> {
+        let gate = test_hooks::gate_probes(&cache.network);
+        let probing = {
+            let cache = cache.clone();
+            tokio::spawn(async move { cache.pinned_writer_bound().await.map(|w| w.generation) })
+        };
+        timeout(Duration::from_secs(30), gate.reached.notified())
+            .await
+            .expect("the probe got its answer");
+        cache.publish_pinned_write_conn(write.clone());
+        test_hooks::ungate_probes(&cache.network);
+        gate.release.add_permits(1);
+        probing.await.unwrap()
+    }
+
+    /// Callers that ask the same store at the same time after a pause all get it.
+    #[tokio::test]
+    async fn concurrent_callers_after_a_pause_all_get_the_writer() {
+        let url = scripted_store(ROLE_PRIMARY, Duration::ZERO).await;
+        let Some((cache, _)) = probe_race_fixture("pinned-probe-concurrent", &url).await else {
+            return;
+        };
+        let gate = test_hooks::gate_probes(&cache.network);
+        let callers: Vec<_> = (0..2)
+            .map(|_| {
+                let cache = cache.clone();
+                tokio::spawn(async move { cache.pinned_writer_bound().await })
+            })
+            .collect();
+        // Both asked the store and have its answer; neither has acted on it yet.
+        for _ in 0..600 {
+            if gate.stopped.load(Ordering::SeqCst) == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(gate.stopped.load(Ordering::SeqCst), 2);
+        test_hooks::ungate_probes(&cache.network);
+        gate.release.add_permits(2);
+        let pinned = cache.pinned_conn.clone().unwrap();
+        for caller in callers {
+            let writer = caller.await.unwrap().expect("the store takes writes");
+            assert!(Arc::ptr_eq(&writer.conn, &pinned));
+            assert!(cache.pinned_writer_current(&writer));
+        }
+        assert_eq!(cache.pinned_read_only_until.load(Ordering::SeqCst), 0);
+    }
+
+    /// A `ROLE` probe that succeeds after the write store connected does not lift the new
+    /// store's pause: the new store is asked itself before its first use.
+    #[tokio::test]
+    async fn a_successful_probe_does_not_lift_the_pause_of_a_store_connected_meanwhile() {
+        let url = scripted_store(ROLE_PRIMARY, Duration::ZERO).await;
+        let Some((cache, write)) = probe_race_fixture("pinned-probe-race", &url).await else {
+            return;
+        };
+        assert_eq!(publish_during_a_probe(&cache, &write).await, None);
+        assert_eq!(
+            cache.pinned_read_only_until.load(Ordering::SeqCst),
+            1,
+            "the new store is still to be asked"
+        );
+        // Its own probe (a primary) lifts its pause.
+        let now = cache.pinned_writer_bound().await.unwrap();
+        assert!(Arc::ptr_eq(&now.conn, &write));
+        assert_eq!(cache.pinned_read_only_until.load(Ordering::SeqCst), 0);
+    }
+
+    /// A `ROLE` probe of the previous store that answers "replica", or does not answer, after
+    /// the write store connected does not pause the new store: it is asked on its next use.
+    #[tokio::test]
+    async fn a_failed_probe_does_not_pause_a_store_connected_meanwhile() {
+        let replica = scripted_store(ROLE_REPLICA, Duration::ZERO).await;
+        let hanging = role_hanging_store().await;
+        for (name, url) in [
+            ("pinned-probe-replica", replica),
+            ("pinned-probe-timeout", hanging),
+        ] {
+            let Some((cache, write)) = probe_race_fixture(name, &url).await else {
+                return;
+            };
+            assert_eq!(publish_during_a_probe(&cache, &write).await, None, "{name}");
+            assert_eq!(
+                cache.pinned_read_only_until.load(Ordering::SeqCst),
+                1,
+                "{name}: asked on its next use, not paused"
+            );
+            let now = cache.pinned_writer_bound().await.unwrap();
+            assert!(Arc::ptr_eq(&now.conn, &write), "{name}");
+        }
+        // Without a change of store the same answers pause the store that gave them.
+        let replica = scripted_store(ROLE_REPLICA, Duration::ZERO).await;
+        let Some((cache, _)) = probe_race_fixture("pinned-probe-replica-kept", &replica).await
+        else {
+            return;
+        };
+        assert!(cache.pinned_writer_bound().await.is_none());
+        assert!(cache.pinned_read_only_until.load(Ordering::SeqCst) > ResponseCache::unix_ms());
+    }
+
+    /// The existence check of a height goes to the store the entries are written to and is
+    /// bounded like its writes: a slow answer of a separate write store is not a missing entry.
+    #[tokio::test]
+    async fn the_existence_check_on_a_write_store_uses_the_write_timeout() {
+        let Some(conn) = required_redis().await else {
+            return;
+        };
+        let network = unique_network("pinned-exists-timeout");
+        let mut cache = test_cache(conn, None, &network);
+        cache.redis_timeout = Duration::from_millis(100);
+        let slow = Duration::from_millis(600);
+        assert!(slow > cache.redis_timeout && slow < PINNED_REMOTE_WRITE_TIMEOUT);
+        let url = scripted_store(ROLE_PRIMARY, slow).await;
+        let store = StoreConn::connect(&url, "pinned_write", network.clone(), Role::Any)
+            .await
+            .unwrap();
+        // A separate write store: bounded by the write timeout, so the entry is found there
+        // and not fetched and written again.
+        cache.pinned_write_conn.store(Some(store.clone()));
+        assert!(cache.pinned_exists_at(&store, 500).await);
+        // No separate write store: bounded by the store timeout (a timeout reads as missing).
+        cache.pinned_write_conn.store(None);
+        assert!(!cache.pinned_exists_at(&store, 500).await);
+    }
+
+    /// The backfill cursor on a separate write store is bounded like its writes: a slow
+    /// answer is a claim, not a cursor timeout.
+    #[tokio::test]
+    async fn the_backfill_cursor_on_a_write_store_uses_the_write_timeout() {
+        let Some(conn) = required_redis().await else {
+            return;
+        };
+        let network = unique_network("pinned-cursor-timeout");
+        let mut cache = test_cache(conn, None, &network);
+        cache.redis_timeout = Duration::from_millis(100);
+        let slow = Duration::from_millis(600);
+        assert!(slow > cache.redis_timeout * 4 && slow < PINNED_REMOTE_WRITE_TIMEOUT);
+        let url = scripted_store(ROLE_PRIMARY, slow).await;
+        let store = StoreConn::connect(&url, "pinned_write", network.clone(), Role::Any)
+            .await
+            .unwrap();
+        cache.pinned_write_conn.store(Some(store.clone()));
+        assert_eq!(cache.pinned_cursor_timeout(), PINNED_REMOTE_WRITE_TIMEOUT);
+        for cmd in ["INCR", "DECR"] {
+            assert!(
+                matches!(cache.pinned_cursor_step(&store, cmd).await, Ok(Ok(1))),
+                "{cmd}"
+            );
+        }
+        // No separate write store: four store timeouts, as before.
+        cache.pinned_write_conn.store(None);
+        assert_eq!(cache.pinned_cursor_timeout(), cache.redis_timeout * 4);
+        assert!(cache.pinned_cursor_step(&store, "INCR").await.is_err());
+    }
+
+    /// A sweep fill whose store is replaced while its upstream fetch hangs is abandoned within
+    /// the check interval, counted, and its claim released (it held the batch until the fill
+    /// timeout).
+    #[tokio::test]
+    async fn a_sweep_fill_whose_store_is_replaced_releases_its_claim_at_once() {
+        let network = unique_network("pinned-sweep-switch-hang");
+        let Some((cache, pinned, c)) =
+            sweep_fixture(&network, (1, 200), (1..=50u64).filter(|h| *h != 17), 50).await
+        else {
+            return;
+        };
+        let (second, second_conn) = second_pinned_store(&network).await;
+        let writer = bound(&cache, &pinned);
+        let hanging = {
+            let (cache, second) = (cache.clone(), second.clone());
+            move |_h: u64| {
+                let (cache, second) = (cache.clone(), second.clone());
+                Box::pin(async move {
+                    cache.pinned_write_conn.store(Some(second));
+                    cache.pinned_writer_gen.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_secs(3600)).await;
+                    anyhow::Ok(Vec::new())
+                })
+                    as std::pin::Pin<
+                        Box<dyn std::future::Future<Output = anyhow::Result<Vec<u8>>> + Send>,
+                    >
+            }
+        };
+        let pass = timeout(
+            PINNED_SWEEP_FILL_TIMEOUT / 4,
+            pinned_sweep_pass(&cache, &writer, (1, 200), 0, &hanging),
+        )
+        .await
+        .expect("abandoned well before the fill timeout")
+        .unwrap();
+        assert_eq!(pass.filled, 0);
+        let count = |result| crate::health::cache_request_count(&network, "GetTreeState", result);
+        assert_eq!(count("pinned_sweep_superseded"), 1, "counted once");
+        assert_eq!(count("pinned_sweep_failed"), 0);
+        assert!(
+            !key_exists(&c, &cache.pinned_sweep_claim_key(sweep_batch_of(17))).await,
+            "the claim of the batch is released"
+        );
+        assert!(!key_exists(&c, &cache.pinned_key(17)).await);
+        assert!(!key_exists(&second_conn, &cache.pinned_key(17)).await);
+        assert!(!key_exists(&c, &cache.pinned_holes_key()).await, "no hole");
+        assert!(!key_exists(&c, &cache.pinned_verified_key()).await);
+    }
+
+    /// A backfill worker whose store is replaced during a fill counts the height it claimed.
+    #[tokio::test]
+    async fn a_backfill_worker_counts_a_height_whose_store_was_replaced() {
+        let Some(conn) = required_redis().await else {
+            return;
+        };
+        let network = unique_network("pinned-backfill-superseded");
+        let mut cache = test_cache(conn.clone(), None, &network);
+        cache.pinned_conn = Some(StoreConn::from_parts(
+            redis::Client::open("redis://127.0.0.1:6379").unwrap(),
+            conn.clone(),
+            "pinned",
+            network.clone(),
+            Role::Any,
+        ));
+        cache.pinned_range = Some((1, u64::MAX));
+        tip_at(&cache, 1000);
+        let (second, second_conn) = second_pinned_store(&network).await;
+        let (_, switching) = switching_fetch(&cache, &second);
+        let switching = Arc::new(switching);
+        let tasks = spawn_pinned_backfill(cache.clone(), 1, move |h| {
+            let switching = switching.clone();
+            async move { (*switching)(h).await }
+        });
+        let count = || {
+            crate::health::cache_request_count(
+                &network,
+                "GetTreeState",
+                "pinned_backfill_superseded",
+            )
+        };
+        let mut counted = false;
+        for _ in 0..400 {
+            if count() >= 1 {
+                counted = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        for task in tasks {
+            task.abort();
+            let _ = task.await;
+        }
+        assert!(counted, "the superseded height is counted");
+        for c in [conn, second_conn] {
+            let mut c = c;
+            let _: () = redis::cmd("DEL")
+                .arg(cache.pinned_cursor_key())
+                .query_async(&mut c)
+                .await
+                .unwrap();
+        }
+    }
+
+    /// A store connected while a lift of the pause is between its checks and the lift waits
+    /// for the lift (the writer state lock is held): the lift does not clear the new store's
+    /// pause, and the writer it returns is no longer current once the new store is published.
+    #[tokio::test]
+    async fn a_store_published_during_a_pause_lift_keeps_its_own_pause() {
+        let url = scripted_store(ROLE_PRIMARY, Duration::ZERO).await;
+        let Some((cache, write)) = probe_race_fixture("pinned-lift-window", &url).await else {
+            return;
+        };
+        let publisher = Arc::new(parking_lot::Mutex::new(None));
+        {
+            let (cache, write, publisher) = (cache.clone(), write.clone(), publisher.clone());
+            test_hooks::on_pause_lift(&cache.network.clone(), move || {
+                // In the window: the state lock is held, so a publication waits for the lift.
+                assert!(cache.pinned_writer_lock.try_lock().is_none());
+                let started = Arc::new(std::sync::Barrier::new(2));
+                let handle = {
+                    let started = started.clone();
+                    std::thread::spawn(move || {
+                        started.wait();
+                        cache.publish_pinned_write_conn(write);
+                    })
+                };
+                started.wait();
+                // Give the publication time to reach the lock.
+                std::thread::sleep(Duration::from_millis(100));
+                *publisher.lock() = Some(handle);
+            });
+        }
+        let writer = cache.pinned_writer_bound().await.expect("lifted");
+        let handle = publisher.lock().take().expect("the hook ran");
+        handle.join().unwrap();
+        assert!(Arc::ptr_eq(
+            &writer.conn,
+            cache.pinned_conn.as_ref().unwrap()
+        ));
+        assert!(
+            !cache.pinned_writer_current(&writer),
+            "the publication after the lift supersedes it"
+        );
+        assert_eq!(
+            cache.pinned_read_only_until.load(Ordering::SeqCst),
+            1,
+            "the new store is still to be asked"
+        );
+        assert!(Arc::ptr_eq(&cache.pinned_write_target().unwrap(), &write));
+    }
+
+    /// A fetch whose every answer is the next gRPC error status of `codes` (HTTP 200, no
+    /// message). Records the heights asked.
+    fn erroring_fetch(
+        codes: &'static [u32],
+    ) -> (
+        Arc<parking_lot::Mutex<Vec<u64>>>,
+        impl Fn(
+            u64,
+        )
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<Vec<u8>>> + Send>>,
+    ) {
+        let fetched = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let f = fetched.clone();
+        let fetch = move |h: u64| {
+            let f = f.clone();
+            Box::pin(async move {
+                let mut asked = f.lock();
+                let code = codes[asked.len() % codes.len()];
+                asked.push(h);
+                anyhow::Ok(grpc_error_answer(code))
+            })
+                as std::pin::Pin<
+                    Box<dyn std::future::Future<Output = anyhow::Result<Vec<u8>>> + Send>,
+                >
+        };
+        (fetched, fetch)
+    }
+
+    /// An error status of the upstream is no verdict about the height (lightwalletd answers
+    /// every failure of the call with `INVALID_ARGUMENT`, an unreachable node included): a
+    /// finalized height answered with `INVALID_ARGUMENT` and `NOT_FOUND` is tried three times,
+    /// becomes a hole, is not dropped before its attempts are used up, and is filled once the
+    /// upstream answers.
+    #[tokio::test]
+    async fn an_error_status_of_the_upstream_is_retried_like_any_failure() {
+        let network = unique_network("pinned-sweep-status");
+        let Some((mut cache, pinned, mut c)) =
+            sweep_fixture(&network, (1, 200), (1..=50u64).filter(|h| *h != 30), 50).await
+        else {
+            return;
+        };
+        // The height is above the lowest one that is filled.
+        cache.pinned_fill_from = 20;
+        let count = |result| crate::health::cache_request_count(&network, "GetTreeState", result);
+        let (fetched, fetch) = erroring_fetch(&[3, 5]);
+        let pass = pinned_sweep_pass(&cache, &bound(&cache, &pinned), (1, 200), 0, &fetch)
+            .await
+            .unwrap();
+        assert_eq!((pass.filled, pass.next, pass.holes), (0, 51, Some(1)));
+        assert_eq!(*fetched.lock(), vec![30, 30, 30], "three attempts");
+        // The hole's retry fails the same way: one attempt counted, the hole stays.
+        let pass = pinned_sweep_pass(&cache, &bound(&cache, &pinned), (1, 200), 0, &fetch)
+            .await
+            .unwrap();
+        assert_eq!(pass.holes, Some(1));
+        assert_eq!(fetched.lock().len(), 6);
+        let attempts: Option<u64> = redis::cmd("HGET")
+            .arg(cache.pinned_hole_attempts_key())
+            .arg(30)
+            .query_async(&mut c)
+            .await
+            .unwrap();
+        assert_eq!(attempts, Some(1));
+        assert!(PINNED_SWEEP_HOLE_ATTEMPTS > 1);
+        assert_eq!(count("pinned_sweep_dropped"), 0);
+        assert_eq!(count("pinned_sweep_failed"), 2);
+        // The upstream answers again: filled, out of the holes.
+        let (_, fetch) = sweep_fetch(Arc::default());
+        let pass = pinned_sweep_pass(&cache, &bound(&cache, &pinned), (1, 200), 0, &fetch)
+            .await
+            .unwrap();
+        assert_eq!((pass.filled, pass.holes), (1, Some(0)));
+        assert!(cache.pinned_exists(30).await);
+        assert_eq!(count("pinned_sweep_dropped"), 0);
+    }
+
+    /// A sweep whose claim of a batch is taken over by another process during a fill leaves
+    /// the batch to it and counts nothing as superseded.
+    #[tokio::test]
+    async fn a_lost_sweep_claim_is_not_counted_as_superseded() {
+        let network = unique_network("pinned-sweep-claim-lost");
+        let missing = [17u64, 18];
+        let Some((cache, pinned, c)) = sweep_fixture(
+            &network,
+            (1, 200),
+            (1..=50u64).filter(|h| !missing.contains(h)),
+            50,
+        )
+        .await
+        else {
+            return;
+        };
+        let key = cache.pinned_sweep_claim_key(sweep_batch_of(17));
+        let fetched = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        // The fetch of the first height finds the claim taken over by another process.
+        let stealing = {
+            let (fetched, key, c) = (fetched.clone(), key.clone(), c.clone());
+            move |h: u64| {
+                let (fetched, key, mut c) = (fetched.clone(), key.clone(), c.clone());
+                Box::pin(async move {
+                    fetched.lock().push(h);
+                    let _: () = redis::cmd("SET")
+                        .arg(&key)
+                        .arg("another-process")
+                        .arg("PX")
+                        .arg(60_000)
+                        .query_async(&mut c)
+                        .await?;
+                    anyhow::Ok(tree_state_answer(h))
+                })
+                    as std::pin::Pin<
+                        Box<dyn std::future::Future<Output = anyhow::Result<Vec<u8>>> + Send>,
+                    >
+            }
+        };
+        let pass = pinned_sweep_pass(&cache, &bound(&cache, &pinned), (1, 200), 0, &stealing)
+            .await
+            .unwrap();
+        assert_eq!(pass.filled, 1);
+        assert_eq!(
+            *fetched.lock(),
+            vec![17],
+            "the batch is the other process's"
+        );
+        assert_eq!(
+            crate::health::cache_request_count(&network, "GetTreeState", "pinned_sweep_superseded"),
+            0
+        );
+        assert!(key_exists(&c, &key).await, "the other holder's claim stays");
+        assert!(!key_exists(&c, &cache.pinned_verified_key()).await);
+        let mut c = c;
+        let _: () = redis::cmd("DEL")
+            .arg(&key)
+            .query_async(&mut c)
+            .await
+            .unwrap();
+    }
+
+    /// A fill under a sweep claim tells a lost claim from a change of store.
+    #[tokio::test]
+    async fn a_sweep_fill_tells_a_lost_claim_from_a_change_of_store() {
+        let network = unique_network("pinned-sweep-fill-ends");
+        let Some((cache, pinned, mut c)) = sweep_fixture(&network, (1, 200), 1..=1u64, 50).await
+        else {
+            return;
+        };
+        let (fetched, fetch) = sweep_fetch(Arc::default());
+        let writer = bound(&cache, &pinned);
+        let key = cache.pinned_sweep_claim_key(sweep_batch_of(1));
+        let take = || SweepClaim::take(&pinned, key.clone(), Duration::from_secs(5));
+        // Taken over by another process while the store is still the one chosen: lost.
+        let claim = take().await.unwrap().unwrap();
+        let _: () = redis::cmd("SET")
+            .arg(&key)
+            .arg("another-process")
+            .query_async(&mut c)
+            .await
+            .unwrap();
+        assert_eq!(
+            claim.fill(&cache, &fetch, 7, &writer).await,
+            SweepFill::ClaimLost
+        );
+        let _: () = redis::cmd("DEL")
+            .arg(&key)
+            .query_async(&mut c)
+            .await
+            .unwrap();
+        // Held, with a current writer: the fill runs.
+        let claim = take().await.unwrap().unwrap();
+        assert_eq!(
+            claim.fill(&cache, &fetch, 7, &writer).await,
+            SweepFill::Done(Fill::Stored)
+        );
+        // Held, another store chosen: superseded, nothing fetched.
+        cache.pinned_writer_gen.fetch_add(1, Ordering::SeqCst);
+        assert_eq!(
+            claim.fill(&cache, &fetch, 8, &writer).await,
+            SweepFill::Superseded
+        );
+        assert_eq!(*fetched.lock(), vec![7]);
+        // Taken over as well, with another store chosen: what the renewal says is about the
+        // store that was replaced, so the fill counts as superseded, not as a lost claim.
+        let _: () = redis::cmd("SET")
+            .arg(&key)
+            .arg("another-process")
+            .query_async(&mut c)
+            .await
+            .unwrap();
+        assert_eq!(
+            claim.fill(&cache, &fetch, 9, &writer).await,
+            SweepFill::Superseded
+        );
+        assert_eq!(*fetched.lock(), vec![7]);
+        claim.release().await;
+        let _: () = redis::cmd("DEL")
+            .arg(&key)
+            .query_async(&mut c)
+            .await
+            .unwrap();
+    }
+
+    /// A pass whose claim renewal fails after another store was chosen (the claim is taken over
+    /// and the store replaced right before the renewal for its second height) counts that
+    /// fill as superseded, once.
+    #[tokio::test]
+    async fn a_failed_renewal_after_a_change_of_store_is_counted_as_superseded() {
+        let network = unique_network("pinned-sweep-renew-switch");
+        let missing = [17u64, 18];
+        let Some((cache, pinned, c)) = sweep_fixture(
+            &network,
+            (1, 200),
+            (1..=50u64).filter(|h| !missing.contains(h)),
+            50,
+        )
+        .await
+        else {
+            return;
+        };
+        let key = cache.pinned_sweep_claim_key(sweep_batch_of(17));
+        // The renewal before the first fill goes through; at the start of the second one
+        // another process takes the claim over and another store is chosen.
+        {
+            let (key, c, cache) = (key.clone(), c.clone(), cache.clone());
+            let mut renewals = 0u32;
+            test_hooks::on_sweep_renewal(&key.clone(), move || {
+                renewals += 1;
+                let second = renewals == 2;
+                let (key, mut c, cache) = (key.clone(), c.clone(), cache.clone());
+                Box::pin(async move {
+                    if !second {
+                        return;
+                    }
+                    let _: () = redis::cmd("SET")
+                        .arg(&key)
+                        .arg("another-process")
+                        .arg("PX")
+                        .arg(60_000)
+                        .query_async(&mut c)
+                        .await
+                        .unwrap();
+                    cache.pinned_writer_gen.fetch_add(1, Ordering::SeqCst);
+                })
+            });
+        }
+        let (fetched, fetch) = sweep_fetch(Arc::default());
+        let pass = pinned_sweep_pass(&cache, &bound(&cache, &pinned), (1, 200), 0, &fetch)
+            .await
+            .unwrap();
+        test_hooks::clear_sweep_renewal(&key);
+        let count = |result| crate::health::cache_request_count(&network, "GetTreeState", result);
+        assert_eq!(*fetched.lock(), vec![17], "the second height is not asked");
+        assert_eq!(pass.filled, 1);
+        assert_eq!(count("pinned_sweep_superseded"), 1, "exactly once");
+        assert_eq!(count("pinned_sweep_failed"), 0);
+        let mut c = c;
+        let _: () = redis::cmd("DEL")
+            .arg(&key)
+            .query_async(&mut c)
+            .await
+            .unwrap();
+    }
+
+    /// Holes below the lowest height that is filled are counted as dropped only once the
+    /// store has removed them: a store that refuses the removal keeps them, uncounted, and
+    /// the next pass on a store that takes it drops them.
+    #[tokio::test]
+    async fn holes_below_the_floor_are_counted_only_once_the_store_removed_them() {
+        let network = unique_network("pinned-sweep-floor-refused");
+        let Some((mut cache, pinned, mut c)) =
+            sweep_fixture(&network, (1, 2000), 600..=700u64, 700).await
+        else {
+            return;
+        };
+        cache.pinned_fill_from = 600;
+        let _: () = redis::cmd("SADD")
+            .arg(cache.pinned_holes_key())
+            .arg(62)
+            .arg(113)
+            .query_async(&mut c)
+            .await
+            .unwrap();
+        // A user of the test store that may not remove from the holes.
+        let user = format!("u-{network}");
+        let _: () = redis::cmd("ACL")
+            .arg("SETUSER")
+            .arg(&user)
+            .arg("on")
+            .arg(">test-only")
+            .arg("~*")
+            .arg("&*")
+            .arg("+@all")
+            .arg("-srem")
+            .arg("-hdel")
+            .query_async(&mut c)
+            .await
+            .unwrap();
+        let refusing = StoreConn::connect(
+            &format!("redis://{user}:test-only@127.0.0.1:6379"),
+            "pinned",
+            network.clone(),
+            Role::Any,
+        )
+        .await
+        .unwrap();
+        let count =
+            || crate::health::cache_request_count(&network, "GetTreeState", "pinned_sweep_dropped");
+        let (fetched, fetch) = sweep_fetch(Arc::default());
+        let pass = pinned_sweep_pass(&cache, &bound(&cache, &refusing), (1, 2000), 0, &fetch)
+            .await
+            .unwrap();
+        assert_eq!(pass.holes, Some(2), "the holes are still there");
+        assert_eq!(count(), 0, "nothing was dropped");
+        // The store takes the removal: dropped and counted, without an upstream call.
+        let pass = pinned_sweep_pass(&cache, &bound(&cache, &pinned), (1, 2000), 0, &fetch)
+            .await
+            .unwrap();
+        assert_eq!(pass.holes, Some(0));
+        assert_eq!(count(), 2);
+        assert!(fetched.lock().is_empty(), "{:?}", fetched.lock());
+        let _: () = redis::cmd("ACL")
+            .arg("DELUSER")
+            .arg(&user)
+            .query_async(&mut c)
+            .await
+            .unwrap();
+    }
+
+    /// What `cursor_store` saw.
+    #[derive(Default)]
+    struct CursorStore {
+        /// The cursor's value.
+        cursor: AtomicU64,
+        /// `INCR`s answered.
+        incrs: AtomicU64,
+        /// Scripts (the cursor step past the lower heights) received.
+        evals: AtomicU64,
+    }
+
+    /// A Redis-protocol server that keeps a backfill cursor: `INCR`/`DECR` move it, a script
+    /// (`EVALSHA`) is refused with an error the first `refused` times and then moves the cursor
+    /// up to `jump_to`; `ROLE` answers as a primary, `EXISTS` 0, every other command `+OK`.
+    async fn cursor_store(refused: u64, jump_to: u64) -> (String, Arc<CursorStore>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = Arc::new(CursorStore::default());
+        let state = seen.clone();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let state = state.clone();
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    loop {
+                        let Ok(n) = stream.read(&mut chunk).await else {
+                            return;
+                        };
+                        if n == 0 {
+                            return;
+                        }
+                        buf.extend_from_slice(&chunk[..n]);
+                        while let Some((len, name)) = resp_command_name(&buf) {
+                            buf.drain(..len);
+                            let answer: Vec<u8> = match name.as_slice() {
+                                b"ROLE" => ROLE_PRIMARY.to_vec(),
+                                b"INCR" => {
+                                    state.incrs.fetch_add(1, Ordering::SeqCst);
+                                    let n = state.cursor.fetch_add(1, Ordering::SeqCst) + 1;
+                                    format!(":{n}\r\n").into_bytes()
+                                }
+                                b"DECR" => {
+                                    let n = state.cursor.fetch_sub(1, Ordering::SeqCst) - 1;
+                                    format!(":{n}\r\n").into_bytes()
+                                }
+                                b"EVALSHA" | b"EVAL" => {
+                                    if state.evals.fetch_add(1, Ordering::SeqCst) < refused {
+                                        b"-ERR refused\r\n".to_vec()
+                                    } else {
+                                        state.cursor.fetch_max(jump_to, Ordering::SeqCst);
+                                        b":1\r\n".to_vec()
+                                    }
+                                }
+                                b"EXISTS" => b":0\r\n".to_vec(),
+                                _ => b"+OK\r\n".to_vec(),
+                            };
+                            if stream.write_all(&answer).await.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        (format!("redis://{addr}"), seen)
+    }
+
+    /// A worker on `cursor_store(refused, floor - 1)` with the lowest fillable height `floor`,
+    /// run until it asked for at least three heights: the heights asked and what the store saw.
+    async fn backfill_on_a_cursor_store(
+        name: &str,
+        refused: u64,
+        floor: u64,
+    ) -> Option<(Vec<u64>, Arc<CursorStore>)> {
+        assert!(floor > 1);
+        let conn = required_redis().await?;
+        let network = unique_network(name);
+        let (url, seen) = cursor_store(refused, floor - 1).await;
+        let mut cache = test_cache(conn, None, &network);
+        cache.pinned_conn = Some(
+            StoreConn::connect(&url, "pinned", network.clone(), Role::Any)
+                .await
+                .unwrap(),
+        );
+        cache.pinned_range = Some((1, u64::MAX));
+        cache.pinned_fill_from = floor;
+        tip_at(&cache, 100_000);
+        let fetched = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let tasks = {
+            let fetched = fetched.clone();
+            spawn_pinned_backfill(cache.clone(), 1, move |h| {
+                let fetched = fetched.clone();
+                async move {
+                    fetched.lock().push(h);
+                    anyhow::Ok(tree_state_answer(h))
+                }
+            })
+        };
+        for _ in 0..600 {
+            if fetched.lock().len() >= 3 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        for task in tasks {
+            task.abort();
+            let _ = task.await;
+        }
+        let fetched = fetched.lock().clone();
+        Some((fetched, seen))
+    }
+
+    /// A cursor step past the lower heights that the store refuses is tried again before the
+    /// next claim: the worker walks only the few heights claimed meanwhile, asks the upstream
+    /// for none of them, and goes on at the lowest fillable height.
+    #[tokio::test]
+    async fn a_refused_cursor_step_is_tried_again_before_the_next_claim() {
+        let Some((fetched, seen)) = backfill_on_a_cursor_store("pinned-skip-retry", 3, 500).await
+        else {
+            return;
+        };
+        assert_eq!(fetched.get(..3), Some(&[500, 501, 502][..]), "{fetched:?}");
+        assert!(fetched.iter().all(|h| *h >= 500), "nothing below is asked");
+        assert_eq!(
+            seen.evals.load(Ordering::SeqCst),
+            4,
+            "three refused, one taken"
+        );
+        assert!(seen.cursor.load(Ordering::SeqCst) >= 500);
+        // 1, 2 and 3 were claimed while the step was refused; every later claim is a height
+        // that is asked for (the last one may have been claimed when the worker was stopped).
+        let claims = seen.incrs.load(Ordering::SeqCst);
+        let asked = fetched.len() as u64;
+        assert!(
+            claims == 3 + asked || claims == 4 + asked,
+            "{claims} claims for {asked} heights asked"
+        );
+    }
+
+    /// On a store that never takes the cursor step the worker walks the lower heights one by
+    /// one, asks the upstream for none of them, and stops trying the step once a claim is
+    /// past them.
+    #[tokio::test]
+    async fn a_cursor_step_that_never_succeeds_is_given_up_past_the_lower_heights() {
+        let Some((fetched, seen)) =
+            backfill_on_a_cursor_store("pinned-skip-never", u64::MAX, 30).await
+        else {
+            return;
+        };
+        assert_eq!(fetched.get(..3), Some(&[30, 31, 32][..]), "{fetched:?}");
+        assert!(fetched.iter().all(|h| *h >= 30), "nothing below is asked");
+        assert!(seen.cursor.load(Ordering::SeqCst) >= 30);
+        assert_eq!(
+            seen.evals.load(Ordering::SeqCst),
+            30,
+            "once before each of the claims 1..=30, none after"
+        );
+    }
+
+    /// A batch whose every height in the range is a hole is done all the same: the mark moves
+    /// past it.
+    #[tokio::test]
+    async fn the_sweep_mark_moves_past_a_batch_of_holes() {
+        let network = unique_network("pinned-sweep-all-holes");
+        // Height 499 is the only one of its batch in the range; 500 and 501 are present.
+        let Some((cache, pinned, _c)) = sweep_fixture(&network, (499, 501), 500..=501u64, 3).await
+        else {
+            return;
+        };
+        let (fetched, fetch) = erroring_fetch(&[14]);
+        let pass = pinned_sweep_pass(&cache, &bound(&cache, &pinned), (499, 501), 0, &fetch)
+            .await
+            .unwrap();
+        assert_eq!((pass.filled, pass.next, pass.holes), (0, 502, Some(1)));
+        assert_eq!(*fetched.lock(), vec![499, 499, 499]);
+    }
+
+    /// Below the lowest height the backfill fills (the Sapling activation in production) the
+    /// sweep asks nothing: holes there (recorded by an earlier version) are dropped without a
+    /// fetch, and the mark starts at that height.
+    #[tokio::test]
+    async fn the_sweep_starts_at_the_lowest_fillable_height() {
+        let network = unique_network("pinned-sweep-floor");
+        let Some((mut cache, pinned, mut c)) =
+            sweep_fixture(&network, (1, 2000), 600..=700u64, 700).await
+        else {
+            return;
+        };
+        cache.pinned_fill_from = 600;
+        let _: () = redis::pipe()
+            .cmd("SADD")
+            .arg(cache.pinned_holes_key())
+            .arg(62)
+            .arg(113)
+            .arg(388)
+            .ignore()
+            .cmd("HSET")
+            .arg(cache.pinned_hole_attempts_key())
+            .arg(62)
+            .arg(3)
+            .ignore()
+            .cmd("SET")
+            .arg(cache.pinned_verified_key())
+            .arg(500)
+            .ignore()
+            .query_async(&mut c)
+            .await
+            .unwrap();
+        let (fetched, fetch) = sweep_fetch(Arc::default());
+        let pass = pinned_sweep_pass(&cache, &bound(&cache, &pinned), (1, 2000), 0, &fetch)
+            .await
+            .unwrap();
+        assert!(fetched.lock().is_empty(), "{:?}", fetched.lock());
+        assert_eq!((pass.filled, pass.next, pass.holes), (0, 701, Some(0)));
+        assert!(!key_exists(&c, &cache.pinned_hole_attempts_key()).await);
+        assert_eq!(
+            crate::health::cache_request_count(&network, "GetTreeState", "pinned_sweep_dropped"),
+            3
+        );
+    }
+
+    /// Backfill workers skip the heights below the lowest fillable one in one step of the
+    /// cursor, without asking the upstream.
+    #[tokio::test]
+    async fn backfill_workers_skip_the_heights_below_the_lowest_fillable_one() {
+        let Some(conn) = required_redis().await else {
+            return;
+        };
+        let network = unique_network("pinned-backfill-floor");
+        let mut cache = test_cache(conn.clone(), None, &network);
+        cache.pinned_conn = Some(StoreConn::from_parts(
+            redis::Client::open("redis://127.0.0.1:6379").unwrap(),
+            conn.clone(),
+            "pinned",
+            network.clone(),
+            Role::Any,
+        ));
+        cache.pinned_range = Some((1, u64::MAX));
+        cache.pinned_fill_from = 300;
+        tip_at(&cache, 1000);
+        let fetched = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let tasks = {
+            let fetched = fetched.clone();
+            spawn_pinned_backfill(cache.clone(), 1, move |h| {
+                let fetched = fetched.clone();
+                async move {
+                    fetched.lock().push(h);
+                    anyhow::Ok(tree_state_answer(h))
+                }
+            })
+        };
+        for _ in 0..400 {
+            if fetched.lock().len() >= 3 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        for task in tasks {
+            task.abort();
+            let _ = task.await;
+        }
+        let first: Vec<u64> = fetched.lock().iter().take(3).copied().collect();
+        assert_eq!(first, vec![300, 301, 302], "the first heights asked");
+        let mut c = conn;
+        let _: () = redis::cmd("DEL")
+            .arg(cache.pinned_cursor_key())
+            .query_async(&mut c)
+            .await
+            .unwrap();
+    }
+
+    /// The lowest height filled comes from the network through `with_pinned`: the Sapling
+    /// activation of mainnet, the testnet one for testnet and for any other network label. A
+    /// range that starts above it keeps its start; one that ends below it fills nothing.
+    #[tokio::test]
+    async fn the_lowest_fillable_height_is_the_networks_sapling_activation() {
+        let Some(conn) = required_redis().await else {
+            return;
+        };
+        let url = "redis://127.0.0.1:6379";
+        for (label, floor) in [
+            ("mainnet".to_string(), 419_200),
+            ("testnet".to_string(), 280_000),
+            (unique_network("pinned-floor-other"), 280_000),
+        ] {
+            let cache = test_cache(conn.clone(), None, &label)
+                .with_pinned(url, None, (1, u64::MAX))
+                .await
+                .unwrap();
+            assert_eq!(cache.pinned_fill_from, floor, "{label}");
+            assert_eq!(crate::store::sapling_activation(&label), floor, "{label}");
+        }
+
+        // A range that starts above the activation: swept from its own start.
+        let network = unique_network("pinned-floor-above");
+        let range = (300_000, 300_010);
+        let cache = test_cache(conn.clone(), None, &network)
+            .with_pinned(url, None, range)
+            .await
+            .unwrap();
+        tip_at(&cache, 400_000);
+        let mut c = conn.clone();
+        let _: () = redis::cmd("SET")
+            .arg(cache.pinned_cursor_key())
+            .arg(5)
+            .query_async(&mut c)
+            .await
+            .unwrap();
+        let writer = cache.pinned_writer_bound().await.unwrap();
+        let (fetched, fetch) = sweep_fetch(Arc::default());
+        let pass = pinned_sweep_pass(&cache, &writer, range, 0, &fetch)
+            .await
+            .unwrap();
+        assert_eq!((pass.filled, pass.next), (5, 300_005));
+        assert_eq!(fetched.lock().first(), Some(&300_000));
+
+        // A range that ends below the activation: nothing is asked, by the sweep or a worker.
+        let network = unique_network("pinned-floor-below");
+        let range = (1, 1_000);
+        let cache = test_cache(conn.clone(), None, &network)
+            .with_pinned(url, None, range)
+            .await
+            .unwrap();
+        tip_at(&cache, 400_000);
+        let _: () = redis::cmd("SET")
+            .arg(cache.pinned_cursor_key())
+            .arg(900)
+            .query_async(&mut c)
+            .await
+            .unwrap();
+        let writer = cache.pinned_writer_bound().await.unwrap();
+        let (fetched, fetch) = sweep_fetch(Arc::default());
+        let pass = pinned_sweep_pass(&cache, &writer, range, 0, &fetch)
+            .await
+            .unwrap();
+        assert_eq!((pass.filled, pass.holes), (0, Some(0)));
+        assert!(pass.next > range.1, "the range counts as swept");
+        let asked = fetched.clone();
+        let mut tasks = spawn_pinned_backfill(cache.clone(), 1, move |h| {
+            let asked = asked.clone();
+            async move {
+                asked.lock().push(h);
+                anyhow::Ok(tree_state_answer(h))
+            }
+        });
+        // The worker (the last task) finds the range done and ends.
+        let worker = tasks.pop().expect("a worker was spawned");
+        timeout(Duration::from_secs(30), worker)
+            .await
+            .expect("the worker ends")
+            .unwrap();
+        for task in tasks {
+            task.abort();
+            let _ = task.await;
+        }
+        assert!(fetched.lock().is_empty(), "{:?}", fetched.lock());
         let _: () = redis::cmd("DEL")
             .arg(cache.pinned_cursor_key())
             .query_async(&mut c)

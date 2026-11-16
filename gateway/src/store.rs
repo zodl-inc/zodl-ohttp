@@ -71,8 +71,17 @@ impl TipCell {
     }
 
     pub fn set(&self, tip: Tip) {
-        self.inner
-            .store(Some(Arc::new((tip, tokio::time::Instant::now()))));
+        self.set_at(tip, tokio::time::Instant::now());
+    }
+
+    /// Set `tip` as seen at `at` (not now): it goes stale [`TIP_STALE_AFTER`] after `at`.
+    pub fn set_at(&self, tip: Tip, at: tokio::time::Instant) {
+        self.inner.store(Some(Arc::new((tip, at))));
+    }
+
+    /// Forget the tip (unknown until the next `set`).
+    pub fn clear(&self) {
+        self.inner.store(None);
     }
 }
 

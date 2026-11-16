@@ -135,8 +135,14 @@ chain state:
   deletion of a reorg are written only while the writer holds the lock with its own token, so
   a leader replaced during a slow tick cannot write the index of another fork, delete what its
   successor wrote or move the tip back. Followers keep the tip fresh only while the leader
-  confirms it (`{chain}tip_seen`); a leader whose lightwalletd is stuck at or behind the tip
-  stops confirming it, and one that stays behind gives the lock up.
+  confirms it (`{chain}tip_seen`); the leader confirms a tip only for 10 minutes after it
+  moved (`{chain}tip_at`, whichever process wrote it), so a lightwalletd stuck at or behind the
+  tip cannot keep it fresh, and one that stays behind gives the lock up. A `tip_at` ahead of a
+  new leader's clock counts from its takeover; a tip that moves while `tip_at` stays (a leader
+  that writes neither key, after a rollback) is followed as one without `tip_at`. A tip a
+  follower serves from its own lightwalletd ahead of a stale leader is dropped when the stored
+  chain forks under it, when the lock is taken while that cannot be checked, and, as leader,
+  when it indexes a lower tip of another fork.
 - Blocks (`GetBlockRange` per block, `GetBlock`, `GetBlockNullifiers`) are served only while
   their hash matches the index; final blocks can live in the permanent tier
   (`PERMANENT_REDIS_URL`). `GetTreeState`, mined `GetTransaction` and `GetSubtreeRoots` entries
