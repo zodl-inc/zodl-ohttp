@@ -229,6 +229,23 @@ keeps its own log in [client/CHANGELOG.md](client/CHANGELOG.md).
   was. Mixed versions: older followers ignore the key, older leaders do not write it (followers
   of this version then infer as before); the other keys keep their format, meaning and
   writers' rules; after a rollback the key expires.
+- A fill of the pinned sweep that is abandoned (another store chosen, its claim lost, or its
+  60 s fill timeout) no longer cancels its upstream `GetTreeState` call in flight: the sweep's
+  calls run in a task of their own and the fill only stops waiting for it; the call runs to
+  its own end and its answer is dropped, no write is started for it (as before, a store
+  command already sent completes on the store it was bound to: an idempotent `SET NX` of a
+  finalized height). A cancelled call can cost the node behind lightwalletd an RPC slot. Each
+  call holds one of 3 permits per cache from before it is spawned until its task is gone
+  (completed, panicked, or dropped at shutdown), so at most 3 sweep-started upstream calls are
+  alive per cache, awaited or abandoned. A fill waits for a permit only while all three are,
+  within its fill timeout (checking every pause whether its store is still the one chosen; the wait is not an
+  attempt), and one that got none ends like a fill that timed out (no answer: the height
+  becomes a hole of the batch, nothing counted against it). A call that panics is a failed
+  attempt. New `ohttp_cache_requests_total{rpc="GetTreeState",result="pinned_fetch_detached"}`:
+  a sweep fill was abandoned while one of its calls was in flight. The backfill workers are
+  unchanged (they never abandon a fill). The fetch given to the backfill must end by itself
+  within a bound; the gateway's (`proxy::forward_to_backend`) is bounded as a whole by
+  `LWD_TIMEOUT_SECS`.
 - Known limits of the chain follower and the pinned backfill after these changes:
   - The drop of a held tip on a scheduled probe without a new observation applies to a held
     tip that is still held when the probe starts (the stored tip is not on its own chain).
@@ -259,9 +276,12 @@ keeps its own log in [client/CHANGELOG.md](client/CHANGELOG.md).
     that starts under a leader that writes no `tip_at` trusts a leftover `tip_at` on its first
     read, as before (the stamp never says "leftover"); and a leftover verdict stays until
     `tip_at` changes.
-  - A sweep fill abandoned because the store changed cancels its upstream call in flight, as
-    the fill timeout and a lost claim do: at most one call per worker per change of store.
-    (Letting it run would hold the batch's claim for the fetch timeout.)
+  - An abandoned sweep call keeps the request-path concurrency permits it holds until it
+    ends (up to 3 sweep calls per cache instead of 1). Upstream calls are still cancelled by
+    the fetch's own timeouts, by the losing attempt of a hedged read, and when the process or
+    runtime stops, as on every request path. A sweep fill that waits for a permit (three
+    sweep-started calls alive) is delayed up to its fill timeout; a fetch that never
+    ended would keep its permit (the gateway's is bounded by `LWD_TIMEOUT_SECS`).
   - The store-backed tests fail without a test store only when `CI` is set; elsewhere they
     are skipped, as the rest of the suite's store-backed tests are.
 - A pinned store whose `ROLE` does not answer in time (or fails on the connection) is treated as

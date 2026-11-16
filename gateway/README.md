@@ -236,7 +236,7 @@ trace ids are never labels. `network` is `NETWORK`.
 | `ohttp_cache_redis_connected` | `network` | Cache Redis connection. |
 | `ohttp_security_redis_connected` | `network` | Security Redis PING (0 also when not configured). |
 | `ohttp_redis_op_timeout_total` | `network, operation` | Redis operation timeouts. |
-| `ohttp_cache_requests_total` | `network, rpc, result` | Cache lookups by result. Also counts answers not stored: `not_positioned`, `not_indexed`. |
+| `ohttp_cache_requests_total` | `network, rpc, result` | Cache lookups by result. Also counts answers not stored: `not_positioned`, `not_indexed`. The pinned backfill and sweep count under `rpc="GetTreeState"` (see `PINNED_BACKFILL_WORKERS` in CONFIG.md), among them `pinned_fetch_detached`: a sweep fill was abandoned while one of its upstream calls was in flight (the call runs to its end, its answer unused). |
 | `ohttp_cache_tip_mismatch_total` | `network, rpc, phase` | Tip-scoped answers not at the tip of their key: `store` (not cached), `lookup` (a stored entry deleted and fetched again; the request counts as a miss above). |
 | `ohttp_cache_tip_height` | `network` | Tip height known to the cache. |
 | `ohttp_local_cache_total` | `network, result` | In-process LRU `hit`, `miss`, `oversized`. |
