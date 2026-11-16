@@ -12183,6 +12183,96 @@ mod tests {
             .unwrap();
     }
 
+    /// The chain follower's tip write against a real store: the tip, `tip_at`, `tip_seen` and
+    /// the stamp binding `tip_at` to the tip are written by one fenced script (all four there,
+    /// the stamp naming the tip and `tip_at` written with it), and refused together while the
+    /// lock is held by another process or by none.
+    #[tokio::test]
+    async fn the_tip_and_its_stamp_are_written_and_refused_together() {
+        use crate::store::{
+            decode_tip_stamp, decode_unix_ms, encode_tip, lock_key, tip_at_key, tip_key,
+            tip_seen_key, tip_stamp_key,
+        };
+        let Some(conn) = required_redis().await else {
+            return;
+        };
+        let network = unique_network("tip-stamp");
+        let cache = Arc::new(test_cache(conn.clone(), None, &network));
+        let lwd = Arc::new(crate::block_cache::test_support::FakeChain::new(500));
+        let f = crate::chain::ChainFollower::new(
+            cache.clone(),
+            Arc::new(crate::chain::test_support::FakeChainSource(lwd)),
+            None,
+            Arc::new(crate::block_cache::PoolKeys::default()),
+            network.clone(),
+        );
+        let prefix = cache.chain_prefix();
+        let keys = [
+            tip_key(&prefix),
+            tip_at_key(&prefix),
+            tip_seen_key(&prefix),
+            tip_stamp_key(&prefix),
+        ];
+        let lock = lock_key(&prefix);
+        let mut c = conn;
+        macro_rules! values {
+            () => {{
+                let mut v = Vec::new();
+                for k in &keys {
+                    v.push(
+                        redis::cmd("GET")
+                            .arg(k)
+                            .query_async::<_, Option<Vec<u8>>>(&mut c)
+                            .await
+                            .unwrap(),
+                    );
+                }
+                v
+            }};
+        }
+        assert_eq!(f.tick().await, crate::chain::Outcome::Cold { tip: 500 });
+        let written = values!();
+        assert!(written.iter().all(Option::is_some), "{written:?}");
+        let stamp = decode_tip_stamp(written[3].as_ref().unwrap()).unwrap();
+        assert_eq!(&stamp.tip, written[0].as_ref().unwrap());
+        assert_eq!(
+            Some(stamp.tip_at_ms),
+            decode_unix_ms(written[1].as_ref().unwrap())
+        );
+        let next = crate::store::Tip {
+            height: 501,
+            hash: vec![5; 32],
+        };
+        assert_ne!(encode_tip(&next).to_vec(), stamp.tip);
+        // Held by another process, then by none: refused, none of the four changed.
+        let _: () = redis::cmd("SET")
+            .arg(&lock)
+            .arg("another-process")
+            .arg("PX")
+            .arg(60_000)
+            .query_async(&mut c)
+            .await
+            .unwrap();
+        assert!(!crate::chain::test_support::write_tip(&f, &next)
+            .await
+            .unwrap());
+        assert_eq!(values!(), written);
+        let _: () = redis::cmd("DEL")
+            .arg(&lock)
+            .query_async(&mut c)
+            .await
+            .unwrap();
+        assert!(!crate::chain::test_support::write_tip(&f, &next)
+            .await
+            .unwrap());
+        assert_eq!(values!(), written);
+        let mut del = redis::cmd("DEL");
+        for k in &keys {
+            del.arg(k);
+        }
+        let _: () = del.arg(&lock).query_async(&mut c).await.unwrap();
+    }
+
     /// With the primary and replica of tests/failover (OHTTP_FAILOVER_REDIS=1): a pinned store
     /// that is a replica is detected at startup and never written to; with the primary as
     /// write store the entry is written there and read back through the replica.

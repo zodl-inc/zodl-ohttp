@@ -1100,6 +1100,8 @@ pub(crate) mod test_support {
         pub down: AtomicBool,
         /// Milliseconds every block fetch of the chain follower's source takes.
         pub blocks_delay_ms: AtomicU64,
+        /// Milliseconds every `latest` call of the chain follower's source takes.
+        pub latest_delay_ms: AtomicU64,
     }
 
     impl FakeChain {
@@ -1111,6 +1113,7 @@ pub(crate) mod test_support {
                 range_calls: Mutex::new(vec![]),
                 down: AtomicBool::new(false),
                 blocks_delay_ms: AtomicU64::new(0),
+                latest_delay_ms: AtomicU64::new(0),
             }
         }
         pub fn tip(&self) -> u64 {

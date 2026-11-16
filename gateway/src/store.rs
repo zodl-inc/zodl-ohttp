@@ -257,6 +257,71 @@ pub fn tip_seen_key(chain_prefix: &str) -> String {
     format!("{chain_prefix}tip_seen")
 }
 
+/// What binds the stored `tip_at` to the tip it was written with:
+/// `1:<tip_at, Unix ms, decimal>:<nonce, 16 lowercase hex digits>:<lowercase hex of the tip
+/// value as stored, encode_tip>`. A leader writes it only together with `tip_at`, in the same
+/// fenced script, with a new random nonce on every write, and never stamps a `tip_at` it only
+/// read. Followers use it as positive evidence only, under the rules of `chain::TipAtRead`
+/// (when a stamp vouches for a read, and when it says nothing). A separate key, so that a
+/// gateway that does not know it reads the other keys as before.
+pub fn tip_stamp_key(chain_prefix: &str) -> String {
+    format!("{chain_prefix}tip_stamp")
+}
+
+/// A parsed `{chain}tip_stamp` value (see [`tip_stamp_key`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TipStamp {
+    /// The `tip_at` value written with it.
+    pub tip_at_ms: u64,
+    /// The write's random nonce.
+    pub nonce: u64,
+    /// The exact bytes of the tip value written with it (`encode_tip`).
+    pub tip: Vec<u8>,
+}
+
+pub fn encode_tip_stamp(tip_at_ms: u64, nonce: u64, tip: &Tip) -> Bytes {
+    Bytes::from(format!(
+        "1:{tip_at_ms}:{nonce:016x}:{}",
+        hex::encode(encode_tip(tip))
+    ))
+}
+
+/// A `{chain}tip_stamp` value; None for anything that is not exactly the format
+/// [`encode_tip_stamp`] writes (another version, missing or extra fields, a decimal with a
+/// sign, spaces or leading zeros, hex that is not lowercase or has an odd length, a tip value
+/// `encode_tip` cannot write: fewer than 8 bytes, or height 0).
+pub fn decode_tip_stamp(bytes: &[u8]) -> Option<TipStamp> {
+    let lower_hex = |s: &str| s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+    let mut fields = std::str::from_utf8(bytes).ok()?.split(':');
+    let (version, ms, nonce, tip) = (
+        fields.next()?,
+        fields.next()?,
+        fields.next()?,
+        fields.next()?,
+    );
+    if fields.next().is_some() || version != "1" {
+        return None;
+    }
+    if ms.is_empty() || !ms.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let tip_at_ms: u64 = ms.parse().ok()?;
+    if tip_at_ms.to_string() != ms || nonce.len() != 16 || !lower_hex(nonce) {
+        return None;
+    }
+    if tip.len() % 2 != 0 || !lower_hex(tip) {
+        return None;
+    }
+    let tip = hex::decode(tip).ok()?;
+    // Only a tip value `encode_tip` writes (a height above 0, then the hash).
+    decode_tip(&tip)?;
+    Some(TipStamp {
+        tip_at_ms,
+        nonce: u64::from_str_radix(nonce, 16).ok()?,
+        tip,
+    })
+}
+
 pub fn encode_unix_ms(ms: u64) -> Bytes {
     Bytes::from(ms.to_string())
 }
@@ -358,6 +423,8 @@ pub(crate) mod test_support {
         pub epoch: u64,
         /// When set, every read answers "nothing" and every write is dropped (Redis down).
         pub down: std::sync::atomic::AtomicBool,
+        /// `Some((part, delay))`: an `mget` of a key containing `part` takes `delay`.
+        pub slow_mget: Mutex<Option<(String, Duration)>>,
     }
 
     impl Default for MemStore {
@@ -371,6 +438,7 @@ pub(crate) mod test_support {
                 tip: TipCell::new(),
                 epoch: 42,
                 down: std::sync::atomic::AtomicBool::new(false),
+                slow_mget: Mutex::new(None),
             }
         }
     }
@@ -421,6 +489,15 @@ pub(crate) mod test_support {
         fn mget(&self, keys: Vec<String>) -> BoxFuture<'_, Vec<Option<Bytes>>> {
             Box::pin(async move {
                 self.mgets.lock().unwrap().push(keys.clone());
+                let slow = self
+                    .slow_mget
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .filter(|(part, _)| keys.iter().any(|k| k.contains(part.as_str())));
+                if let Some((_, delay)) = slow {
+                    tokio::time::sleep(delay).await;
+                }
                 if self.is_down() {
                     return vec![None; keys.len()];
                 }
@@ -733,6 +810,72 @@ pub(crate) mod test_support {
         }
         fn writable(&self) -> bool {
             !self.replica.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[test]
+    fn tip_stamp_codec() {
+        let tip = Tip {
+            height: 1_000_001,
+            hash: vec![0xab, 0x01, 0xff],
+        };
+        let raw = encode_tip_stamp(1_700_000_000_123, 0x0123_4567_89ab_cdef, &tip);
+        assert_eq!(
+            &raw[..],
+            b"1:1700000000123:0123456789abcdef:00000000000f4241ab01ff"
+        );
+        assert_eq!(
+            decode_tip_stamp(&raw),
+            Some(TipStamp {
+                tip_at_ms: 1_700_000_000_123,
+                nonce: 0x0123_4567_89ab_cdef,
+                tip: encode_tip(&tip).to_vec(),
+            })
+        );
+        // A tip with an empty hash; the smallest values.
+        let bare = Tip {
+            height: 7,
+            hash: vec![],
+        };
+        let raw = encode_tip_stamp(0, 0, &bare);
+        assert_eq!(&raw[..], b"1:0:0000000000000000:0000000000000007");
+        let stamp = decode_tip_stamp(&raw).unwrap();
+        assert_eq!(decode_tip(&stamp.tip), Some(bare));
+        assert_eq!((stamp.tip_at_ms, stamp.nonce), (0, 0));
+        for bad in [
+            &b""[..],
+            b"2:5:0123456789abcdef:0000000000000007",
+            b"01:5:0123456789abcdef:0000000000000007",
+            b"1:5:0123456789abcdef",
+            b"1:5:0123456789abcdef:0000000000000007:",
+            b"1:5:0123456789abcdef:0000000000000007:00",
+            b"1::0123456789abcdef:0000000000000007",
+            b"1:+5:0123456789abcdef:0000000000000007",
+            b"1:05:0123456789abcdef:0000000000000007",
+            b"1: 5:0123456789abcdef:0000000000000007",
+            b"1:18446744073709551616:0123456789abcdef:0000000000000007",
+            b"1:5:0123456789abcde:0000000000000007",
+            b"1:5:0123456789abcdef0:0000000000000007",
+            b"1:5:0123456789ABCDEF:0000000000000007",
+            b"1:5:0123456789abcdeg:0000000000000007",
+            b"1:5:0123456789abcdef:000000000000000",
+            b"1:5:0123456789abcdef:000000000000000G",
+            b"1:5:0123456789abcdef:00000000000000AB",
+            b"1:5:0123456789abcdef:0000000000000007\n",
+            b"1:5:0123456789abcdef:0000000000000007 ",
+            b"\xff:5:0123456789abcdef:0000000000000007",
+            // Not a tip value: empty, shorter than a height, height 0.
+            b"1:5:0123456789abcdef:",
+            b"1:5:0123456789abcdef:00000000000007",
+            b"1:5:0123456789abcdef:0000000000000000",
+            b"1:5:0123456789abcdef:0000000000000000ab",
+        ] {
+            assert_eq!(
+                decode_tip_stamp(bad),
+                None,
+                "{:?}",
+                String::from_utf8_lossy(bad)
+            );
         }
     }
 
