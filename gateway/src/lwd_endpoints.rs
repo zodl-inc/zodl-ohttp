@@ -33,13 +33,22 @@
 //! - **One retry**:
 //!   - after a connect error, for every call (no byte of the request reached lightwalletd, so
 //!     nothing can run twice, `SendTransaction` included);
+//!   - after an error that says the request was not written to the connection
+//!     ([`RequestError::not_written`]: the HTTP client got the request back unsent, or the
+//!     connection was closed between its handshake and the request), for every call as well;
 //!   - for an idempotent call (every `CompactTxStreamer` RPC except `SendTransaction`) also after
-//!     a transport error. A `SendTransaction` is never sent twice by the gateway.
+//!     any other transport error. A `SendTransaction` that may have been written is never sent
+//!     twice by the gateway: every error that does not prove the opposite fails it.
 //! - **Hedged reads**: an idempotent read whose response head has not arrived after the hedge
 //!   delay (`LWD_HEDGE_DELAY_MS`, default half of the head deadline) is sent a second time to a
 //!   *different* instance of `LWD_ENDPOINTS` (none: no hedge), while the first attempt keeps
-//!   running. The first head wins and the other attempt is cancelled; both share the call's
+//!   running. The first head wins; both share the call's
 //!   whole head deadline, so a read that is merely slow is no longer cut at half of it. The
+//!   other attempt is not cancelled (a cancelled call makes lightwalletd cancel the node RPC
+//!   behind it, which can cost the node an RPC slot): it runs to its end in a task of its own
+//!   and its answer is discarded ([`detach_loser`]), unless as many detached attempts as
+//!   `LWD_HEDGE_MAX_INFLIGHT` are running already (then it is cancelled, as before), or its
+//!   request was not given to a connection yet (then it is dropped: nothing was sent). The
 //!   loser is not a failure (not a timeout, not a failed call, no pool replacement); an
 //!   attempt that fails is settled as failed even when the other one then answers. An instance
 //!   that loses two hedges in a row, without a response head from it in between, is skipped for
@@ -54,12 +63,16 @@
 //!   failed; a read that is not hedged holds none), and the rate cap ([`HedgeRate`]): six
 //!   hedges a minute are always allowed, above that hedges stay at most one in ten of the
 //!   hedgeable reads of the last minute. Hedges are
-//!   not counted in `MAX_INFLIGHT_LWD` (the caller's permit covers the first attempt only), so
-//!   hedging adds at most `LWD_HEDGE_MAX_INFLIGHT` concurrent lightwalletd calls, and 10 % more
+//!   not counted in `MAX_INFLIGHT_LWD` (the caller's permit covers the attempt whose answer
+//!   it gets), nor are detached losers, which hold a permit of a second set of the same size
+//!   and none of the caller's: hedging adds at most `LWD_HEDGE_MAX_INFLIGHT` hedges in flight
+//!   plus as many detached losers to the concurrent lightwalletd calls, and 10 % more
 //!   calls plus at most six a minute. Counted in `ohttp_lwd_hedges_total`.
 //!
-//!   Every attempt cut by the call's deadline counts in `ohttp_lwd_timeouts_total`, also when
-//!   another attempt answers.
+//!   Every attempt cut by the call's deadline while the call still waits for it counts in
+//!   `ohttp_lwd_timeouts_total`, also when another attempt answers afterwards. A detached
+//!   loser cut by that deadline does not (the call has its answer): it counts as
+//!   `ohttp_lwd_hedges_total{event="loser_expired"}`.
 //!
 //!   The retry goes to another instance when `LWD_ENDPOINTS` has one, always on a new connection.
 //!   Only the phase up to the response head is retried: a call that fails after its head arrived
@@ -70,9 +83,13 @@
 //!   there and eject an instance: a head that is merely late is not a lightwalletd failure.
 
 use axum::body::Bytes;
+use futures_util::future::BoxFuture;
 use http_body_util::Full;
 use hyper::Request;
-use hyper_util::client::legacy::{connect::HttpConnector, Client};
+use hyper_util::client::legacy::{
+    connect::{capture_connection, CaptureConnection, Connect, HttpConnector},
+    Client,
+};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, OnceLock};
@@ -90,6 +107,13 @@ const RESOLVE_TIMEOUT: Duration = Duration::from_secs(1);
 const REFRESH_TIMEOUT: Duration = Duration::from_secs(30);
 /// Pause before the retry after a connect error.
 const CONNECT_RETRY_DELAY: Duration = Duration::from_millis(50);
+
+/// A detached loser of a hedge ([`detach_loser`]) reads its answer's body for this long at most.
+const DETACHED_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
+/// A detached loser of a hedge reads this much of its answer's body at most.
+const DETACHED_DRAIN_MAX_BYTES: usize = 8 * 1024 * 1024;
+/// A detached loser of a hedge lets other tasks run after this many frames of its body.
+const DETACHED_DRAIN_YIELD_EVERY: u32 = 64;
 
 pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_millis(2000);
 /// Hedges in flight per process at most (`LWD_HEDGE_MAX_INFLIGHT`).
@@ -315,21 +339,26 @@ impl HedgeRate {
     }
 }
 
-/// How [`request_with`] hedges: the delay, the permits of hedges in flight and the rate cap.
+/// How [`request_with`] hedges: the delay, the permits of hedges in flight, the permits of
+/// detached losers and the rate cap.
 #[derive(Clone)]
 pub struct Hedging {
     pub delay: HedgeDelay,
     pub permits: Arc<tokio::sync::Semaphore>,
+    /// One per attempt that lost its race and runs to its end detached ([`detach_loser`]): as
+    /// many as `permits`, and apart from them, so that losers on an instance that hangs do not
+    /// use up the hedges.
+    pub detached: Arc<tokio::sync::Semaphore>,
     pub rate: Arc<HedgeRate>,
 }
 
 impl Hedging {
     pub fn new(delay: HedgeDelay, max_inflight: usize) -> Self {
+        let max = max_inflight.clamp(1, tokio::sync::Semaphore::MAX_PERMITS);
         Self {
             delay,
-            permits: Arc::new(tokio::sync::Semaphore::new(
-                max_inflight.clamp(1, tokio::sync::Semaphore::MAX_PERMITS),
-            )),
+            permits: Arc::new(tokio::sync::Semaphore::new(max)),
+            detached: Arc::new(tokio::sync::Semaphore::new(max)),
             rate: Arc::new(HedgeRate::default()),
         }
     }
@@ -606,6 +635,45 @@ impl RequestError {
     fn is_connect(&self) -> bool {
         matches!(self, RequestError::Http(e) if e.is_connect())
     }
+
+    /// The error says that no byte of the request was written to a connection, so the call may
+    /// be sent again whatever it is. From the HTTP client's sources (hyper 1.x, HTTP/2), the
+    /// error it wraps is one of exactly two kinds then:
+    ///
+    /// - *canceled*: the connection gave the request back unsent (it was not ready, or its
+    ///   task ended with the request still queued and unread). The client itself sends such a
+    ///   request again when the connection was a reused pooled one; this is the same error on
+    ///   a connection that was new.
+    /// - *closed*: the connection was closed between its handshake and the moment the request
+    ///   would have been handed to it.
+    ///
+    /// This is read from the sources of the HTTP client at the versions of the lock file
+    /// (hyper 1.12, hyper-util 0.1.21), not promised by their documentation: check it again
+    /// when either is updated. There, *canceled* is made only where the request is still in
+    /// hand (`client::conn::http2::SendRequest::try_send_request`, and the drop of a queued
+    /// request the connection task never took), *closed* only by `SendRequest::poll_ready`,
+    /// and every failure after the connection task took the request is an HTTP/2, I/O or
+    /// user error. `a_request_the_connection_gave_back_was_not_written` and the tests of a
+    /// refused stream and of a connection that shuts down or fails after the request hold
+    /// both sides.
+    ///
+    /// Every other error is ambiguous and false here: the client reports a failed handshake,
+    /// a request the connection refused to start and a stream or connection that failed after
+    /// the request was written as the same kind. A connect error is not covered either (see
+    /// `is_connect`), nor is a deadline.
+    pub fn not_written(&self) -> bool {
+        match self {
+            RequestError::Http(e) => std::error::Error::source(e)
+                .and_then(|cause| cause.downcast_ref::<hyper::Error>())
+                .is_some_and(hyper_not_written),
+            RequestError::Timeout => false,
+        }
+    }
+}
+
+/// See [`RequestError::not_written`].
+fn hyper_not_written(e: &hyper::Error) -> bool {
+    e.is_canceled() || e.is_closed()
 }
 
 /// The call-specific part of [`request`].
@@ -649,14 +717,31 @@ pub async fn request(
     .await
 }
 
+/// A response head, or why there is none.
+type Head = Result<hyper::Response<hyper::body::Incoming>, RequestError>;
+
+/// One attempt in flight. It owns what it needs, so the loser of a hedge can outlive its call.
+struct Attempt {
+    head: BoxFuture<'static, Head>,
+    /// Tells whether the HTTP client has given the request to a connection yet.
+    connection: CaptureConnection,
+}
+
+impl Attempt {
+    /// The request was given to a connection: it may be at lightwalletd. False while the
+    /// attempt was not polled, still connects, or failed before that: dropping it then sends
+    /// nothing and cancels nothing. True is not proof that it was sent: it stays true when a
+    /// pooled connection gave the request back and the client is connecting again for it.
+    /// Such a loser is detached like one that was sent, and its call then runs as any other
+    /// (one more read; nothing is cancelled by it).
+    fn handed_over(&self) -> bool {
+        self.connection.connection_metadata().is_some()
+    }
+}
+
 /// One attempt's result, the instance it went to, whether a hedge was sent (the call's
 /// second send: no retry after it), and whether a failure was already settled and counted.
-type Attempted = (
-    Result<hyper::Response<hyper::body::Incoming>, RequestError>,
-    Option<SocketAddr>,
-    bool,
-    bool,
-);
+type Attempted = (Head, Option<SocketAddr>, bool, bool);
 
 /// [`request`] with the transport given: `own` = a call to the gateway's own lightwalletd;
 /// `hedging` None = no hedged reads.
@@ -666,7 +751,28 @@ pub async fn request_with(
     own: bool,
     endpoints: Option<&EndpointSet>,
     hedging: Option<&Hedging>,
-) -> Result<hyper::Response<hyper::body::Incoming>, RequestError> {
+) -> Head {
+    let client = if opts.pooled {
+        crate::lwd::lwd_client()
+    } else {
+        fresh_client()
+    };
+    request_on(&client, req, opts, own, endpoints, hedging).await
+}
+
+/// [`request_with`] with the client of the first attempt given (the retry and the hedge always
+/// use a new connection of their own).
+async fn request_on<C>(
+    client: &Client<C, Full<Bytes>>,
+    req: Request<Full<Bytes>>,
+    opts: CallOpts<'_>,
+    own: bool,
+    endpoints: Option<&EndpointSet>,
+    hedging: Option<&Hedging>,
+) -> Head
+where
+    C: Connect + Clone + Send + Sync + 'static,
+{
     // One absolute deadline, fixed before the instances are resolved: resolution and every
     // attempt share it.
     let start = Instant::now();
@@ -684,12 +790,7 @@ pub async fn request_with(
     let pick = |avoid| endpoints.and_then(|set| set.pick(&addrs, avoid, Instant::now()));
 
     let first_addr = pick(None);
-    let client = if opts.pooled {
-        crate::lwd::lwd_client()
-    } else {
-        fresh_client()
-    };
-    let first = attempt(&client, &req, first_addr, deadline);
+    let first = attempt(client, &req, first_addr, deadline);
     let hedge = match (hedging, endpoints) {
         (Some(h), Some(set)) if retry_reads && !slow_head && opts.may_hedge => h
             .delay
@@ -699,7 +800,7 @@ pub async fn request_with(
         _ => None,
     };
     let (result, addr, hedge_sent, accounted) = match hedge {
-        None => (first.await, first_addr, false, false),
+        None => (first.head.await, first_addr, false, false),
         Some((at, h, set)) => {
             h.rate.record_read(start);
             hedged(first, first_addr, at, h, set, &addrs, &req, deadline, opts).await
@@ -730,7 +831,10 @@ pub async fn request_with(
         }
     }
     let connect = err.is_connect();
-    let retry = !hedge_sent && (connect || (retry_reads && !timed_out));
+    // Not written to the connection: as safe to send again as after a connect error, for
+    // every call. A read gets its retry after any transport error anyway.
+    let unsent = !connect && err.not_written();
+    let retry = !hedge_sent && (connect || unsent || (retry_reads && !timed_out));
     let remaining = deadline.saturating_duration_since(Instant::now());
     if !retry || remaining.is_zero() {
         if own && instance_failed {
@@ -745,13 +849,23 @@ pub async fn request_with(
         tracing::warn!(error = %err, "lightwalletd connect failed, retrying once");
         crate::health::record_lwd_connect_retry();
         tokio::time::sleep(CONNECT_RETRY_DELAY.min(remaining)).await;
+    } else if unsent && !retry_reads {
+        tracing::warn!(error = %err, "lightwalletd connection ended before the request was written to it, sending it once on a new connection");
+        let call = if path.ends_with("/SendTransaction") {
+            "send"
+        } else {
+            "other"
+        };
+        crate::health::record_lwd_unsent_retry(opts.network, call);
     } else {
         tracing::debug!(to = ?second_addr, "lightwalletd read retry");
         tracing::warn!(error = %err, path = %req.uri().path(), "lightwalletd read failed before its answer, retrying once");
         crate::health::record_lwd_read_retry(opts.network, "error");
     }
     // Always a new connection: a pooled one may be the one that hangs.
-    let second = attempt(&fresh_client(), &req, second_addr, deadline).await;
+    let second = attempt(&fresh_client(), &req, second_addr, deadline)
+        .head
+        .await;
     let ok = second.is_ok();
     let timed_out = matches!(second, Err(RequestError::Timeout));
     let instance_failed = !ok && !(timed_out && slow_head);
@@ -771,15 +885,16 @@ pub async fn request_with(
 
 /// Race `first` against a hedge to a different instance started at `hedge_at` (when the first
 /// has no head by then, another instance exists, a hedge permit is free and the rate cap allows
-/// one). The first head wins; the other attempt is cancelled (dropped). The loser of the race
+/// one). The first head wins; the other attempt, when it is still running, goes on in a task
+/// of its own ([`detach_loser`]). The loser of the race
 /// is not a failure: it is not counted as a timeout or as a failed call, and does not count
 /// towards replacing the pool (it was only slower); an instance that loses hedges in a row is
 /// skipped for a while ([`EndpointSet::hedge_lost`]). An attempt that fails while the other still runs is
 /// settled as failed at once (its instance is skipped), and the other one is awaited; when both
 /// fail, the first attempt's error is returned for the caller to settle and count.
 #[allow(clippy::too_many_arguments)]
-async fn hedged<F>(
-    first: F,
+async fn hedged(
+    mut first: Attempt,
     first_addr: Option<SocketAddr>,
     hedge_at: Instant,
     hedging: &Hedging,
@@ -788,42 +903,43 @@ async fn hedged<F>(
     req: &Request<Full<Bytes>>,
     deadline: Instant,
     opts: CallOpts<'_>,
-) -> Attempted
-where
-    F: std::future::Future<Output = Result<hyper::Response<hyper::body::Incoming>, RequestError>>,
-{
-    let mut first = std::pin::pin!(first);
+) -> Attempted {
     tokio::select! {
-        r = &mut first => return (r, first_addr, false, false),
+        r = &mut first.head => return (r, first_addr, false, false),
         _ = tokio::time::sleep_until(tokio::time::Instant::from_std(hedge_at)) => {}
     }
     let Some(second_addr) = set.pick_other(addrs, first_addr, Instant::now()) else {
-        return (first.await, first_addr, false, false);
+        return (first.head.await, first_addr, false, false);
     };
     let Ok(permit) = hedging.permits.clone().try_acquire_owned() else {
         crate::health::record_lwd_hedge(opts.network, "no_permit");
-        return (first.await, first_addr, false, false);
+        return (first.head.await, first_addr, false, false);
     };
     if !hedging.rate.try_hedge(Instant::now()) {
         crate::health::record_lwd_hedge(opts.network, "rate_limited");
         // Not hedged: the permit goes back before the wait for the first attempt, which may
         // last until the deadline.
         drop(permit);
-        return (first.await, first_addr, false, false);
+        return (first.head.await, first_addr, false, false);
     }
     // Held until the race ends (this function returns), also while the first attempt still
     // runs after the hedge failed.
     let _permit = permit;
     crate::health::record_lwd_hedge(opts.network, "started");
     tracing::debug!(path = %req.uri().path(), to = %second_addr, "lightwalletd read without a head yet: hedged on another instance");
-    let client = fresh_client();
-    let mut second = std::pin::pin!(attempt(&client, req, Some(second_addr), deadline));
+    let mut second = attempt(&fresh_client(), req, Some(second_addr), deadline);
     let mut first_err: Option<RequestError> = None;
     let mut second_failed = false;
     loop {
         tokio::select! {
-            r = &mut first, if first_err.is_none() => match r {
-                Ok(resp) => return (Ok(resp), first_addr, true, false),
+            r = &mut first.head, if first_err.is_none() => match r {
+                Ok(resp) => {
+                    if !second_failed {
+                        // The hedge is still running: it lost.
+                        detach_loser(hedging, opts.network, second);
+                    }
+                    return (Ok(resp), first_addr, true, false);
+                }
                 Err(e) => {
                     if second_failed {
                         return (Err(e), first_addr, true, false);
@@ -838,7 +954,7 @@ where
                     first_err = Some(e);
                 }
             },
-            r = &mut second, if !second_failed => match r {
+            r = &mut second.head, if !second_failed => match r {
                 Ok(resp) => {
                     crate::health::record_lwd_hedge(opts.network, "won");
                     // The first attempt still has no head: its instance lost this hedge. Not a
@@ -849,6 +965,9 @@ where
                             crate::health::record_lwd_hedge(opts.network, "loser_skipped");
                             tracing::debug!(addr = %lost, "lightwalletd instance keeps losing hedges: skipped");
                         }
+                    }
+                    if first_err.is_none() {
+                        detach_loser(hedging, opts.network, first);
                     }
                     return (Ok(resp), Some(second_addr), true, false);
                 }
@@ -886,14 +1005,119 @@ fn settle(endpoints: Option<&EndpointSet>, addr: Option<SocketAddr>, ok: bool) {
     }
 }
 
+/// The attempt that lost a hedge race, still without a head: instead of being cancelled it runs
+/// to its end in a task of its own, and its answer is discarded. A cancelled call makes
+/// lightwalletd cancel the node RPC behind it, which can cost the node an RPC slot.
+///
+/// - **Bounds**: the head by the call's own head deadline (inside the attempt), the body by
+///   [`DETACHED_DRAIN_TIMEOUT`] and [`DETACHED_DRAIN_MAX_BYTES`]. The body is read because a
+///   server stream sends its head with its first message while the call still runs: dropping
+///   it there would cancel the call all the same. A loser cut by one of the bounds is
+///   cancelled then, as every call that runs into its deadline (`event="loser_expired"`).
+/// - **Permits**: one of [`Hedging::detached`] (as many as `LWD_HEDGE_MAX_INFLIGHT`), held
+///   until the task is gone. None free: the loser is cancelled as before
+///   (`event="loser_cancelled"`). It holds no hedge permit (that one goes back when the race
+///   ends, so losers on an instance that hangs do not use up the hedges) and no permit of the
+///   caller (`MAX_INFLIGHT_LWD` covers the attempt whose answer the caller reads), so it never
+///   keeps a request waiting; it is one more call at lightwalletd, at most
+///   `LWD_HEDGE_MAX_INFLIGHT` of them at a time.
+/// - **No outcome**: whatever the loser ends with settles nothing (no `/healthz` outcome, no
+///   timeout counted, the instance neither skipped nor cleared: a late head does not reset its
+///   lost hedges), exactly as when it was cancelled.
+///
+/// A loser whose request was not given to a connection yet (never polled, or still
+/// connecting) is dropped instead, without an event: nothing of it is at lightwalletd, and
+/// detaching it would send a call after the answer is there.
+///
+/// When the caller itself goes away during the race, both attempts are dropped as before.
+fn detach_loser(hedging: &Hedging, network: &str, loser: Attempt) {
+    if !loser.handed_over() {
+        return;
+    }
+    let Ok(permit) = hedging.detached.clone().try_acquire_owned() else {
+        crate::health::record_lwd_hedge(network, "loser_cancelled");
+        // Dropped here: cancelled.
+        return;
+    };
+    crate::health::record_lwd_hedge(network, "loser_detached");
+    let network = network.to_string();
+    tokio::spawn(async move {
+        let _permit = permit;
+        let ended = match loser.head.await {
+            Ok(resp) => {
+                // For the tests: the loser has its head and reads its body from here on.
+                #[cfg(test)]
+                crate::health::record_lwd_hedge(&network, tests::LOSER_HAS_ITS_HEAD);
+                drained(
+                    resp.into_body(),
+                    DETACHED_DRAIN_TIMEOUT,
+                    DETACHED_DRAIN_MAX_BYTES,
+                )
+                .await
+            }
+            // Cut by the head deadline: the attempt dropped its request.
+            Err(RequestError::Timeout) => false,
+            Err(RequestError::Http(_)) => true,
+        };
+        if !ended {
+            crate::health::record_lwd_hedge(&network, "loser_expired");
+        }
+    });
+}
+
+/// Read `body` to its end and discard it; false when `timeout` passed or more than
+/// `max_bytes` came first (the caller drops it, which cancels the call): the data of its
+/// frames, a frame without data counted as one byte. A body that ends with an error has
+/// ended.
+async fn drained<B>(mut body: B, timeout: Duration, max_bytes: usize) -> bool
+where
+    B: hyper::body::Body + Unpin,
+{
+    use bytes::Buf;
+    use http_body_util::BodyExt;
+    let end = tokio::time::Instant::now() + timeout;
+    let mut left = max_bytes;
+    let mut frames = 0u32;
+    loop {
+        // Checked here as well: a timeout polls its future first, so frames that are always
+        // ready would never let it fire.
+        if tokio::time::Instant::now() >= end {
+            return false;
+        }
+        // Frames that are always ready never let this task wait: it gives way to the others
+        // now and then.
+        frames = frames.wrapping_add(1);
+        if frames % DETACHED_DRAIN_YIELD_EVERY == 0 {
+            tokio::task::yield_now().await;
+        }
+        match tokio::time::timeout_at(end, body.frame()).await {
+            Err(_) => return false,
+            Ok(None) | Ok(Some(Err(_))) => return true,
+            Ok(Some(Ok(frame))) => {
+                // Every frame costs at least one byte of the bound: frames without data
+                // (empty ones, trailers) cannot go on for ever either.
+                let n = frame.data_ref().map_or(0, |data| data.remaining()).max(1);
+                if n > left {
+                    return false;
+                }
+                left -= n;
+            }
+        }
+    }
+}
+
 /// One attempt: `req` (sent to `addr` instead of its authority when given) on `client`, until
-/// `deadline`.
-async fn attempt(
-    client: &LwdClient,
+/// `deadline`. The future owns the request and its handle on the client; nothing is sent
+/// before it is polled.
+fn attempt<C>(
+    client: &Client<C, Full<Bytes>>,
     req: &Request<Full<Bytes>>,
     addr: Option<SocketAddr>,
     deadline: Instant,
-) -> Result<hyper::Response<hyper::body::Incoming>, RequestError> {
+) -> Attempt
+where
+    C: Connect + Clone + Send + Sync + 'static,
+{
     let mut copy = Request::new(req.body().clone());
     *copy.method_mut() = req.method().clone();
     *copy.uri_mut() = match addr {
@@ -903,10 +1127,17 @@ async fn attempt(
     *copy.version_mut() = req.version();
     *copy.headers_mut() = req.headers().clone();
     let deadline = tokio::time::Instant::from_std(deadline);
-    match tokio::time::timeout_at(deadline, client.request(copy)).await {
-        Ok(Ok(resp)) => Ok(resp),
-        Ok(Err(e)) => Err(RequestError::Http(e)),
-        Err(_) => Err(RequestError::Timeout),
+    let connection = capture_connection(&mut copy);
+    let sent = client.request(copy);
+    Attempt {
+        head: Box::pin(async move {
+            match tokio::time::timeout_at(deadline, sent).await {
+                Ok(Ok(resp)) => Ok(resp),
+                Ok(Err(e)) => Err(RequestError::Http(e)),
+                Err(_) => Err(RequestError::Timeout),
+            }
+        }),
+        connection,
     }
 }
 
@@ -925,6 +1156,10 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+
+    /// Counted in test builds, as an `event` of the hedge counter, when a detached loser has
+    /// its response head and starts to read its body (`detach_loser`).
+    pub(super) const LOSER_HAS_ITS_HEAD: &str = "test_loser_has_its_head";
 
     const READ: &str = "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetLatestBlock";
     const WRITE: &str = "/cash.z.wallet.sdk.rpc.CompactTxStreamer/SendTransaction";
@@ -1671,5 +1906,1027 @@ mod tests {
         .await;
         assert!(matches!(r, Err(RequestError::Timeout)));
         assert_eq!(hung_count.load(Ordering::SeqCst), 1);
+    }
+
+    /// What a [`gated`] upstream saw.
+    struct Gated {
+        addr: SocketAddr,
+        /// Requests received.
+        received: Arc<AtomicUsize>,
+        /// Handlers that ran to their end (the answer's head was handed to the server).
+        finished: Arc<AtomicUsize>,
+        /// Handlers that are gone, finished or dropped (the handler of a request the client
+        /// cancels is dropped before its end).
+        ended: Arc<AtomicUsize>,
+        /// Answer bodies whose one message was produced.
+        produced: Arc<AtomicUsize>,
+        /// One permit lets one handler answer.
+        head: Arc<tokio::sync::Semaphore>,
+        /// One permit lets one answer's body produce its message (only with `streamed`).
+        body: Arc<tokio::sync::Semaphore>,
+    }
+
+    /// Counts a handler that is gone, however it ended.
+    struct Ended(Arc<AtomicUsize>);
+
+    impl Drop for Ended {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// An h2c server whose handlers wait for the test: each request is answered once a permit
+    /// is added to `head`. The answer's body is one message: with `streamed` it is produced
+    /// once a permit is added to `body` (the head goes out before it), without, at once. No
+    /// timing: the test decides what happens when.
+    async fn gated(streamed: bool) -> Gated {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let state = Gated {
+            addr: listener.local_addr().unwrap(),
+            received: Default::default(),
+            finished: Default::default(),
+            ended: Default::default(),
+            produced: Default::default(),
+            head: Arc::new(tokio::sync::Semaphore::new(0)),
+            body: Arc::new(tokio::sync::Semaphore::new(0)),
+        };
+        let handles = (
+            state.received.clone(),
+            state.finished.clone(),
+            state.ended.clone(),
+            state.produced.clone(),
+            state.head.clone(),
+            state.body.clone(),
+        );
+        tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let handles = handles.clone();
+                let service = hyper::service::service_fn(
+                    move |_req: hyper::Request<hyper::body::Incoming>| {
+                        let (received, finished, ended, produced, head, body) = handles.clone();
+                        async move {
+                            let _ended = Ended(ended);
+                            received.fetch_add(1, Ordering::SeqCst);
+                            head.acquire().await.unwrap().forget();
+                            let message = futures_util::stream::once(Box::pin(async move {
+                                if streamed {
+                                    body.acquire().await.unwrap().forget();
+                                    produced.fetch_add(1, Ordering::SeqCst);
+                                }
+                                Ok::<_, std::convert::Infallible>(hyper::body::Frame::data(
+                                    Bytes::from_static(&[0, 0, 0, 0, 0]),
+                                ))
+                            }));
+                            finished.fetch_add(1, Ordering::SeqCst);
+                            Ok::<_, std::convert::Infallible>(
+                                hyper::Response::builder()
+                                    .status(200)
+                                    .header("content-type", "application/grpc")
+                                    .body(http_body_util::StreamBody::new(message))
+                                    .unwrap(),
+                            )
+                        }
+                    },
+                );
+                tokio::spawn(async move {
+                    let _ = hyper_util::server::conn::auto::Builder::new(
+                        hyper_util::rt::TokioExecutor::new(),
+                    )
+                    .serve_connection(hyper_util::rt::TokioIo::new(stream), service)
+                    .await;
+                });
+            }
+        });
+        state
+    }
+
+    /// Wait until `done` holds, for at most 10 s (a bound for a broken test, not a margin:
+    /// nothing here depends on how long it takes).
+    async fn eventually(what: &str, done: impl Fn() -> bool) {
+        let start = Instant::now();
+        while !done() {
+            assert!(
+                start.elapsed() < Duration::from_secs(10),
+                "never happened: {what}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// The head deadline of the detached-loser tests: the hedge goes out after half of it,
+    /// and the other half is the room a loser has before its deadline.
+    const DETACH_HEAD_MS: u64 = 6000;
+
+    #[tokio::test]
+    async fn the_loser_of_a_hedge_runs_to_its_end() {
+        // The first attempt goes to an instance that answers only when the test lets it;
+        // the hedge is answered at once and wins. The first attempt is not cancelled.
+        let slow_one = gated(false).await;
+        let (good, good_count) = answering().await;
+        let set = EndpointSet::fixed(vec![slow_one.addr, good]);
+        set.mark_failed(good, Instant::now());
+        let h = hedging();
+        let network = "test-hedge-detached";
+        request_with(
+            req("lwd:9067", READ),
+            opts_on(network, DETACH_HEAD_MS),
+            true,
+            Some(&set),
+            Some(&h),
+        )
+        .await
+        .expect("the hedge answers");
+        assert_eq!(crate::health::lwd_hedges(network, "won"), 1);
+        assert_eq!(crate::health::lwd_hedges(network, "loser_detached"), 1);
+        assert_eq!(good_count.load(Ordering::SeqCst), 1);
+        assert_eq!(slow_one.received.load(Ordering::SeqCst), 1);
+        assert_eq!(slow_one.ended.load(Ordering::SeqCst), 0, "still running");
+        assert_eq!(
+            h.detached.available_permits(),
+            DEFAULT_HEDGE_MAX_INFLIGHT - 1,
+            "the detached loser holds a permit of its own"
+        );
+        assert_eq!(
+            h.permits.available_permits(),
+            DEFAULT_HEDGE_MAX_INFLIGHT,
+            "the hedge permit went back when the race ended"
+        );
+        slow_one.head.add_permits(1);
+        eventually("the loser ran to its end and gave its permit back", || {
+            slow_one.finished.load(Ordering::SeqCst) == 1
+                && h.detached.available_permits() == DEFAULT_HEDGE_MAX_INFLIGHT
+        })
+        .await;
+        assert_eq!(crate::health::lwd_hedges(network, "loser_cancelled"), 0);
+        assert_eq!(crate::health::lwd_hedges(network, "loser_expired"), 0);
+        // Its late answer settles nothing: neither skipped nor cleared.
+        assert!(!set.state.lock().failed.contains_key(&slow_one.addr));
+        assert_eq!(set.state.lock().lost_hedges.get(&slow_one.addr), Some(&1));
+        assert_eq!(crate::health::lwd_call_totals(network), (1, 0));
+    }
+
+    #[tokio::test]
+    async fn a_hedge_that_loses_runs_to_its_end_too() {
+        // Both instances answer only when the test lets them: the first attempt once the
+        // hedge has arrived at the other one, the hedge after the call has its answer.
+        let first = gated(false).await;
+        let second = gated(false).await;
+        let set = Arc::new(EndpointSet::fixed(vec![first.addr, second.addr]));
+        set.mark_failed(second.addr, Instant::now());
+        let h = hedging();
+        let network = "test-hedge-detached-second";
+        let call = {
+            let (set, h) = (set.clone(), h.clone());
+            tokio::spawn(async move {
+                request_with(
+                    req("lwd:9067", READ),
+                    opts_on(network, DETACH_HEAD_MS),
+                    true,
+                    Some(&*set),
+                    Some(&h),
+                )
+                .await
+                .map(|resp| resp.status())
+            })
+        };
+        eventually("the hedge arrived", || {
+            second.received.load(Ordering::SeqCst) == 1
+        })
+        .await;
+        first.head.add_permits(1);
+        let status = call.await.unwrap().expect("the first attempt answers");
+        assert_eq!(status, 200);
+        assert_eq!(first.received.load(Ordering::SeqCst), 1);
+        assert_eq!(crate::health::lwd_hedges(network, "won"), 0);
+        assert_eq!(crate::health::lwd_hedges(network, "loser_detached"), 1);
+        assert_eq!(second.ended.load(Ordering::SeqCst), 0, "still running");
+        second.head.add_permits(1);
+        eventually("the hedge ran to its end and gave its permit back", || {
+            second.finished.load(Ordering::SeqCst) == 1
+                && h.detached.available_permits() == DEFAULT_HEDGE_MAX_INFLIGHT
+        })
+        .await;
+        assert_eq!(crate::health::lwd_hedges(network, "loser_expired"), 0);
+    }
+
+    #[tokio::test]
+    async fn without_a_free_permit_the_loser_is_cancelled_and_counted() {
+        let slow_one = gated(false).await;
+        let (good, _) = answering().await;
+        let set = EndpointSet::fixed(vec![slow_one.addr, good]);
+        set.mark_failed(good, Instant::now());
+        let h = warm(Hedging::new(HedgeDelay::Half, 1));
+        let held = h.detached.clone().try_acquire_owned().unwrap();
+        let network = "test-hedge-detached-full";
+        request_with(
+            req("lwd:9067", READ),
+            opts_on(network, DETACH_HEAD_MS),
+            true,
+            Some(&set),
+            Some(&h),
+        )
+        .await
+        .expect("the hedge answers");
+        assert_eq!(crate::health::lwd_hedges(network, "loser_cancelled"), 1);
+        assert_eq!(crate::health::lwd_hedges(network, "loser_detached"), 0);
+        assert_eq!(slow_one.received.load(Ordering::SeqCst), 1);
+        // The instance sees the cancellation: its handler is dropped, never let through.
+        eventually("the loser's handler was dropped", || {
+            slow_one.ended.load(Ordering::SeqCst) == 1
+        })
+        .await;
+        assert_eq!(
+            slow_one.finished.load(Ordering::SeqCst),
+            0,
+            "cancelled, as before"
+        );
+        drop(held);
+        assert_eq!(h.detached.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_detached_loser_that_never_answers_ends_at_its_deadline() {
+        // Never let through: the loser has no head at the call's head deadline.
+        let hung = gated(false).await;
+        let (good, _) = answering().await;
+        let set = EndpointSet::fixed(vec![hung.addr, good]);
+        set.mark_failed(good, Instant::now());
+        let h = warm(Hedging::new(HedgeDelay::Half, 2));
+        let network = "test-hedge-detached-expired";
+        let call = CallOpts {
+            class: Some("unary"),
+            ..opts_on(network, 1000)
+        };
+        request_with(req("lwd:9067", READ), call, true, Some(&set), Some(&h))
+            .await
+            .expect("the hedge answers");
+        assert_eq!(crate::health::lwd_hedges(network, "loser_detached"), 1);
+        eventually("the loser was cut by the head deadline", || {
+            crate::health::lwd_hedges(network, "loser_expired") == 1
+                && h.detached.available_permits() == 2
+        })
+        .await;
+        // Cut means cancelled: the instance's handler is dropped.
+        eventually("the loser's handler was dropped", || {
+            hung.ended.load(Ordering::SeqCst) == 1
+        })
+        .await;
+        assert_eq!(hung.received.load(Ordering::SeqCst), 1);
+        assert_eq!(hung.finished.load(Ordering::SeqCst), 0);
+        // Not a failure of lightwalletd, as when the loser was cancelled.
+        assert_eq!(crate::health::lwd_timeouts(network, "unary", "head"), 0);
+        assert_eq!(crate::health::lwd_call_totals(network), (1, 0));
+        assert!(!set.state.lock().failed.contains_key(&hung.addr));
+    }
+
+    #[tokio::test]
+    async fn a_detached_loser_reads_its_streamed_answer_to_the_end() {
+        // The loser's head goes out when the test lets it, the one message of its body only
+        // after that: dropping the answer at its head would cancel the stream before the
+        // message is produced.
+        let streaming = gated(true).await;
+        let (good, _) = answering().await;
+        let set = EndpointSet::fixed(vec![streaming.addr, good]);
+        set.mark_failed(good, Instant::now());
+        let h = hedging();
+        let network = "test-hedge-detached-stream";
+        request_with(
+            req("lwd:9067", READ),
+            opts_on(network, DETACH_HEAD_MS),
+            true,
+            Some(&set),
+            Some(&h),
+        )
+        .await
+        .expect("the hedge answers");
+        assert_eq!(crate::health::lwd_hedges(network, "loser_detached"), 1);
+        streaming.head.add_permits(1);
+        eventually("the loser has its head and reads its body", || {
+            crate::health::lwd_hedges(network, LOSER_HAS_ITS_HEAD) == 1
+        })
+        .await;
+        // The head is with the loser, its body still open (the message waits for the test):
+        // the loser goes on, and holds its permit. One that dropped the answer at its head
+        // would have given the permit back with it.
+        assert_eq!(
+            h.detached.available_permits(),
+            DEFAULT_HEDGE_MAX_INFLIGHT - 1,
+            "held while the body is read"
+        );
+        assert_eq!(streaming.produced.load(Ordering::SeqCst), 0);
+        streaming.body.add_permits(1);
+        eventually("the body was read to its end", || {
+            streaming.produced.load(Ordering::SeqCst) == 1
+                && h.detached.available_permits() == DEFAULT_HEDGE_MAX_INFLIGHT
+        })
+        .await;
+        assert_eq!(crate::health::lwd_hedges(network, "loser_expired"), 0);
+    }
+
+    /// The two errors of the HTTP client that say a request was not written, made the way the
+    /// client meets them: a connection whose task is gone.
+    #[tokio::test]
+    async fn a_request_the_connection_gave_back_was_not_written() {
+        let (io, _peer) = tokio::io::duplex(64 * 1024);
+        let (mut sender, conn) = hyper::client::conn::http2::handshake::<_, _, Full<Bytes>>(
+            hyper_util::rt::TokioExecutor::new(),
+            hyper_util::rt::TokioIo::new(io),
+        )
+        .await
+        .expect("the handshake only writes");
+        drop(conn);
+        let Err(closed) = sender.ready().await else {
+            panic!("the connection is gone");
+        };
+        assert!(closed.is_closed(), "{closed:?}");
+        assert!(hyper_not_written(&closed));
+        let Err(unsent) = sender.try_send_request(req("lwd:9067", WRITE)).await else {
+            panic!("the connection is gone");
+        };
+        assert!(unsent.message().is_some(), "the request came back");
+        let unsent = unsent.into_error();
+        assert!(unsent.is_canceled(), "{unsent:?}");
+        assert!(hyper_not_written(&unsent));
+        assert!(!RequestError::Timeout.not_written());
+    }
+
+    /// A connection that takes everything written to it (and keeps it for the test) and reads
+    /// as closed at once: its HTTP/2 handshake (which only writes) succeeds, and the
+    /// connection ends before the request is written to it.
+    struct ClosedAfterHandshake {
+        written: Arc<std::sync::Mutex<Vec<u8>>>,
+    }
+
+    impl hyper::rt::Read for ClosedAfterHandshake {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: hyper::rt::ReadBufCursor<'_>,
+        ) -> std::task::Poll<Result<(), std::io::Error>> {
+            // Nothing read: the end of the stream.
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    impl hyper::rt::Write for ClosedAfterHandshake {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<Result<usize, std::io::Error>> {
+            self.written.lock().unwrap().extend_from_slice(buf);
+            std::task::Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), std::io::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), std::io::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    impl hyper_util::client::legacy::connect::Connection for ClosedAfterHandshake {
+        fn connected(&self) -> hyper_util::client::legacy::connect::Connected {
+            hyper_util::client::legacy::connect::Connected::new()
+        }
+    }
+
+    /// Gives out [`ClosedAfterHandshake`] connections; `written` is everything the client
+    /// wrote to any of them.
+    #[derive(Clone, Default)]
+    struct ClosedConnector {
+        written: Arc<std::sync::Mutex<Vec<u8>>>,
+    }
+
+    impl tower::Service<hyper::Uri> for ClosedConnector {
+        type Response = ClosedAfterHandshake;
+        type Error = std::io::Error;
+        type Future = std::future::Ready<Result<ClosedAfterHandshake, std::io::Error>>;
+
+        fn poll_ready(
+            &mut self,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, _dst: hyper::Uri) -> Self::Future {
+            std::future::ready(Ok(ClosedAfterHandshake {
+                written: self.written.clone(),
+            }))
+        }
+    }
+
+    /// The length of the HTTP/2 client connection preface.
+    const H2_PREFACE_LEN: usize = 24;
+
+    /// The (type, stream id) of every HTTP/2 frame in `bytes`, which must be a client
+    /// connection preface followed by whole frames and nothing else.
+    fn h2_frames(bytes: &[u8]) -> Vec<(u8, u32)> {
+        assert!(
+            bytes.starts_with(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"),
+            "no connection preface"
+        );
+        let mut bytes = &bytes[H2_PREFACE_LEN..];
+        let mut frames = Vec::new();
+        while !bytes.is_empty() {
+            assert!(bytes.len() >= 9, "a truncated frame header");
+            let len = u32::from_be_bytes([0, bytes[0], bytes[1], bytes[2]]) as usize;
+            let stream = u32::from_be_bytes([bytes[5], bytes[6], bytes[7], bytes[8]]) & 0x7fff_ffff;
+            assert!(bytes.len() >= 9 + len, "a truncated frame");
+            frames.push((bytes[3], stream));
+            bytes = &bytes[9 + len..];
+        }
+        frames
+    }
+
+    #[test]
+    fn h2_frames_reads_whole_frames_only() {
+        let mut bytes = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".to_vec();
+        assert_eq!(bytes.len(), H2_PREFACE_LEN);
+        assert!(h2_frames(&bytes).is_empty());
+        // SETTINGS on stream 0, then HEADERS on stream 1 with a payload of two bytes.
+        bytes.extend_from_slice(&[0, 0, 0, 4, 0, 0, 0, 0, 0]);
+        bytes.extend_from_slice(&[0, 0, 2, 1, 4, 0, 0, 0, 1, 0x82, 0x86]);
+        assert_eq!(h2_frames(&bytes), vec![(4, 0), (1, 1)]);
+        for truncated in [&bytes[..bytes.len() - 1], &bytes[..H2_PREFACE_LEN + 4]] {
+            let truncated = truncated.to_vec();
+            assert!(std::panic::catch_unwind(move || h2_frames(&truncated)).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn a_send_that_was_not_written_is_sent_once_on_a_new_connection() {
+        // The first attempt's connection ends between its handshake and the request; the
+        // other instance answers.
+        let connector = ClosedConnector::default();
+        let client: Client<ClosedConnector, Full<Bytes>> =
+            Client::builder(hyper_util::rt::TokioExecutor::new())
+                .http2_only(true)
+                .build(connector.clone());
+        let (good, good_count) = answering().await;
+        let closed: SocketAddr = "192.0.2.1:9067".parse().unwrap();
+        let set = EndpointSet::fixed(vec![closed, good]);
+        set.mark_failed(good, Instant::now());
+        let network = "test-unsent-send";
+        let resp = request_on(
+            &client,
+            req("lwd:9067", WRITE),
+            opts_on(network, 2000),
+            true,
+            Some(&set),
+            Some(&hedging()),
+        )
+        .await
+        .expect("not written the first time: sent once on a new connection");
+        assert_eq!(resp.status(), 200);
+        assert_eq!(good_count.load(Ordering::SeqCst), 1, "sent exactly once");
+        assert_eq!(crate::health::lwd_unsent_retries(network, "send"), 1);
+        assert!(set.state.lock().failed.contains_key(&closed));
+        assert_eq!(crate::health::lwd_call_totals(network), (1, 0));
+        // Every byte the first connection was given: the preface and whole connection-level
+        // frames (stream 0), no frame of a request.
+        let written = connector.written.lock().unwrap().clone();
+        let frames = h2_frames(&written);
+        assert!(
+            frames.iter().all(|(_, stream)| *stream == 0),
+            "nothing of the request was written: {frames:?}"
+        );
+        // One retry only: when the retry fails too (here: nothing listens), the call fails
+        // with the retry's error and nothing is sent a third time.
+        let dead = refusing().await;
+        let set = EndpointSet::fixed(vec![dead]);
+        let network = "test-unsent-once";
+        let err = request_on(
+            &client,
+            req("lwd:9067", WRITE),
+            opts_on(network, 2000),
+            true,
+            Some(&set),
+            None,
+        )
+        .await
+        .expect_err("the retry is refused");
+        assert!(!err.not_written(), "{err:?}");
+        assert_eq!(crate::health::lwd_unsent_retries(network, "send"), 1);
+        assert_eq!(crate::health::lwd_call_totals(network), (0, 1));
+    }
+
+    /// A raw HTTP/2 server that lets the client open its first stream and then either
+    /// refuses it (`RST_STREAM` with `REFUSED_STREAM`) or announces a shutdown that leaves it
+    /// out (`GOAWAY` with last stream 0), without ever answering; counts the request HEADERS
+    /// frames it received.
+    async fn turning_the_request_away(goaway: bool) -> (SocketAddr, Arc<AtomicUsize>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let count = Arc::new(AtomicUsize::new(0));
+        let seen = count.clone();
+        tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let seen = seen.clone();
+                tokio::spawn(async move {
+                    let mut preface = [0u8; H2_PREFACE_LEN];
+                    if stream.read_exact(&mut preface).await.is_err() {
+                        return;
+                    }
+                    // The server's (empty) SETTINGS.
+                    if stream
+                        .write_all(&[0, 0, 0, 4, 0, 0, 0, 0, 0])
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                    loop {
+                        let mut header = [0u8; 9];
+                        if stream.read_exact(&mut header).await.is_err() {
+                            return;
+                        }
+                        let len = u32::from_be_bytes([0, header[0], header[1], header[2]]);
+                        let mut payload = vec![0u8; len as usize];
+                        if stream.read_exact(&mut payload).await.is_err() {
+                            return;
+                        }
+                        // HEADERS: the request.
+                        if header[3] != 1 {
+                            continue;
+                        }
+                        seen.fetch_add(1, Ordering::SeqCst);
+                        let id = [header[5], header[6], header[7], header[8]];
+                        let frame: Vec<u8> = if goaway {
+                            // GOAWAY, last stream 0, NO_ERROR.
+                            vec![0, 0, 8, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+                        } else {
+                            // RST_STREAM on the request's stream, REFUSED_STREAM (7).
+                            vec![0, 0, 4, 3, 0, id[0], id[1], id[2], id[3], 0, 0, 0, 7]
+                        };
+                        if stream.write_all(&frame).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        (addr, count)
+    }
+
+    /// A stream the peer refused and a shutdown that leaves the request out: the peer says
+    /// it did not process the request, but the request was written. Not "not written": a
+    /// `SendTransaction` is not sent again.
+    #[tokio::test]
+    async fn a_send_the_peer_turned_away_after_it_was_written_is_not_sent_again() {
+        for goaway in [false, true] {
+            let (turning_away, received) = turning_the_request_away(goaway).await;
+            let (good, good_count) = answering().await;
+            let set = EndpointSet::fixed(vec![turning_away, good]);
+            set.mark_failed(good, Instant::now());
+            let network = if goaway {
+                "test-unsent-goaway"
+            } else {
+                "test-unsent-refused"
+            };
+            let err = request_with(
+                req("lwd:9067", WRITE),
+                opts_on(network, 2000),
+                true,
+                Some(&set),
+                Some(&hedging()),
+            )
+            .await
+            .expect_err("written: never sent a second time");
+            assert!(
+                matches!(err, RequestError::Http(_)),
+                "goaway {goaway}: {err:?}"
+            );
+            assert!(!err.not_written(), "goaway {goaway}: {err:?}");
+            assert_eq!(received.load(Ordering::SeqCst), 1);
+            assert_eq!(good_count.load(Ordering::SeqCst), 0, "no second send");
+            assert_eq!(crate::health::lwd_unsent_retries(network, "send"), 0);
+        }
+    }
+
+    /// The bounds of reading a detached loser's body.
+    #[tokio::test(start_paused = true)]
+    async fn the_body_of_a_detached_loser_is_read_within_its_bounds() {
+        use http_body_util::StreamBody;
+        use hyper::body::Frame;
+        type Item = Result<Frame<Bytes>, std::convert::Infallible>;
+        let chunk = || -> Item { Ok(Frame::data(Bytes::from_static(&[0u8; 1024]))) };
+        let limit = Duration::from_secs(10);
+        // Exactly the byte bound, then the end: read to the end.
+        let exact = StreamBody::new(futures_util::stream::iter((0..4).map(|_| chunk())));
+        assert!(drained(exact, limit, 4096).await);
+        // One byte more than the bound: given up.
+        let over = StreamBody::new(futures_util::stream::iter(vec![
+            chunk(),
+            Ok(Frame::data(Bytes::from_static(&[0u8; 1]))),
+        ]));
+        assert!(!drained(over, limit, 1024).await);
+        // A body that never ends: given up at the byte bound.
+        let endless = StreamBody::new(futures_util::stream::repeat_with(chunk));
+        assert!(!drained(endless, limit, 64 * 1024).await);
+        // A body that stalls: given up at the time bound, not before.
+        let stalled = StreamBody::new(futures_util::stream::pending::<Item>());
+        let start = tokio::time::Instant::now();
+        assert!(!drained(stalled, limit, 4096).await);
+        assert_eq!(start.elapsed(), limit);
+        // An empty body has ended.
+        assert!(drained(Full::new(Bytes::new()), limit, 0).await);
+        // Frames without data, for ever: each costs one byte of the bound.
+        let empty = || -> Item { Ok(Frame::data(Bytes::new())) };
+        let hollow = StreamBody::new(futures_util::stream::repeat_with(empty));
+        assert!(!drained(hollow, limit, 4096).await);
+        // A few of them and the end: read to the end.
+        let few = StreamBody::new(futures_util::stream::iter((0..3).map(|_| empty())));
+        assert!(drained(few, limit, 4096).await);
+    }
+
+    /// Frames that are always ready do not outlast the time bound (a timeout alone polls
+    /// its future first and would never fire). On the real clock: nothing waits here, so a
+    /// paused one would not move.
+    #[tokio::test]
+    async fn the_time_bound_of_a_detached_loser_holds_for_frames_that_are_always_ready() {
+        use http_body_util::StreamBody;
+        use hyper::body::Frame;
+        type Item = Result<Frame<Bytes>, std::convert::Infallible>;
+        let ready = StreamBody::new(futures_util::stream::repeat_with(|| -> Item {
+            Ok(Frame::data(Bytes::new()))
+        }));
+        let limit = Duration::from_millis(50);
+        // Another task of this (single-threaded) runtime: it runs only when the reader
+        // gives way.
+        let beats = Arc::new(AtomicUsize::new(0));
+        let heartbeat = {
+            let beats = beats.clone();
+            tokio::spawn(async move {
+                loop {
+                    beats.fetch_add(1, Ordering::SeqCst);
+                    tokio::task::yield_now().await;
+                }
+            })
+        };
+        let start = Instant::now();
+        assert!(!drained(ready, limit, usize::MAX).await);
+        assert!(start.elapsed() >= limit);
+        assert!(
+            beats.load(Ordering::SeqCst) > 1,
+            "other tasks ran while the body was read"
+        );
+        heartbeat.abort();
+    }
+
+    /// A connector whose connections are never established: counts the attempts it was asked
+    /// for and the ones that were abandoned (their future dropped).
+    #[derive(Clone, Default)]
+    struct PendingConnector {
+        calls: Arc<AtomicUsize>,
+        abandoned: Arc<AtomicUsize>,
+    }
+
+    impl tower::Service<hyper::Uri> for PendingConnector {
+        type Response = ClosedAfterHandshake;
+        type Error = std::io::Error;
+        type Future = std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<ClosedAfterHandshake, std::io::Error>>
+                    + Send,
+            >,
+        >;
+
+        fn poll_ready(
+            &mut self,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, _dst: hyper::Uri) -> Self::Future {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let abandoned = Ended(self.abandoned.clone());
+            Box::pin(async move {
+                let _abandoned = abandoned;
+                std::future::pending::<Result<ClosedAfterHandshake, std::io::Error>>().await
+            })
+        }
+    }
+
+    /// A loser whose request was not given to a connection is dropped, not detached:
+    /// detaching it would send the call after the answer is there. Both cases: an attempt
+    /// that was never polled, and one that is still connecting.
+    #[tokio::test]
+    async fn a_loser_that_was_not_sent_yet_is_dropped_without_sending() {
+        let h = hedging();
+        let network = "test-hedge-detached-unsent";
+        let connector = PendingConnector::default();
+        let client: Client<PendingConnector, Full<Bytes>> =
+            Client::builder(hyper_util::rt::TokioExecutor::new())
+                .http2_only(true)
+                .build(connector.clone());
+        let deadline = Instant::now() + Duration::from_secs(30);
+        // Never polled: not even a connection was asked for, and none is after the drop.
+        let unsent = attempt(&client, &req("lwd:9067", READ), None, deadline);
+        assert!(!unsent.handed_over());
+        detach_loser(&h, network, unsent);
+        assert_eq!(connector.calls.load(Ordering::SeqCst), 0, "nothing started");
+        // Still connecting: polled until the client asked for its connection, which is never
+        // established.
+        let mut connecting = attempt(&client, &req("lwd:9067", READ), None, deadline);
+        let start = Instant::now();
+        while connector.calls.load(Ordering::SeqCst) == 0 {
+            assert!(futures_util::poll!(&mut connecting.head).is_pending());
+            assert!(
+                start.elapsed() < Duration::from_secs(10),
+                "the client never asked for a connection"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(futures_util::poll!(&mut connecting.head).is_pending());
+        assert!(!connecting.handed_over());
+        assert_eq!(connector.abandoned.load(Ordering::SeqCst), 0);
+        detach_loser(&h, network, connecting);
+        // Dropped: the connection attempt is abandoned, so no request can follow it.
+        eventually("the connection attempt was abandoned", || {
+            connector.abandoned.load(Ordering::SeqCst) == 1
+        })
+        .await;
+        assert_eq!(connector.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(crate::health::lwd_hedges(network, "loser_detached"), 0);
+        assert_eq!(crate::health::lwd_hedges(network, "loser_cancelled"), 0);
+        assert_eq!(h.detached.available_permits(), DEFAULT_HEDGE_MAX_INFLIGHT);
+        // One that got its answer was given to a connection.
+        let (other, _) = answering().await;
+        let mut sent = attempt(
+            &fresh_client(),
+            &req(&other.to_string(), READ),
+            None,
+            Instant::now() + Duration::from_secs(10),
+        );
+        (&mut sent.head).await.expect("answered");
+        assert!(sent.handed_over());
+    }
+
+    /// An h2c server that takes a request and then drops its connection without an answer;
+    /// counts the requests it received.
+    async fn dropping_after_the_request() -> (SocketAddr, Arc<AtomicUsize>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let count = Arc::new(AtomicUsize::new(0));
+        let seen = count.clone();
+        tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let seen = seen.clone();
+                let got = Arc::new(tokio::sync::Notify::new());
+                let notify = got.clone();
+                let service = hyper::service::service_fn(
+                    move |_req: hyper::Request<hyper::body::Incoming>| {
+                        let (seen, notify) = (seen.clone(), notify.clone());
+                        async move {
+                            seen.fetch_add(1, Ordering::SeqCst);
+                            notify.notify_one();
+                            std::future::pending::<()>().await;
+                            Ok::<_, std::convert::Infallible>(hyper::Response::new(Full::new(
+                                Bytes::new(),
+                            )))
+                        }
+                    },
+                );
+                tokio::spawn(async move {
+                    let builder = hyper_util::server::conn::auto::Builder::new(
+                        hyper_util::rt::TokioExecutor::new(),
+                    );
+                    let conn =
+                        builder.serve_connection(hyper_util::rt::TokioIo::new(stream), service);
+                    tokio::select! {
+                        _ = conn => {}
+                        _ = got.notified() => {}
+                    }
+                });
+            }
+        });
+        (addr, count)
+    }
+
+    #[tokio::test]
+    async fn a_send_whose_connection_fails_after_the_request_is_not_sent_again() {
+        let (dropping, received) = dropping_after_the_request().await;
+        let (good, good_count) = answering().await;
+        let set = EndpointSet::fixed(vec![dropping, good]);
+        set.mark_failed(good, Instant::now());
+        let network = "test-unsent-ambiguous";
+        let err = request_with(
+            req("lwd:9067", WRITE),
+            opts_on(network, 2000),
+            true,
+            Some(&set),
+            Some(&hedging()),
+        )
+        .await
+        .expect_err("the request reached the instance: never sent a second time");
+        assert!(matches!(err, RequestError::Http(_)), "{err:?}");
+        assert!(!err.not_written(), "{err:?}");
+        assert_eq!(received.load(Ordering::SeqCst), 1);
+        assert_eq!(good_count.load(Ordering::SeqCst), 0, "no second send");
+        assert_eq!(crate::health::lwd_unsent_retries(network, "send"), 0);
+        assert_eq!(crate::health::lwd_call_totals(network), (0, 1));
+    }
+
+    /// An h2c server that answers the first request of every connection and then closes that
+    /// connection; counts connections and requests.
+    async fn one_request_per_connection() -> (SocketAddr, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let connections = Arc::new(AtomicUsize::new(0));
+        let requests = Arc::new(AtomicUsize::new(0));
+        let (accepted, seen) = (connections.clone(), requests.clone());
+        tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                accepted.fetch_add(1, Ordering::SeqCst);
+                let seen = seen.clone();
+                let got = Arc::new(tokio::sync::Notify::new());
+                let notify = got.clone();
+                let service = hyper::service::service_fn(
+                    move |_req: hyper::Request<hyper::body::Incoming>| {
+                        let (seen, notify) = (seen.clone(), notify.clone());
+                        async move {
+                            seen.fetch_add(1, Ordering::SeqCst);
+                            notify.notify_one();
+                            Ok::<_, std::convert::Infallible>(
+                                hyper::Response::builder()
+                                    .status(200)
+                                    .header("content-type", "application/grpc")
+                                    .header("grpc-status", "0")
+                                    .body(Full::new(Bytes::new()))
+                                    .unwrap(),
+                            )
+                        }
+                    },
+                );
+                tokio::spawn(async move {
+                    let builder = hyper_util::server::conn::auto::Builder::new(
+                        hyper_util::rt::TokioExecutor::new(),
+                    );
+                    let conn =
+                        builder.serve_connection(hyper_util::rt::TokioIo::new(stream), service);
+                    tokio::pin!(conn);
+                    tokio::select! {
+                        _ = conn.as_mut() => {}
+                        _ = got.notified() => {
+                            // The answer in flight is completed, then the connection closed.
+                            conn.as_mut().graceful_shutdown();
+                            let _ = conn.await;
+                        }
+                    }
+                });
+            }
+        });
+        (addr, connections, requests)
+    }
+
+    /// A TCP connection that counts when the client is done with it (dropped).
+    struct Watched {
+        io: hyper_util::rt::TokioIo<tokio::net::TcpStream>,
+        _closed: Ended,
+    }
+
+    impl hyper::rt::Read for Watched {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: hyper::rt::ReadBufCursor<'_>,
+        ) -> std::task::Poll<Result<(), std::io::Error>> {
+            hyper::rt::Read::poll_read(std::pin::Pin::new(&mut self.io), cx, buf)
+        }
+    }
+
+    impl hyper::rt::Write for Watched {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<Result<usize, std::io::Error>> {
+            hyper::rt::Write::poll_write(std::pin::Pin::new(&mut self.io), cx, buf)
+        }
+
+        fn poll_flush(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), std::io::Error>> {
+            hyper::rt::Write::poll_flush(std::pin::Pin::new(&mut self.io), cx)
+        }
+
+        fn poll_shutdown(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), std::io::Error>> {
+            hyper::rt::Write::poll_shutdown(std::pin::Pin::new(&mut self.io), cx)
+        }
+    }
+
+    impl hyper_util::client::legacy::connect::Connection for Watched {
+        fn connected(&self) -> hyper_util::client::legacy::connect::Connected {
+            hyper_util::client::legacy::connect::Connected::new()
+        }
+    }
+
+    /// Connects over TCP and counts the connections it opened and the ones the client is
+    /// done with.
+    #[derive(Clone, Default)]
+    struct WatchedConnector {
+        opened: Arc<AtomicUsize>,
+        closed: Arc<AtomicUsize>,
+    }
+
+    impl tower::Service<hyper::Uri> for WatchedConnector {
+        type Response = Watched;
+        type Error = std::io::Error;
+        type Future = std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<Watched, std::io::Error>> + Send>,
+        >;
+
+        fn poll_ready(
+            &mut self,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, dst: hyper::Uri) -> Self::Future {
+            let (opened, closed) = (self.opened.clone(), self.closed.clone());
+            Box::pin(async move {
+                let host = dst.host().unwrap_or("127.0.0.1").to_string();
+                let port = dst.port_u16().unwrap_or(80);
+                let stream = tokio::net::TcpStream::connect((host.as_str(), port)).await?;
+                opened.fetch_add(1, Ordering::SeqCst);
+                Ok(Watched {
+                    io: hyper_util::rt::TokioIo::new(stream),
+                    _closed: Ended(closed),
+                })
+            })
+        }
+    }
+
+    /// A send after the upstream closed the connection the client had pooled arrives exactly
+    /// once, on a new connection. The test waits until the client itself is done with the
+    /// first connection (no timing); from there the client opens a new one for the send,
+    /// which is the client library's handling, kept visible here.
+    #[tokio::test]
+    async fn a_send_after_the_upstream_closed_the_pooled_connection_is_received_once() {
+        let (upstream, connections, requests) = one_request_per_connection().await;
+        // One client for both calls: the second would find the first one's connection in
+        // its pool.
+        let connector = WatchedConnector::default();
+        let client: Client<WatchedConnector, Full<Bytes>> =
+            Client::builder(hyper_util::rt::TokioExecutor::new())
+                .http2_only(true)
+                .build(connector.clone());
+        let authority = upstream.to_string();
+        let network = "test-unsent-pooled";
+        request_on(
+            &client,
+            req(&authority, READ),
+            opts_on(network, 5000),
+            true,
+            None,
+            None,
+        )
+        .await
+        .expect("the read answers");
+        assert_eq!(connector.opened.load(Ordering::SeqCst), 1);
+        // The upstream closes the connection after its answer; the client ends its side.
+        eventually("the client is done with the first connection", || {
+            connector.closed.load(Ordering::SeqCst) == 1
+        })
+        .await;
+        let resp = request_on(
+            &client,
+            req(&authority, WRITE),
+            opts_on(network, 5000),
+            true,
+            None,
+            None,
+        )
+        .await
+        .expect("sent on a new connection");
+        assert_eq!(resp.status(), 200);
+        assert_eq!(
+            connector.opened.load(Ordering::SeqCst),
+            2,
+            "a new connection for the send"
+        );
+        assert_eq!(connections.load(Ordering::SeqCst), 2);
+        assert_eq!(requests.load(Ordering::SeqCst), 2, "the send arrived once");
     }
 }

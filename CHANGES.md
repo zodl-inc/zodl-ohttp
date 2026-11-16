@@ -259,6 +259,39 @@ keeps its own log in [client/CHANGELOG.md](client/CHANGELOG.md).
   there fails the test. `tests/store_failover.rs` (opt-in by `OHTTP_FAILOVER_REDIS`, its own
   primary/replica pair) and `cache_retry_test.rs` (uses the store only if it is there) keep
   their own rules. No production code changes.
+- The attempt that loses a hedged lightwalletd read is no longer cancelled: it runs to its end
+  in a task of its own and its answer is discarded. Cancelling a call makes lightwalletd
+  cancel the node RPC behind it, which can cost the node an RPC slot. The detached attempt's
+  head is still bounded by the call's head deadline; its body is read to the end (a server
+  stream sends its head while the call still runs) for at most 10 s and 8 MiB. One cut by
+  these bounds is cancelled then, as any call that runs into its deadline: an instance that
+  does not answer within the call's head deadline still gets that one cancellation, the
+  detached attempt saves the ones that answer after the race and within it. A loser whose
+  request was not given to a connection yet (still connecting) is dropped as before: nothing
+  of it was sent. Each holds a permit
+  of a second set of `LWD_HEDGE_MAX_INFLIGHT` permits until it ends, none of the hedge permits
+  (those go back when the race ends, as before) and none of `MAX_INFLIGHT_LWD` (the caller's
+  permit covers the attempt whose answer it reads): hedging now adds at most twice
+  `LWD_HEDGE_MAX_INFLIGHT` concurrent lightwalletd calls instead of once, and no request waits
+  for a detached attempt. With all of them in use the loser is cancelled as before. Whatever a
+  detached attempt ends with settles nothing, as when it was cancelled: no `/healthz` outcome,
+  no timeout counted, its instance neither skipped nor cleared (a late head does not reset the
+  count of lost hedges). New values of `ohttp_lwd_hedges_total{event}`: `loser_detached`,
+  `loser_cancelled`, `loser_expired`. Both attempts are still dropped when the caller itself
+  goes away. No new variable.
+- A lightwalletd call whose connection ended before the request was written to it is sent once
+  more on a new connection (to another instance when `LWD_ENDPOINTS` has one), within the same
+  deadline, `SendTransaction` included; before, only a connect error was followed by that retry
+  for a `SendTransaction`. "Not written" is exactly what the HTTP client reports as such: it
+  got the request back unsent (the connection was not ready, or its task ended with the request
+  still queued), or the connection was closed between its handshake and the request. The
+  client already resends such a request itself on a reused pooled connection; this covers a
+  connection that was new. Every other error still fails a `SendTransaction` without a retry,
+  as does a deadline: a failed handshake, a request the connection refused to start and a
+  failure after the request was written are one error kind to the gateway, and a stream the
+  peer refused or a connection it is shutting down count as written. New
+  `ohttp_lwd_unsent_retries_total{network,call="send|other"}`; reads retried for this reason
+  count in `ohttp_lwd_read_retries_total` as before.
 - Known limits of the chain follower and the pinned backfill after these changes:
   - The drop of a held tip on a scheduled probe without a new observation applies to a held
     tip that is still held when the probe starts (the stored tip is not on its own chain).
@@ -291,7 +324,8 @@ keeps its own log in [client/CHANGELOG.md](client/CHANGELOG.md).
     `tip_at` changes.
   - An abandoned sweep call keeps the request-path concurrency permits it holds until it
     ends (up to 3 sweep calls per cache instead of 1). Upstream calls are still cancelled by
-    the fetch's own timeouts, by the losing attempt of a hedged read, and when the process or
+    the fetch's own timeouts, by a caller that goes away, by the losing attempt of a hedged
+    read when no detached permit is free or its bounds cut it, and when the process or
     runtime stops, as on every request path. A sweep fill that waits for a permit (three
     sweep-started calls alive) is delayed up to its fill timeout; a fetch that never
     ended would keep its permit (the gateway's is bounded by `LWD_TIMEOUT_SECS`).

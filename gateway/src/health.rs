@@ -520,6 +520,7 @@ pub fn init_metrics() {
         &*OHTTP_LWD_HEDGES_TOTAL,
         &*OHTTP_LWD_MEMPOOL_NO_HEAD_TOTAL,
         &*OHTTP_CACHE_TIP_MISMATCH_TOTAL,
+        &*OHTTP_LWD_UNSENT_RETRIES_TOTAL,
     ] {
         REGISTRY.register(Box::new(c.clone())).ok();
     }
@@ -1458,10 +1459,32 @@ pub fn record_lwd_timeout(network: &str, class: &str, phase: &str) {
 
 lazy_static::lazy_static! {
     static ref OHTTP_LWD_HEDGES_TOTAL: IntCounterVec = IntCounterVec::new(
-        Opts::new("ohttp_lwd_hedges_total", "Hedged lightwalletd reads (lwd_endpoints): event started (a read without a head after LWD_HEDGE_DELAY_MS was sent to another instance as well), won (the hedge's head came first), no_permit (no hedge: LWD_HEDGE_MAX_INFLIGHT hedges in flight), rate_limited (no hedge: six or more hedges in the last minute already, and one more would exceed one in ten of its hedgeable reads), loser_skipped (an instance lost its second or a later hedge in a row and is skipped for a while)"),
+        Opts::new("ohttp_lwd_hedges_total", "Hedged lightwalletd reads (lwd_endpoints): event started (a read without a head after LWD_HEDGE_DELAY_MS was sent to another instance as well), won (the hedge's head came first), no_permit (no hedge: LWD_HEDGE_MAX_INFLIGHT hedges in flight), rate_limited (no hedge: six or more hedges in the last minute already, and one more would exceed one in ten of its hedgeable reads), loser_skipped (an instance lost its second or a later hedge in a row and is skipped for a while), loser_detached (the attempt that lost the race runs to its end in a task of its own, its answer discarded), loser_cancelled (the attempt that lost the race was cancelled: as many detached ones as LWD_HEDGE_MAX_INFLIGHT were running), loser_expired (a detached one was cut by its head deadline or by the bound on reading its body)"),
         &["network", "event"]
     )
     .unwrap();
+}
+
+lazy_static::lazy_static! {
+    static ref OHTTP_LWD_UNSENT_RETRIES_TOTAL: IntCounterVec = IntCounterVec::new(
+        Opts::new("ohttp_lwd_unsent_retries_total", "Calls sent a second time, on a new connection, because the first connection ended before the request was written to it (the HTTP client returned the request unsent). call: send (SendTransaction), other (any other call that has no read retry). Reads of the gateway's own lightwalletd retried for the same reason count in ohttp_lwd_read_retries_total"),
+        &["network", "call"]
+    )
+    .unwrap();
+}
+
+/// `call`: send | other.
+pub fn record_lwd_unsent_retry(network: &str, call: &str) {
+    OHTTP_LWD_UNSENT_RETRIES_TOTAL
+        .with_label_values(&[network, call])
+        .inc();
+}
+
+#[cfg(test)]
+pub fn lwd_unsent_retries(network: &str, call: &str) -> u64 {
+    OHTTP_LWD_UNSENT_RETRIES_TOTAL
+        .with_label_values(&[network, call])
+        .get()
 }
 
 lazy_static::lazy_static! {
@@ -1507,7 +1530,8 @@ pub fn lwd_mempool_no_head(network: &str) -> u64 {
         .get()
 }
 
-/// `event`: started | won | no_permit | rate_limited | loser_skipped.
+/// `event`: started | won | no_permit | rate_limited | loser_skipped | loser_detached |
+/// loser_cancelled | loser_expired.
 pub fn record_lwd_hedge(network: &str, event: &str) {
     OHTTP_LWD_HEDGES_TOTAL
         .with_label_values(&[network, event])
