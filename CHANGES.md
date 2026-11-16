@@ -135,6 +135,36 @@ keeps its own log in [client/CHANGELOG.md](client/CHANGELOG.md).
   refreshed only by a changed `tip_seen` and goes stale otherwise, the same as under a leader
   of this version (it was refreshed without a bound). Without a stored `tip_at`, or without a
   `tip_seen` key, such a leader is followed as before.
+- The pinned backfill workers and the sweep write through the store they chose, bound to the
+  generation of that choice, like the cursor: once another store is chosen (the write store
+  connected, the store found read-only or writable again), a fill in flight sends no entry and
+  the worker chooses its store again; a sweep pass sends no further entry, hole or mark and
+  ends. Before, the fill chose its store again on its own, so a height claimed on one store's
+  cursor could be written to another. The generation is checked in the gateway before a
+  command is sent, not by the store: a command already sent completes on the store it was
+  bound to (for an entry an idempotent `SET NX` of a finalized height), never on another, and
+  a sweep claim is still renewed and released by its own token on its own store. A sweep fill
+  in flight checks every second whether its store was replaced and is then abandoned (its
+  upstream fetch too) and its claim released, instead of being renewed until the fill timeout
+  (60 s; the batch stayed claimed meanwhile). The check does not run while a renewal of the
+  claim waits for the store, so the fill ends within a second plus the bound of one claim
+  command (four store timeouts, at least 2 s on a separate write store) of the change; the
+  release of the claim is one more such command, checked by its token. Such a fill is counted (`ohttp_cache_requests_total{rpc="GetTreeState",
+  result="pinned_sweep_superseded"}`, new; a fill whose claim was lost to another process is
+  not), and so is the height a worker had claimed when its store is replaced during the fill
+  (`result="pinned_backfill_superseded"`, new; that store's sweep finds the height if it is
+  chosen again). The backfill cursor's `INCR`/`DECR` on a separate write store are bounded like
+  the sweep's commands there (four store timeouts, at least 2 s); they had four store timeouts. A worker
+  checks whether a height is present on that store too (it checked `REDIS_PINNED_URL`, which
+  with `REDIS_PINNED_WRITE_URL` set is a replica of it), and the existence checks and the
+  sweep's commands on a separate write store are bounded like its writes (at least 2 s), so a
+  slow answer is not taken for a missing entry.
+- A `ROLE` probe that was in flight when another pinned write store was chosen no longer acts
+  on that store: it neither lifts its pause (a write store that connects is asked before its
+  first use) nor pauses it when the probed store answered as a replica or not at all; a
+  read-only answer to a write pauses pinned writes only while the store and the choice it was
+  written under are still current. Callers that ask the same store at the same time after a
+  pause all get it once it answers as writable.
 - Pinned backfill workers (`PINNED_BACKFILL_WORKERS`) are started also when the store the
   entries go to is a read replica at startup: they wait and start once it takes writes (asked
   again every 5 minutes, as pinned writes are), so a promoted replica gets its backfill without
@@ -145,7 +175,26 @@ keeps its own log in [client/CHANGELOG.md](client/CHANGELOG.md).
   `REDIS_PINNED_WRITE_URL` that is unreachable at startup is connected in the background
   (backoff 1 s up to 60 s) instead of staying off until a restart; once connected, its `ROLE` is
   asked before the first write to it.
-- Known limits of the chain follower after these changes:
+- The pinned backfill and sweep no longer fill heights below the network's Sapling activation
+  (419200 for the network label `mainnet`, 280000, the testnet one, for `testnet` and any other
+  label), whatever `PINNED_TREESTATE_RANGE` says: there is no tree state there and lightwalletd
+  answers those heights with an error, so with a range that starts lower every one of them
+  became a hole of the sweep, retried 10 times (up to 100 holes per pass, three failing upstream calls each), while
+  the sweep's mark crawled through them. The workers move the shared cursor past them in one
+  step (forward only; the cursor still counts from the range start), the sweep starts its mark
+  there, and holes below it are dropped without an upstream call; they are counted, and
+  logged (one line with their number at most once a minute), once the store has removed them
+  (a store that refuses the removal keeps them for a later pass). That includes holes below
+  the range start, left over after `PINNED_TREESTATE_RANGE` was raised. A cursor step that
+  fails is logged (at most once a minute) and tried again before the worker's next claim,
+  until a claim is past those heights. `result="pinned_sweep_dropped"` now has two causes: a hole
+  below that height, and a hole whose 10 answered retries are used up. Lookups in the range
+  are unchanged, and so is the handling of every other failing height (three attempts, then a
+  hole, dropped after 10 answered retries; no answer counts nothing): an error status of the
+  upstream is not taken as a verdict about the height, since lightwalletd answers every
+  failure of this call, an unreachable node included, with the same status. A batch whose
+  heights are all holes still moves the mark on.
+- Known limits of the chain follower and the pinned backfill after these changes:
   - The drop of a held tip on a scheduled probe without a new observation applies to a held
     tip that is still held when the probe starts (the stored tip is not on its own chain).
     When the index check itself drops the held tip on a probe tick (the stored chain changed
@@ -163,6 +212,11 @@ keeps its own log in [client/CHANGELOG.md](client/CHANGELOG.md).
     follower that missed the reads in between; the tip is then followed as one without
     `tip_at` until `tip_at` changes. (Telling these apart needs a writer epoch in the store,
     a change of the protocol between versions.)
+  - A sweep fill abandoned because the store changed cancels its upstream call in flight, as
+    the fill timeout and a lost claim do: at most one call per worker per change of store.
+    (Letting it run would hold the batch's claim for the fetch timeout.)
+  - The store-backed tests fail without a test store only when `CI` is set; elsewhere they
+    are skipped, as the rest of the suite's store-backed tests are.
 - A pinned store whose `ROLE` does not answer in time (or fails on the connection) is treated as
   not writable and asked again after 30 s, instead of as writable: pinned writes and the
   backfill wait meanwhile. A store without the `ROLE` command (an error answer) stays writable.

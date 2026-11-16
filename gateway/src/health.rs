@@ -1008,6 +1008,14 @@ pub fn record_replay_async_dropped(network: &str, peer: usize, reason: &str) {
         .inc();
 }
 
+/// Current value of `ohttp_cache_requests_total` for one series (tests).
+#[cfg(test)]
+pub(crate) fn cache_request_count(network: &str, rpc: &str, result: &str) -> u64 {
+    OHTTP_CACHE_REQUESTS_TOTAL
+        .with_label_values(&[network, rpc, result])
+        .get()
+}
+
 /// Current value of `ohttp_replay_async_dropped_total` for one series (tests).
 #[cfg(test)]
 pub(crate) fn replay_async_dropped_count(network: &str, peer: usize, reason: &str) -> u64 {
