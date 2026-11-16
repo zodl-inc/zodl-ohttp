@@ -62,6 +62,45 @@ keeps its own log in [client/CHANGELOG.md](client/CHANGELOG.md).
 
 ### Gateway
 
+- New, off by default: **dynamic third-party hosts** (`DYNAMIC_HOST_SOURCES`, a JSON array of
+  sources). A source is the URL of a JSON document plus, per list in it, a JSON pointer to an
+  array of URLs and the routes those hosts get. The gateway reads each source every
+  `refresh_secs` (default 60) and serves the listed hosts like a `BACKENDS` alias whose target
+  is the host itself, without a restart. Static configuration wins: a `BACKENDS` alias, a
+  `GATEWAY_HOSTS` name and the host of a `BACKENDS` target or of `LWD_ADDR` are never served
+  from a source. A listed URL must be a plain
+  `https://host[:port]` whose host is a DNS name or a public IPv4 address (port 443 unless the
+  source allows another); requests to dynamic hosts use a client that connects to public
+  addresses only, so a listed name that resolves to a private, loopback or link-local address
+  is not connected to (`DYNAMIC_HOSTS_DENY_CIDRS` adds blocks of the operator's choice). Dynamic
+  hosts get only their list's routes, no `BACKEND_HEADERS`
+  credentials, the per-backend in-flight limit and an optional per-host `rate_limit`; their
+  replay class comes from their list's `read_routes` alone (`REPLAY_READ_ROUTES` and
+  `REPLAY_ONE_SIDED_WRITE_ROUTES` are not consulted for them). Bounded
+  by `max_hosts`, `max_new_hosts_per_refresh`, `DYNAMIC_HOSTS_MAX_DOCUMENT_BYTES` and
+  `DYNAMIC_HOSTS_FETCH_TIMEOUT_SECS`; optional detached Ed25519 signature of the document
+  (`signature_url`, `signature_keys`). Failure semantics: any failed refresh (fetch, status,
+  size, JSON, missing list, no valid host, too many hosts, signature) keeps the hosts of the
+  last accepted document; a source that is down at startup does not stop the start and its
+  hosts are missing until it answers. Every process refreshes on its own. New metrics
+  `ohttp_dynamic_hosts`, `ohttp_dynamic_hosts_refresh_total`,
+  `ohttp_dynamic_hosts_last_success_timestamp_seconds`, `ohttp_dynamic_hosts_held`,
+  `ohttp_dynamic_hosts_rejected`, `ohttp_dynamic_hosts_shadowed`; the `backend` label of a
+  dynamic host is `dynamic:<source>`. See gateway/CONFIG.md "Dynamic third-party hosts".
+- New, off by default: **the third-party host list for wallets**
+  (`THIRD_PARTY_HOSTS_PUBLISH=dynamic|all`, `THIRD_PARTY_HOSTS_MAX_AGE_SECS`). The inner request
+  `GET /ohttp-gateway/v1/third-party-hosts` to a `GATEWAY_HOSTS` name, through OHTTP only, is
+  answered by the gateway with the hosts it carries and their routes (versioned JSON with a
+  `revision` that names the document, a `scope`, `etag`/`if-none-match`,
+  `cache-control: max-age`; an inner 503 while the process has no complete list). Only the names wallets address
+  are published, never an alias target or a credential. With the default `off` the path is
+  handled as before.
+- The replay class of an inner request (READ or WRITE) is decided once per request instead of
+  at each replay stage; the result is the same for every existing route.
+- Logs: the path of an inner request whose authority is neither a `GATEWAY_HOSTS` name nor a
+  `BACKENDS` alias (refused with the inner 403) is logged as `(unknown authority)` instead of
+  the path the client sent, which could carry resource ids of a third party. Paths to the
+  gateway's own hosts and to aliases are logged as before.
 - The tip a follower holds from its own lightwalletd while the leader's tip stopped moving is
   served for at most 30 s in total after its lightwalletd last answered with it (it is served
   as seen then and goes stale at that bound; before, every tick served it anew, so it could

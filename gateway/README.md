@@ -22,6 +22,11 @@ Public listener (`PORT`, default 8080):
 | `/healthz` | GET | `200 ok` while replay protection works, lightwalletd is reachable and recent lightwalletd calls did not fail too often (`HEALTHZ_LWD_ERROR_RATIO`), else `503 unavailable`. Replay protection works while the security Redis answers and its connection reaches a primary (not while its last `ROLE` said replica, or a reconnect after a failover signal has been pending for more than 2 s), or, with `REPLAY_UNAVAILABLE_FALLBACK` (`failover` mode, or `async-reads` whose own store is the fallback store: `ohttp_replay_local_fallback` 1), while it does not but every peer store answers and decides in its place (`ohttp_replay_serving_via_fallback`) and the WRITEs decided there do not keep failing (`REPLAY_FALLBACK_HEALTH_FAILURES`). At startup it also waits (`REPLAY_STARTUP_STORES_WAIT_SECS`, default 10 s) until the replay peers and standby stores are connected, each with an open `WAIT` connection where its replica acknowledgement is required, and the local `WAIT` pool has a usable connection. Unauthenticated, no I/O, no details in the body: a monitor path for a load balancer. |
 | `/health/startup` | GET | `200` once the process is listening and the startup gate of the replay stores is open (`503 starting` while it waits, as for `/healthz`, at most `REPLAY_STARTUP_STORES_WAIT_SECS`). Does not depend on lightwalletd. |
 
+Inside OHTTP only (an inner request to a `GATEWAY_HOSTS` name; not a path of the public
+listener): `GET /ohttp-gateway/v1/third-party-hosts`, the third-party hosts this gateway carries
+and their routes, for wallets, when `THIRD_PARTY_HOSTS_PUBLISH` is set (see
+[CONFIG.md](CONFIG.md), "The host list for wallets").
+
 Any other method on these paths, and any other path in `ohttp` mode, answers `426`. With
 `RELAY_SECRET_ON_KEY_CONFIG=require` the two key-configuration GETs need `X-Relay-Secret` too.
 
@@ -207,6 +212,95 @@ sent a second time by the gateway (only a connect error, and an error by which t
 says the request was not written, are followed by the one retry; every other error fails it), and a call that fails after its response head arrived is not
 retried.
 
+## Third-party host list: wallet integration
+
+For wallet SDKs. A wallet sends a third-party request through the gateway only when it knows
+the gateway carries the host; anything else it refuses, and it never falls back to a direct
+connection. A compiled copy of the gateway's hosts goes stale whenever the gateway's set
+changes, so the gateway publishes the set (`THIRD_PARTY_HOSTS_PUBLISH`, see
+[CONFIG.md](CONFIG.md)).
+
+**Request.** An ordinary OHTTP request to the gateway that carries the third-party hosts, with
+the inner request
+
+```
+GET /ohttp-gateway/v1/third-party-hosts
+:authority  <the gateway's own host name, as for lightwalletd calls>
+if-none-match: "<revision>"        (optional, when a list is held)
+```
+
+No body, no query, no credential. The path exists only inside OHTTP; a plain HTTPS request to
+it is not answered.
+
+**Answer.** `200`, `content-type: application/json`, `cache-control: max-age=<max_age_secs>`,
+`etag: "<revision>"`:
+
+```json
+{"version":1,"revision":"5b0c1d9e7a3f2c44","scope":"all","max_age_secs":300,
+ "hosts":[{"host":"api.example.org","routes":["GET /*","POST /*"]},
+          {"host":"query.example.org:8443","routes":["GET /root","POST /v1/query"]}]}
+```
+
+- `host`: exactly what the wallet puts in `:authority` to reach that host through the gateway:
+  a lower-case name, with `:port` only for a port other than 443. Compare whole values,
+  case-insensitively; no suffix or wildcard matching.
+- `routes`: what the gateway forwards to the host, `METHOD /path`: `*` as method means any;
+  a path ending in `/*` is a prefix on a segment boundary (`/a/*` matches `/a` and `/a/b`, not
+  `/ab`), any other path is exact (a query string may follow). Informational for a wallet: the
+  gateway enforces them (inner `403 policy denied`).
+- `scope`: `all`: the list is every third-party host this gateway carries; a host that is
+  not in it is not carried. `dynamic`: the list holds only the hosts the gateway reads from
+  published server lists; hosts the gateway carries by static configuration are not in it,
+  so for those the compiled list stays in force. A gateway meant to replace the compiled list
+  publishes `all`.
+- `revision`: names this document (it changes when anything in it changes). `304` (no body)
+  answers an `if-none-match` that carries it: keep the held list and restart its lifetime.
+- `max_age_secs`: how long to use the list before asking again.
+- `version`: `1`. Unknown top-level or per-host fields must be ignored; a document with another
+  `version` must be treated as no list.
+
+**No list.** A gateway that does not publish the list answers this request like any other
+unknown lightwalletd path (an inner `403`, a gRPC error or a `404`, depending on its
+configuration). A gateway that publishes it but has no complete list answers an inner `503`: until
+every published server list it reads has been read once since the process started (one that
+keeps failing keeps it at `503`), or if the document would exceed 256 KiB. Treat every answer that is not
+a `200` with a parsable `version` 1 document (or a `304` for a held revision), any transport
+error, and any body larger than 256 KiB (the gateway never sends a larger one) as "no list":
+keep what is held, the bootstrap list if nothing was fetched yet.
+
+**What a wallet should do.**
+
+1. The allowed hosts are, at any moment:
+   - before any list was fetched: the compiled (bootstrap) list;
+   - while the list held has `scope` `all`: exactly the hosts of that list (a host it lacks
+     is not carried by the gateway, whatever the compiled list says);
+   - while the list held has `scope` `dynamic`, or a `scope` the wallet does not know: the
+     hosts of that list plus the compiled list.
+
+   "The list held" is the last one fetched successfully; it replaces the one before it as a
+   whole, also when its `scope` differs. A gateway is expected to keep its `scope`.
+2. Fetch the list through OHTTP, from the same relay and gateway pair that carries the
+   third-party requests. Never fetch it directly.
+3. Hold it in memory for `max_age_secs` (clamp to 30 s..24 h, the range a gateway can set).
+   When it is older, refresh in the background (one fetch at a time) and keep using the held
+   list meanwhile. After a failed refresh keep the held list and retry with backoff (for
+   example 30 s, doubling to 5 min).
+4. Allow a third-party request when its `host[:port]` is an allowed host by rule 1. Refuse
+   everything else as before. Never send a refused request directly.
+5. When choosing among the servers a service's own discovery document offers, drop the ones
+   the gateway does not carry and use the rest; fail only when none is left. For a host that
+   is not allowed by rule 1, one refresh (if the list is older than a few seconds) before
+   refusing picks up a host that was added since.
+6. Replicas of a gateway refresh independently, so for a short time one replica can list a host
+   another does not serve yet. An inner `403` with the body `unknown authority` for a listed
+   host means that: try another server of the service, and refresh the list (at most once per
+   30 s for this reason).
+7. The list is per gateway. A wallet that talks to more than one gateway (one per network)
+   keeps one list per gateway.
+
+The list tells a wallet where the gateway will forward. It does not authenticate the hosts:
+which servers a wallet uses still comes from the service's own discovery and its checks.
+
 ## Metrics
 
 All metrics are registered in `src/health.rs` and served on `:9090/metrics`. Request ids and
@@ -221,7 +315,7 @@ trace ids are never labels. `network` is `NETWORK`.
 | `ohttp_relay_request_id_total` | `network, state` | Relay correlation id `present`, `missing` or `invalid`. |
 | `ohttp_decrypt_errors_total` | - | Requests that did not decapsulate. |
 | `ohttp_encrypt_errors_total` | - | Registered for compatibility; no longer incremented. |
-| `ohttp_policy_denied_total` | `alias` | Inner requests refused by `BACKENDS_POLICY`. |
+| `ohttp_policy_denied_total` | `alias` | Inner requests refused by `BACKENDS_POLICY`, or by the routes of a dynamic host (`alias` is then `dynamic:<source>`). |
 | `ohttp_freshness_total` | `network, result` | Freshness verdicts: `fresh`, `missing`, `malformed`, `stale`. |
 | `ohttp_chunks_sent_total` | `network, kind` | Sealed response chunks: `full`, `flush`, `final`. |
 | `ohttp_response_truncated_total` | `network` | Upstream answers cut at `MAX_UPSTREAM_RESPONSE_BYTES`. |
@@ -245,7 +339,13 @@ trace ids are never labels. `network` is `NETWORK`.
 | `ohttp_lwd_permit_waited_total` | `network, class` | Calls that waited for a permit. |
 | `ohttp_lwd_permit_wait_seconds` | `network, class` | Permit wait time (histogram). |
 | `ohttp_third_party_cache_total` | `network, authority, result` | Third-party cache `hit` / `miss`. |
-| `ohttp_third_party_limited_total` | `network, authority` | Third-party calls refused by `THIRD_PARTY_RATE_LIMITS`. |
+| `ohttp_third_party_limited_total` | `network, authority` | Third-party calls refused by `THIRD_PARTY_RATE_LIMITS`, or by the `rate_limit` of a dynamic host source (then `authority` is `dynamic:<source>`). |
+| `ohttp_dynamic_hosts` | `network, source` | Third-party hosts served from a dynamic host source (`DYNAMIC_HOST_SOURCES`). |
+| `ohttp_dynamic_hosts_refresh_total` | `network, source, result` | Refreshes of a source: `ok`, `unchanged`, `partial` (new hosts held by `max_new_hosts_per_refresh`), `fetch_error`, `too_large`, `parse_error`, `invalid`, `empty`, `signature`. After any result but the first three the last accepted hosts stay served. |
+| `ohttp_dynamic_hosts_last_success_timestamp_seconds` | `network, source` | Unix time of the last refresh whose document was accepted. |
+| `ohttp_dynamic_hosts_held` | `network, source` | New hosts of the current document not admitted yet. |
+| `ohttp_dynamic_hosts_rejected` | `network, source` | Entries of the last accepted document refused by validation. |
+| `ohttp_dynamic_hosts_shadowed` | `network, source` | Listed hosts that the static configuration (`BACKENDS` aliases and targets, `GATEWAY_HOSTS`, `LWD_ADDR`) or an earlier source keeps. |
 | `ohttp_redis_connected` | `network` | 1 while both the cache and the security Redis are connected. |
 | `ohttp_cache_redis_connected` | `network` | Cache Redis connection. |
 | `ohttp_security_redis_connected` | `network` | Security Redis PING (0 also when not configured). |

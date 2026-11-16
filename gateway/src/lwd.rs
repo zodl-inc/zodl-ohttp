@@ -1284,6 +1284,8 @@ mod tests {
             flexa_publishable_key: None,
             flexa_alias: None,
             near_alias: None,
+            dynamic_hosts: Default::default(),
+            host_list: Default::default(),
             relay_secret_on_key_config: super::super::config::RelaySecretOnKeyConfig::Off,
             lwd_permit_wait_ms: 2000,
             lwd_permit_max_waiters: 0,

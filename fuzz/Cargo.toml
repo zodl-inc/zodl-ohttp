@@ -60,6 +60,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "gateway_dynamic_hosts"
+path = "fuzz_targets/gateway_dynamic_hosts.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "client_chunked_response"
 path = "fuzz_targets/client_chunked_response.rs"
 test = false

@@ -34,8 +34,9 @@ ohttp/
 ### Gateway (`gateway/`)
 
 The OHTTP gateway. Decapsulates chunked OHTTP requests, enforces the request policy,
-proxies to lightwalletd (gRPC) or to an allow-listed third-party backend, and encapsulates the
-response. Replay protection, response caching, a signed key-configuration endpoint
+proxies to lightwalletd (gRPC) or to an allow-listed third-party backend (a static map, or
+hosts read from a published server list and refreshed while the gateway runs), and encapsulates
+the response. Replay protection, response caching, a signed key-configuration endpoint
 (`/ohttp-configs/signed`) and Prometheus metrics are built in.
 
 See [gateway/README.md](gateway/README.md) for endpoints, metrics and key rotation, and

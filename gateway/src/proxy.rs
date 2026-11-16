@@ -21,6 +21,7 @@
 // trailers are folded into the header list of the InnerResponse so that the client can
 // read `grpc-status` from the Binary HTTP header section.
 
+use crate::dynamic_hosts::{DynamicHost, PublicResolver};
 use crate::{config::Config, ohttp::InnerRequest, ohttp::InnerResponse, AppState};
 use anyhow::{anyhow, Result};
 use axum::{body::Bytes, extract::State, http::StatusCode, response::IntoResponse};
@@ -67,6 +68,132 @@ fn backend_pool_builder() -> hyper_util::client::legacy::Builder {
 fn https_backend_client() -> &'static BackendClient {
     static CLIENT: OnceLock<BackendClient> = OnceLock::new();
     CLIENT.get_or_init(|| backend_pool_builder().build(HttpsConnector::new()))
+}
+
+type DynamicBackendClient = Client<HttpsConnector<HttpConnector<PublicResolver>>, Full<Bytes>>;
+
+/// The client for dynamic hosts (`DYNAMIC_HOST_SOURCES`): HTTPS only, and its connector gets
+/// only the public addresses a host name resolves to ([`PublicResolver`]), so a listed name
+/// that resolves to a private, loopback or link-local address is never connected to. The
+/// connector does not resolve an address literal; a literal host is admitted only when it is
+/// a public IPv4 address (when it is listed, and again in [`resolve_backend_in`]). Its pool is
+/// separate from the static backends' pool. Like that one it follows no redirect.
+fn dynamic_backend_client() -> &'static DynamicBackendClient {
+    static CLIENT: OnceLock<DynamicBackendClient> = OnceLock::new();
+    CLIENT.get_or_init(|| {
+        let mut http = HttpConnector::new_with_resolver(PublicResolver);
+        http.enforce_http(false);
+        let mut https = HttpsConnector::new_with_connector(http);
+        https.https_only(true);
+        backend_pool_builder().build(https)
+    })
+}
+
+/// The dynamic host an inner authority (lowercase) names, if any. Static configuration wins:
+/// a `BACKENDS` alias or a `GATEWAY_HOSTS` name is never a dynamic host.
+pub fn dynamic_host(config: &Config, authority_lower: &str) -> Option<Arc<DynamicHost>> {
+    if config.backends.contains_key(authority_lower)
+        || is_gateway_host(authority_lower, &config.gateway_hosts)
+    {
+        return None;
+    }
+    config.dynamic_hosts.lookup(authority_lower)
+}
+
+/// The dynamic-host view of one inner request, read from the served set exactly once.
+///
+/// The OHTTP handler resolves it before the replay stages and hands it to everything that
+/// follows (replay class, policy, labels, logged route, limits, the forward itself), so one
+/// request never mixes two versions of the dynamic hosts when a refresh swaps the set while
+/// it is being handled. A request whose host is removed meanwhile completes on the entry it
+/// holds.
+#[derive(Clone, Default)]
+pub struct RouteContext {
+    dynamic: Option<Arc<DynamicHost>>,
+}
+
+impl RouteContext {
+    /// Read the served set for `inner_request`'s authority. Static configuration wins: the
+    /// context holds no entry for a `BACKENDS` alias or a `GATEWAY_HOSTS` name.
+    pub fn resolve(config: &Config, inner_request: &InnerRequest) -> Self {
+        Self {
+            dynamic: dynamic_host(config, &inner_request.authority.to_ascii_lowercase()),
+        }
+    }
+
+    /// The dynamic host the request is for, if any.
+    pub fn dynamic(&self) -> Option<&Arc<DynamicHost>> {
+        self.dynamic.as_ref()
+    }
+
+    /// For a request to a dynamic host: whether it is a READ for the replay check, by that
+    /// host's lists alone (`REPLAY_READ_ROUTES` names static authorities and is not consulted).
+    /// `None`: not a dynamic host.
+    pub fn dynamic_read(&self, inner_request: &InnerRequest) -> Option<bool> {
+        self.dynamic
+            .as_ref()
+            .map(|host| host.is_read_route(&inner_request.method, &inner_request.path))
+    }
+
+    /// The replay class of the request, for every replay stage: for a dynamic host what its
+    /// lists say ([`RouteContext::dynamic_read`]), and never `read_routes`, which names static
+    /// authorities (and matches hosts without their port, so an entry for a static alias must
+    /// not decide for a dynamic host of the same name on another port); for anything else
+    /// `read_routes` (`REPLAY_READ_ROUTES`).
+    pub fn replay_class(
+        &self,
+        read_routes: &crate::origin::ReadRoutes,
+        is_lwd: bool,
+        inner_request: &InnerRequest,
+    ) -> crate::origin::RouteClass {
+        match self.dynamic_read(inner_request) {
+            Some(true) => crate::origin::RouteClass::Read,
+            Some(false) => crate::origin::RouteClass::Write,
+            None => read_routes.classify(
+                is_lwd,
+                &inner_request.authority,
+                &inner_request.method,
+                &inner_request.path,
+            ),
+        }
+    }
+
+    /// Whether a WRITE may run on one replay store's verdict (`REPLAY_ONE_SIDED_WRITE_ROUTES`,
+    /// `routes`): never for a dynamic host.
+    pub fn one_sided_write(
+        &self,
+        routes: &crate::origin::ReadRoutes,
+        is_lwd: bool,
+        inner_request: &InnerRequest,
+    ) -> bool {
+        self.dynamic.is_none()
+            && routes.matches(
+                is_lwd,
+                &inner_request.authority,
+                &inner_request.method,
+                &inner_request.path,
+            )
+    }
+
+    /// The `backend` metric label: `dynamic:<source>` for a dynamic host (bounded by the
+    /// configured sources, never the host name), else [`crate::health::normalize_backend`].
+    pub fn backend_label(&self, config: &Config, authority: &str) -> String {
+        match &self.dynamic {
+            Some(host) => host.label.clone(),
+            None => {
+                crate::health::normalize_backend(authority, &config.gateway_hosts, &config.backends)
+            }
+        }
+    }
+}
+
+/// [`RouteContext::backend_label`] for a request that has no context yet.
+#[allow(dead_code)]
+pub fn backend_label(config: &Config, authority: &str) -> String {
+    RouteContext {
+        dynamic: dynamic_host(config, &authority.to_ascii_lowercase()),
+    }
+    .backend_label(config, authority)
 }
 
 /// Track the end offset of the last complete gRPC message in a buffer.
@@ -149,12 +276,41 @@ fn matching_rule<'a>(
 /// The path of a `BACKENDS` (third-party) request as logged: the path pattern of the policy entry
 /// that admitted it (`/v0/status`, `/commerce_sessions/*`), so that the logs keep the route but
 /// not the query or the resource ids in the path (deposit addresses, session ids). One no entry
-/// admits (refused with the inner 403) is logged as `(not in policy)`; a request of any other
-/// authority with its path.
+/// admits (refused with the inner 403) is logged as `(not in policy)`; a request to the
+/// gateway's own hosts with its path (lightwalletd RPC names); one to any other authority as
+/// `(unknown authority)`.
+#[allow(dead_code)]
 pub fn loggable_route(config: &Config, inner_request: &InnerRequest) -> String {
+    loggable_route_in(
+        config,
+        inner_request,
+        &RouteContext::resolve(config, inner_request),
+    )
+}
+
+/// [`loggable_route`] in the request's [`RouteContext`]: a request to a dynamic host is logged
+/// by its list's route pattern even after a refresh removed the host.
+pub fn loggable_route_in(
+    config: &Config,
+    inner_request: &InnerRequest,
+    route: &RouteContext,
+) -> String {
     let authority = inner_request.authority.to_ascii_lowercase();
+    if let Some(host) = route.dynamic() {
+        return matching_rule(&host.routes, &inner_request.method, &inner_request.path)
+            .map(|(_, pattern)| pattern.clone())
+            .unwrap_or_else(|| "(not in policy)".to_string());
+    }
     if !config.backends.contains_key(&authority) {
-        return inner_request.path.clone();
+        // The light client server's paths are RPC names. A path sent to any other authority
+        // (unknown, or a dynamic host this process does not serve) may carry resource ids.
+        return if config.gateway_hosts.is_empty()
+            || is_gateway_host(&inner_request.authority, &config.gateway_hosts)
+        {
+            inner_request.path.clone()
+        } else {
+            "(unknown authority)".to_string()
+        };
     }
     config
         .backends_policy
@@ -169,8 +325,23 @@ pub fn loggable_route(config: &Config, inner_request: &InnerRequest) -> String {
 /// label names the operation while its values stay bounded by the configuration (never the
 /// request's own path, query or resource ids); `other` when no entry admits it. Any other
 /// request: [`crate::health::normalize_rpc_name`].
+#[allow(dead_code)]
 pub fn rpc_label(config: &Config, inner_request: &InnerRequest) -> String {
+    rpc_label_in(
+        config,
+        inner_request,
+        &RouteContext::resolve(config, inner_request),
+    )
+}
+
+/// [`rpc_label`] in the request's [`RouteContext`].
+pub fn rpc_label_in(config: &Config, inner_request: &InnerRequest, route: &RouteContext) -> String {
     let authority = inner_request.authority.to_ascii_lowercase();
+    if let Some(host) = route.dynamic() {
+        return matching_rule(&host.routes, &inner_request.method, &inner_request.path)
+            .map(|(method, pattern)| format!("{} {pattern}", method.to_ascii_uppercase()))
+            .unwrap_or_else(|| "other".to_string());
+    }
     if !config.backends.contains_key(&authority) {
         return crate::health::normalize_rpc_name(&inner_request.path, &inner_request.method);
     }
@@ -180,6 +351,61 @@ pub fn rpc_label(config: &Config, inner_request: &InnerRequest) -> String {
         .and_then(|policies| matching_rule(policies, &inner_request.method, &inner_request.path))
         .map(|(method, pattern)| format!("{} {pattern}", method.to_ascii_uppercase()))
         .unwrap_or_else(|| "other".to_string())
+}
+
+/// Paths no policy admits: directory traversal, encoded dots, double slashes.
+fn path_trick(path: &str) -> Option<&'static str> {
+    // Reject paths with directory traversal or encoding tricks
+    if path.contains("..") || path.contains("%2e") || path.contains("%2E") {
+        return Some("path contains directory traversal");
+    }
+    // Reject paths with double slashes (beyond the first byte; bytes, since the path is not
+    // validated yet and may start with a multi-byte character)
+    if path
+        .as_bytes()
+        .get(1..)
+        .is_some_and(|rest| rest.windows(2).any(|w| w == b"//"))
+    {
+        return Some("path contains double slashes");
+    }
+    None
+}
+
+/// Whether a dynamic host's routes refuse `method path`: `None` if allowed, `Some(reason)` if
+/// not. Only the routes of the host's list count; `BACKENDS_POLICY_DEFAULT` never applies.
+fn check_dynamic_policy(host: &DynamicHost, method: &str, path: &str) -> Option<&'static str> {
+    if let Some(reason) = path_trick(path) {
+        return Some(reason);
+    }
+    if matching_rule(&host.routes, method, path).is_some() {
+        None
+    } else {
+        Some("operation not in the dynamic host's routes")
+    }
+}
+
+/// The policy verdict for a request the forwarder resolved: the routes of `dynamic` when the
+/// authority is a dynamic host, the `BACKENDS_POLICY` of a `BACKENDS` alias otherwise.
+fn route_denial(
+    config: &Config,
+    dynamic: Option<&DynamicHost>,
+    inner_request: &InnerRequest,
+) -> Option<&'static str> {
+    if let Some(host) = dynamic {
+        return check_dynamic_policy(host, &inner_request.method, &inner_request.path);
+    }
+    if !config
+        .backends
+        .contains_key(&inner_request.authority.to_ascii_lowercase())
+    {
+        return None;
+    }
+    check_operation_policy(
+        config,
+        &inner_request.authority,
+        &inner_request.method,
+        &inner_request.path,
+    )
 }
 
 /// Check if a request matches the per-alias operation policy.
@@ -193,18 +419,8 @@ fn check_operation_policy(
     method: &str,
     path: &str,
 ) -> Option<&'static str> {
-    // Reject paths with directory traversal or encoding tricks
-    if path.contains("..") || path.contains("%2e") || path.contains("%2E") {
-        return Some("path contains directory traversal");
-    }
-    // Reject paths with double slashes (beyond the first byte; bytes, since the path is not
-    // validated yet and may start with a multi-byte character)
-    if path
-        .as_bytes()
-        .get(1..)
-        .is_some_and(|rest| rest.windows(2).any(|w| w == b"//"))
-    {
-        return Some("path contains double slashes");
+    if let Some(reason) = path_trick(path) {
+        return Some(reason);
     }
 
     let authority_lower = authority.to_ascii_lowercase();
@@ -227,7 +443,24 @@ fn check_operation_policy(
 
 /// Whether `inner_request` maps to a `BACKENDS` entry whose policy refuses it: such a request
 /// gets the inner 403 before any third-party cache or upstream cap is consulted.
+#[allow(dead_code)]
 pub fn policy_denies(config: &Config, inner_request: &InnerRequest) -> bool {
+    policy_denies_in(
+        config,
+        inner_request,
+        &RouteContext::resolve(config, inner_request),
+    )
+}
+
+/// [`policy_denies`] in the request's [`RouteContext`].
+pub fn policy_denies_in(
+    config: &Config,
+    inner_request: &InnerRequest,
+    route: &RouteContext,
+) -> bool {
+    if let Some(host) = route.dynamic() {
+        return check_dynamic_policy(host, &inner_request.method, &inner_request.path).is_some();
+    }
     config
         .backends
         .contains_key(&inner_request.authority.to_ascii_lowercase())
@@ -691,12 +924,28 @@ fn build_validated_uri(base_url: &str, path: &str, expected_host: &str) -> Resul
 /// 1. Validate authority structurally (malformed, including upper case → generic 403)
 /// 2. Validate path structurally (malformed → 400)
 /// 3. Exact match of the lowercase authority in the backends map → mapped backend
+/// 3b. A dynamic host (`DYNAMIC_HOST_SOURCES`) that is neither a backends alias nor a gateway
+///     host → that host itself (`https://host[:port]`)
 /// 4. Empty authority → 403
 /// 5. If GATEWAY_HOSTS not configured (empty) → LWD fallback (permissive; the binary refuses to
 ///    start in ohttp mode without GATEWAY_HOSTS, so only a `Config` built in code reaches this)
 /// 6. If authority matches gateway_hosts → LWD
 /// 7. Otherwise → reject with 403
 pub fn resolve_backend(config: &Config, inner_request: &InnerRequest) -> BackendTarget {
+    resolve_backend_in(
+        config,
+        inner_request,
+        &RouteContext::resolve(config, inner_request),
+    )
+}
+
+/// [`resolve_backend`] in the request's [`RouteContext`]: the dynamic host, if the request is
+/// for one, is the context's entry and the served set is not read again.
+pub fn resolve_backend_in(
+    config: &Config,
+    inner_request: &InnerRequest,
+    route: &RouteContext,
+) -> BackendTarget {
     // Step 1: Validate authority structurally
     if let Some(reason) = validate_authority(&inner_request.authority) {
         warn!(
@@ -712,7 +961,7 @@ pub fn resolve_backend(config: &Config, inner_request: &InnerRequest) -> Backend
     if let Some(reason) = validate_path(&inner_request.path) {
         warn!(
             authority = %inner_request.authority,
-            path = %loggable_route(config, inner_request),
+            path = %loggable_route_in(config, inner_request, route),
             reason = reason,
             "Rejecting request with malformed path"
         );
@@ -730,6 +979,16 @@ pub fn resolve_backend(config: &Config, inner_request: &InnerRequest) -> Backend
 
     // Lowercase authority for case-insensitive backends map lookup
     let authority_lower = inner_request.authority.to_ascii_lowercase();
+
+    // The context must be this request's, before anything is resolved: an entry read for
+    // another authority must never lend its policy or limits to this one.
+    if route
+        .dynamic()
+        .is_some_and(|host| crate::dynamic_hosts::authority_key(&authority_lower) != host.authority)
+    {
+        warn!("Route context of another authority");
+        return BackendTarget::Rejected;
+    }
 
     // Step 4: Check backends map (case-insensitive)
     if let Some(base_url) = config.backends.get(&authority_lower) {
@@ -777,6 +1036,35 @@ pub fn resolve_backend(config: &Config, inner_request: &InnerRequest) -> Backend
         }
     }
 
+    // Step 4b: a dynamic host (DYNAMIC_HOST_SOURCES), after the static map (static wins) and
+    // never one of the gateway's own names. Its target is the listed host itself.
+    if let Some(host) = route.dynamic() {
+        let expected_host = host.authority.split(':').next().unwrap_or(&host.authority);
+        // The connector does not ask the resolver for an address literal, so a literal is
+        // checked here as well as when it was listed: only a public address is ever a target.
+        if expected_host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| !crate::dynamic_hosts::is_connectable(ip))
+        {
+            warn!(backend = %host.label, "Dynamic host is a non-public address literal");
+            return BackendTarget::Rejected;
+        }
+        return match build_validated_uri(&host.base_url, &inner_request.path, expected_host) {
+            Ok(uri) => BackendTarget::Upstream {
+                uri,
+                label: host.label.clone(),
+            },
+            Err(e) => {
+                warn!(
+                    backend = %host.label,
+                    error = %e,
+                    "URI validation failed for dynamic host"
+                );
+                BackendTarget::Rejected
+            }
+        };
+    }
+
     // Step 5: Suffix routing removed per security audit (SSRF surface)
     // Use exact BACKENDS map entries instead
 
@@ -820,6 +1108,22 @@ pub fn resolve_backend(config: &Config, inner_request: &InnerRequest) -> Backend
     BackendTarget::Rejected
 }
 
+/// Count one upstream call against a dynamic host's cap: `Some(retry_after_secs)` when it is
+/// spent (logged and counted by the source's label), `None` otherwise or for any other backend.
+fn dynamic_host_limited(config: &Config, dynamic: Option<&DynamicHost>) -> Option<u64> {
+    let host = dynamic?;
+    let retry_after = host.check_rate().err()?;
+    warn!(
+        backend = %host.label,
+        retry_after,
+        network = %config.network,
+        "dynamic host upstream cap reached (inner 429)"
+    );
+    crate::health::record_third_party_limited(&config.network, &host.label);
+    crate::health::record_upstream_request(&config.network, &host.label, "other", 429, "-", 0.0);
+    Some(retry_after)
+}
+
 /// Create a 403 Binary HTTP response for rejected authority.
 fn create_rejected_authority_response() -> InnerResponse {
     InnerResponse {
@@ -843,7 +1147,16 @@ pub async fn forward_to_backend(
     state: &Arc<AppState>,
     inner_request: &InnerRequest,
 ) -> Result<InnerResponse> {
-    forward_to_backend_internal(state, inner_request, None, None).await
+    forward_to_backend_internal(state, inner_request, None, None, None).await
+}
+
+/// [`forward_to_backend`] in the request's [`RouteContext`].
+pub async fn forward_to_backend_in(
+    state: &Arc<AppState>,
+    inner_request: &InnerRequest,
+    route: &RouteContext,
+) -> Result<InnerResponse> {
+    forward_to_backend_internal(state, inner_request, None, None, Some(route)).await
 }
 
 async fn forward_to_backend_internal(
@@ -851,13 +1164,24 @@ async fn forward_to_backend_internal(
     inner_request: &InnerRequest,
     request_id: Option<uuid::Uuid>,
     client_trace_id: Option<String>,
+    route: Option<&RouteContext>,
 ) -> Result<InnerResponse> {
     let config = &state.config;
     use crate::health;
     let upstream_start = std::time::Instant::now();
 
     // Authority and path validation happens here AND in main.rs before the cache lookup (resolve_backend).
-    let (lwd_uri, backend_type) = match resolve_backend(config, inner_request) {
+    let resolved;
+    let route = match route {
+        Some(route) => route,
+        None => {
+            resolved = RouteContext::resolve(config, inner_request);
+            &resolved
+        }
+    };
+    // The dynamic host entry of this request: target, routes, limits and labels all come from it.
+    let dynamic = route.dynamic().cloned();
+    let (lwd_uri, backend_type) = match resolve_backend_in(config, inner_request, route) {
         BackendTarget::Upstream { uri, label } => (uri, label),
         BackendTarget::Rejected => {
             // Unknown authority: reject with 403 per ZIP draft
@@ -892,7 +1216,7 @@ async fn forward_to_backend_internal(
             // Malformed path: reject with 400 (path logged as its policy pattern, see resolve_backend)
             warn!(
                 request_id = ?request_id,
-                path = %loggable_route(config, inner_request),
+                path = %loggable_route_in(config, inner_request, route),
                 reason = reason,
                 network = %config.network,
                 "Rejecting request with malformed path"
@@ -907,19 +1231,14 @@ async fn forward_to_backend_internal(
 
     // Check operation policy for mapped backends
     let authority_lower = inner_request.authority.to_ascii_lowercase();
-    if config.backends.contains_key(&authority_lower) {
-        if let Some(reason) = check_operation_policy(
-            config,
-            &inner_request.authority,
-            &inner_request.method,
-            &inner_request.path,
-        ) {
+    {
+        if let Some(reason) = route_denial(config, dynamic.as_deref(), inner_request) {
             warn!(
                 policy = "deny",
                 request_id = ?request_id,
                 authority = %inner_request.authority,
                 method = %inner_request.method,
-                path = %loggable_route(config, inner_request),
+                path = %loggable_route_in(config, inner_request, route),
                 reason = reason,
                 network = %config.network,
                 "Operation denied by policy"
@@ -932,7 +1251,11 @@ async fn forward_to_backend_internal(
                 "-",
                 0.0,
             );
-            health::record_policy_denied(&inner_request.authority);
+            health::record_policy_denied(
+                dynamic
+                    .as_ref()
+                    .map_or(inner_request.authority.as_str(), |h| h.label.as_str()),
+            );
             // Policy denial returns "policy denied" per spec
             return Ok(InnerResponse {
                 status: 403,
@@ -940,6 +1263,13 @@ async fn forward_to_backend_internal(
                 body: b"policy denied".to_vec(),
             });
         }
+    }
+
+    // The per-host cap of a dynamic host (its source's `rate_limit`): inner 429, no upstream call.
+    if let Some(retry_after) = dynamic_host_limited(config, dynamic.as_deref()) {
+        return Ok(crate::third_party_cache::create_rate_limited_response(
+            retry_after,
+        ));
     }
 
     // Block range enforcement for GetBlockRange gRPC calls
@@ -1039,6 +1369,9 @@ async fn forward_to_backend_internal(
     // Use dedicated lwd_semaphore for own-LWD, per_backend semaphores for backend aliases
     let backend_sem = if backend_type == "lwd" {
         state.lwd_semaphore.clone()
+    } else if let Some(host) = &dynamic {
+        // Per dynamic host, held in its entry (it goes away with the host).
+        host.semaphore.clone()
     } else {
         crate::enforcement::get_backend_semaphore(
             &backend_type,
@@ -1083,14 +1416,15 @@ async fn forward_to_backend_internal(
         .method(inner_request.method.as_str())
         .uri(&lwd_uri);
 
-    // Gateway-owned X-Request-Id (replace any client value)
-    if let Some(req_id) = request_id {
+    // Gateway-owned X-Request-Id (replace any client value). Not for a dynamic host: a host a
+    // published document chose gets no key that joins its logs to the gateway's.
+    if let (Some(req_id), None) = (request_id, &dynamic) {
         req_builder = req_builder.header("X-Request-Id", req_id.to_string());
     }
 
     // Determine if we'll inject grpc-accept-encoding: identity (h2c backends only)
     let inject_identity_encoding = !lwd_uri.to_string().starts_with("https://");
-    if let (true, Some(req_id)) = (is_grpc_request(inner_request), request_id) {
+    if let (true, Some(req_id), None) = (is_grpc_request(inner_request), request_id, &dynamic) {
         req_builder = req_builder.header("grpc-request-id", req_id.to_string());
     }
 
@@ -1104,7 +1438,8 @@ async fn forward_to_backend_internal(
             req_builder = req_builder.header(name.as_str(), value.as_str());
         }
     }
-    if crate::flexa::is_alias(config.flexa_alias.as_deref(), &authority_lower) {
+    if dynamic.is_none() && crate::flexa::is_alias(config.flexa_alias.as_deref(), &authority_lower)
+    {
         for (name, value) in crate::flexa::upstream_headers(
             &inner_request.headers,
             config.flexa_publishable_key.as_deref(),
@@ -1122,8 +1457,13 @@ async fn forward_to_backend_internal(
         req_builder = req_builder.header("grpc-accept-encoding", "identity");
     }
 
-    // Inject per-backend credentials (REPLACES any client auth, never appends)
-    if let Some(extra) = config.backend_headers.get(&authority_lower) {
+    // Inject per-backend credentials (REPLACES any client auth, never appends). Never for a
+    // dynamic host: credentials belong to `BACKENDS` aliases only.
+    if let Some(extra) = config
+        .backend_headers
+        .get(&authority_lower)
+        .filter(|_| dynamic.is_none())
+    {
         for (name, value) in extra {
             req_builder = req_builder.header(name.as_str(), value.as_str());
         }
@@ -1141,7 +1481,13 @@ async fn forward_to_backend_internal(
     let idle = Duration::from_secs(config.long_poll_idle_secs);
 
     // Use a TLS-capable client for https:// backends and an h2c client for http:// upstreams.
-    let http_response = if lwd_uri.starts_with("https://") {
+    let http_response = if dynamic.is_some() {
+        // Dynamic hosts: the client whose resolver hands out public addresses only.
+        timeout(overall, dynamic_backend_client().request(http_request))
+            .await
+            .map_err(|_| anyhow!("Backend did not respond within {:?}", overall))?
+            .map_err(|e| anyhow!("HTTPS request failed: {:?}", e))?
+    } else if lwd_uri.starts_with("https://") {
         timeout(overall, https_backend_client().request(http_request))
             .await
             .map_err(|_| anyhow!("Backend did not respond within {:?}", overall))?
@@ -1212,7 +1558,7 @@ async fn forward_to_backend_internal(
                             if let Some(req_id) = request_id {
                                 warn!(
                                     request_id = %req_id,
-                                    path = %loggable_route(config, inner_request),
+                                    path = %loggable_route_in(config, inner_request, route),
                                     bytes_kept = last_boundary,
                                     message_count = message_count,
                                     "Response truncated at gateway size cap"
@@ -1350,12 +1696,15 @@ async fn forward_to_backend_internal(
             "-"
         });
 
-    let backend_label = health::normalize_backend(
-        &inner_request.authority,
-        &config.gateway_hosts,
-        &config.backends,
-    );
-    let rpc_name = rpc_label(config, inner_request);
+    let backend_label = match &dynamic {
+        Some(host) => host.label.clone(),
+        None => health::normalize_backend(
+            &inner_request.authority,
+            &config.gateway_hosts,
+            &config.backends,
+        ),
+    };
+    let rpc_name = rpc_label_in(config, inner_request, route);
     let duration_secs = upstream_start.elapsed().as_secs_f64();
 
     health::record_upstream_request(
@@ -1378,14 +1727,21 @@ async fn forward_to_backend_internal(
 ///
 /// Performs the same backend resolution, policy checks, and credential injection as
 /// `forward_to_backend`, but streams the response body instead of buffering it; `request_id` is
-/// forwarded as `X-Request-Id` (and `grpc-request-id` for a gRPC call); `client_trace_id` is only
-/// logged.
+/// forwarded as `X-Request-Id` (and `grpc-request-id` for a gRPC call), except to a dynamic
+/// host; `client_trace_id` is only logged.
+#[allow(dead_code)]
 pub async fn forward_to_backend_stream(
     state: &Arc<AppState>,
     inner_request: &InnerRequest,
     request_id: uuid::Uuid,
     client_trace_id: Option<String>,
-) -> Result<(
+) -> Result<StreamedAnswer> {
+    let route = RouteContext::resolve(&state.config, inner_request);
+    forward_to_backend_stream_in(state, inner_request, request_id, client_trace_id, &route).await
+}
+
+/// What a streaming forward returns: status, headers and the body frames.
+pub type StreamedAnswer = (
     u16,
     Vec<(String, String)>,
     Pin<
@@ -1395,7 +1751,16 @@ pub async fn forward_to_backend_stream(
                 + 'static,
         >,
     >,
-)> {
+);
+
+/// [`forward_to_backend_stream`] in the request's [`RouteContext`].
+pub async fn forward_to_backend_stream_in(
+    state: &Arc<AppState>,
+    inner_request: &InnerRequest,
+    request_id: uuid::Uuid,
+    client_trace_id: Option<String>,
+    route: &RouteContext,
+) -> Result<StreamedAnswer> {
     use crate::chunked_stream::UpFrame;
     use futures_util::stream;
 
@@ -1404,7 +1769,9 @@ pub async fn forward_to_backend_stream(
     let upstream_start = std::time::Instant::now();
 
     // Authority and path validation
-    let (backend_uri, backend_type) = match resolve_backend(config, inner_request) {
+    // The dynamic host entry of this request: target, routes, limits and labels all come from it.
+    let dynamic = route.dynamic().cloned();
+    let (backend_uri, backend_type) = match resolve_backend_in(config, inner_request, route) {
         BackendTarget::Upstream { uri, label } => (uri, label),
         BackendTarget::Rejected => {
             warn!(
@@ -1444,7 +1811,7 @@ pub async fn forward_to_backend_stream(
         BackendTarget::MalformedPath(reason) => {
             warn!(
                 request_id = ?request_id,
-                path = %loggable_route(config, inner_request),
+                path = %loggable_route_in(config, inner_request, route),
                 reason = reason,
                 network = %config.network,
                 "Rejecting request with malformed path"
@@ -1463,19 +1830,14 @@ pub async fn forward_to_backend_stream(
 
     // Check operation policy for mapped backends
     let authority_lower = inner_request.authority.to_ascii_lowercase();
-    if config.backends.contains_key(&authority_lower) {
-        if let Some(reason) = check_operation_policy(
-            config,
-            &inner_request.authority,
-            &inner_request.method,
-            &inner_request.path,
-        ) {
+    {
+        if let Some(reason) = route_denial(config, dynamic.as_deref(), inner_request) {
             warn!(
                 policy = "deny",
                 request_id = ?request_id,
                 authority = %inner_request.authority,
                 method = %inner_request.method,
-                path = %loggable_route(config, inner_request),
+                path = %loggable_route_in(config, inner_request, route),
                 reason = reason,
                 network = %config.network,
                 "Operation denied by policy"
@@ -1488,7 +1850,11 @@ pub async fn forward_to_backend_stream(
                 "-",
                 0.0,
             );
-            health::record_policy_denied(&inner_request.authority);
+            health::record_policy_denied(
+                dynamic
+                    .as_ref()
+                    .map_or(inner_request.authority.as_str(), |h| h.label.as_str()),
+            );
             let response = InnerResponse {
                 status: 403,
                 headers: vec![("content-type".to_string(), "text/plain".to_string())],
@@ -1502,6 +1868,18 @@ pub async fn forward_to_backend_stream(
                 })),
             ));
         }
+    }
+
+    // The per-host cap of a dynamic host (its source's `rate_limit`): inner 429, no upstream call.
+    if let Some(retry_after) = dynamic_host_limited(config, dynamic.as_deref()) {
+        let response = crate::third_party_cache::create_rate_limited_response(retry_after);
+        return Ok((
+            response.status,
+            response.headers,
+            Box::pin(stream::once(async move {
+                Ok(UpFrame::Data(Bytes::from(response.body)))
+            })),
+        ));
     }
 
     // Block range enforcement for GetBlockRange gRPC calls
@@ -1586,7 +1964,7 @@ pub async fn forward_to_backend_stream(
             client_trace_id = %trace_id,
             backend = backend_type,
             method = %inner_request.method,
-            path = %loggable_route(config, inner_request),
+            path = %loggable_route_in(config, inner_request, route),
             network = %config.network,
             hop = "upstream",
             "Forwarding to backend (streaming)"
@@ -1596,7 +1974,7 @@ pub async fn forward_to_backend_stream(
             request_id = %request_id,
             backend = backend_type,
             method = %inner_request.method,
-            path = %loggable_route(config, inner_request),
+            path = %loggable_route_in(config, inner_request, route),
             network = %config.network,
             hop = "upstream",
             "Forwarding to backend (streaming)"
@@ -1606,6 +1984,9 @@ pub async fn forward_to_backend_stream(
     // Use dedicated lwd_semaphore for own-LWD, per_backend semaphores for backend aliases
     let backend_sem = if backend_type == "lwd" {
         state.lwd_semaphore.clone()
+    } else if let Some(host) = &dynamic {
+        // Per dynamic host, held in its entry (it goes away with the host).
+        host.semaphore.clone()
     } else {
         crate::enforcement::get_backend_semaphore(
             &backend_type,
@@ -1657,12 +2038,15 @@ pub async fn forward_to_backend_stream(
         .method(inner_request.method.as_str())
         .uri(&backend_uri);
 
-    // Gateway-owned X-Request-Id
-    req_builder = req_builder.header("X-Request-Id", request_id.to_string());
+    // Gateway-owned X-Request-Id. Not for a dynamic host: a host a published document chose
+    // gets no key that joins its logs to the gateway's.
+    if dynamic.is_none() {
+        req_builder = req_builder.header("X-Request-Id", request_id.to_string());
+    }
 
     // Determine if we'll inject grpc-accept-encoding: identity (h2c backends only)
     let inject_identity_encoding = !backend_uri.to_string().starts_with("https://");
-    if is_grpc_request(inner_request) {
+    if dynamic.is_none() && is_grpc_request(inner_request) {
         req_builder = req_builder.header("grpc-request-id", request_id.to_string());
     }
 
@@ -1675,7 +2059,8 @@ pub async fn forward_to_backend_stream(
             req_builder = req_builder.header(name.as_str(), value.as_str());
         }
     }
-    if crate::flexa::is_alias(config.flexa_alias.as_deref(), &authority_lower) {
+    if dynamic.is_none() && crate::flexa::is_alias(config.flexa_alias.as_deref(), &authority_lower)
+    {
         for (name, value) in crate::flexa::upstream_headers(
             &inner_request.headers,
             config.flexa_publishable_key.as_deref(),
@@ -1692,8 +2077,13 @@ pub async fn forward_to_backend_stream(
         req_builder = req_builder.header("grpc-accept-encoding", "identity");
     }
 
-    // Inject per-backend credentials
-    if let Some(extra) = config.backend_headers.get(&authority_lower) {
+    // Inject per-backend credentials. Never for a dynamic host: credentials belong to
+    // `BACKENDS` aliases only.
+    if let Some(extra) = config
+        .backend_headers
+        .get(&authority_lower)
+        .filter(|_| dynamic.is_none())
+    {
         for (name, value) in extra {
             req_builder = req_builder.header(name.as_str(), value.as_str());
         }
@@ -1713,7 +2103,13 @@ pub async fn forward_to_backend_stream(
     // (a) Normal SSE backends (Flexa) send headers immediately and stream events.
     // (b) The overall timeout bounds the worst case.
     // (c) A backend that takes >25s to send headers is effectively unavailable.
-    let http_response = if backend_uri.starts_with("https://") {
+    let http_response = if dynamic.is_some() {
+        // Dynamic hosts: the client whose resolver hands out public addresses only.
+        timeout(overall, dynamic_backend_client().request(http_request))
+            .await
+            .map_err(|_| anyhow!("Backend did not respond within {:?}", overall))?
+            .map_err(|e| anyhow!("HTTPS request failed: {:?}", e))?
+    } else if backend_uri.starts_with("https://") {
         timeout(overall, https_backend_client().request(http_request))
             .await
             .map_err(|_| anyhow!("Backend did not respond within {:?}", overall))?
@@ -1754,7 +2150,7 @@ pub async fn forward_to_backend_stream(
     let backend_label = backend_type.clone();
 
     // Computed before the stream, which captures no borrowed references.
-    let rpc_name = rpc_label(config, inner_request);
+    let rpc_name = rpc_label_in(config, inner_request, route);
 
     // GW-SILENCE: SSE keep-alive interval to prevent relay between-bytes timeouts
     let sse_keepalive = if event_stream {
@@ -2143,6 +2539,8 @@ mod tests {
             flexa_publishable_key: None,
             flexa_alias: None,
             near_alias: None,
+            dynamic_hosts: Default::default(),
+            host_list: Default::default(),
             relay_secret_on_key_config: crate::config::RelaySecretOnKeyConfig::Off,
         }
     }
@@ -2581,6 +2979,8 @@ mod policy_enforcement_tests {
             flexa_publishable_key: None,
             flexa_alias: None,
             near_alias: None,
+            dynamic_hosts: Default::default(),
+            host_list: Default::default(),
             relay_secret_on_key_config: crate::config::RelaySecretOnKeyConfig::Off,
         }
     }
@@ -2813,6 +3213,8 @@ mod policy_tests {
             flexa_publishable_key: None,
             flexa_alias: None,
             near_alias: None,
+            dynamic_hosts: Default::default(),
+            host_list: Default::default(),
             relay_secret_on_key_config: crate::config::RelaySecretOnKeyConfig::Off,
         }
     }
@@ -2948,6 +3350,8 @@ mod method_wildcard_tests {
             flexa_publishable_key: None,
             flexa_alias: None,
             near_alias: None,
+            dynamic_hosts: Default::default(),
+            host_list: Default::default(),
             relay_secret_on_key_config: crate::config::RelaySecretOnKeyConfig::Off,
         };
 
@@ -3022,6 +3426,8 @@ mod path_semantics_tests {
             flexa_publishable_key: None,
             flexa_alias: None,
             near_alias: None,
+            dynamic_hosts: Default::default(),
+            host_list: Default::default(),
             relay_secret_on_key_config: crate::config::RelaySecretOnKeyConfig::Off,
         };
 
@@ -3100,6 +3506,8 @@ mod path_semantics_tests {
             flexa_publishable_key: None,
             flexa_alias: None,
             near_alias: None,
+            dynamic_hosts: Default::default(),
+            host_list: Default::default(),
             relay_secret_on_key_config: crate::config::RelaySecretOnKeyConfig::Off,
         };
 
@@ -3186,6 +3594,8 @@ mod path_semantics_tests {
             flexa_publishable_key: None,
             flexa_alias: None,
             near_alias: None,
+            dynamic_hosts: Default::default(),
+            host_list: Default::default(),
             relay_secret_on_key_config: crate::config::RelaySecretOnKeyConfig::Off,
         };
 
@@ -3401,6 +3811,8 @@ mod stream_tests {
             flexa_publishable_key: None,
             flexa_alias: None,
             near_alias: None,
+            dynamic_hosts: Default::default(),
+            host_list: Default::default(),
             relay_secret_on_key_config: crate::config::RelaySecretOnKeyConfig::Off,
         };
 
@@ -3625,6 +4037,8 @@ mod stream_tests {
             flexa_publishable_key: None,
             flexa_alias: None,
             near_alias: None,
+            dynamic_hosts: Default::default(),
+            host_list: Default::default(),
             relay_secret_on_key_config: crate::config::RelaySecretOnKeyConfig::Off,
         };
 

@@ -419,6 +419,36 @@ lazy_static::lazy_static! {
 
 // A second block: one more static in the first exceeds the macro recursion limit.
 lazy_static::lazy_static! {
+    static ref OHTTP_DYNAMIC_HOSTS: IntGaugeVec = IntGaugeVec::new(
+        Opts::new("ohttp_dynamic_hosts", "Third-party hosts served from a dynamic host source (DYNAMIC_HOST_SOURCES)"),
+        &["network", "source"]
+    )
+    .unwrap();
+    static ref OHTTP_DYNAMIC_HOSTS_SHADOWED: IntGaugeVec = IntGaugeVec::new(
+        Opts::new("ohttp_dynamic_hosts_shadowed", "Hosts a dynamic host source lists that the static configuration (BACKENDS aliases and targets, GATEWAY_HOSTS, LWD_ADDR) or an earlier source keeps"),
+        &["network", "source"]
+    )
+    .unwrap();
+    static ref OHTTP_DYNAMIC_HOSTS_HELD: IntGaugeVec = IntGaugeVec::new(
+        Opts::new("ohttp_dynamic_hosts_held", "New hosts of a source's current document not admitted yet (max_new_hosts_per_refresh)"),
+        &["network", "source"]
+    )
+    .unwrap();
+    static ref OHTTP_DYNAMIC_HOSTS_REJECTED: IntGaugeVec = IntGaugeVec::new(
+        Opts::new("ohttp_dynamic_hosts_rejected", "Entries of a source's last accepted document refused by validation"),
+        &["network", "source"]
+    )
+    .unwrap();
+    static ref OHTTP_DYNAMIC_HOSTS_REFRESH_TOTAL: IntCounterVec = IntCounterVec::new(
+        Opts::new("ohttp_dynamic_hosts_refresh_total", "Refreshes of a dynamic host source by result: ok, unchanged, partial, fetch_error, too_large, parse_error, invalid, empty, signature"),
+        &["network", "source", "result"]
+    )
+    .unwrap();
+    static ref OHTTP_DYNAMIC_HOSTS_LAST_SUCCESS: IntGaugeVec = IntGaugeVec::new(
+        Opts::new("ohttp_dynamic_hosts_last_success_timestamp_seconds", "Unix time of the last refresh of a dynamic host source whose document was accepted (ok, unchanged, partial)"),
+        &["network", "source"]
+    )
+    .unwrap();
     static ref OHTTP_REPLAY_STANDBY_CONNECTED: IntGaugeVec = IntGaugeVec::new(
         Opts::new("ohttp_replay_standby_connected", "Standby store (REPLAY_STANDBY_URLS) PING, per peer label; kept apart from ohttp_replay_peer_connected, which means the peers"),
         &["network", "peer"]
@@ -433,6 +463,18 @@ lazy_static::lazy_static! {
 }
 
 pub fn init_metrics() {
+    for gauge in [
+        &*OHTTP_DYNAMIC_HOSTS,
+        &*OHTTP_DYNAMIC_HOSTS_SHADOWED,
+        &*OHTTP_DYNAMIC_HOSTS_HELD,
+        &*OHTTP_DYNAMIC_HOSTS_REJECTED,
+        &*OHTTP_DYNAMIC_HOSTS_LAST_SUCCESS,
+    ] {
+        REGISTRY.register(Box::new(gauge.clone())).ok();
+    }
+    REGISTRY
+        .register(Box::new(OHTTP_DYNAMIC_HOSTS_REFRESH_TOTAL.clone()))
+        .ok();
     REGISTRY
         .register(Box::new(OHTTP_REQUESTS_TOTAL.clone()))
         .ok();
@@ -1753,6 +1795,69 @@ pub fn record_third_party_cache(network: &str, authority: &str, result: &str) {
     OHTTP_THIRD_PARTY_CACHE_TOTAL
         .with_label_values(&[network, authority, result])
         .inc();
+}
+
+/// Hosts a dynamic host source serves, and hosts it lists that something else serves.
+pub fn record_dynamic_hosts(network: &str, source: &str, served: usize, shadowed: usize) {
+    OHTTP_DYNAMIC_HOSTS
+        .with_label_values(&[network, source])
+        .set(served as i64);
+    OHTTP_DYNAMIC_HOSTS_SHADOWED
+        .with_label_values(&[network, source])
+        .set(shadowed as i64);
+}
+
+/// Of a source's last accepted document: new hosts held back, entries refused.
+pub fn record_dynamic_hosts_document(network: &str, source: &str, held: usize, rejected: usize) {
+    OHTTP_DYNAMIC_HOSTS_HELD
+        .with_label_values(&[network, source])
+        .set(held as i64);
+    OHTTP_DYNAMIC_HOSTS_REJECTED
+        .with_label_values(&[network, source])
+        .set(rejected as i64);
+}
+
+/// One refresh of a dynamic host source (`dynamic_hosts::RefreshResult::as_str`).
+pub fn record_dynamic_hosts_refresh(network: &str, source: &str, result: &str) {
+    OHTTP_DYNAMIC_HOSTS_REFRESH_TOTAL
+        .with_label_values(&[network, source, result])
+        .inc();
+}
+
+/// A source's document was accepted now.
+pub fn record_dynamic_hosts_success(network: &str, source: &str) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    OHTTP_DYNAMIC_HOSTS_LAST_SUCCESS
+        .with_label_values(&[network, source])
+        .set(now);
+}
+
+#[cfg(test)]
+pub fn dynamic_hosts_refreshes(network: &str, source: &str, result: &str) -> u64 {
+    OHTTP_DYNAMIC_HOSTS_REFRESH_TOTAL
+        .with_label_values(&[network, source, result])
+        .get()
+}
+
+#[cfg(test)]
+pub fn dynamic_hosts_gauges(network: &str, source: &str) -> (i64, i64, i64, i64) {
+    (
+        OHTTP_DYNAMIC_HOSTS
+            .with_label_values(&[network, source])
+            .get(),
+        OHTTP_DYNAMIC_HOSTS_SHADOWED
+            .with_label_values(&[network, source])
+            .get(),
+        OHTTP_DYNAMIC_HOSTS_HELD
+            .with_label_values(&[network, source])
+            .get(),
+        OHTTP_DYNAMIC_HOSTS_REJECTED
+            .with_label_values(&[network, source])
+            .get(),
+    )
 }
 
 pub fn record_third_party_limited(network: &str, authority: &str) {

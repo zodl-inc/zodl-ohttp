@@ -49,10 +49,12 @@ mod cache;
 mod chain;
 mod chunked_stream;
 mod config;
+mod dynamic_hosts;
 mod enforcement;
 mod flexa;
 mod freshness;
 mod health;
+mod host_list;
 mod hpke;
 mod local;
 mod lwd;
@@ -245,6 +247,30 @@ async fn main() -> anyhow::Result<()> {
     // An OHTTP gateway answers only for its own host names (ZIP "Gateway behaviour" rule 5).
     // Without GATEWAY_HOSTS every unknown authority would reach lightwalletd, so refuse to start.
     config::require_gateway_hosts(&config.mode, &config.gateway_hosts)?;
+
+    // Dynamic third-party hosts (DYNAMIC_HOST_SOURCES): one refresh per source before serving
+    // (its network waits end with the fetch timeout; checking and applying a document comes on
+    // top), so a starting process knows the hosts its peers serve. A
+    // source that does not answer leaves its hosts out until it does; it never stops the start.
+    if config.dynamic_hosts.enabled() {
+        info!(
+            sources = %config.dynamic_hosts.source_names().join(","),
+            network = %config.network,
+            "Dynamic host sources configured (DYNAMIC_HOST_SOURCES)"
+        );
+        config.dynamic_hosts.refresh_all().await;
+        config.dynamic_hosts.spawn_refresh_tasks();
+    }
+    match config.host_list.mode {
+        host_list::PublishMode::Off => {}
+        mode => info!(
+            mode = ?mode,
+            max_age_secs = config.host_list.max_age_secs,
+            path = host_list::HOST_LIST_PATH,
+            network = %config.network,
+            "Third-party host list published to wallets (THIRD_PARTY_HOSTS_PUBLISH)"
+        ),
+    }
 
     match config.flexa_alias.as_deref() {
         Some(alias) if !config.backends.contains_key(alias) => warn!(
@@ -1261,6 +1287,24 @@ impl RequestLog {
         );
     }
 
+    /// An answer of the gateway itself (the third-party host list) is being sent.
+    fn served_gateway(&self, route: &str, status: u16, bytes_out: usize) {
+        info!(
+            request_id = %self.request_id,
+            client_trace_id = self.trace(),
+            method = %self.method,
+            path = %self.path,
+            route,
+            status,
+            bytes_out,
+            duration_ms = self.start.elapsed().as_millis() as u64,
+            network = %self.network,
+            origin = %self.origin,
+            hop = "gateway",
+            "Serving gateway request"
+        );
+    }
+
     /// A complete third-party answer (`third_party_cache`: a cache hit, the per-backend cap's
     /// 429, or one upstream call) is being sent.
     fn served_third_party(&self, status: u16, bytes_out: usize) {
@@ -1962,6 +2006,10 @@ async fn gateway_handler(
         }
     }
 
+    // The dynamic-host view of this request, read once: the replay class, policy, labels, logged
+    // route and the forward all use it, whatever a refresh does to the served set meanwhile.
+    let route = proxy::RouteContext::resolve(&state.config, &inner_request);
+
     // Third-party paths are logged as their policy pattern at every level, debug included.
     let log = RequestLog {
         request_id,
@@ -1969,7 +2017,7 @@ async fn gateway_handler(
         network: network.clone(),
         origin: state.origin.label().to_string(),
         method: inner_request.method.clone(),
-        path: proxy::loggable_route(&state.config, &inner_request),
+        path: proxy::loggable_route_in(&state.config, &inner_request, &route),
         start,
     };
     debug!(
@@ -1985,11 +2033,31 @@ async fn gateway_handler(
     // Resolve the backend from the inner :authority BEFORE touching the cache. The cache key is
     // path + body only, so a cached lightwalletd answer must never be returned to a request whose
     // authority is unknown (must get 403) or maps to a third-party upstream.
-    let cache_allowed = proxy::resolve_backend(&state.config, &inner_request).is_lwd();
+    let cache_allowed = proxy::resolve_backend_in(&state.config, &inner_request, &route).is_lwd();
+
+    // The gateway's own host list (THIRD_PARTY_HOSTS_PUBLISH): answered below, after the replay
+    // stages every inner request passes. Not a lightwalletd route, so the gateway host's
+    // BACKENDS_POLICY entry does not apply to it.
+    let host_list_request = cache_allowed && host_list::is_request(&state.config, &inner_request);
+    // The replay class, decided once for all replay stages. READ: the host list; for a dynamic
+    // host, what its lists call a READ (REPLAY_READ_ROUTES is not consulted for it); for
+    // anything else, a route on REPLAY_READ_ROUTES. Everything else is a WRITE.
+    let route_class = if host_list_request {
+        origin::RouteClass::Read
+    } else {
+        route.replay_class(
+            &state.origin.replay_read_routes,
+            cache_allowed,
+            &inner_request,
+        )
+    };
 
     // The light client server's own operation policy (BACKENDS_POLICY entry of a GATEWAY_HOSTS
     // authority): inner 403 before the cache and before anything is forwarded.
-    if cache_allowed && proxy::gateway_host_policy_denies(&state.config, &inner_request) {
+    if cache_allowed
+        && !host_list_request
+        && proxy::gateway_host_policy_denies(&state.config, &inner_request)
+    {
         warn!(
             policy = "deny",
             request_id = %request_id,
@@ -2027,23 +2095,16 @@ async fn gateway_handler(
     // With `local_unavailable` the peer stores decide alone (admit_without_local).
     // REPLAY_ONE_SIDED_WRITE_ROUTES: whether this WRITE may run on one store's verdict
     // (write_fallback.rs, "Partition tolerance"). Not on the list: both stores must take it.
-    let write_policy =
-        cache::WritePolicy::for_route(state.origin.replay_one_sided_write_routes.matches(
-            cache_allowed,
-            &inner_request.authority,
-            &inner_request.method,
-            &inner_request.path,
-        ));
+    let write_policy = cache::WritePolicy::for_route(route.one_sided_write(
+        &state.origin.replay_one_sided_write_routes,
+        cache_allowed,
+        &inner_request,
+    ));
     // The peer stage runs for every request the local check admitted (without peers it decides
     // nothing): its result, bound to this request's nonce, is what the later steps require.
     let mut peer_check: Option<cache::PeerCheck> = None;
     if let (Some(cache), Some(local)) = (state.cache.as_ref(), local_check.as_ref()) {
-        let class = state.origin.replay_read_routes.classify(
-            cache_allowed,
-            &inner_request.authority,
-            &inner_request.method,
-            &inner_request.path,
-        );
+        let class = route_class;
         if local_unavailable || cache.replay_peers().is_some() {
             health::record_replay_class(&network, class.as_str());
         }
@@ -2148,12 +2209,7 @@ async fn gateway_handler(
         local_check.as_ref(),
         peer_check.as_ref().filter(|c| !c.local_bypassed()),
     ) {
-        let class = state.origin.replay_read_routes.classify(
-            cache_allowed,
-            &inner_request.authority,
-            &inner_request.method,
-            &inner_request.path,
-        );
+        let class = route_class;
         if class == origin::RouteClass::Write {
             let result = cache.confirm_write_nonce(local, check).await;
             if let Ok(cache::WriteAdmission::Replay) = result {
@@ -2245,16 +2301,41 @@ async fn gateway_handler(
         local_check.as_ref(),
         peer_check.take(),
     ) {
-        let class = state.origin.replay_read_routes.classify(
-            cache_allowed,
-            &inner_request.authority,
-            &inner_request.method,
-            &inner_request.path,
-        );
+        let class = route_class;
         // Already confirmed there synchronously (the hub fallback or window).
         if class == origin::RouteClass::Write {
             cache.replicate_write_to_standby(local, check);
         }
+    }
+
+    // The host list: built from the configuration and the current dynamic hosts, no upstream.
+    if host_list_request {
+        let resp = host_list::answer(&state.config, &inner_request);
+        let status = resp.status;
+        health::record_request_detailed(
+            if status == 503 {
+                "unavailable"
+            } else {
+                "success"
+            },
+            "ohttp",
+            &network,
+            "ohttp",
+            "GET",
+            status,
+            "-",
+            "gateway",
+            "other",
+        );
+        health::record_duration(
+            &network,
+            "ohttp",
+            "gateway",
+            "third_party_hosts",
+            start.elapsed().as_secs_f64(),
+        );
+        log.served_gateway("host_list", status, resp.body.len());
+        return responder.collected(resp);
     }
 
     // GW-GRPC-COMPRESSED: Reject compressed gRPC messages on all lightwalletd RPCs (ZIP L602-604).
@@ -2336,21 +2417,23 @@ async fn gateway_handler(
     }
 
     let method_label = health::normalize_method(&inner_request.method);
-    let backend = health::normalize_backend(
-        &inner_request.authority,
-        &state.config.gateway_hosts,
-        &state.config.backends,
-    );
+    let backend = route.backend_label(&state.config, &inner_request.authority);
     let rpc = health::normalize_rpc_name(&inner_request.path, &inner_request.method);
     // Third-party requests: the policy entry that admits them (proxy::rpc_label).
-    let backend_rpc = proxy::rpc_label(&state.config, &inner_request);
+    let backend_rpc = proxy::rpc_label_in(&state.config, &inner_request, &route);
 
     // Third-party backends: an answer from THIRD_PARTY_CACHE_ROUTES, or the per-backend cap's
     // inner 429 (THIRD_PARTY_RATE_LIMITS), before the usual streamed forward. The gateway cannot
     // see clients, so a backend's quota is protected per backend. A request the backend's policy
     // refuses skips both: it gets the inner 403 below and uses up no quota.
-    if !cache_allowed && !proxy::policy_denies(&state.config, &inner_request) {
-        let fetch = || proxy::forward_to_backend(&state, &inner_request);
+    // A dynamic host has neither: THIRD_PARTY_CACHE_ROUTES and THIRD_PARTY_RATE_LIMITS belong to
+    // BACKENDS aliases; its cap is its source's `rate_limit`, counted in the forwarder.
+    let is_dynamic_host = route.dynamic().is_some();
+    if !cache_allowed
+        && !is_dynamic_host
+        && !proxy::policy_denies_in(&state.config, &inner_request, &route)
+    {
+        let fetch = || proxy::forward_to_backend_in(&state, &inner_request, &route);
         if let Some(resp) = state
             .third_party
             .answer(
@@ -2393,11 +2476,12 @@ async fn gateway_handler(
 
     // Third-party backends, and authorities proxy.rs rejects (403/400): now streamed like lightwalletd.
     if !cache_allowed {
-        let (status, headers, stream) = match proxy::forward_to_backend_stream(
+        let (status, headers, stream) = match proxy::forward_to_backend_stream_in(
             &state,
             &inner_request,
             request_id,
             client_trace_id.clone(),
+            &route,
         )
         .await
         {
@@ -2859,6 +2943,8 @@ mod handler_tests {
             flexa_publishable_key: None,
             flexa_alias: None,
             near_alias: None,
+            dynamic_hosts: Default::default(),
+            host_list: Default::default(),
             relay_secret_on_key_config: config::RelaySecretOnKeyConfig::Off,
         }
     }
@@ -3265,6 +3351,93 @@ mod handler_tests {
             lwd_hits,
         )
         .await;
+    }
+
+    /// The third-party host list (THIRD_PARTY_HOSTS_PUBLISH) through the OHTTP handler: answered
+    /// by the gateway itself after the replay check, not subject to the gateway host's own
+    /// policy, never forwarded; any other method on the path, and the path while publishing is
+    /// off, is an ordinary request to the gateway host.
+    #[tokio::test]
+    async fn the_host_list_is_answered_inside_ohttp_after_the_replay_check() {
+        if !store_up("redis://127.0.0.1:6379", "the test Redis").await {
+            return;
+        }
+        health::init_metrics();
+        let (tp, tp_hits) = upstream(true).await;
+        let (lwd, lwd_hits) = upstream(false).await;
+        let mut config = config(
+            "testnet-handler-hostlist",
+            "redis://127.0.0.1:6379/1",
+            &lwd,
+            &tp,
+        );
+        config.host_list = host_list::HostListSettings {
+            mode: host_list::PublishMode::All,
+            max_age_secs: 300,
+        };
+        // The gateway host admits lightwalletd RPCs only: as a lightwalletd route the list's
+        // path would be refused.
+        config.backends_policy.insert(
+            "lwd.example.com".to_string(),
+            vec![(
+                "POST".to_string(),
+                "/cash.z.wallet.sdk.rpc.CompactTxStreamer/*".to_string(),
+            )],
+        );
+        let origin = origin_env("sync", true);
+        let cache = base_cache(&config, &origin, PEER_WAIT).await;
+        let state = app_state(config.clone(), origin.clone(), cache);
+        let list = |method: &str| {
+            bhttp(
+                method,
+                "lwd.example.com",
+                host_list::HOST_LIST_PATH,
+                "application/json",
+                b"",
+            )
+        };
+
+        let key_config = state.hpke.as_ref().unwrap().public_config();
+        let (sealed, enc, secret) = seal(&key_config, &list("GET"));
+        let (status, wire) = post_sealed(&state, sealed.clone()).await;
+        assert_eq!(status, StatusCode::OK);
+        let (inner_status, fields, body) = open(&enc, &secret, &wire);
+        assert_eq!(inner_status, 200, "{}", String::from_utf8_lossy(&body));
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("the host list");
+        assert_eq!(json["version"], 1);
+        assert_eq!(json["scope"], "all");
+        assert_eq!(json["hosts"][0]["host"], "api.example.com");
+        assert_eq!(json["hosts"][0]["routes"][0], "* /*");
+        assert!(fields.to_ascii_lowercase().contains("etag"), "{fields}");
+        assert!(
+            !String::from_utf8_lossy(&body).contains("127.0.0.1"),
+            "no alias target in the list"
+        );
+        // It passed the replay check like any inner request: the same bytes again are refused.
+        let (status, _) = post_sealed(&state, sealed).await;
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "the same request again is a replay"
+        );
+
+        // Another method on the path is not the list: the gateway host's policy refuses it.
+        let (inner_status, _, body) = post(&state, list("POST")).await;
+        assert_eq!(inner_status, 403, "{}", String::from_utf8_lossy(&body));
+        assert_eq!(body, b"policy denied");
+
+        // Publishing off (the default): the path is an ordinary path of the gateway host.
+        let mut off = config;
+        off.network = "testnet-handler-hostlist-off".to_string();
+        off.host_list = host_list::HostListSettings::default();
+        let cache = base_cache(&off, &origin, PEER_WAIT).await;
+        let state = app_state(off, origin, cache);
+        let (inner_status, _, body) = post(&state, list("GET")).await;
+        assert_eq!(inner_status, 403, "{}", String::from_utf8_lossy(&body));
+        assert_eq!(body, b"policy denied");
+
+        assert_eq!(tp_hits.load(Ordering::SeqCst), 0, "nothing forwarded");
+        assert_eq!(lwd_hits.load(Ordering::SeqCst), 0, "nothing forwarded");
     }
 
     /// `async-reads`, `REPLAY_PEER_FAIL_CLOSED_WRITES=0` (an unreachable hub tolerated).

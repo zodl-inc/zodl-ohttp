@@ -98,4 +98,8 @@ the gateway's own `request_id` but without the request's hash (the replay nonce)
 `request_id`, `relay_request_id` and `client_trace_id` are never metric labels. The `rpc` label
 is one of the known lightwalletd method names, for a third-party (`BACKENDS`) request the method
 and path pattern of the `BACKENDS_POLICY` entry that admitted it (`GET /v0/status`, so bounded by
-the configuration), or `other`; a request's own path, query or ids never become labels.
+the configuration), or `other`; a request's own path, query or ids never become labels. The
+`backend` label of a host served from a dynamic host source is `dynamic:<source>`, never the
+host name: the hosts change with the source's document, the sources only with the configuration.
+The refresh log lines of a source name the hosts added and removed (public server names from the
+document, at most 16 per line) and counts; they carry no request data.

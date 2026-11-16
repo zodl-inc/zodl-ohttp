@@ -226,9 +226,36 @@ impl CacheRoutes {
     }
 }
 
+/// Parse one `REQUESTS/WINDOWs` cap (`120/60s`) of the variable `name`: both parts positive.
+pub(crate) fn parse_rate_spec(name: &str, spec: &str) -> Result<(u64, Duration)> {
+    let Some((requests, window)) = spec.split_once('/') else {
+        anyhow::bail!("Malformed {name}: '{spec}' must be 'REQUESTS/WINDOW'");
+    };
+    let requests = requests
+        .trim()
+        .parse::<u64>()
+        .map_err(|_| anyhow!("Invalid {name} requests in '{spec}': must be a positive integer"))?;
+    if requests == 0 {
+        anyhow::bail!("Invalid {name} requests in '{spec}': must be > 0");
+    }
+    let window = window.trim();
+    let Some(secs) = window.strip_suffix('s') else {
+        anyhow::bail!(
+            "Invalid {name} window '{window}' in '{spec}': must end with 's' (e.g., '60s')"
+        );
+    };
+    let secs = secs.parse::<u64>().map_err(|_| {
+        anyhow!("Invalid {name} window '{window}' in '{spec}': must be a positive integer followed by 's'")
+    })?;
+    if secs == 0 {
+        anyhow::bail!("Invalid {name} window '{window}' in '{spec}': must be > 0");
+    }
+    Ok((requests, Duration::from_secs(secs)))
+}
+
 /// Rate limit window: fixed window per backend.
 #[derive(Debug)]
-struct RateWindow {
+pub(crate) struct RateWindow {
     /// Window start time.
     window_start: Instant,
     /// Window duration.
@@ -240,7 +267,7 @@ struct RateWindow {
 }
 
 impl RateWindow {
-    fn new(limit: u64, window_duration: Duration) -> Self {
+    pub(crate) fn new(limit: u64, window_duration: Duration) -> Self {
         Self {
             window_start: Instant::now(),
             window_duration,
@@ -250,7 +277,7 @@ impl RateWindow {
     }
 
     /// Check and increment. Returns Ok(()) if allowed, Err(retry_after_secs) if limited.
-    fn check_and_increment(&mut self) -> Result<(), u64> {
+    pub(crate) fn check_and_increment(&mut self) -> Result<(), u64> {
         let now = Instant::now();
         let elapsed = now.duration_since(self.window_start);
 
@@ -310,39 +337,8 @@ impl RateLimiters {
             if authority.is_empty() {
                 anyhow::bail!("Malformed THIRD_PARTY_RATE_LIMITS: missing authority in '{entry}'");
             }
-            let Some((requests, window)) = limit_window.split_once('/') else {
-                anyhow::bail!(
-                    "Malformed THIRD_PARTY_RATE_LIMITS: '{limit_window}' must be 'REQUESTS/WINDOW' (entry: '{entry}')"
-                );
-            };
-            let requests = requests.trim().parse::<u64>().map_err(|_| {
-                anyhow!(
-                    "Invalid THIRD_PARTY_RATE_LIMITS requests '{requests}' in '{entry}': must be a positive integer"
-                )
-            })?;
-            if requests == 0 {
-                anyhow::bail!(
-                    "Invalid THIRD_PARTY_RATE_LIMITS requests '{requests}' in '{entry}': must be > 0"
-                );
-            }
-            let window = window.trim();
-            let duration = if let Some(secs) = window.strip_suffix('s') {
-                let secs = secs.parse::<u64>().map_err(|_| {
-                    anyhow!(
-                        "Invalid THIRD_PARTY_RATE_LIMITS window '{window}' in '{entry}': must be a positive integer followed by 's'"
-                    )
-                })?;
-                Duration::from_secs(secs)
-            } else {
-                anyhow::bail!(
-                    "Invalid THIRD_PARTY_RATE_LIMITS window '{window}' in '{entry}': must end with 's' (e.g., '60s')"
-                );
-            };
-            if duration.as_secs() == 0 {
-                anyhow::bail!(
-                    "Invalid THIRD_PARTY_RATE_LIMITS window '{window}' in '{entry}': must be > 0"
-                );
-            }
+            let (requests, duration) = parse_rate_spec("THIRD_PARTY_RATE_LIMITS", limit_window)
+                .map_err(|e| anyhow!("{e} (entry: '{entry}')"))?;
             configs.insert(authority, (requests, duration));
         }
         if configs.is_empty() {

@@ -282,6 +282,13 @@ pub struct Config {
     pub near_alias: Option<String>,
     /// `RELAY_SECRET_ON_KEY_CONFIG` (default `off`).
     pub relay_secret_on_key_config: RelaySecretOnKeyConfig,
+    /// `DYNAMIC_HOST_SOURCES`: third-party hosts read from published documents and refreshed
+    /// while the gateway runs (`dynamic_hosts.rs`). A handle: clones of the configuration share
+    /// one served set. Default: no source, no host.
+    pub dynamic_hosts: crate::dynamic_hosts::DynamicHosts,
+    /// `THIRD_PARTY_HOSTS_PUBLISH` / `THIRD_PARTY_HOSTS_MAX_AGE_SECS`: the host list published
+    /// to wallets (`host_list.rs`). Default: off.
+    pub host_list: crate::host_list::HostListSettings,
 }
 
 impl Config {
@@ -439,7 +446,7 @@ impl Config {
             .map(|v| v.eq_ignore_ascii_case("allow"))
             .unwrap_or(false);
 
-        Ok(Self {
+        let config = Self {
             port: env::var("PORT")
                 .unwrap_or_else(|_| "8080".to_string())
                 .parse()?,
@@ -716,6 +723,25 @@ impl Config {
             relay_secret_on_key_config: RelaySecretOnKeyConfig::parse(
                 &env::var("RELAY_SECRET_ON_KEY_CONFIG").unwrap_or_default(),
             )?,
+            dynamic_hosts: crate::dynamic_hosts::DynamicHosts::default(),
+            host_list: crate::host_list::HostListSettings::from_env()?,
+        };
+        // The dynamic sources need the static names they must never take.
+        let dynamic_hosts = crate::dynamic_hosts::DynamicHosts::from_env(
+            crate::dynamic_hosts::Reserved {
+                aliases: config.backends.keys().cloned().collect(),
+                gateway_hosts: config.gateway_hosts.iter().cloned().collect(),
+                targets: crate::dynamic_hosts::static_target_hosts(
+                    config.backends.values(),
+                    &config.lwd_addr,
+                ),
+            },
+            &config.network,
+            config.max_inflight_per_backend,
+        )?;
+        Ok(Self {
+            dynamic_hosts,
+            ..config
         })
     }
 }
@@ -841,6 +867,8 @@ impl std::fmt::Debug for Config {
             .field("flexa_publishable_key", &"<REDACTED>")
             .field("flexa_alias", &self.flexa_alias)
             .field("near_alias", &self.near_alias)
+            .field("dynamic_hosts", &self.dynamic_hosts)
+            .field("host_list", &self.host_list)
             .finish()
     }
 }
@@ -855,6 +883,58 @@ pub fn require_gateway_hosts(mode: &str, gateway_hosts: &[String]) -> anyhow::Re
         );
     }
     Ok(())
+}
+
+/// A configuration for unit tests: `ohttp` mode on `testnet`, the gateway host
+/// `ohttp-gateway.example`, no backend, no policy (default deny), no dynamic source.
+#[cfg(test)]
+pub(crate) fn test_config() -> Config {
+    Config {
+        port: 8080,
+        lwd_addr: "lwd:9067".to_string(),
+        mode: "ohttp".to_string(),
+        relay_secrets: vec![],
+        allow_unauthenticated_relay: true,
+        hpke_private_key: None,
+        hpke_key_id: 1,
+        hpke_keys: vec![],
+        lwd_timeout_secs: 5,
+        long_poll_max_initial_silence_secs: 25,
+        long_poll_idle_secs: 3,
+        sse_keepalive_secs: 20,
+        redis_url: String::new(),
+        redis_security_url: String::new(),
+        backends: HashMap::new(),
+        backend_headers: HashMap::new(),
+        backends_policy: HashMap::new(),
+        backends_policy_default_allow: false,
+        max_inflight_lwd: 128,
+        max_inflight_lwd_heavy: 32,
+        lwd_heavy_block_range: 100,
+        lwd_permit_wait_ms: 2000,
+        lwd_permit_max_waiters: 0,
+        redis_op_timeout_ms: 250,
+        max_cache_get_concurrency: 64,
+        max_large_response_concurrency: 2,
+        large_response_threshold: 8 * 1024 * 1024,
+        proxy_allow_suffixes: vec![],
+        network: "testnet".to_string(),
+        log_outer_header_names: false,
+        gateway_hosts: vec!["ohttp-gateway.example".to_string()],
+        configs_signing_seed: None,
+        max_upstream_response_bytes: 1024 * 1024,
+        max_inflight_upstream: 256,
+        max_inflight_per_backend: 64,
+        max_block_range: 1000,
+        chunk_size: 16384,
+        chunk_flush_ms: 50,
+        flexa_publishable_key: None,
+        flexa_alias: None,
+        near_alias: None,
+        relay_secret_on_key_config: RelaySecretOnKeyConfig::Off,
+        dynamic_hosts: Default::default(),
+        host_list: Default::default(),
+    }
 }
 
 /// Serialises the tests that set or read the process environment (`Config::from_env`): the
