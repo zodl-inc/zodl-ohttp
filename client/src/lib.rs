@@ -169,9 +169,9 @@ pub enum Error {
         /// The outer HTTP status.
         status: u16,
     },
-    /// A `Client` constructor refused its arguments: the `what` (`relay URL`,
-    /// `key-configuration URL`, `key configuration source`) breaks the `rule`. Names neither
-    /// value.
+    /// A `Client` constructor refused its arguments or could not set itself up: the `what`
+    /// (`relay URL`, `key-configuration URL`, `key configuration source`, or `TLS backend` when
+    /// the HTTP stack cannot be initialized) breaks the `rule`. Names neither value.
     #[error("client setup: the {what} {rule}")]
     Setup {
         /// What was refused.

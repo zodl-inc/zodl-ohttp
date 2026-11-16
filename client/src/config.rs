@@ -122,10 +122,11 @@ pub struct OhttpConfigParams<'a> {
     /// requests; a lower-case bare DNS host name (no scheme, port, path or trailing dot).
     pub gateway_host: &'a str,
     /// The URL sealed requests are posted to; `https://`, a host (DNS name or IP address) other
-    /// than a gateway host, an optional numeric port and an optional path; ASCII, without
-    /// userinfo, query, fragment, backslash, whitespace, control characters, encoded `/` or `\`
-    /// and empty path segments. Kept in its canonical form ([`OhttpConfig::relay_url`]), one
-    /// trailing `/` removed.
+    /// than a gateway host (both compared as the URL parser reads them, so a gateway host
+    /// written as a numeric IPv4 alias is the address it names), an optional numeric port and
+    /// an optional path; ASCII, without userinfo, query, fragment, backslash, whitespace,
+    /// control characters, encoded `/` or `\` and empty path segments. Kept in its canonical
+    /// form ([`OhttpConfig::relay_url`]), one trailing `/` removed.
     pub relay_url: &'a str,
     /// The DNS TXT name of the gateway's signed key configuration, the last-resort source of
     /// it; a lower-case bare DNS host name.
@@ -163,6 +164,8 @@ pub struct OhttpConfig {
     signing_pubkey: VerifyingKey,
     /// The relay URL's host, port and path, canonical, for comparisons.
     relay: RelayTarget,
+    /// The gateway host as the URL parser reads it, for comparisons with relay hosts.
+    gateway_key: String,
 }
 
 impl OhttpConfig {
@@ -188,8 +191,11 @@ impl OhttpConfig {
         let invalid = |field| move |rule| ConfigError::Invalid { field, rule };
         check_host_name(gateway_host).map_err(invalid(ConfigField::GatewayHost))?;
         let relay = parse_relay_url(relay_url).map_err(invalid(ConfigField::RelayUrl))?;
-        // A relay on the gateway's own host would hand the gateway the client's address.
-        if relay.host == gateway_host {
+        // A relay on the gateway's own host would hand the gateway the client's address. Both
+        // sides in the URL parser's form, so that a gateway host written as a numeric IPv4
+        // alias (`0xc0000201`, `0300.0.2.1`, `192.0.513`) matches a relay on that address.
+        let gateway_key = host_key(gateway_host);
+        if relay.host == gateway_key {
             return Err(invalid(ConfigField::RelayUrl)(RELAY_ON_GATEWAY_HOST));
         }
         check_host_name(keys_dns_name).map_err(invalid(ConfigField::KeysDnsName))?;
@@ -201,6 +207,7 @@ impl OhttpConfig {
             keys_dns_name: keys_dns_name.to_owned(),
             signing_pubkey,
             relay,
+            gateway_key,
         })
     }
 
@@ -274,13 +281,16 @@ impl OhttpNetworks {
     /// literal in any of its spellings, no port the same as port 443), the keys DNS name
     /// (ignoring ASCII case), nor the signing key. The error names the first shared field. Nor
     /// may one network's relay be on the other's gateway host
-    /// ([`ConfigError::Invalid`] for [`ConfigField::RelayUrl`]).
+    /// ([`ConfigError::Invalid`] for [`ConfigField::RelayUrl`]). Gateway hosts are compared,
+    /// with each other and with relay hosts, in the form the URL parser reads them in: a gateway
+    /// host that is a numeric IPv4 alias (`0xc0000201`, `0300.0.2.1`, `192.0.513`) is the
+    /// address it names.
     pub fn new(
         mainnet: Option<OhttpConfig>,
         testnet: Option<OhttpConfig>,
     ) -> Result<Self, ConfigError> {
         if let (Some(main), Some(test)) = (&mainnet, &testnet) {
-            if main.relay.host == test.gateway_host || test.relay.host == main.gateway_host {
+            if main.relay.host == test.gateway_key || test.relay.host == main.gateway_key {
                 return Err(ConfigError::Invalid {
                     field: ConfigField::RelayUrl,
                     rule: RELAY_ON_GATEWAY_HOST,
@@ -289,7 +299,7 @@ impl OhttpNetworks {
             let shared = [
                 (
                     ConfigField::GatewayHost,
-                    main.gateway_host.eq_ignore_ascii_case(&test.gateway_host),
+                    main.gateway_key.eq_ignore_ascii_case(&test.gateway_key),
                 ),
                 (ConfigField::RelayUrl, main.relay.same_relay(&test.relay)),
                 (
@@ -359,6 +369,24 @@ pub fn canonical_relay_url(value: &str) -> Result<String, ConfigError> {
             field: ConfigField::RelayUrl,
             rule,
         })
+}
+
+/// `host` (a checked gateway host name) as the URL parser reads it and as
+/// [`RelayTarget::host`] holds a relay host: a name that the URL standard reads as an IPv4
+/// address (a numeric alias such as `0xc0000201`, `0300.0.2.1`, `3221225985` or `192.0.513`) as
+/// that address in dotted decimal, any other name as the parser gives it (the same name, for
+/// every name `check_host_name` accepts). A name the parser refuses (such as `1.2.3.4.5`) is
+/// kept as given: no relay URL can name it, so it cannot match one.
+fn host_key(host: &str) -> String {
+    match url::Url::parse(&format!("https://{host}/")) {
+        Ok(url) => match url.host() {
+            Some(url::Host::Ipv4(ip)) => ip.to_string(),
+            Some(url::Host::Domain(name)) => name.to_owned(),
+            // Not reachable for a checked host name (no brackets, never empty).
+            Some(url::Host::Ipv6(_)) | None => host.to_owned(),
+        },
+        Err(_) => host.to_owned(),
+    }
 }
 
 /// The rule broken by a relay URL on a gateway host.
@@ -637,6 +665,98 @@ pub(crate) mod tests {
             Err(ConfigError::Invalid {
                 field: ConfigField::RelayUrl,
                 rule: "must be an https:// URL"
+            })
+        );
+    }
+
+    fn config(gateway_host: &str, relay_url: &str, seed: u8) -> Result<OhttpConfig, ConfigError> {
+        OhttpConfig::new(OhttpConfigParams {
+            gateway_host,
+            relay_url,
+            keys_dns_name: &format!("keys-{seed}.example"),
+            signing_pubkey: &key_hex(seed),
+        })
+    }
+
+    const ON_GATEWAY: ConfigError = ConfigError::Invalid {
+        field: ConfigField::RelayUrl,
+        rule: RELAY_ON_GATEWAY_HOST,
+    };
+
+    #[test]
+    fn a_numeric_ipv4_alias_is_the_address_it_names() {
+        for alias in [
+            "192.0.2.1",
+            "0xc0000201",
+            "0300.0.2.1",
+            "0xc0.0.2.1",
+            "3221225985",
+            "192.0.513",
+            "192.513",
+        ] {
+            assert_eq!(host_key(alias), "192.0.2.1", "{alias}");
+        }
+        for name in [
+            "ohttp-gateway.example",
+            "xn--bcher-kva.example",
+            "1.2.3.4.5",
+            "09.0.0.1",
+            "a0xc0000201",
+        ] {
+            assert_eq!(host_key(name), name);
+        }
+        // A relay on a name in its `xn--` form is on the gateway host of the same name.
+        assert_eq!(
+            config(
+                "xn--bcher-kva.example",
+                "https://XN--Bcher-Kva.example/relay",
+                1
+            ),
+            Err(ON_GATEWAY)
+        );
+    }
+
+    #[test]
+    fn a_relay_on_a_numeric_alias_of_the_gateway_host_is_refused() {
+        for (gateway, relay) in [
+            ("0xc0000201", "https://192.0.2.1/relay"),
+            ("0300.0.2.1", "https://192.0.2.1:8443/relay"),
+            ("3221225985", "https://[::ffff:192.0.2.1]/relay"),
+            ("192.0.513", "https://0xc0000201/relay"),
+            ("192.0.2.1", "https://0300.0.2.1/relay"),
+        ] {
+            assert_eq!(
+                config(gateway, relay, 1),
+                Err(ON_GATEWAY),
+                "{gateway} {relay}"
+            );
+        }
+        // Another address is not the gateway's.
+        assert!(config("0xc0000201", "https://192.0.2.2/relay", 1).is_ok());
+    }
+
+    #[test]
+    fn numeric_aliases_are_compared_across_networks() {
+        let main = config("0xc0000201", "https://relay-mainnet.example/relay", 1).unwrap();
+        let test = config(
+            "ohttp-gateway-testnet.example",
+            "https://192.0.2.1/relay",
+            2,
+        )
+        .unwrap();
+        assert_eq!(
+            OhttpNetworks::new(Some(main.clone()), Some(test.clone())),
+            Err(ON_GATEWAY)
+        );
+        assert_eq!(
+            OhttpNetworks::new(Some(test), Some(main.clone())),
+            Err(ON_GATEWAY)
+        );
+        let same_gateway = config("192.0.513", "https://relay-testnet.example/relay", 2).unwrap();
+        assert_eq!(
+            OhttpNetworks::new(Some(main), Some(same_gateway)),
+            Err(ConfigError::SharedAcrossNetworks {
+                field: ConfigField::GatewayHost
             })
         );
     }

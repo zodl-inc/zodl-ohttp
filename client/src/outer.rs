@@ -475,10 +475,30 @@ pub fn retry_after_delay(value: Option<&str>) -> Option<Duration> {
 ///
 /// [`note`](Self::note) records a pause when a `429` arrives; [`remaining`](Self::remaining)
 /// is checked before every post, and a request is not sent while a pause is running.
-/// [`RelayBackoff::global`] is the one table a process shares.
-#[derive(Debug, Default)]
+/// [`RelayBackoff::global`] is the one table a process shares. Its `Debug` output gives the
+/// number of relays in the table only (`<locked>` while the table is in use; formatting never
+/// waits for it), never a relay URL or a pause.
+#[derive(Default)]
 pub struct RelayBackoff {
     not_before: Mutex<HashMap<String, Instant>>,
+}
+
+impl std::fmt::Debug for RelayBackoff {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Never waits for the table: formatting while it is in use, by this thread included,
+        // must return.
+        let relays = match self.not_before.try_lock() {
+            Ok(map) => Some(map.len()),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => Some(poisoned.into_inner().len()),
+            Err(std::sync::TryLockError::WouldBlock) => None,
+        };
+        let mut s = f.debug_struct("RelayBackoff");
+        match relays {
+            Some(relays) => s.field("relays", &relays),
+            None => s.field("relays", &format_args!("<locked>")),
+        };
+        s.finish()
+    }
 }
 
 impl RelayBackoff {
@@ -1138,6 +1158,43 @@ mod tests {
             None
         );
         assert_eq!(retry_after_delay(Some("-1")), None);
+    }
+
+    #[test]
+    fn a_relay_backoff_debug_shows_no_relay_url() {
+        let backoff = RelayBackoff::new();
+        assert_eq!(format!("{backoff:?}"), "RelayBackoff { relays: 0 }");
+        backoff.note("https://relay.example/relay", Duration::from_secs(30));
+        let shown = format!("{backoff:?}");
+        assert_eq!(shown, "RelayBackoff { relays: 1 }");
+        assert!(!shown.contains("relay.example"));
+    }
+
+    #[test]
+    fn a_relay_backoff_debug_does_not_wait_for_the_table() {
+        let backoff = RelayBackoff::new();
+        backoff.note("https://relay.example/relay", Duration::from_secs(30));
+        // Held by this very thread: a blocking lock would never return.
+        let held = backoff.not_before.lock().unwrap();
+        let shown = format!("{backoff:?}");
+        assert_eq!(shown, "RelayBackoff { relays: <locked> }");
+        assert!(!shown.contains("relay.example"));
+        drop(held);
+        assert_eq!(format!("{backoff:?}"), "RelayBackoff { relays: 1 }");
+    }
+
+    #[test]
+    fn a_relay_backoff_debug_counts_a_poisoned_table() {
+        let backoff = std::sync::Arc::new(RelayBackoff::new());
+        backoff.note("https://relay.example/relay", Duration::from_secs(30));
+        let poisoner = backoff.clone();
+        let _ = std::thread::spawn(move || {
+            let _held = poisoner.not_before.lock().unwrap();
+            panic!("poisons the table");
+        })
+        .join();
+        assert!(backoff.not_before.is_poisoned());
+        assert_eq!(format!("{backoff:?}"), "RelayBackoff { relays: 1 }");
     }
 
     #[test]

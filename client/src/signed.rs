@@ -417,7 +417,6 @@ pub fn verify_signed_config_with(
     })
 }
 
-/// The top-level keys of the JSON object `json`, repeats included.
 /// Why `json` is not an envelope, without quoting it.
 fn not_an_envelope(error: &serde_json::Error) -> String {
     format!("not a signed envelope: {}", json_error(error))
@@ -439,6 +438,7 @@ pub(crate) fn json_error(error: &serde_json::Error) -> String {
     )
 }
 
+/// The top-level keys of the JSON object `json`, repeats included.
 fn top_level_keys(json: &[u8]) -> Result<Vec<String>, serde_json::Error> {
     struct Keys;
     impl<'de> Visitor<'de> for Keys {
