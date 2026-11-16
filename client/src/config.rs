@@ -123,10 +123,13 @@ pub struct OhttpConfigParams<'a> {
     pub gateway_host: &'a str,
     /// The URL sealed requests are posted to; `https://`, a host (DNS name or IP address) other
     /// than a gateway host (both compared as the URL parser reads them, so a gateway host
-    /// written as a numeric IPv4 alias is the address it names), an optional numeric port and
-    /// an optional path; ASCII, without userinfo, query, fragment, backslash, whitespace,
-    /// control characters, encoded `/` or `\` and empty path segments. Kept in its canonical
-    /// form ([`OhttpConfig::relay_url`]), one trailing `/` removed.
+    /// written as a numeric IPv4 alias is the address it names, and an IPv6 literal that embeds
+    /// an IPv4 address, `::ffff:a.b.c.d`, `::a.b.c.d` (only when `a` and `b` are not both
+    /// zero: `::` to `::ffff` are plain IPv6 addresses) or `64:ff9b::a.b.c.d`, is on that
+    /// address), an optional numeric port and an optional path; ASCII, without userinfo, query,
+    /// fragment, backslash, whitespace, control characters, encoded `/` or `\` and empty path
+    /// segments. Kept in its canonical form ([`OhttpConfig::relay_url`]), one trailing `/`
+    /// removed.
     pub relay_url: &'a str,
     /// The DNS TXT name of the gateway's signed key configuration, the last-resort source of
     /// it; a lower-case bare DNS host name.
@@ -193,9 +196,10 @@ impl OhttpConfig {
         let relay = parse_relay_url(relay_url).map_err(invalid(ConfigField::RelayUrl))?;
         // A relay on the gateway's own host would hand the gateway the client's address. Both
         // sides in the URL parser's form, so that a gateway host written as a numeric IPv4
-        // alias (`0xc0000201`, `0300.0.2.1`, `192.0.513`) matches a relay on that address.
+        // alias (`0xc0000201`, `0300.0.2.1`, `192.0.513`) matches a relay on that address, and
+        // an IPv6 literal that embeds an IPv4 address matches a gateway on that address.
         let gateway_key = host_key(gateway_host);
-        if relay.host == gateway_key {
+        if relay.on_host(&gateway_key) {
             return Err(invalid(ConfigField::RelayUrl)(RELAY_ON_GATEWAY_HOST));
         }
         check_host_name(keys_dns_name).map_err(invalid(ConfigField::KeysDnsName))?;
@@ -278,19 +282,22 @@ impl OhttpNetworks {
     ///
     /// When both are given they must not share a value: not the gateway host, the relay URL
     /// (the same host, port and path: the host and the path compared ignoring ASCII case, an IPv6
-    /// literal in any of its spellings, no port the same as port 443), the keys DNS name
+    /// literal in any of its spellings, an IPv6 literal that embeds an IPv4 address the same as
+    /// that address, no port the same as port 443), the keys DNS name
     /// (ignoring ASCII case), nor the signing key. The error names the first shared field. Nor
     /// may one network's relay be on the other's gateway host
     /// ([`ConfigError::Invalid`] for [`ConfigField::RelayUrl`]). Gateway hosts are compared,
     /// with each other and with relay hosts, in the form the URL parser reads them in: a gateway
     /// host that is a numeric IPv4 alias (`0xc0000201`, `0300.0.2.1`, `192.0.513`) is the
-    /// address it names.
+    /// address it names, and a relay on an IPv6 literal that embeds an IPv4 address
+    /// (`::ffff:a.b.c.d`, `64:ff9b::a.b.c.d`, or `::a.b.c.d` when `a` and `b` are not both
+    /// zero, so not `::` to `::ffff`) is on that address.
     pub fn new(
         mainnet: Option<OhttpConfig>,
         testnet: Option<OhttpConfig>,
     ) -> Result<Self, ConfigError> {
         if let (Some(main), Some(test)) = (&mainnet, &testnet) {
-            if main.relay.host == test.gateway_key || test.relay.host == main.gateway_key {
+            if main.relay.on_host(&test.gateway_key) || test.relay.on_host(&main.gateway_key) {
                 return Err(ConfigError::Invalid {
                     field: ConfigField::RelayUrl,
                     rule: RELAY_ON_GATEWAY_HOST,
@@ -389,6 +396,26 @@ fn host_key(host: &str) -> String {
     }
 }
 
+/// The IPv4 address an IPv6 address `ip` that is not IPv4-mapped (`::ffff:a.b.c.d`, which
+/// [`RelayTarget::host`] already holds as its IPv4 address) names in its last 32 bits: an
+/// IPv4-compatible address (`::a.b.c.d`, RFC 4291 §2.5.5.1, deprecated), read as one only when
+/// the high 16 bits of `a.b.c.d` are not zero (so not `::`, `::1` or `::2` to `::ffff`, which
+/// are ordinary IPv6 addresses), or one under the NAT64 well-known prefix (`64:ff9b::a.b.c.d`,
+/// RFC 6052 §2.1). A relay on such an address counts as on the gateway host of that IPv4
+/// address, and as the same relay as one on it. Deliberately not matched:
+/// an IPv4-translated address (`::ffff:0:a.b.c.d`), 6to4, Teredo and a network-specific NAT64
+/// prefix, which name another host or cannot be told from the address alone.
+fn embedded_ipv4(ip: &std::net::Ipv6Addr) -> Option<std::net::Ipv4Addr> {
+    let [a, b, c, d, e, f, high, low] = ip.segments();
+    let compatible = [a, b, c, d, e, f] == [0; 6] && high != 0;
+    let nat64 = [a, b, c, d, e, f] == [0x64, 0xff9b, 0, 0, 0, 0];
+    (compatible || nat64).then(|| {
+        let [o1, o2] = high.to_be_bytes();
+        let [o3, o4] = low.to_be_bytes();
+        std::net::Ipv4Addr::new(o1, o2, o3, o4)
+    })
+}
+
 /// The rule broken by a relay URL on a gateway host.
 const RELAY_ON_GATEWAY_HOST: &str = "must not be on a gateway host";
 
@@ -403,6 +430,9 @@ pub(crate) struct RelayTarget {
     /// The host for comparisons: as in `url` without brackets, an IPv4-mapped IPv6 address as
     /// its IPv4 address.
     pub(crate) host: String,
+    /// The IPv4 address, dotted decimal, that an IPv6 literal host other than an IPv4-mapped
+    /// one embeds ([`embedded_ipv4`]), for the gateway-host rule and relay identity.
+    pub(crate) embedded_ipv4: Option<String>,
     /// The port, 443 when the URL has none.
     pub(crate) port: u16,
     /// The path as in `url` (empty for the root).
@@ -410,10 +440,23 @@ pub(crate) struct RelayTarget {
 }
 
 impl RelayTarget {
-    /// Whether `self` and `other` are the same relay: the same host and port and the same path
-    /// ignoring ASCII case (conservative: two paths differing in case only count as one).
+    /// Whether the relay is on the host `gateway_key` (a [`host_key`]): its host, or the IPv4
+    /// address its IPv6 literal embeds.
+    fn on_host(&self, gateway_key: &str) -> bool {
+        self.host == gateway_key || self.embedded_ipv4.as_deref() == Some(gateway_key)
+    }
+
+    /// The host as relays are told apart: the IPv4 address an IPv6 literal embeds, else
+    /// [`RelayTarget::host`].
+    fn identity_host(&self) -> &str {
+        self.embedded_ipv4.as_deref().unwrap_or(&self.host)
+    }
+
+    /// Whether `self` and `other` are the same relay: the same host (an IPv6 literal that
+    /// embeds an IPv4 address as that address) and port and the same path ignoring ASCII case
+    /// (conservative: two paths differing in case only count as one).
     fn same_relay(&self, other: &RelayTarget) -> bool {
-        self.host == other.host
+        self.identity_host() == other.identity_host()
             && self.port == other.port
             && self.path.eq_ignore_ascii_case(&other.path)
     }
@@ -471,6 +514,7 @@ pub(crate) fn parse_relay_url(value: &str) -> Result<RelayTarget, &'static str> 
         }
         Err(_) => return Err("must have a valid host"),
     };
+    let mut embedded = None;
     let host = match url.host() {
         Some(url::Host::Domain(name)) => {
             if check_host_name(name).is_err() {
@@ -481,7 +525,10 @@ pub(crate) fn parse_relay_url(value: &str) -> Result<RelayTarget, &'static str> 
         Some(url::Host::Ipv4(ip)) => ip.to_string(),
         Some(url::Host::Ipv6(ip)) => match ip.to_ipv4_mapped() {
             Some(v4) => v4.to_string(),
-            None => ip.to_string(),
+            None => {
+                embedded = embedded_ipv4(&ip).map(|v4| v4.to_string());
+                ip.to_string()
+            }
         },
         None => return Err("must have a non-empty host"),
     };
@@ -511,6 +558,7 @@ pub(crate) fn parse_relay_url(value: &str) -> Result<RelayTarget, &'static str> 
     Ok(RelayTarget {
         url: canonical,
         host,
+        embedded_ipv4: embedded,
         port,
         path,
     })
@@ -733,6 +781,155 @@ pub(crate) mod tests {
         }
         // Another address is not the gateway's.
         assert!(config("0xc0000201", "https://192.0.2.2/relay", 1).is_ok());
+    }
+
+    #[test]
+    fn a_relay_on_an_ipv6_literal_embedding_the_gateway_address_is_refused() {
+        for relay in [
+            // IPv4-mapped, IPv4-compatible and NAT64 (well-known prefix), in several spellings.
+            "https://[::ffff:c000:201]/relay",
+            "https://[::192.0.2.1]/relay",
+            "https://[::c000:201]:8443/relay",
+            "https://[0:0:0:0:0:0:c000:0201]/relay",
+            "https://[64:ff9b::192.0.2.1]/relay",
+            "https://[64:ff9b::c000:201]/relay",
+            "https://[0064:FF9B:0:0:0:0:C000:0201]/relay",
+        ] {
+            for gateway in ["192.0.2.1", "0xc0000201"] {
+                assert_eq!(
+                    config(gateway, relay, 1),
+                    Err(ON_GATEWAY),
+                    "{gateway} {relay}"
+                );
+            }
+            // Another gateway address, or a gateway name: no match.
+            assert!(config("192.0.2.2", relay, 1).is_ok(), "{relay}");
+            assert!(config("ohttp-gateway.example", relay, 1).is_ok(), "{relay}");
+        }
+        // The canonical URL keeps the IPv6 literal; only the comparison reads the embedding.
+        assert_eq!(
+            config("192.0.2.2", "https://[64:ff9b::192.0.2.1]/relay", 1)
+                .unwrap()
+                .relay_url(),
+            "https://[64:ff9b::c000:201]/relay"
+        );
+        // IPv4-compatible needs the high 16 bits of the IPv4 address set.
+        for (gateway, relay) in [
+            ("0.1.0.0", "https://[::0.1.0.0]/relay"),
+            ("0.1.0.0", "https://[::1:0]/relay"),
+            ("198.51.100.7", "https://[::198.51.100.7]/relay"),
+            ("255.255.255.255", "https://[::ffff:ffff]/relay"),
+        ] {
+            assert_eq!(
+                config(gateway, relay, 1),
+                Err(ON_GATEWAY),
+                "{gateway} {relay}"
+            );
+        }
+        for not_embedding in [
+            // Loopback, unspecified and the rest of ::/112 are not IPv4-compatible addresses.
+            ("0.0.0.1", "https://[::1]/relay"),
+            ("0.0.0.0", "https://[::]/relay"),
+            ("0.0.0.2", "https://[::2]/relay"),
+            ("0.0.255.255", "https://[::ffff]/relay"),
+            ("0.0.1.0", "https://[::0.0.1.0]/relay"),
+            // Another prefix (6to4, a network-specific NAT64 prefix): another host.
+            ("192.0.2.1", "https://[2002:c000:201::1]/relay"),
+            ("192.0.2.1", "https://[2001:db8::c000:201]/relay"),
+            ("192.0.2.1", "https://[64:ff9b:1::c000:201]/relay"),
+            // IPv4-translated (`::ffff:0:a.b.c.d`) is not IPv4-mapped.
+            ("192.0.2.1", "https://[::ffff:0:c000:201]/relay"),
+        ] {
+            let (gateway, relay) = not_embedding;
+            assert!(config(gateway, relay, 1).is_ok(), "{gateway} {relay}");
+        }
+    }
+
+    #[test]
+    fn an_embedded_ipv4_relay_is_compared_with_the_other_networks_gateway() {
+        let main = config("192.0.2.1", "https://relay-mainnet.example/relay", 1).unwrap();
+        for relay in [
+            "https://[::192.0.2.1]/relay",
+            "https://[64:ff9b::c000:201]/relay",
+        ] {
+            let test = config("ohttp-gateway-testnet.example", relay, 2).unwrap();
+            assert_eq!(
+                OhttpNetworks::new(Some(main.clone()), Some(test.clone())),
+                Err(ON_GATEWAY),
+                "{relay}"
+            );
+            assert_eq!(
+                OhttpNetworks::new(Some(test), Some(main.clone())),
+                Err(ON_GATEWAY),
+                "{relay}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_embedded_ipv4_relay_is_the_relay_on_that_address() {
+        let shared = Err(ConfigError::SharedAcrossNetworks {
+            field: ConfigField::RelayUrl,
+        });
+        for (mainnet_relay, testnet_relay) in [
+            (
+                "https://192.0.2.1/relay",
+                "https://[64:ff9b::c000:201]/relay",
+            ),
+            ("https://192.0.2.1/relay", "https://[::192.0.2.1]:443/Relay"),
+            (
+                "https://[::ffff:192.0.2.1]/relay",
+                "https://[::c000:201]/relay",
+            ),
+            (
+                "https://[64:ff9b::192.0.2.1]/relay",
+                "https://[::192.0.2.1]/relay",
+            ),
+            (
+                "https://0xc0000201:8443/relay",
+                "https://[64:ff9b::c000:201]:8443/relay",
+            ),
+        ] {
+            let main = config("ohttp-gateway.example", mainnet_relay, 1).unwrap();
+            let test = config("ohttp-gateway-testnet.example", testnet_relay, 2).unwrap();
+            assert_eq!(
+                OhttpNetworks::new(Some(main.clone()), Some(test.clone())),
+                shared,
+                "{mainnet_relay} {testnet_relay}"
+            );
+            assert_eq!(
+                OhttpNetworks::new(Some(test), Some(main)),
+                shared,
+                "{testnet_relay} {mainnet_relay}"
+            );
+        }
+        // Another port, path or address, or an IPv6 address that embeds none: two relays.
+        for (mainnet_relay, testnet_relay) in [
+            (
+                "https://192.0.2.1/relay",
+                "https://[64:ff9b::c000:201]:8443/relay",
+            ),
+            (
+                "https://192.0.2.1/relay",
+                "https://[64:ff9b::c000:201]/other",
+            ),
+            (
+                "https://192.0.2.1/relay",
+                "https://[64:ff9b::c000:202]/relay",
+            ),
+            ("https://0.0.0.2/relay", "https://[::2]/relay"),
+            (
+                "https://192.0.2.1/relay",
+                "https://[::ffff:0:c000:201]/relay",
+            ),
+        ] {
+            let main = config("ohttp-gateway.example", mainnet_relay, 1).unwrap();
+            let test = config("ohttp-gateway-testnet.example", testnet_relay, 2).unwrap();
+            assert!(
+                OhttpNetworks::new(Some(main), Some(test)).is_ok(),
+                "{mainnet_relay} {testnet_relay}"
+            );
+        }
     }
 
     #[test]
