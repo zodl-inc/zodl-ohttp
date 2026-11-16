@@ -499,6 +499,65 @@ keeps its own log in [client/CHANGELOG.md](client/CHANGELOG.md).
   alone.
 - The selected HPKE key id is no longer printed (`key selected: kem=... kdf=... aead=...`, and
   `key selected` in the DNS mode).
+- The key-configuration source guess (`OHTTP_E2E_KEY_CONFIG_SOURCE` unset) is deprecated: such
+  a run also prints a warning on standard error saying so. A later version will require the
+  variable; scripts should set it now.
+- `OHTTP_E2E_DUMP_HEADERS` is on with `1` only, read with the other settings before anything
+  is sent: empty is off, and any other value (`0` included, which used to turn it on, as did
+  an empty value) fails the run, as does a value that is not Unicode.
+- A non-Unicode `OHTTP_E2E_GATEWAY_HOST_<NET>`, `OHTTP_E2E_RELAY_URL_<NET>`,
+  `OHTTP_E2E_KEYS_DNS_NAME_<NET>` or `OHTTP_E2E_SIGNING_PUBKEY_<NET>` fails the run, naming the
+  variable, instead of being read as unset: every exchange run before anything is sent,
+  whatever the key source (a run with an unsigned source used not to read these variables, and
+  still does not check their contents), and the DNS mode when it reads its configuration.
+- A relay or replay URL whose scheme is not in lower case (`HTTP://`, `HTTPS://`) is refused,
+  with or without `OHTTP_E2E_PLAIN_HTTP_RELAY=1`, by an error saying so: the scheme is read as
+  written, as the configuration rules read `https://` (an upper-case `HTTP://` used to get the
+  misleading error that the URL must be `https://`).
+- An `OHTTP_E2E_REPLAY_URLS` entry is named in an error by its position in the value as
+  written, from 0, empty entries counted (`a,,b`: `b` is entry 2); empty entries used to be
+  dropped before numbering. The output (`[XREPLAY i]`, trace suffix `-r<i>`) still numbers the
+  sends in the order sent.
+- `scripts/test-e2e.sh` prints a `FAIL:` line when the e2e client itself exits non-zero (the
+  script used to end without one), and takes `RELAY_SIMULATOR=1|0` to say whether `RELAY_URL`
+  is a relay simulator; unset, empty or `auto`, it still looks for the text `relay-simulator`
+  in `RELAY_URL`. The unknown-authority step runs with `OHTTP_E2E_EXPECT_OK` empty, so a
+  caller's `OHTTP_E2E_EXPECT_OK=1` does not turn the expected inner 403 into a failure.
+- `OHTTP_E2E_REPLAY` and `OHTTP_E2E_EXPECT_OK` are on with `1` only, read by an exchange run
+  with the other settings before anything is sent: empty is off, any other value (`0`, `true`:
+  they used to mean off) or a non-Unicode one fails the run.
+- `OHTTP_E2E_REPLAY_GAP_MS` is read then too and must be decimal digits: any other value, or a
+  non-Unicode one, fails the run naming the variable (a value that did not parse as a number
+  used to count as 0, silently; only digits are accepted now, so `+5` is refused too). Unset or
+  empty is 0, as before.
+- `OHTTP_E2E_REQUEST_ID` and `OHTTP_E2E_EXTRA_HEADERS` are read then too, and checked for
+  Unicode only: a non-Unicode value fails the run instead of being read as unset. As before, an
+  extra-headers entry without a `:` is ignored, and a header name or value HTTP does not allow
+  is refused when a request carrying it is built: for the extra headers that is the
+  key-configuration request, before anything is sent. The request id goes only on the relay
+  request of a run without `OHTTP_E2E_REPLAY=1` and `OHTTP_E2E_REPLAY_URLS` (an empty one as an
+  empty `X-Request-Id`); with either it is neither sent nor refused. The DNS mode reads none
+  of these settings.
+- The warning about a guessed key source is printed after these checks, so an exchange run that
+  fails on one of them no longer prints it first.
+- `scripts/test-e2e.sh` no longer prints `RELAY_URL`, `CONFIGS_URL` or the trace id, and a relay
+  simulator's `RELAY_URL` that does not end in `/relay` fails the script (exit 2) unless
+  `CONFIGS_URL` is set, instead of deriving a wrong key-configuration URL.
+- New tests run the binary against a local server, each run killed and failed after 120 s (with
+  what it wrote): an explicit `signed` source refuses an unsigned answer and a tampered
+  envelope, the explicit source wins over the answer's `Content-Type` either way, a refused
+  setting sends no request at all (a bad later replay entry, an upper-case scheme,
+  `OHTTP_E2E_DUMP_HEADERS=0`, `OHTTP_E2E_EXPECT_OK=0`, `OHTTP_E2E_REPLAY=true`, a bad
+  `OHTTP_E2E_REPLAY_GAP_MS`, `NETWORK` or source, an `http://` relay without the opt-in, and on
+  Unix a non-Unicode per-network variable, `OHTTP_E2E_REQUEST_ID` or `OHTTP_E2E_EXTRA_HEADERS`),
+  and the header count is printed with `OHTTP_E2E_DUMP_HEADERS=1` only. The tests keep the
+  inherited environment but the tool's own and the proxy variables, and their server logs a
+  connection that sends nothing as such.
+- New tests (Unix, with bash) run `scripts/test-e2e.sh` in a temporary copy of the layout it
+  expects, with a fake e2e client that records its calls: `PASS` without either URL or the
+  trace id in the output, the `FAIL:` line of each step, `OHTTP_E2E_EXPECT_OK` emptied for the
+  unknown-authority step only, the `/relay` rule and its `CONFIGS_URL` exception, and
+  `RELAY_SIMULATOR` (`1`, `0`, unset, empty, `auto`, another value).
 
 ## 1.1.0
 

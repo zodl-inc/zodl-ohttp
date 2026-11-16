@@ -736,8 +736,11 @@ name = "ohttp-e2e"
 version = "1.1.0"
 dependencies = [
  "anyhow",
+ "base64",
+ "ed25519-dalek",
  "hex",
  "reqwest",
+ "sha2",
  "url",
  "zodl-ohttp-client",
 ]

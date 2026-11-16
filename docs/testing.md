@@ -118,7 +118,11 @@ the relay when `RELAY_URL` points at a relay simulator, else `https://$GATEWAY_H
 The script reads the key configuration as the unsigned document unless
 `OHTTP_E2E_KEY_CONFIG_SOURCE=signed` is set (with a signed `CONFIGS_URL` and the
 `OHTTP_E2E_*_<NET>` variables). It sets `OHTTP_E2E_PLAIN_HTTP_RELAY=1` itself only for a relay
-simulator; for any other `http://` relay URL the caller sets it.
+simulator; for any other `http://` relay URL the caller sets it. `RELAY_URL` counts as a relay
+simulator with `RELAY_SIMULATOR=1`, not with `RELAY_SIMULATOR=0`; unset, empty or `auto`, when
+it contains the text `relay-simulator`. A simulator's `RELAY_URL` must end in `/relay` unless
+`CONFIGS_URL` is set. A run of the e2e client that exits non-zero prints a `FAIL:` line and
+fails the script. The script prints neither URL nor the trace id.
 
 The e2e client can also be run directly (`e2e-client/README.md`): signed or unsigned key
 configurations, gRPC or plain HTTP inner requests, the DNS key-configuration source
