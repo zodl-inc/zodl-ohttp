@@ -521,6 +521,8 @@ pub fn init_metrics() {
         &*OHTTP_LWD_MEMPOOL_NO_HEAD_TOTAL,
         &*OHTTP_CACHE_TIP_MISMATCH_TOTAL,
         &*OHTTP_LWD_UNSENT_RETRIES_TOTAL,
+        &*OHTTP_CHAIN_TIP_AT_REWRITES_TOTAL,
+        &*OHTTP_CHAIN_TIP_STAMP_LOST_TOTAL,
     ] {
         REGISTRY.register(Box::new(c.clone())).ok();
     }
@@ -1471,6 +1473,16 @@ lazy_static::lazy_static! {
         &["network", "call"]
     )
     .unwrap();
+    static ref OHTTP_CHAIN_TIP_AT_REWRITES_TOTAL: IntCounterVec = IntCounterVec::new(
+        Opts::new("ohttp_chain_tip_at_rewrites_total", "Times this process, as chain leader, replaced a stored tip_at that was ahead of its clock by the tip's time on its clock, with a confirmation (a tip it took over, or its own after its clock stepped back)"),
+        &["network"]
+    )
+    .unwrap();
+    static ref OHTTP_CHAIN_TIP_STAMP_LOST_TOTAL: IntCounterVec = IntCounterVec::new(
+        Opts::new("ohttp_chain_tip_stamp_lost_total", "Stored tip records whose tip_stamp key was gone on a read while the tip and tip_at it had vouched for were still stored (counted when the loss is first read, again if the stamp came back and was lost again): the earlier verdict is kept"),
+        &["network"]
+    )
+    .unwrap();
 }
 
 /// `call`: send | other.
@@ -1484,6 +1496,32 @@ pub fn record_lwd_unsent_retry(network: &str, call: &str) {
 pub fn lwd_unsent_retries(network: &str, call: &str) -> u64 {
     OHTTP_LWD_UNSENT_RETRIES_TOTAL
         .with_label_values(&[network, call])
+        .get()
+}
+
+pub fn record_chain_tip_at_rewrite(network: &str) {
+    OHTTP_CHAIN_TIP_AT_REWRITES_TOTAL
+        .with_label_values(&[network])
+        .inc();
+}
+
+#[cfg(test)]
+pub(crate) fn chain_tip_at_rewrites(network: &str) -> u64 {
+    OHTTP_CHAIN_TIP_AT_REWRITES_TOTAL
+        .with_label_values(&[network])
+        .get()
+}
+
+pub fn record_chain_tip_stamp_lost(network: &str) {
+    OHTTP_CHAIN_TIP_STAMP_LOST_TOTAL
+        .with_label_values(&[network])
+        .inc();
+}
+
+#[cfg(test)]
+pub(crate) fn chain_tip_stamp_lost(network: &str) -> u64 {
+    OHTTP_CHAIN_TIP_STAMP_LOST_TOTAL
+        .with_label_values(&[network])
         .get()
 }
 
