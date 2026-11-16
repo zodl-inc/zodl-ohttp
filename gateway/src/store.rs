@@ -260,9 +260,12 @@ pub fn tip_seen_key(chain_prefix: &str) -> String {
 /// What binds the stored `tip_at` to the tip it was written with:
 /// `1:<tip_at, Unix ms, decimal>:<nonce, 16 lowercase hex digits>:<lowercase hex of the tip
 /// value as stored, encode_tip>`. A leader writes it only together with `tip_at`, in the same
-/// fenced script, with a new random nonce on every write, and never stamps a `tip_at` it only
+/// fenced script, with a new random nonce on every write (the next nonce of the replaced
+/// stamp's line when it replaces the `tip_at` of a tip that did not move, see
+/// `chain::next_stamp_nonce`), and never stamps a `tip_at` it only
 /// read. Followers use it as positive evidence only, under the rules of `chain::TipAtRead`
-/// (when a stamp vouches for a read, and when it says nothing). A separate key, so that a
+/// (when a stamp vouches for a read, when it says nothing, and what stands when only this key
+/// is lost). A separate key, so that a
 /// gateway that does not know it reads the other keys as before.
 pub fn tip_stamp_key(chain_prefix: &str) -> String {
     format!("{chain_prefix}tip_stamp")

@@ -204,7 +204,7 @@ keeps its own log in [client/CHANGELOG.md](client/CHANGELOG.md).
   probe condition `CHAIN_TIP_STALE_SECS` after its first read of an unmoved record, whatever
   the skew, and a process that takes the lock counts the confirmation bound from its first
   read of that record as a follower (from the takeover without one, as before). Nothing stored
-  changes. Another record starts the count again (also when the stamp key is lost); a read
+  changes. Another record starts the count again (the stamp key alone lost: see below); a read
   with a tip and no `tip_at` that counts clears it, a read that returns no tip (a store error,
   no key) leaves it, and a `tip_at` the process writes as leader clears it.
   `ohttp_chain_tip_age_seconds` on followers reports the larger of the two ages. New gauge
@@ -217,7 +217,7 @@ keeps its own log in [client/CHANGELOG.md](client/CHANGELOG.md).
   `1:<tip_at, Unix ms>:<nonce, 16 lowercase hex digits>:<lowercase hex of the stored tip value>`,
   written by the leader in the same fenced script as every `tip_at` it writes (with a new tip,
   and the pending `tip_at` of the first confirmation of a tip taken over without one), with a
-  new random nonce per write and the TTL of the other chain keys; never without `tip_at`, never
+  new random nonce per write (see below for the one derived nonce) and the TTL of the other chain keys; never without `tip_at`, never
   for a `tip_at` it only read. Followers (and a process taking the lock) read it in the same
   `MGET` as the tip and use it as positive evidence only: a stamp that names exactly the stored
   tip and `tip_at` makes that `tip_at` the tip's time, unless the process remembers a leftover
@@ -259,6 +259,80 @@ keeps its own log in [client/CHANGELOG.md](client/CHANGELOG.md).
   there fails the test. `tests/store_failover.rs` (opt-in by `OHTTP_FAILOVER_REDIS`, its own
   primary/replica pair) and `cache_retry_test.rs` (uses the store only if it is there) keep
   their own rules. No production code changes.
+- The attempt that loses a hedged lightwalletd read is no longer cancelled: it runs to its end
+  in a task of its own and its answer is discarded. Cancelling a call makes lightwalletd
+  cancel the node RPC behind it, which can cost the node an RPC slot. The detached attempt's
+  head is still bounded by the call's head deadline; its body is read to the end (a server
+  stream sends its head while the call still runs) for at most 10 s and 8 MiB (a frame
+  without data counts as one byte; the reader gives way to other tasks every 64 frames). One cut by
+  these bounds is cancelled then, as any call that runs into its deadline: an instance that
+  does not answer within the call's head deadline still gets that one cancellation, the
+  detached attempt saves the ones that answer after the race and within it. A loser whose
+  request was not given to a connection yet (still connecting) is dropped as before: nothing
+  of it was sent. Each holds a permit
+  of a second set of `LWD_HEDGE_MAX_INFLIGHT` permits until it ends, none of the hedge permits
+  (those go back when the race ends, as before) and none of `MAX_INFLIGHT_LWD` (the caller's
+  permit covers the attempt whose answer it reads): hedging now adds at most twice
+  `LWD_HEDGE_MAX_INFLIGHT` concurrent lightwalletd calls instead of once, and no request waits
+  for a detached attempt. With all of them in use the loser is cancelled as before. Whatever a
+  detached attempt ends with settles nothing, as when it was cancelled: no `/healthz` outcome,
+  no timeout counted, its instance neither skipped nor cleared (a late head does not reset the
+  count of lost hedges). New values of `ohttp_lwd_hedges_total{event}`: `loser_detached`,
+  `loser_cancelled`, `loser_expired`. Both attempts are still dropped when the caller itself
+  goes away. No new variable.
+- A lightwalletd call whose connection ended before the request was written to it is sent once
+  more on a new connection (to another instance when `LWD_ENDPOINTS` has one), within the same
+  deadline, `SendTransaction` included; before, only a connect error was followed by that retry
+  for a `SendTransaction`. "Not written" is exactly what the HTTP client reports as such: it
+  got the request back unsent (the connection was not ready, or its task ended with the request
+  still queued), or the connection was closed between its handshake and the request. The
+  client already resends such a request itself on a reused pooled connection; this covers a
+  connection that was new. Every other error still fails a `SendTransaction` without a retry,
+  as does a deadline: a failed handshake, a request the connection refused to start and a
+  failure after the request was written are one error kind to the gateway, and a stream the
+  peer refused or a connection it is shutting down count as written. New
+  `ohttp_lwd_unsent_retries_total{network,call="send|other"}`; reads retried for this reason
+  count in `ohttp_lwd_read_retries_total` as before.
+- A chain leader that takes over a stored tip whose `tip_at` is more than 2 s ahead of its
+  clock replaces it: its first confirmation of that tip writes, in the confirmation's fenced
+  script, `tip_at` = the time it counts the tip's age from (the takeover, or its first read of
+  the record as a follower) and the stamp for it, as it already did for a tip taken over
+  without `tip_at`. The leader's own confirmation bound is unchanged; followers now read the
+  same age instead of 0 for the skew. Within 2 s the value is kept as stored, as before. A
+  leader whose own clock stepped back by more than 2 s since it wrote or took over the tip
+  does the same with its next confirmation, when the step leaves the stored `tip_at` more
+  than 2 s ahead of its clock: the tip's time becomes now, less the local
+  (monotonic) time since the tip moved. Whatever the step, a leader now also counts its
+  confirmation bound on its local clock since the tip moved (or since the time it took over
+  with): the bound ends 10 minutes after the tip moved instead of the step later, and a tip
+  past it by the local clock is not confirmed again by a step back. (A wall clock that
+  jumped ahead still ends the confirmations early, and they resume when it is corrected
+  while the tip is within the bound by the local clock, as before.) A follower of this
+  version keeps its local count of the tip's age across
+  such a replacement: the tip did not move. It recognises one by the stamp: the leader stamps
+  a `tip_at` that replaces a stamped one with the next nonce of that stamp's line (the same
+  upper 32 bits, the lower 32 bits one higher; every other stamp still gets a random nonce,
+  and the stamp's format is unchanged), and the follower goes on counting for the same tip
+  with an earlier `tip_at` and another nonce of the line it read, however many replacements
+  it did not read in between (a line has 2^32 nonces). A `tip_at` that had no stamp the leader read, and any other
+  write of the same tip (it may have moved away and back; a random nonce is on the line by
+  a coincidence of 32 bits), is another record as before. Mixed
+  versions: a follower of the previous version finds the stamp vouching for the new value and
+  starts its local count again, once; one
+  that knows no stamp reads `tip_at` as it always did (a `tip_at` that changes under an
+  unchanged tip is never taken for a leftover), and it is the write such a version does itself
+  for a tip without `tip_at`, with that write's limit: such a follower, if it missed the
+  value replaced, takes the tip's time for a leftover when the replacement is, to the
+  millisecond, the `tip_at` it read with the tip before (a leader that replaces its own
+  `tip_at` avoids the value last stored with the tip before; it does not know an earlier
+  value of that tip that was itself replaced, and a new leader knows neither). A tip past the confirmation bound is not confirmed and not
+  rewritten. New `ohttp_chain_tip_at_rewrites_total{network}`.
+- When only the `{chain}tip_stamp` key is lost (evicted) while the tip and `tip_at` it vouched
+  for on a process's last read stay, the process keeps what the stamp said: `tip_at` is the
+  tip's time and the record is the same one, so the local count of its age goes on (it
+  started again before) and a takeover counts from the first read. That ends when the tip or
+  `tip_at` changes or any stamp value is read. New `ohttp_chain_tip_stamp_lost_total{network}`
+  (counted when a loss is first read; again when the stamp came back and was lost again).
 - Known limits of the chain follower and the pinned backfill after these changes:
   - The drop of a held tip on a scheduled probe without a new observation applies to a held
     tip that is still held when the probe starts (the stored tip is not on its own chain).
@@ -267,10 +341,15 @@ keeps its own log in [client/CHANGELOG.md](client/CHANGELOG.md).
     observation of the process's own lightwalletd tip, as before these changes: a stored tip
     that has not moved for the stale bound while its own lightwalletd is ahead is what the
     stale-leader handling serves.
-  - A `tip_at` ahead of the clocks stays stored until the tip next moves (rewriting it with a
-    confirmation would change a key older versions read): processes of this version bound
+  - A `tip_at` ahead of the clocks by at most 2 s and one of a tip that is past the
+    confirmation bound stay stored until the tip next moves: processes of this version bound
     its age by their own reads of the record, older followers in a mixed fleet keep their
-    uncompensated age. A process restarted during a stall (every process, after a restart of
+    uncompensated age. A leader whose clock is behind the others by more than 2 s replaces a
+    correct `tip_at` of a tip it takes over by its own older time (as every tip it writes
+    carries): followers probe their lightwalletd more often until the tip next moves; a
+    leader whose clock is ahead of the one that wrote `tip_at` reads the tip as that much
+    older and may stop confirming it early, as before. A
+    process restarted during a stall (every process, after a restart of
     the whole fleet) counts again from its first read while the skew lasts; the store's clock
     is not used. The local count can exceed the record's age only after a state the process
     missed: a leader of an earlier version moved the tip away and back to the same block with
@@ -279,19 +358,25 @@ keeps its own log in [client/CHANGELOG.md](client/CHANGELOG.md).
     failover that lost writes); the effects are those of a writer clock behind (probes of its
     own lightwalletd, a takeover only with that lightwalletd ahead twice, an early end of the
     refresh under a leader that does not confirm, or of a taken-over tip's confirmations).
-    After a takeover the age origin is a wall-clock value again, so a backward step of the
-    leader's clock extends its confirmation bound by the step, as before.
+    After a takeover the age origin is a wall-clock value again; a backward step of the
+    leader's clock no longer extends its confirmation bound (counted on its local clock too),
+    and the stored `tip_at` is replaced only when the step leaves it more than 2 s ahead:
+    after a smaller step, or one that leaves `tip_at` in the past, followers read the tip
+    as younger by the step (never younger than their own count of it).
   - Without a stamp that vouches for the read the inference from two reads keeps its limits:
     for tips written by a leader of an earlier version (a rolling upgrade, a rollback) and a
     tip a leader took over without rewriting `tip_at`, until a leader of this version writes
-    the next tip; when the stamp key alone was lost (evicted) while `tip_at` stays (with
+    the next tip; when the stamp key alone was lost (evicted) while `tip_at` stays and the
+    process did not read the stamp next to that tip before, or the tip then moves with the
+    same `tip_at` and no stamp again (with
     writers of this version a wrong verdict then needs the same millisecond twice); a process
     that starts under a leader that writes no `tip_at` trusts a leftover `tip_at` on its first
     read, as before (the stamp never says "leftover"); and a leftover verdict stays until
     `tip_at` changes.
   - An abandoned sweep call keeps the request-path concurrency permits it holds until it
     ends (up to 3 sweep calls per cache instead of 1). Upstream calls are still cancelled by
-    the fetch's own timeouts, by the losing attempt of a hedged read, and when the process or
+    the fetch's own timeouts, by a caller that goes away, by the losing attempt of a hedged
+    read when no detached permit is free or its bounds cut it, and when the process or
     runtime stops, as on every request path. A sweep fill that waits for a permit (three
     sweep-started calls alive) is delayed up to its fill timeout; a fetch that never
     ended would keep its permit (the gateway's is bounded by `LWD_TIMEOUT_SECS`).
