@@ -20,7 +20,8 @@ does, has the gateway open it and answer from a slow upstream, and checks that s
 leave before the upstream ends and that every chunk has the configured size.
 
 The tests that need Redis (replay store, replay peers and background replication, response
-cache) connect to `redis://127.0.0.1:6379` and are skipped when nothing listens there. CI runs
+cache) connect to `redis://127.0.0.1:6379` and fail when nothing listens there; outside CI,
+`OHTTP_TEST_ALLOW_NO_STORE=1` skips them instead (ignored when `CI` is set). CI runs
 them against a `redis:7-alpine` service container; locally:
 
 ```bash

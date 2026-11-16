@@ -846,16 +846,22 @@ mod tests {
     /// replacement), and is not counted as a change of the store.
     #[tokio::test]
     async fn a_quiet_retirement_replaces_only_the_named_generation() {
-        let Ok(c) = StoreConn::connect(
-            "redis://127.0.0.1:6379",
-            "test",
-            "testnet-retire".to_string(),
-            Role::Primary,
+        use crate::store::test_support::{store_missing, STORE_CONNECT_TIMEOUT, TEST_STORE};
+        let url = format!("redis://{TEST_STORE}");
+        let connected = tokio::time::timeout(
+            STORE_CONNECT_TIMEOUT,
+            StoreConn::connect(&url, "test", "testnet-retire".to_string(), Role::Primary),
         )
-        .await
-        else {
-            assert!(std::env::var("CI").is_err(), "Redis not reachable in CI");
-            return;
+        .await;
+        let c = match connected {
+            Ok(Ok(c)) => c,
+            Ok(Err(e)) => return store_missing(&format!("the test store {url}"), &e),
+            Err(_) => {
+                return store_missing(
+                    &format!("the test store {url}"),
+                    &format!("no connection within {STORE_CONNECT_TIMEOUT:?}"),
+                )
+            }
         };
         let g = c.generation();
         assert!(

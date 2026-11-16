@@ -36,11 +36,14 @@
 //!   key is a leftover of an earlier leader: the tip moved since), and when its value stays the
 //!   same while the stored tip changes, until the value changes again. With a `tip_seen` key
 //!   and `tip_at` stored, such a leader is followed that way only while the tip moved at most
-//!   [`MAX_CONFIRM_AGE`] ago: an older tip goes stale on followers as it does under a leader of
+//!   [`MAX_CONFIRM_AGE`] ago (by `tip_at`, and by this process's own reads of the same record,
+//!   see "Stale leader"): an older tip goes stale on followers as it does under a leader of
 //!   this version, until a confirmation changes.
 //! - **Stale leader**: a leader can keep its lock and still stop moving the tip (its
 //!   lightwalletd answers with an old tip, or keeps failing the block fetch). With every tip it
-//!   writes, the leader also stores when it moved it (`{chain}tip_at`). A follower that finds
+//!   writes, the leader also stores when it moved it (`{chain}tip_at`), and in the same script a
+//!   stamp that binds that time to that tip with a nonce of the write (`{chain}tip_stamp`,
+//!   see `TipAtRead`; written with every `tip_at`, never without one). A follower that finds
 //!   the stored tip unmoved for longer than [`DEFAULT_TIP_STALE_AFTER`]
 //!   (`CHAIN_TIP_STALE_SECS`) asks its own lightwalletd every [`STALE_PROBE_EVERY`] ticks.
 //!   If that is ahead, it serves its own tip at once, and if it is still ahead on the next
@@ -60,13 +63,20 @@
 //!   check of the stored chain that finds no index entry is retried on the next read as a
 //!   follower; when the lock is taken it drops the held tip.
 //!   A chain that really has no new block leaves every lightwalletd at the stored tip,
-//!   so nothing happens. The age is wall-clock time between processes: clock skew beyond the
-//!   bound makes followers probe more often, never take over from a leader whose tip moves. A
+//!   so nothing happens. The age is wall-clock time between processes, and at least as long
+//!   as this process has read the same stored record (its monotonic clock, see `Unmoved`): a
+//!   stored time ahead of a follower's clock delays the probe by at most the time that
+//!   follower needs to see the record for the bound itself, whatever the skew. A writer clock
+//!   behind makes followers probe more often, never take over from a leader whose tip moves. A
 //!   leader that does not store the time (an older version) is never treated as stale, nor is
 //!   one whose tip moves while the stored time stays (a leftover of a newer leader after a
-//!   rollback, see `TipAtRead`): such a tip is followed as one without a time. A stored time
-//!   ahead of a new leader's clock counts from its takeover for [`MAX_CONFIRM_AGE`].
-//!   Metrics `ohttp_chain_tip_age_seconds`, `ohttp_chain_stale_leader_total`.
+//!   rollback, see `TipAtRead`; a stamp that vouches for the read says it is not one: it names
+//!   the stored tip and time, no leftover verdict for that time is remembered, and this process
+//!   did not read the same stamp value before next to another stored tip):
+//!   such a tip is followed as one without a time. A stored time ahead of a new leader's clock
+//!   counts from its takeover, or from its first read of the same record as a follower, for
+//!   [`MAX_CONFIRM_AGE`]. Metrics `ohttp_chain_tip_age_seconds`,
+//!   `ohttp_chain_tip_time_ahead_seconds`, `ohttp_chain_stale_leader_total`.
 //! - **Fencing**: the tip, every index entry with its block (one script per batch of at most
 //!   [`BLOCK_WRITE_BATCH`] blocks and [`BLOCK_WRITE_BATCH_BYTES`] of payload), the confirmation and every deletion of a reorg are written
 //!   only while the writer holds the lock with its own token (an absent lock refuses too). A
@@ -105,9 +115,9 @@
 use crate::block_cache::{block_key, grpc_frame, FetchedBlock, PoolKeys};
 use crate::local::LocalCache;
 use crate::store::{
-    decode_tip, decode_unix_ms, encode_tip, encode_unix_ms, index_key, lock_key,
-    permanent_block_key, tip_at_key, tip_key, tip_seen_key, unix_ms_now, CacheStore,
-    PermanentStore, Tip, INDEX_WINDOW, PERMANENT_DEPTH,
+    decode_tip, decode_tip_stamp, decode_unix_ms, encode_tip, encode_tip_stamp, encode_unix_ms,
+    index_key, lock_key, permanent_block_key, tip_at_key, tip_key, tip_seen_key, tip_stamp_key,
+    unix_ms_now, CacheStore, PermanentStore, Tip, INDEX_WINDOW, PERMANENT_DEPTH,
 };
 use anyhow::Result;
 use bytes::Bytes;
@@ -170,7 +180,8 @@ pub const BEHIND_COOLDOWN_TICKS: u64 = 5;
 /// blocks is rare (well below 0.1 % of blocks at a 75 s target spacing), and during one the
 /// request paths only answer from upstream. A new tip confirms again. The age is wall-clock time
 /// between processes when the tip was written by another one: a clock ahead of that writer's
-/// stops confirming earlier, one behind it later.
+/// stops confirming earlier, one behind it later, but not later than this bound after the
+/// takeover, or after this process's first read of the same record as a follower.
 pub const MAX_CONFIRM_AGE: Duration = Duration::from_secs(600);
 /// Blocks written per fenced script at most (two entries each: index and block).
 const BLOCK_WRITE_BATCH: usize = 32;
@@ -252,8 +263,9 @@ pub struct ChainFollower {
     /// Follower: what the last probes of its own lightwalletd found (see [`HeldTip`]).
     stale: parking_lot::Mutex<Option<HeldTip>>,
     /// Leader: Unix milliseconds of when the indexed tip moved (`tip_at`: the last tip this
-    /// process wrote, or the stored `tip_at` it took over, at most the time it took it over;
-    /// 0 = none). The [`MAX_CONFIRM_AGE`] bound counts from it.
+    /// process wrote, or the stored `tip_at` it took over, at most the time it took it over, or
+    /// the time of its first read of the same record as a follower, see [`Unmoved`]; 0 = none).
+    /// The [`MAX_CONFIRM_AGE`] bound counts from it.
     moved_at_ms: AtomicU64,
     /// Leader: the `tip_at` stored with the indexed tip, as stored (not clamped like
     /// `moved_at_ms`): confirmations are never below it (see [`Self::adopt_tip_at`]).
@@ -286,6 +298,12 @@ pub struct ChainFollower {
     last_seen: parking_lot::Mutex<Option<SeenTip>>,
     /// Follower: the stored tip and `tip_at` read last (see [`TipAtRead`]).
     last_tip_at: parking_lot::Mutex<Option<TipAtRead>>,
+    /// The last `{chain}tip_stamp` value read while it named another tip than the stored one
+    /// (as a follower or when taking the lock, first reads included): it is never evidence for
+    /// a stored tip later (see [`TipAtRead`]).
+    stamp_beside_other: parking_lot::Mutex<Option<Bytes>>,
+    /// The stored record read unchanged since a local instant (see [`Unmoved`]).
+    unmoved: parking_lot::Mutex<Option<Unmoved>>,
 }
 
 /// A follower's last read of the stored tip and its `tip_at`. A leader of this version writes
@@ -305,12 +323,89 @@ pub struct ChainFollower {
 /// writes differ: a `tip_at` equal to the one a follower read several tips earlier (it missed
 /// the reads in between, and the clock value was the same millisecond, e.g. after the
 /// leader's clock stepped back) is taken for a leftover until `tip_at` changes.
+///
+/// The stamp (`{chain}tip_stamp`, see `store::tip_stamp_key`) only ever turns a leftover
+/// verdict this read would newly make into "not a leftover": when it names exactly the stored
+/// tip and the stored `tip_at` (a leader of this version wrote all three in one script, read by
+/// one `MGET`), unless a leftover verdict for this same `tip_at` is remembered, or this process
+/// read this exact stamp value before next to another stored tip (a leader that writes no
+/// `tip_at` moved the tip away and back to the stamped block). Then `tip_at` is the tip's time,
+/// whatever the inference from two reads would say: two tips with the same millisecond (a
+/// leader of an earlier version, a handover between leaders with skewed clocks) and reads a
+/// follower missed are no longer taken for leftovers. Any other stamp (absent, unparsable,
+/// another tip or time) is no evidence either way: the inference above decides, on its own
+/// state, as without a stamp.
 #[derive(Clone, Debug)]
 struct TipAtRead {
     tip: Tip,
     tip_at: Option<u64>,
     /// The stored `tip_at` is a leftover (see above).
     leftover: bool,
+}
+
+/// The identity of a stored tip record as read: the tip, its effective `tip_at`
+/// ([`ChainFollower::effective_tip_at`]) and the nonce of the stamp when the stamp vouches for
+/// the read (a leader of this version draws a new one for every `tip_at` it writes, so two of
+/// its writes are never the same record). Without a vouching stamp the identity is the pair.
+#[derive(Clone, Debug, PartialEq)]
+struct TipRecord {
+    tip: Tip,
+    tip_at: u64,
+    nonce: Option<u64>,
+}
+
+/// The stored record this process has read unchanged since `since` (the local monotonic
+/// clock): it is at least `since.elapsed()` old, whatever the wall clocks say. That is a lower
+/// bound of the tip's age next to the wall-clock age `now - tip_at` (two clocks: a writer clock
+/// ahead of this one makes that read 0 for the skew), so a `tip_at` ahead of this clock delays
+/// the stale-leader probe, the bound on following a leader that does not confirm and the
+/// confirmation bound after a takeover by at most the time this process needs to see the
+/// record itself for that long.
+///
+/// A read of another record (another tip, `tip_at` or nonce, or the stamp no longer vouching)
+/// starts it again; a read with a tip and no effective `tip_at` clears it; a read without a
+/// tip (a store error or no key: not told apart) leaves it. Taking the lock consumes it (its
+/// elapsed time counts at the takeover only if it is of the record continued), and a `tip_at`
+/// this process writes as leader clears it. The bound can exceed the record's true age only if
+/// this process missed an intermediate state: a leader of an earlier version moved the tip
+/// away and back to the same block with the same `tip_at` (the same millisecond again, or no
+/// `tip_at` written at all), or the store went back to an older copy of the record (a failover
+/// that lost writes). The effects are then those of a writer clock behind (probes, a takeover
+/// only with its own lightwalletd ahead twice, a refresh or a confirmation bound that ends
+/// early).
+#[derive(Clone, Debug)]
+struct Unmoved {
+    record: TipRecord,
+    since: tokio::time::Instant,
+    /// The stale-leader probe condition was met on the local bound alone, and logged.
+    warned: bool,
+}
+
+/// The stored tip's age as a follower sees it: by the wall clocks (`now - tip_at`) and the
+/// local lower bound ([`Unmoved`]). It holds the inputs, not a value: every use computes the
+/// larger of the two at that moment, so work awaited between the read and the use (a probe, a
+/// block fetch, a lock command) counts in the age as it did with the wall clock alone.
+#[derive(Clone, Copy, Debug)]
+struct TipAge {
+    /// The effective `tip_at` read.
+    tip_at: u64,
+    /// Since when this process has read the record (None: no observation, a read without a
+    /// stored tip).
+    since: Option<tokio::time::Instant>,
+}
+
+impl TipAge {
+    fn wall(&self) -> Duration {
+        age_of(self.tip_at)
+    }
+
+    fn local(&self) -> Duration {
+        self.since.map_or(Duration::ZERO, |s| s.elapsed())
+    }
+
+    fn get(&self) -> Duration {
+        self.wall().max(self.local())
+    }
 }
 
 /// A follower's last read of the leader's confirmation.
@@ -441,6 +536,8 @@ impl ChainFollower {
             cooldown_until: AtomicU64::new(0),
             last_seen: parking_lot::Mutex::new(None),
             last_tip_at: parking_lot::Mutex::new(None),
+            stamp_beside_other: parking_lot::Mutex::new(None),
+            unmoved: parking_lot::Mutex::new(None),
         }
     }
 
@@ -555,27 +652,42 @@ impl ChainFollower {
     /// across leader changes.
     ///
     /// A `tip_at` ahead of this clock (written by a process whose clock is ahead) counts from
-    /// now: the bound is at most [`MAX_CONFIRM_AGE`] after the takeover, not that plus the
-    /// skew. Only the age is clamped. The confirmations stay at or above the stored value
+    /// now at the latest, and from the first read of the same record as a follower when there
+    /// was one (`observed`): the bound is at most [`MAX_CONFIRM_AGE`] after the takeover, or
+    /// after that first read, not that plus the skew. Only the age is clamped. The
+    /// confirmations stay at or above the stored value
     /// (`tip_at_floor_ms`, see [`Self::confirm`]): followers take a `tip_seen` below `tip_at`
     /// for a leftover of a leader that does not confirm and then refresh on every read, and
     /// with a `tip_at` in the future (an age of zero on their clocks) that would keep the tip
     /// fresh on them for the skew past the bound. So the leader stops confirming at most
-    /// [`MAX_CONFIRM_AGE`] after it took over, and the followers still need each confirmation.
+    /// [`MAX_CONFIRM_AGE`] after it took over (or after that first read), and the followers
+    /// still need each confirmation.
+    ///
+    /// `observed` is how long this process has read the same record as a follower before
+    /// ([`Unmoved`], zero without such a read): the age counts from that much before now at the
+    /// latest, so a `tip_at` ahead of this clock that it already watched for a while does not
+    /// get the full bound again at the takeover.
     ///
     /// `stored_ms` is the `tip_at` in the store, whether `tip_at_ms` goes by it or not (a
     /// leftover does not count as the tip's time, but the next tip must not come with it).
-    fn adopt_tip_at(&self, tip_at_ms: Option<u64>, stored_ms: Option<u64>) {
+    fn adopt_tip_at(&self, tip_at_ms: Option<u64>, stored_ms: Option<u64>, observed: Duration) {
         self.tip_at_stored_ms
             .store(stored_ms.unwrap_or(0), Ordering::Relaxed);
         let now = unix_ms_now();
         match tip_at_ms {
             Some(ms) => {
-                self.moved_at_ms.store(ms.min(now), Ordering::Relaxed);
+                let origin = now.saturating_sub(observed.as_millis() as u64);
+                crate::health::record_chain_tip_time_ahead(
+                    &self.network,
+                    Duration::from_millis(ms.saturating_sub(now)),
+                );
+                self.moved_at_ms
+                    .store(ms.min(origin).max(1), Ordering::Relaxed);
                 self.tip_at_floor_ms.store(ms, Ordering::Relaxed);
                 self.tip_at_pending.store(false, Ordering::Relaxed);
             }
             None => {
+                crate::health::record_chain_tip_time_ahead(&self.network, Duration::ZERO);
                 self.moved_at_ms.store(now, Ordering::Relaxed);
                 self.tip_at_floor_ms.store(now, Ordering::Relaxed);
                 self.tip_at_pending.store(true, Ordering::Relaxed);
@@ -584,12 +696,45 @@ impl ChainFollower {
         self.unconfirmed_logged.store(false, Ordering::Relaxed);
     }
 
-    /// Follower: the `tip_at` to go by for the stored tip `tip` read with `tip_at`: None when
-    /// it is a leftover ([`TipAtRead`]): the tip changed since the last read while `tip_at`
-    /// did not, and it has not changed since. Decided from this process's own reads only: its
-    /// first read takes `tip_at` as stored, and a leftover stays one until `tip_at` changes.
-    fn effective_tip_at(&self, tip: &Tip, tip_at: Option<u64>) -> Option<u64> {
+    /// Follower (and leader taking the lock): the `tip_at` to go by for the stored tip `tip`
+    /// read with `tip_at` and the stamp `stamp`, and the stamp's nonce when the stamp vouches
+    /// for the read. None when `tip_at` is a leftover ([`TipAtRead`]): the tip changed since
+    /// the last read while `tip_at` did not, and it has not changed since. Decided from this
+    /// process's own reads only: its first read takes `tip_at` as stored, and a leftover stays
+    /// one until `tip_at` changes. A stamp that names exactly this tip and this `tip_at`, unless
+    /// a leftover verdict for this `tip_at` is remembered or this process read this stamp value
+    /// next to another stored tip, makes `tip_at` this tip's time instead.
+    fn effective_tip_at(
+        &self,
+        tip: &Tip,
+        tip_at: Option<u64>,
+        stamp: Option<&Bytes>,
+    ) -> (Option<u64>, Option<u64>) {
+        let encoded = encode_tip(tip);
+        let mut beside_other = self.stamp_beside_other.lock();
         let mut last = self.last_tip_at.lock();
+        let vouching = match stamp.and_then(|raw| Some((raw, decode_tip_stamp(raw)?))) {
+            Some((raw, s)) if s.tip.as_slice() != &encoded[..] => {
+                // Says nothing about the stored tip, and never will (see `TipAtRead`).
+                *beside_other = Some(raw.clone());
+                None
+            }
+            Some((raw, s)) => (tip_at == Some(s.tip_at_ms)
+                && !last
+                    .as_ref()
+                    .is_some_and(|p| p.leftover && p.tip_at == tip_at)
+                && beside_other.as_ref() != Some(raw))
+            .then_some(s.nonce),
+            None => None,
+        };
+        if vouching.is_some() {
+            *last = Some(TipAtRead {
+                tip: tip.clone(),
+                tip_at,
+                leftover: false,
+            });
+            return (tip_at, vouching);
+        }
         let leftover = match last.as_ref() {
             Some(prev) if tip_at.is_some() && prev.tip_at == tip_at => {
                 prev.leftover || prev.tip != *tip
@@ -604,7 +749,55 @@ impl ChainFollower {
             tip_at,
             leftover,
         });
-        tip_at.filter(|_| !leftover)
+        (tip_at.filter(|_| !leftover), None)
+    }
+
+    /// Follower: note the read of the stored record (`tip`, its effective `tip_at`, the nonce
+    /// of a vouching stamp, see [`Unmoved`]) and return the tip's age, None without an effective
+    /// `tip_at` (no age, as without a stored time). Also sets
+    /// `ohttp_chain_tip_time_ahead_seconds`.
+    fn observe(&self, tip: &Tip, tip_at: Option<u64>, nonce: Option<u64>) -> Option<TipAge> {
+        let mut unmoved = self.unmoved.lock();
+        let Some(at) = tip_at else {
+            *unmoved = None;
+            crate::health::record_chain_tip_time_ahead(&self.network, Duration::ZERO);
+            return None;
+        };
+        let record = TipRecord {
+            tip: tip.clone(),
+            tip_at: at,
+            nonce,
+        };
+        if !unmoved.as_ref().is_some_and(|u| u.record == record) {
+            *unmoved = Some(Unmoved {
+                record,
+                since: tokio::time::Instant::now(),
+                warned: false,
+            });
+        }
+        let since = unmoved.as_ref().map(|u| u.since);
+        crate::health::record_chain_tip_time_ahead(
+            &self.network,
+            Duration::from_millis(at.saturating_sub(unix_ms_now())),
+        );
+        Some(TipAge { tip_at: at, since })
+    }
+
+    /// Taking the lock: consume the observation ([`Unmoved`]: none is left afterwards) and
+    /// return how long this process has read the record it continues (`tip`, `tip_at`,
+    /// `nonce`) unchanged as a follower, measured now; zero when the observation was of another
+    /// record, or there was none.
+    fn consume_observed(&self, tip: &Tip, tip_at: u64, nonce: Option<u64>) -> Duration {
+        let record = TipRecord {
+            tip: tip.clone(),
+            tip_at,
+            nonce,
+        };
+        self.unmoved
+            .lock()
+            .take()
+            .filter(|u| u.record == record)
+            .map_or(Duration::ZERO, |u| u.since.elapsed())
     }
 
     /// Leader: whether the indexed tip moved recently enough to be confirmed (see
@@ -622,9 +815,10 @@ impl ChainFollower {
     }
 
     /// The stored tip, when the leader moved it in Unix milliseconds (`tip_at`, None: not
-    /// stored, e.g. by a leader that does not write it) and the leader's last confirmation
-    /// (`tip_seen`, None: not stored).
-    async fn read_stored(&self) -> (Option<Tip>, Option<u64>, Option<Bytes>) {
+    /// stored, e.g. by a leader that does not write it), the leader's last confirmation
+    /// (`tip_seen`, None: not stored) and the stamp that binds `tip_at` to its tip
+    /// (`tip_stamp`, raw, None: not stored), in one `MGET`.
+    async fn read_stored(&self) -> (Option<Tip>, Option<u64>, Option<Bytes>, Option<Bytes>) {
         let chain = self.store.chain_prefix();
         let mut values = self
             .store
@@ -632,13 +826,15 @@ impl ChainFollower {
                 tip_key(&chain),
                 tip_at_key(&chain),
                 tip_seen_key(&chain),
+                tip_stamp_key(&chain),
             ])
             .await
             .into_iter();
         let tip = values.next().flatten().and_then(|b| decode_tip(&b));
         let tip_at = values.next().flatten().and_then(|b| decode_unix_ms(&b));
         let seen = values.next().flatten();
-        (tip, tip_at, seen)
+        let stamp = values.next().flatten();
+        (tip, tip_at, seen, stamp)
     }
 
     /// Drop the held tip (see [`HeldTip`]) when the stored chain is no longer the one it was
@@ -749,16 +945,27 @@ impl ChainFollower {
     /// did: a stored tip unmoved for the stale bound with its own lightwalletd ahead is what
     /// this handling serves. None = nothing to do
     /// (the caller serves the stored tip, or the tip held from an earlier probe, see
-    /// [`Self::follow_stored`]). See the module docs, "Stale leader".
+    /// [`Self::follow_stored`]). `age` is the stored tip's age (wall clock and local bound, see
+    /// [`Unmoved`]), None without an effective `tip_at`. See the module docs, "Stale leader".
     async fn check_stale_leader(
         &self,
         n: u64,
         stored: &Tip,
         tip_at_ms: Option<u64>,
+        nonce: Option<u64>,
+        age: Option<TipAge>,
     ) -> Option<Outcome> {
-        let age = tip_at_ms.map(age_of);
-        if age.is_none_or(|a| a <= self.stale_after) || !n.is_multiple_of(STALE_PROBE_EVERY) {
+        if age.is_none_or(|a| a.get() <= self.stale_after) || !n.is_multiple_of(STALE_PROBE_EVERY) {
             return None;
+        }
+        // Met by the local bound alone: the stored time is ahead of this clock (a writer clock
+        // ahead, this one behind, or a clock step). Logged once per record.
+        if let Some(a) = age.filter(|a| a.wall() <= self.stale_after) {
+            let mut unmoved = self.unmoved.lock();
+            if let Some(u) = unmoved.as_mut().filter(|u| !u.warned) {
+                u.warned = true;
+                warn!(network = %self.network, stored = stored.height, local_secs = a.local().as_secs(), wall_secs = a.wall().as_secs(), "chain follower: the stored tip has not changed for longer than the stale bound by this process's clock, while its stored time is recent or ahead of this clock; probing its own lightwalletd");
+            }
         }
         // A stored tip the held tip's own chain does not have (`HeldChain`): the held tip is
         // dropped here as on any other read (`follow_stored`), before anything is asked. No
@@ -866,7 +1073,7 @@ impl ChainFollower {
         // As seen at its probe: stale at the hold bound, not later.
         self.store.tip_cell().set_at(served.clone(), confirmed_at);
         crate::health::record_cache_tip_height(&self.network, served.height);
-        let age_secs = age.map_or(0, |a| a.as_secs());
+        let age_secs = age.map_or(0, |a| a.get().as_secs());
         let Some(holder) = holder.filter(|_| seen_before) else {
             warn!(network = %self.network, stored = stored.height, own = own.height, age_secs, "chain tip has not moved and this process's lightwalletd is ahead: serving its tip");
             crate::health::record_chain_stale_leader(&self.network, "local_tip");
@@ -895,7 +1102,16 @@ impl ChainFollower {
             *self.last.lock() = Some(stored.clone());
             *self.backfill_cursor.lock() = None;
             self.behind_ticks.store(0, Ordering::Relaxed);
-            self.adopt_tip_at(tip_at_ms, tip_at_ms);
+            // The age counts from the first read of this record at the latest, measured now
+            // (after the probe and the lock commands); the observation is consumed.
+            let observed = match tip_at_ms {
+                Some(at) => self.consume_observed(stored, at, nonce),
+                None => {
+                    *self.unmoved.lock() = None;
+                    Duration::ZERO
+                }
+            };
+            self.adopt_tip_at(tip_at_ms, tip_at_ms, observed);
             // The held tip stays: what it indexes as leader does not make the served tip step
             // back within the hold (`serve_tip`). Unless the stored chain under it could not be
             // checked: no read as a follower checks it again.
@@ -936,10 +1152,14 @@ impl ChainFollower {
     ///   cases only while the tip moved at most [`MAX_CONFIRM_AGE`] ago by `tip_at` (when
     ///   stored): an older tip is refreshed only by a changed `seen`, as under a leader of this
     ///   version.
+    ///
+    /// `age` is the stored tip's age ([`TipAge`]: the larger of the wall-clock age and the
+    /// local bound), None without an effective `tip_at`.
     fn follow_stored(
         &self,
         stored: &Tip,
         tip_at_ms: Option<u64>,
+        age: Option<TipAge>,
         seen: Option<Bytes>,
         forked: bool,
     ) {
@@ -966,7 +1186,7 @@ impl ChainFollower {
         // the tip moved at most `MAX_CONFIRM_AGE` ago, the bound a leader of this version
         // confirms within: an older tip is refreshed only by a new confirmation. Without
         // `tip_at` there is no age to bound by.
-        let legacy_fresh = tip_at_ms.is_none_or(|at| age_of(at) <= MAX_CONFIRM_AGE);
+        let legacy_fresh = age.is_none_or(|a| a.get() <= MAX_CONFIRM_AGE);
         let confirmed = match seen {
             None => {
                 *self.last_seen.lock() = None;
@@ -1029,23 +1249,38 @@ impl ChainFollower {
         if !self.is_leader() {
             // Follow the leader's tip unless it stopped moving while this process's own
             // lightwalletd moved on; probe lightwalletd now and then for the health gauge.
-            let (stored, tip_at, seen) = self.read_stored().await;
-            let tip_at = match &stored {
-                Some(tip) => self.effective_tip_at(tip, tip_at),
-                None => tip_at,
+            let (stored, tip_at, seen, stamp) = self.read_stored().await;
+            let (tip_at, nonce, age) = match &stored {
+                Some(tip) => {
+                    let (tip_at, nonce) = self.effective_tip_at(tip, tip_at, stamp.as_ref());
+                    (tip_at, nonce, self.observe(tip, tip_at, nonce))
+                }
+                // No tip read (a store error or no key): no record to observe, the observation
+                // is kept; no stored time to compare with this clock.
+                None => {
+                    crate::health::record_chain_tip_time_ahead(&self.network, Duration::ZERO);
+                    (
+                        tip_at,
+                        None,
+                        tip_at.map(|at| TipAge {
+                            tip_at: at,
+                            since: None,
+                        }),
+                    )
+                }
             };
-            crate::health::record_chain_tip_age(&self.network, tip_at.map(age_of));
+            crate::health::record_chain_tip_age(&self.network, age.map(|a| a.get()));
             let mut took_over = false;
             if let Some(tip) = stored {
                 let forked = self.revalidate_held(&tip).await == Revalidation::Dropped;
-                match self.check_stale_leader(n, &tip, tip_at).await {
+                match self.check_stale_leader(n, &tip, tip_at, nonce, age).await {
                     // Leader now: this tick continues as one (below), so the stored tip moves
                     // before another process could take it over too.
                     Some(Outcome::StaleLeader {
                         took_over: true, ..
                     }) => took_over = true,
                     Some(outcome) => return outcome,
-                    None => self.follow_stored(&tip, tip_at, seen, forked),
+                    None => self.follow_stored(&tip, tip_at, age, seen, forked),
                 }
             }
             if !took_over {
@@ -1126,7 +1361,16 @@ impl ChainFollower {
         let pending = self.tip_at_pending.load(Ordering::Relaxed);
         let mut entries = vec![(tip_seen_key(&chain), encode_unix_ms(seen), INDEX_TTL_SECS)];
         if pending {
+            // `tip_at` with its stamp for the indexed tip. This script does not compare the
+            // stored tip: in a store that lost writes the stamp may name another tip than the
+            // stored one, and is then no evidence for readers.
+            let nonce = rand::random::<u64>();
             entries.push((tip_at_key(&chain), encode_unix_ms(moved_at), INDEX_TTL_SECS));
+            entries.push((
+                tip_stamp_key(&chain),
+                encode_tip_stamp(moved_at, nonce, tip),
+                INDEX_TTL_SECS,
+            ));
         }
         match self
             .store
@@ -1138,6 +1382,9 @@ impl ChainFollower {
                 if pending {
                     self.tip_at_pending.store(false, Ordering::Relaxed);
                     self.tip_at_stored_ms.store(moved_at, Ordering::Relaxed);
+                    *self.unmoved.lock() = None;
+                    // Its own time from now on.
+                    crate::health::record_chain_tip_time_ahead(&self.network, Duration::ZERO);
                 }
                 self.serve_tip(tip);
                 true
@@ -1162,9 +1409,11 @@ impl ChainFollower {
             // A `tip_at` this process saw left over by a leader that does not write it (as a
             // follower, see `TipAtRead`) does not count: the time is now, written with the next
             // confirmation.
-            let (stored, tip_at, _) = self.read_stored().await;
+            // The age counts from this process's first read of the same record as a follower
+            // at the latest (`Unmoved`).
+            let (stored, tip_at, _, stamp) = self.read_stored().await;
             let stored_raw_tip_at = tip_at;
-            let (dropped, tip_at) = match &stored {
+            let (dropped, tip_at, observed) = match &stored {
                 Some(stored) => {
                     let dropped = match self.revalidate_held(stored).await {
                         Revalidation::Kept => false,
@@ -1172,16 +1421,23 @@ impl ChainFollower {
                         // As leader nothing reads the stored chain to check it again.
                         Revalidation::Unknown => self.drop_unresolved(),
                     };
-                    (dropped, self.effective_tip_at(stored, tip_at))
+                    let (tip_at, nonce) = self.effective_tip_at(stored, tip_at, stamp.as_ref());
+                    let observed = match tip_at {
+                        Some(at) => self.consume_observed(stored, at, nonce),
+                        None => Duration::ZERO,
+                    };
+                    (dropped, tip_at, observed)
                 }
-                None => (self.stale.lock().take().is_some(), tip_at),
+                None => (self.stale.lock().take().is_some(), tip_at, Duration::ZERO),
             };
+            // Consumed by the takeover, whatever it continues.
+            *self.unmoved.lock() = None;
             if dropped {
                 // Unknown until this tick serves what it indexes.
                 self.store.tip_cell().clear();
             }
             *self.last.lock() = stored;
-            self.adopt_tip_at(tip_at, stored_raw_tip_at);
+            self.adopt_tip_at(tip_at, stored_raw_tip_at, observed);
             *self.backfill_cursor.lock() = None;
             self.behind_ticks.store(0, Ordering::Relaxed);
         }
@@ -1609,6 +1865,8 @@ impl ChainFollower {
         );
         // A new confirmation, never below `tip_at` (see `confirm`).
         let seen = now.max(self.seen_written_ms.load(Ordering::Relaxed) + 1);
+        // The stamp binds `tip_at` to this tip, with a nonce of this write (`TipAtRead`).
+        let nonce = rand::random::<u64>();
         let written = self
             .store
             .set_if_lock_held(
@@ -1619,6 +1877,11 @@ impl ChainFollower {
                     (tip_key(&chain), encode_tip(tip), INDEX_TTL_SECS),
                     (tip_at_key(&chain), encode_unix_ms(now), INDEX_TTL_SECS),
                     (tip_seen_key(&chain), encode_unix_ms(seen), INDEX_TTL_SECS),
+                    (
+                        tip_stamp_key(&chain),
+                        encode_tip_stamp(now, nonce, tip),
+                        INDEX_TTL_SECS,
+                    ),
                 ],
             )
             .await;
@@ -1643,6 +1906,9 @@ impl ChainFollower {
         self.seen_written_ms.store(seen, Ordering::Relaxed);
         self.tip_at_pending.store(false, Ordering::Relaxed);
         self.unconfirmed_logged.store(false, Ordering::Relaxed);
+        *self.unmoved.lock() = None;
+        // Its own time from now on.
+        crate::health::record_chain_tip_time_ahead(&self.network, Duration::ZERO);
         *self.last.lock() = Some(tip.clone());
         self.notify_new_block(tip);
         Ok(true)
@@ -1767,11 +2033,20 @@ pub(crate) mod test_support {
     /// The fake lightwalletd's chain view as a `ChainSource`.
     pub struct FakeChainSource(pub Arc<FakeChain>);
 
+    /// `ChainFollower::write_tip`, for the tests against a real store.
+    pub async fn write_tip(f: &ChainFollower, tip: &Tip) -> Result<bool> {
+        f.write_tip(tip).await
+    }
+
     impl ChainSource for FakeChainSource {
         fn latest(&self) -> BoxFuture<'static, Result<Tip>> {
             let c = self.0.clone();
             Box::pin(async move {
                 c.latest_calls.fetch_add(1, Ordering::SeqCst);
+                let delay = c.latest_delay_ms.load(Ordering::SeqCst);
+                if delay > 0 {
+                    tokio::time::sleep(Duration::from_millis(delay)).await;
+                }
                 if c.down.load(Ordering::SeqCst) {
                     anyhow::bail!("lwd down");
                 }
@@ -3886,12 +4161,12 @@ mod tests {
     async fn the_stored_tip_at_is_remembered_whether_it_counts_or_not() {
         let store = Arc::new(MemStore::default());
         let f = follower(store, Arc::new(FakeChain::new(100)), None);
-        f.adopt_tip_at(None, Some(77));
+        f.adopt_tip_at(None, Some(77), Duration::ZERO);
         assert_eq!(f.tip_at_stored_ms.load(Ordering::Relaxed), 77);
         assert!(f.tip_at_pending.load(Ordering::Relaxed));
-        f.adopt_tip_at(Some(88), Some(88));
+        f.adopt_tip_at(Some(88), Some(88), Duration::ZERO);
         assert_eq!(f.tip_at_stored_ms.load(Ordering::Relaxed), 88);
-        f.adopt_tip_at(None, None);
+        f.adopt_tip_at(None, None, Duration::ZERO);
         assert_eq!(f.tip_at_stored_ms.load(Ordering::Relaxed), 0);
     }
 
@@ -4072,5 +4347,735 @@ mod tests {
         );
         assert_eq!(follower.tip().unwrap().height, 1006);
         assert!(follower.stale.lock().is_some());
+    }
+
+    /// Store the tip `height` (fork 0) with `tip_at` and, with a nonce, the stamp a leader of
+    /// this version writes with them (without one: no stamp, as an earlier version writes).
+    fn put_record(store: &MemStore, height: u64, tip_at: u64, nonce: Option<u64>) -> Tip {
+        let chain = store.chain_prefix();
+        let tip = Tip {
+            height,
+            hash: hash_at(height, 0),
+        };
+        store.put(&tip_key(&chain), encode_tip(&tip));
+        store.put(&tip_at_key(&chain), encode_unix_ms(tip_at));
+        match nonce {
+            Some(n) => store.put(&tip_stamp_key(&chain), encode_tip_stamp(tip_at, n, &tip)),
+            None => {
+                store.data.lock().unwrap().remove(&tip_stamp_key(&chain));
+            }
+        }
+        tip
+    }
+
+    /// A `tip_at` an hour ahead of this clock (the writer's clock is ahead) and a leader that
+    /// stopped moving the tip: the probe comes once the stale bound passed on this process's
+    /// own clock since its first read of the record (by the wall clocks the tip never ages
+    /// within the hour), and the second probe takes over.
+    #[tokio::test(start_paused = true)]
+    async fn a_tip_at_ahead_of_this_clock_is_probed_after_the_stale_bound_of_local_time() {
+        let store = Arc::new(MemStore::default());
+        let _leader = KeysOnlyLeader::new(&store);
+        let live = Arc::new(FakeChain::new(1006));
+        let f = follower(store.clone(), live, None);
+        put_record(&store, 1000, unix_ms_now() + 3_600_000, Some(1));
+        let step = Duration::from_secs(5);
+        let mut waited = Duration::ZERO;
+        let probed_at = loop {
+            match f.tick().await {
+                Outcome::Follower => {}
+                Outcome::StaleLeader {
+                    from: 1000,
+                    to: 1006,
+                    took_over: false,
+                } => break waited,
+                other => panic!("{other:?} after {waited:?}"),
+            }
+            assert!(waited <= 2 * DEFAULT_TIP_STALE_AFTER, "never probed");
+            tokio::time::advance(step).await;
+            waited += step;
+        };
+        assert!(
+            probed_at > DEFAULT_TIP_STALE_AFTER,
+            "not before the bound: {probed_at:?}"
+        );
+        assert!(
+            probed_at <= DEFAULT_TIP_STALE_AFTER + step * STALE_PROBE_EVERY as u32,
+            "at the first scheduled probe after it: {probed_at:?}"
+        );
+        assert_eq!(f.tip().unwrap().height, 1006, "its own tip at once");
+        for _ in 1..STALE_PROBE_EVERY {
+            tokio::time::advance(step).await;
+            assert_eq!(f.tick().await, Outcome::Follower);
+        }
+        tokio::time::advance(step).await;
+        assert_eq!(
+            f.tick().await,
+            Outcome::Advanced {
+                from: 1001,
+                to: 1006
+            }
+        );
+        assert!(f.is_leader());
+    }
+
+    /// A tip that moves on every read is never probed, whatever its `tip_at` says (here ahead
+    /// of this clock): every read is another record.
+    #[tokio::test(start_paused = true)]
+    async fn a_tip_that_keeps_moving_with_a_tip_at_ahead_is_never_probed() {
+        let store = Arc::new(MemStore::default());
+        let _leader = KeysOnlyLeader::new(&store);
+        let f = follower(store.clone(), Arc::new(FakeChain::new(5000)), None);
+        let ahead = unix_ms_now() + 3_600_000;
+        let reads = 2 * DEFAULT_TIP_STALE_AFTER.as_secs() / 5 + 2 * STALE_PROBE_EVERY;
+        for i in 0..reads {
+            // Stamped or not (a leader of an earlier version): another tip on every read.
+            put_record(&store, 1000 + i, ahead + i, (i % 2 == 0).then_some(i));
+            assert_eq!(f.tick().await, Outcome::Follower, "read {i}");
+            assert_eq!(f.tip().unwrap().height, 1000 + i);
+            tokio::time::advance(Duration::from_secs(5)).await;
+        }
+    }
+
+    /// Under a leader taken for one that does not confirm (its `tip_seen` is older than
+    /// `tip_at`), with a `tip_at` ahead of this clock, the tip is refreshed on every read only
+    /// for MAX_CONFIRM_AGE after the first read of the record, then it goes stale (by the wall
+    /// clocks alone it stayed fresh for the skew).
+    #[tokio::test(start_paused = true)]
+    async fn a_leader_that_does_not_confirm_is_followed_for_the_bound_after_the_first_read() {
+        let store = Arc::new(MemStore::default());
+        let _leader = KeysOnlyLeader::new(&store);
+        // Its own lightwalletd is at the stored tip: probes find nothing to take over.
+        let f = follower(store.clone(), Arc::new(FakeChain::new(1000)), None);
+        put_record(&store, 1000, unix_ms_now() + 3_600_000, Some(7));
+        store.put(&tip_seen_key(&store.chain_prefix()), encode_unix_ms(1));
+        assert_eq!(f.tick().await, Outcome::Follower);
+        let step = Duration::from_secs(5);
+        let mut waited = Duration::ZERO;
+        while waited < MAX_CONFIRM_AGE {
+            tokio::time::advance(step).await;
+            waited += step;
+            assert_eq!(f.tick().await, Outcome::Follower);
+            assert_eq!(f.tip().unwrap().height, 1000, "after {waited:?}");
+        }
+        while waited <= MAX_CONFIRM_AGE + crate::store::TIP_STALE_AFTER + step {
+            tokio::time::advance(step).await;
+            waited += step;
+            assert_eq!(f.tick().await, Outcome::Follower);
+        }
+        assert_eq!(f.tip(), None);
+    }
+
+    /// A process that read a record with a `tip_at` ahead of its clock as a follower and then
+    /// takes the lock counts the confirmation bound from that first read: after more than
+    /// MAX_CONFIRM_AGE it does not confirm at all; after less, the age starts that much earlier.
+    /// Without an earlier read it counts from the takeover
+    /// (`a_tip_at_in_the_future_is_counted_from_the_takeover`).
+    #[tokio::test(start_paused = true)]
+    async fn a_takeover_counts_the_confirmation_bound_from_the_first_read_as_follower() {
+        for (watched, confirmed) in [
+            (MAX_CONFIRM_AGE + Duration::from_secs(10), false),
+            (Duration::from_secs(400), true),
+        ] {
+            let store = Arc::new(MemStore::default());
+            let _leader = KeysOnlyLeader::new(&store);
+            let f = follower(store.clone(), Arc::new(FakeChain::new(500)), None);
+            let prefix = store.chain_prefix();
+            let future = unix_ms_now() + 3_600_000;
+            put_record(&store, 500, future, Some(3));
+            assert_eq!(f.tick().await, Outcome::Follower);
+            tokio::time::advance(watched).await;
+            // The leader's lock lapses; this process leads from its next tick.
+            store.locks.lock().unwrap().clear();
+            let before = unix_ms_now();
+            assert_eq!(f.tick().await, Outcome::Idle);
+            assert!(f.is_leader());
+            let moved_at = f.moved_at_ms.load(Ordering::Relaxed);
+            let watched_ms = watched.as_millis() as u64;
+            assert!(
+                moved_at + watched_ms >= before && moved_at + watched_ms <= unix_ms_now(),
+                "the age counts from the first read: {watched:?}"
+            );
+            assert_eq!(
+                store.get(&tip_seen_key(&prefix)).is_some(),
+                confirmed,
+                "{watched:?}"
+            );
+            if confirmed {
+                let seen = store
+                    .get(&tip_seen_key(&prefix))
+                    .and_then(|b| decode_unix_ms(&b))
+                    .unwrap();
+                assert!(seen >= future, "never below the stored tip_at");
+            }
+            assert_eq!(
+                store
+                    .get(&tip_at_key(&prefix))
+                    .and_then(|b| decode_unix_ms(&b)),
+                Some(future),
+                "kept as stored"
+            );
+        }
+    }
+
+    /// The local observation: kept over a failed read and over reads of the same record;
+    /// started again by another tip, another `tip_at`, another nonce with the same tip and
+    /// `tip_at`, and a stamp that no longer vouches; cleared by a read without an effective
+    /// `tip_at`; consumed when the lock is taken (the clearing by a leader's own `tip_at`
+    /// write: `a_tip_at_written_as_leader_clears_the_local_observation`).
+    #[tokio::test(start_paused = true)]
+    async fn the_local_observation_is_kept_started_again_and_cleared() {
+        let store = Arc::new(MemStore::default());
+        let _leader = KeysOnlyLeader::new(&store);
+        let chain = Arc::new(FakeChain::new(1000));
+        let f = follower(store.clone(), chain.clone(), None);
+        let since = || f.unmoved.lock().as_ref().map(|u| u.since);
+        let at = unix_ms_now() + 3_600_000;
+        let tip = put_record(&store, 1000, at, Some(1));
+        assert_eq!(f.tick().await, Outcome::Follower);
+        let first = since().expect("observed");
+        tokio::time::advance(Duration::from_secs(10)).await;
+        // A failed read in between (the store does not answer): kept.
+        store.down.store(true, Ordering::SeqCst);
+        assert_eq!(f.tick().await, Outcome::Follower);
+        store.down.store(false, Ordering::SeqCst);
+        assert_eq!(since(), Some(first));
+        tokio::time::advance(Duration::from_secs(10)).await;
+        assert_eq!(f.tick().await, Outcome::Follower);
+        assert_eq!(since(), Some(first));
+        assert_eq!(first.elapsed(), Duration::from_secs(20));
+        assert_eq!(
+            f.unmoved.lock().as_ref().unwrap().record,
+            TipRecord {
+                tip: tip.clone(),
+                tip_at: at,
+                nonce: Some(1)
+            }
+        );
+        let mut last = first;
+        let mut started_again = |what: &str| {
+            let now = since().expect(what);
+            assert_ne!(now, last, "{what}");
+            last = now;
+        };
+        // Another nonce, with the same tip and tip_at.
+        tokio::time::advance(Duration::from_secs(1)).await;
+        put_record(&store, 1000, at, Some(2));
+        f.tick().await;
+        started_again("another nonce");
+        // Another tip_at.
+        tokio::time::advance(Duration::from_secs(1)).await;
+        put_record(&store, 1000, at + 1, Some(2));
+        f.tick().await;
+        started_again("another tip_at");
+        // Another tip.
+        tokio::time::advance(Duration::from_secs(1)).await;
+        put_record(&store, 1001, at + 1, Some(2));
+        f.tick().await;
+        started_again("another tip");
+        // The stamp lost: the same tip and tip_at, but another record.
+        tokio::time::advance(Duration::from_secs(1)).await;
+        store
+            .data
+            .lock()
+            .unwrap()
+            .remove(&tip_stamp_key(&store.chain_prefix()));
+        f.tick().await;
+        started_again("the stamp lost");
+        // No tip_at: cleared.
+        store
+            .data
+            .lock()
+            .unwrap()
+            .remove(&tip_at_key(&store.chain_prefix()));
+        f.tick().await;
+        assert_eq!(since(), None, "no tip_at");
+        // Taking the lock consumes it (a leader's own tip_at write clears it too, see
+        // `a_tip_at_written_as_leader_clears_the_local_observation`).
+        put_record(&store, 1001, at + 2, Some(3));
+        f.tick().await;
+        assert!(since().is_some());
+        store.locks.lock().unwrap().clear();
+        chain.set_tip(1002);
+        assert_eq!(
+            f.tick().await,
+            Outcome::Advanced {
+                from: 1002,
+                to: 1002
+            }
+        );
+        assert_eq!(
+            since(),
+            None,
+            "consumed at the takeover; nothing is observed while leading"
+        );
+    }
+
+    fn tip_n(height: u64) -> Tip {
+        Tip {
+            height,
+            hash: hash_at(height, 0),
+        }
+    }
+
+    fn stamp_of(at: u64, nonce: u64, height: u64) -> Bytes {
+        encode_tip_stamp(at, nonce, &tip_n(height))
+    }
+
+    fn plain_follower() -> Arc<ChainFollower> {
+        follower(
+            Arc::new(MemStore::default()),
+            Arc::new(FakeChain::new(1)),
+            None,
+        )
+    }
+
+    /// A leader stamps every `tip_at` it writes, in the same fenced script, with that value,
+    /// the stored tip and a nonce of its own per write; the pending `tip_at` of a confirmation
+    /// too; a plain confirmation writes neither.
+    #[tokio::test(start_paused = true)]
+    async fn the_leader_stamps_every_tip_at_it_writes() {
+        let store = Arc::new(MemStore::default());
+        let chain = Arc::new(FakeChain::new(500));
+        let f = follower(store.clone(), chain.clone(), None);
+        let prefix = store.chain_prefix();
+        let keys = [
+            tip_key(&prefix),
+            tip_at_key(&prefix),
+            tip_seen_key(&prefix),
+            tip_stamp_key(&prefix),
+        ];
+        let stamp = || decode_tip_stamp(&store.get(&tip_stamp_key(&prefix)).unwrap()).unwrap();
+        let tip_at = || {
+            store
+                .get(&tip_at_key(&prefix))
+                .and_then(|b| decode_unix_ms(&b))
+                .unwrap()
+        };
+        let scripts = || std::mem::take(&mut *store.fenced_writes.lock().unwrap());
+        let writes = |scripts: &[Vec<String>], key: &String| {
+            scripts.iter().filter(|s| s.contains(key)).count()
+        };
+        assert_eq!(f.tick().await, Outcome::Cold { tip: 500 });
+        let written = scripts();
+        assert!(written.contains(&keys.to_vec()), "{written:?}");
+        assert_eq!(writes(&written[..], &keys[3]), 1);
+        let first = stamp();
+        assert_eq!(first.tip_at_ms, tip_at());
+        assert_eq!(first.tip, store.get(&keys[0]).unwrap().to_vec());
+        chain.set_tip(501);
+        assert!(matches!(f.tick().await, Outcome::Advanced { .. }));
+        let written = scripts();
+        assert!(written.contains(&keys.to_vec()), "{written:?}");
+        let second = stamp();
+        assert_eq!(second.tip_at_ms, tip_at());
+        assert_eq!(second.tip, store.get(&keys[0]).unwrap().to_vec());
+        assert_ne!(second.nonce, first.nonce, "a nonce per write");
+        // A plain confirmation: `tip_seen` only.
+        assert_eq!(f.tick().await, Outcome::Idle);
+        let written = scripts();
+        assert!(written.contains(&vec![keys[2].clone()]), "{written:?}");
+        assert_eq!(
+            writes(&written[..], &keys[1]) + writes(&written[..], &keys[3]),
+            0
+        );
+
+        // A tip taken over without `tip_at`: the first confirmation writes it with its stamp.
+        let store = Arc::new(MemStore::default());
+        let f = follower(store.clone(), Arc::new(FakeChain::new(500)), None);
+        store.put(&keys[0], encode_tip(&tip_n(500)));
+        assert_eq!(f.tick().await, Outcome::Idle);
+        let written = std::mem::take(&mut *store.fenced_writes.lock().unwrap());
+        assert_eq!(
+            written,
+            vec![vec![keys[2].clone(), keys[1].clone(), keys[3].clone()]]
+        );
+        let stamp = decode_tip_stamp(&store.get(&keys[3]).unwrap()).unwrap();
+        assert_eq!(
+            Some(stamp.tip_at_ms),
+            store.get(&keys[1]).and_then(|b| decode_unix_ms(&b))
+        );
+        assert_eq!(stamp.tip, encode_tip(&tip_n(500)).to_vec());
+    }
+
+    /// Two tips with the same `tip_at`, each stamped by its write: not a leftover (without the
+    /// stamps the inference from two reads takes the second for one).
+    #[test]
+    fn a_stamped_tip_with_the_same_tip_at_is_not_a_leftover() {
+        let a = 1_700_000_000_000;
+        let f = plain_follower();
+        assert_eq!(
+            f.effective_tip_at(&tip_n(1), Some(a), Some(&stamp_of(a, 1, 1))),
+            (Some(a), Some(1))
+        );
+        assert_eq!(
+            f.effective_tip_at(&tip_n(2), Some(a), Some(&stamp_of(a, 2, 2))),
+            (Some(a), Some(2))
+        );
+        assert!(!f.last_tip_at.lock().as_ref().unwrap().leftover);
+        let g = plain_follower();
+        assert_eq!(
+            g.effective_tip_at(&tip_n(1), Some(a), None),
+            (Some(a), None)
+        );
+        assert_eq!(g.effective_tip_at(&tip_n(2), Some(a), None), (None, None));
+    }
+
+    /// A follower that missed the reads in between: (T1, a), then (T3, a) stamped for T3.
+    #[test]
+    fn a_stamped_tip_after_skipped_reads_is_not_a_leftover() {
+        let a = 1_700_000_000_000;
+        let f = plain_follower();
+        assert_eq!(
+            f.effective_tip_at(&tip_n(1), Some(a), None),
+            (Some(a), None)
+        );
+        assert_eq!(
+            f.effective_tip_at(&tip_n(3), Some(a), Some(&stamp_of(a, 9, 3))),
+            (Some(a), Some(9))
+        );
+        let g = plain_follower();
+        assert_eq!(
+            g.effective_tip_at(&tip_n(1), Some(a), None),
+            (Some(a), None)
+        );
+        assert_eq!(g.effective_tip_at(&tip_n(3), Some(a), None), (None, None));
+    }
+
+    /// A stamp that names another tip with the same `tip_at` (a leader that writes no
+    /// `tip_at` moved the tip after a rollback) is no evidence: the inference from two reads
+    /// decides. On the way back to the stamped block, a process that saw the other tip in
+    /// between (as a later read, or as its first read) gets that inference's verdict; one that
+    /// read nothing in between trusts the time, as the inference does.
+    #[test]
+    fn a_stamp_of_another_tip_is_no_evidence() {
+        let a = 1_700_000_000_000;
+        let s1 = stamp_of(a, 1, 1);
+        // Saw the stamped tip, then the other one, then the stamped one again.
+        let f = plain_follower();
+        assert_eq!(
+            f.effective_tip_at(&tip_n(1), Some(a), Some(&s1)),
+            (Some(a), Some(1))
+        );
+        assert_eq!(
+            f.effective_tip_at(&tip_n(2), Some(a), Some(&s1)),
+            (None, None)
+        );
+        assert_eq!(
+            f.effective_tip_at(&tip_n(1), Some(a), Some(&s1)),
+            (None, None),
+            "a leftover verdict for this tip_at is remembered"
+        );
+        // First read beside the other tip: trusted (first read), then not on the way back.
+        let g = plain_follower();
+        assert_eq!(
+            g.effective_tip_at(&tip_n(2), Some(a), Some(&s1)),
+            (Some(a), None)
+        );
+        assert_eq!(
+            g.effective_tip_at(&tip_n(1), Some(a), Some(&s1)),
+            (None, None),
+            "the stamp was seen beside another tip"
+        );
+        // Read nothing in between: an unchanged record, trusted.
+        let h = plain_follower();
+        for _ in 0..2 {
+            assert_eq!(
+                h.effective_tip_at(&tip_n(1), Some(a), Some(&s1)),
+                (Some(a), Some(1))
+            );
+        }
+    }
+
+    /// A stamp with another time, an absent and an unparsable one, and a stamp without a
+    /// stored `tip_at`: the inference from two reads, as without a stamp.
+    #[test]
+    fn a_stamp_of_another_time_absent_or_unparsable_is_no_evidence() {
+        let a = 1_700_000_000_000;
+        for second in [
+            Some(stamp_of(a + 1, 5, 2)),
+            None,
+            Some(Bytes::from_static(b"not a stamp")),
+            Some(Bytes::from(stamp_of(a, 5, 2).to_ascii_uppercase())),
+        ] {
+            let f = plain_follower();
+            assert_eq!(
+                f.effective_tip_at(&tip_n(1), Some(a), None),
+                (Some(a), None)
+            );
+            assert_eq!(
+                f.effective_tip_at(&tip_n(2), Some(a), second.as_ref()),
+                (None, None),
+                "{second:?}"
+            );
+            assert!(f.last_tip_at.lock().as_ref().unwrap().leftover);
+        }
+        let f = plain_follower();
+        assert_eq!(
+            f.effective_tip_at(&tip_n(2), None, Some(&stamp_of(a, 5, 2))),
+            (None, None)
+        );
+    }
+
+    /// The stamp lost after a match (evicted while `tip_at` stays): not a leftover while the tip
+    /// and `tip_at` stay; a tip that then moves with the same `tip_at` is one, as without stamps.
+    #[test]
+    fn a_stamp_lost_after_a_match_keeps_the_verdict() {
+        let a = 1_700_000_000_000;
+        let f = plain_follower();
+        assert_eq!(
+            f.effective_tip_at(&tip_n(1), Some(a), Some(&stamp_of(a, 1, 1))),
+            (Some(a), Some(1))
+        );
+        for _ in 0..2 {
+            assert_eq!(
+                f.effective_tip_at(&tip_n(1), Some(a), None),
+                (Some(a), None)
+            );
+        }
+        assert_eq!(f.effective_tip_at(&tip_n(2), Some(a), None), (None, None));
+    }
+
+    /// A follower constructed on a network label of its own (for the gauges).
+    fn follower_on(store: Arc<MemStore>, chain: Arc<FakeChain>, network: &str) -> ChainFollower {
+        ChainFollower::new(
+            store,
+            Arc::new(FakeChainSource(chain)),
+            None,
+            Arc::new(PoolKeys::default()),
+            network.to_string(),
+        )
+    }
+
+    /// The takeover's age origin is measured when the lock is taken, not at the read: work
+    /// awaited between the read and the takeover (here a slow fetch of the held tip's chain on
+    /// the second probe) counts in it.
+    #[tokio::test(start_paused = true)]
+    async fn the_takeover_counts_the_time_awaited_after_the_read() {
+        let store = Arc::new(MemStore::default());
+        let _leader = KeysOnlyLeader::new(&store);
+        let live = Arc::new(FakeChain::new(1006));
+        let f = follower(store.clone(), live.clone(), None);
+        put_record(&store, 1000, unix_ms_now() + 3_600_000, Some(1));
+        let start = tokio::time::Instant::now();
+        // The first probe (tick 35, local age 175 s).
+        loop {
+            match f.tick().await {
+                Outcome::Follower => tokio::time::advance(Duration::from_secs(5)).await,
+                Outcome::StaleLeader {
+                    took_over: false, ..
+                } => break,
+                other => panic!("{other:?}"),
+            }
+        }
+        for _ in 1..STALE_PROBE_EVERY {
+            tokio::time::advance(Duration::from_secs(1)).await;
+            assert_eq!(f.tick().await, Outcome::Follower);
+        }
+        tokio::time::advance(Duration::from_secs(1)).await;
+        // The second probe: its own tip moved on, so the chain of the new tip is fetched, for
+        // 8 s, and then its lightwalletd fails: the lock is taken over, and the tick then fails
+        // and hands the lock over, leaving the adopted age origin to be read.
+        live.set_tip(1007);
+        live.blocks_delay_ms.store(8_000, Ordering::SeqCst);
+        let read_at = start.elapsed();
+        let (outcome, ()) = tokio::join!(f.tick(), async {
+            tokio::time::sleep(Duration::from_secs(4)).await;
+            live.down.store(true, Ordering::SeqCst);
+        });
+        assert!(matches!(outcome, Outcome::Error(_)), "{outcome:?}");
+        let age_ms = unix_ms_now().saturating_sub(f.moved_at_ms.load(Ordering::Relaxed));
+        let awaited = Duration::from_secs(8);
+        assert!(
+            age_ms >= (read_at + awaited).as_millis() as u64,
+            "the age at the takeover includes the awaited fetch: {age_ms} ms, read at {read_at:?}"
+        );
+        assert!(age_ms < (read_at + awaited).as_millis() as u64 + 5_000);
+    }
+
+    /// Taking the lock consumes the observation: after a leadership without a `tip_at` write
+    /// and the lock lost again, the next read of the same record starts a new one.
+    #[tokio::test(start_paused = true)]
+    async fn taking_the_lock_consumes_the_local_observation() {
+        let store = Arc::new(MemStore::default());
+        let _leader = KeysOnlyLeader::new(&store);
+        let f = follower(store.clone(), Arc::new(FakeChain::new(500)), None);
+        put_record(&store, 500, unix_ms_now() + 3_600_000, Some(4));
+        assert_eq!(f.tick().await, Outcome::Follower);
+        let first = f.unmoved.lock().as_ref().unwrap().since;
+        tokio::time::advance(Duration::from_secs(10)).await;
+        store.locks.lock().unwrap().clear();
+        // Leads without writing `tip_at` (it continues the stored one; confirmations only).
+        assert_eq!(f.tick().await, Outcome::Idle);
+        assert!(f.is_leader());
+        assert!(f.unmoved.lock().is_none(), "consumed");
+        // Another process takes the lock; this one follows the same record again.
+        store.locks.lock().unwrap().insert(
+            lock_key(&store.chain_prefix()),
+            (
+                "another-process".to_string(),
+                tokio::time::Instant::now() + Duration::from_secs(3600),
+            ),
+        );
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert_eq!(f.tick().await, Outcome::Follower);
+        let since = f.unmoved.lock().as_ref().unwrap().since;
+        assert_ne!(since, first);
+        assert_eq!(since.elapsed(), Duration::ZERO, "a new observation");
+    }
+
+    /// `ohttp_chain_tip_time_ahead_seconds`: how far the effective stored `tip_at` is ahead at
+    /// a follower's read; 0 on a read without a tip (the observation is kept) or without an
+    /// effective `tip_at`, and once this process wrote its own `tip_at` as leader.
+    #[tokio::test(start_paused = true)]
+    async fn the_time_ahead_gauge() {
+        let network = format!("testnet-time-ahead-{}", std::process::id());
+        let store = Arc::new(MemStore::default());
+        let _leader = KeysOnlyLeader::new(&store);
+        let chain = Arc::new(FakeChain::new(1000));
+        let f = follower_on(store.clone(), chain.clone(), &network);
+        let gauge = || crate::health::chain_tip_time_ahead(&network);
+        let at = unix_ms_now() + 3_600_000;
+        put_record(&store, 1000, at, Some(1));
+        assert_eq!(f.tick().await, Outcome::Follower);
+        assert!((3_595..=3_600).contains(&gauge()), "{}", gauge());
+        // A read without a tip: 0, the observation kept.
+        let since = f.unmoved.lock().as_ref().unwrap().since;
+        store.down.store(true, Ordering::SeqCst);
+        assert_eq!(f.tick().await, Outcome::Follower);
+        store.down.store(false, Ordering::SeqCst);
+        assert_eq!(gauge(), 0);
+        assert_eq!(f.unmoved.lock().as_ref().unwrap().since, since);
+        assert_eq!(f.tick().await, Outcome::Follower);
+        assert!(gauge() > 0);
+        // Without `tip_at`: 0.
+        store
+            .data
+            .lock()
+            .unwrap()
+            .remove(&tip_at_key(&store.chain_prefix()));
+        assert_eq!(f.tick().await, Outcome::Follower);
+        assert_eq!(gauge(), 0);
+        put_record(&store, 1000, at, Some(1));
+        assert_eq!(f.tick().await, Outcome::Follower);
+        assert!(gauge() > 0);
+        // It leads and writes its own `tip_at`: 0.
+        store.locks.lock().unwrap().clear();
+        chain.set_tip(1001);
+        assert_eq!(
+            f.tick().await,
+            Outcome::Advanced {
+                from: 1001,
+                to: 1001
+            }
+        );
+        assert_eq!(gauge(), 0);
+    }
+
+    /// A `tip_at` this process writes as leader clears the observation: with a new tip and
+    /// with the pending `tip_at` of a confirmation; a plain confirmation (no `tip_at`) leaves
+    /// it. Seeded directly: nothing observes while leading.
+    #[tokio::test(start_paused = true)]
+    async fn a_tip_at_written_as_leader_clears_the_local_observation() {
+        let store = Arc::new(MemStore::default());
+        let chain = Arc::new(FakeChain::new(500));
+        let f = follower(store.clone(), chain.clone(), None);
+        assert_eq!(f.tick().await, Outcome::Cold { tip: 500 });
+        let seed = || {
+            *f.unmoved.lock() = Some(Unmoved {
+                record: TipRecord {
+                    tip: tip_n(500),
+                    tip_at: 1,
+                    nonce: None,
+                },
+                since: tokio::time::Instant::now(),
+                warned: false,
+            });
+        };
+        seed();
+        chain.set_tip(501);
+        assert!(matches!(f.tick().await, Outcome::Advanced { .. }));
+        assert!(f.unmoved.lock().is_none(), "a new tip written");
+        seed();
+        assert_eq!(f.tick().await, Outcome::Idle);
+        assert!(f.unmoved.lock().is_some(), "a confirmation without tip_at");
+        f.tip_at_pending.store(true, Ordering::Relaxed);
+        assert!(f.confirm(&tip_n(501)).await);
+        assert!(f.unmoved.lock().is_none(), "the pending tip_at written");
+    }
+
+    /// The bound on following a leader that does not confirm is checked when it is used, not
+    /// at the read: a read just under MAX_CONFIRM_AGE by the local observation whose tick then
+    /// waits for a slow probe of its own lightwalletd past the bound does not refresh the tip.
+    #[tokio::test(start_paused = true)]
+    async fn awaited_work_after_the_read_counts_in_the_bound_on_an_unconfirming_leader() {
+        let store = Arc::new(MemStore::default());
+        let _leader = KeysOnlyLeader::new(&store);
+        let lwd = Arc::new(FakeChain::new(1000));
+        let f = follower(store.clone(), lwd.clone(), None);
+        put_record(&store, 1000, unix_ms_now() + 3_600_000, Some(7));
+        store.put(&tip_seen_key(&store.chain_prefix()), encode_unix_ms(1));
+        let step = Duration::from_secs(5);
+        assert_eq!(f.tick().await, Outcome::Follower);
+        // Ticks 1 ..= 119, the last one at 595 s: still refreshed.
+        for _ in 1..120 {
+            tokio::time::advance(step).await;
+            assert_eq!(f.tick().await, Outcome::Follower);
+        }
+        assert_eq!(f.tip().unwrap().height, 1000);
+        let refreshed_at = tokio::time::Instant::now();
+        // Tick 120 (a scheduled probe) reads at 598 s; the probe takes 5 s.
+        tokio::time::advance(Duration::from_secs(3)).await;
+        lwd.latest_delay_ms.store(5_000, Ordering::SeqCst);
+        assert_eq!(f.tick().await, Outcome::Follower);
+        lwd.latest_delay_ms.store(0, Ordering::SeqCst);
+        // Not refreshed on that tick: stale once the bound passed since 595 s.
+        let stale_at = refreshed_at + crate::store::TIP_STALE_AFTER + Duration::from_secs(1);
+        tokio::time::advance(stale_at.saturating_duration_since(tokio::time::Instant::now())).await;
+        assert_eq!(f.tip(), None);
+    }
+
+    /// The stale-leader probe condition is checked after the index check of a held tip: a read
+    /// just under the stale bound by the local observation whose index check is slow probes on
+    /// that tick.
+    #[tokio::test(start_paused = true)]
+    async fn awaited_work_after_the_read_counts_in_the_probe_condition() {
+        let store = Arc::new(MemStore::default());
+        let _leader = KeysOnlyLeader::new(&store);
+        let f = follower(store.clone(), Arc::new(FakeChain::new(1006)), None);
+        put_record(&store, 1002, unix_ms_now() + 3_600_000, Some(2));
+        store.put(
+            &index_key(&store.chain_prefix(), 1000),
+            Bytes::from(hash_at(1000, 0)),
+        );
+        let step = Duration::from_secs(5);
+        assert_eq!(f.tick().await, Outcome::Follower);
+        // Ticks 1 ..= 29, the last one at 145 s: no probe.
+        for _ in 1..30 {
+            tokio::time::advance(step).await;
+            assert_eq!(f.tick().await, Outcome::Follower);
+        }
+        // A tip held over 1000 (checked against the index at 1000 on the next read), and that
+        // index read takes 5 s. Tick 30 (a scheduled probe) reads at 148 s.
+        tokio::time::advance(Duration::from_secs(3)).await;
+        *f.stale.lock() = Some(HeldTip {
+            stored: tip_n(1000),
+            last_stored: tip_n(1000),
+            own: tip_n(1006),
+            confirmed_at: tokio::time::Instant::now(),
+            ahead: false,
+            holder: None,
+            unresolved: false,
+            chain: None,
+        });
+        *store.slow_mget.lock().unwrap() = Some((":index:".to_string(), Duration::from_secs(5)));
+        assert_eq!(
+            f.tick().await,
+            Outcome::StaleLeader {
+                from: 1002,
+                to: 1006,
+                took_over: false
+            }
+        );
     }
 }

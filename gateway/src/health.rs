@@ -529,6 +529,7 @@ pub fn init_metrics() {
         &*OHTTP_REPLAY_SERVING_VIA_FALLBACK,
         &*OHTTP_REPLAY_LOCAL_FALLBACK,
         &*OHTTP_CHAIN_TIP_AGE_SECONDS,
+        &*OHTTP_CHAIN_TIP_TIME_AHEAD_SECONDS,
         &*OHTTP_PERMANENT_STORE_REPLICA,
     ] {
         REGISTRY.register(Box::new(g.clone())).ok();
@@ -1317,7 +1318,12 @@ lazy_static::lazy_static! {
     )
     .unwrap();
     static ref OHTTP_CHAIN_TIP_AGE_SECONDS: IntGaugeVec = IntGaugeVec::new(
-        Opts::new("ohttp_chain_tip_age_seconds", "Seconds since the chain follower's leader last moved the stored tip, as this process sees it (-1 = unknown)"),
+        Opts::new("ohttp_chain_tip_age_seconds", "Seconds since the chain follower's leader last moved the stored tip, as this process sees it (-1 = unknown); on a follower at least as long as it has read the same stored record"),
+        &["network"]
+    )
+    .unwrap();
+    static ref OHTTP_CHAIN_TIP_TIME_AHEAD_SECONDS: IntGaugeVec = IntGaugeVec::new(
+        Opts::new("ohttp_chain_tip_time_ahead_seconds", "Seconds the stored tip_at was ahead of this process's clock at its last read as a chain follower or at a takeover (0 = not ahead, or no tip_at): a discrepancy between the stored time and this clock (a writer clock ahead, this clock behind, or a clock step)"),
         &["network"]
     )
     .unwrap();
@@ -1406,6 +1412,21 @@ pub fn record_chain_tip_age(network: &str, age: Option<std::time::Duration>) {
     OHTTP_CHAIN_TIP_AGE_SECONDS
         .with_label_values(&[network])
         .set(age.map_or(-1, |a| a.as_secs() as i64));
+}
+
+/// How far the stored `tip_at` was ahead of this process's clock at its last read as a
+/// follower or at a takeover (zero when it was not, or without a `tip_at`).
+pub fn record_chain_tip_time_ahead(network: &str, ahead: std::time::Duration) {
+    OHTTP_CHAIN_TIP_TIME_AHEAD_SECONDS
+        .with_label_values(&[network])
+        .set(ahead.as_secs() as i64);
+}
+
+#[cfg(test)]
+pub(crate) fn chain_tip_time_ahead(network: &str) -> i64 {
+    OHTTP_CHAIN_TIP_TIME_AHEAD_SECONDS
+        .with_label_values(&[network])
+        .get()
 }
 
 /// `action`: local_tip | takeover.

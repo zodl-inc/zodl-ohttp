@@ -18,7 +18,8 @@
 //! test Redis, through a proxy that loses one message of the first `SET NX`: its reply (the
 //! nonce was stored, the answer never came), or the command itself (nothing was stored). The
 //! retry goes over another connection to the store (`SET key value NX GET`) and tells new from
-//! held. Needs the test Redis on 127.0.0.1:6379 (Redis >= 7.0); in CI a missing one fails.
+//! held. Needs the test Redis on 127.0.0.1:6379 (Redis >= 7.0): without it the tests fail, unless
+//! `OHTTP_TEST_ALLOW_NO_STORE=1` outside CI (then they return early).
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -233,21 +234,31 @@ fn command_args(frame: &[u8]) -> Vec<Vec<u8>> {
     args
 }
 
-/// Whether the test Redis answers; in CI a missing one fails the test.
-async fn redis_up() -> bool {
-    let up = TcpStream::connect(REDIS).await.is_ok();
-    if !up && std::env::var("CI").is_ok() {
-        panic!("the test Redis is not reachable in CI");
+/// The connection to the test Redis (database 9) the tests use, or None when they are to be
+/// skipped: its first connection is bounded (5 s), and a missing store fails the test unless
+/// `OHTTP_TEST_ALLOW_NO_STORE=1` and `CI` is not set (then the test returns early, with one
+/// line on stderr: the policy of the crate's own store-backed tests).
+async fn test_store() -> Option<redis::aio::MultiplexedConnection> {
+    let connect = async {
+        redis::Client::open(format!("redis://{REDIS}/9"))?
+            .get_multiplexed_async_connection()
+            .await
+    };
+    let error = match tokio::time::timeout(Duration::from_secs(5), connect).await {
+        Ok(Ok(conn)) => return Some(conn),
+        Ok(Err(e)) => e.to_string(),
+        Err(_) => "no connection within 5 s".to_string(),
+    };
+    let ci = std::env::var_os("CI").is_some();
+    let allowed = std::env::var("OHTTP_TEST_ALLOW_NO_STORE").is_ok_and(|v| v == "1");
+    if !ci && allowed {
+        eprintln!("test skipped: the test store {REDIS} is not reachable ({error}) and OHTTP_TEST_ALLOW_NO_STORE=1");
+        return None;
     }
-    up
-}
-
-async fn redis() -> redis::aio::MultiplexedConnection {
-    redis::Client::open(format!("redis://{REDIS}/9"))
-        .unwrap()
-        .get_multiplexed_async_connection()
-        .await
-        .unwrap()
+    panic!(
+        "the test store {REDIS} is not reachable: {error}. Run a Redis there (CI has one as a \
+         service), or set OHTTP_TEST_ALLOW_NO_STORE=1 outside CI to skip the tests that need it"
+    );
 }
 
 fn unique_key(tag: &str) -> String {
@@ -283,19 +294,19 @@ async fn peer(port: u16) -> ReplayPeers {
     peers
 }
 
-async fn exists(key: &str) -> bool {
+async fn exists(store: &mut redis::aio::MultiplexedConnection, key: &str) -> bool {
     redis::cmd("EXISTS")
         .arg(key)
-        .query_async::<_, bool>(&mut redis().await)
+        .query_async::<_, bool>(store)
         .await
         .unwrap()
 }
 
 #[tokio::test]
 async fn a_lost_reply_of_a_set_nx_that_landed_is_new_on_the_retry() {
-    if !redis_up().await {
+    let Some(mut store) = test_store().await else {
         return;
-    }
+    };
     let (proxy, port) = Proxy::start().await;
     let peers = peer(port).await;
     let key = unique_key("lost-reply");
@@ -304,14 +315,14 @@ async fn a_lost_reply_of_a_set_nx_that_landed_is_new_on_the_retry() {
         peers.write_nonce_retrying(&key, 60).await,
         vec![PeerOutcome::Fresh]
     );
-    assert!(exists(&key).await);
+    assert!(exists(&mut store, &key).await);
 }
 
 #[tokio::test]
 async fn a_lost_set_nx_is_stored_by_the_retry() {
-    if !redis_up().await {
+    let Some(mut store) = test_store().await else {
         return;
-    }
+    };
     let (proxy, port) = Proxy::start().await;
     let peers = peer(port).await;
     let key = unique_key("lost-request");
@@ -320,14 +331,17 @@ async fn a_lost_set_nx_is_stored_by_the_retry() {
         peers.write_nonce_retrying(&key, 60).await,
         vec![PeerOutcome::Fresh]
     );
-    assert!(exists(&key).await, "nil on the retry: stored by it");
+    assert!(
+        exists(&mut store, &key).await,
+        "nil on the retry: stored by it"
+    );
 }
 
 #[tokio::test]
 async fn a_nonce_held_by_another_request_is_a_replay_on_the_retry() {
-    if !redis_up().await {
+    let Some(mut store) = test_store().await else {
         return;
-    }
+    };
     let (proxy, port) = Proxy::start().await;
     let peers = peer(port).await;
     let key = unique_key("held");
@@ -336,7 +350,7 @@ async fn a_nonce_held_by_another_request_is_a_replay_on_the_retry() {
         .arg("1")
         .arg("EX")
         .arg(60)
-        .query_async(&mut redis().await)
+        .query_async(&mut store)
         .await
         .unwrap();
     proxy.arm(DROP_REPLY);
@@ -348,9 +362,9 @@ async fn a_nonce_held_by_another_request_is_a_replay_on_the_retry() {
 
 #[tokio::test]
 async fn the_retry_works_while_the_main_connection_is_replaced() {
-    if !redis_up().await {
+    let Some(_store) = test_store().await else {
         return;
-    }
+    };
     let (proxy, port) = Proxy::start().await;
     let peers = peer(port).await;
     let key = unique_key("replaced");
@@ -375,9 +389,9 @@ async fn the_retry_works_while_the_main_connection_is_replaced() {
 /// connection.
 #[tokio::test]
 async fn the_retry_works_without_a_wait_pool() {
-    if !redis_up().await {
+    let Some(mut store) = test_store().await else {
         return;
-    }
+    };
     let (proxy, port) = Proxy::start().await;
     let peers = ReplayPeers::connect(
         &[format!("redis://127.0.0.1:{port}/9")],
@@ -396,7 +410,7 @@ async fn the_retry_works_without_a_wait_pool() {
         peers.write_nonce_retrying(&key, 60).await,
         vec![PeerOutcome::Fresh]
     );
-    assert!(exists(&key).await);
+    assert!(exists(&mut store, &key).await);
 }
 
 /// `sync` mode with REPLAY_PEER_FAIL_CLOSED=1: a peer whose `SET NX` timed out on the check is
@@ -404,9 +418,9 @@ async fn the_retry_works_without_a_wait_pool() {
 /// (a READ as well as a WRITE).
 #[tokio::test]
 async fn a_strict_sync_peer_that_timed_out_is_retried_after_classification() {
-    if !redis_up().await {
+    let Some(_store) = test_store().await else {
         return;
-    }
+    };
     let (proxy, port) = Proxy::start().await;
     let network = "testnet-retry-strict";
     let peers = ReplayPeers::connect(
@@ -463,9 +477,9 @@ async fn a_strict_sync_peer_that_timed_out_is_retried_after_classification() {
 /// connection the retry used is replaced, and the pool is whole and usable again afterwards.
 #[tokio::test]
 async fn a_retry_without_an_answer_replaces_its_connection() {
-    if !redis_up().await {
+    let Some(_store) = test_store().await else {
         return;
-    }
+    };
     let (proxy, port) = Proxy::start().await;
     let peers = peer(port).await;
     let key = unique_key("retry-lost");

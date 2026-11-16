@@ -50,7 +50,8 @@ calls.
 
 ```bash
 cargo build --release            # binary target/release/ohttp-gateway
-cargo test                       # Redis-backed tests need a Redis on 127.0.0.1:6379, else they are skipped
+cargo test                       # store-backed tests need a Redis on 127.0.0.1:6379 and fail without it;
+                                 # OHTTP_TEST_ALLOW_NO_STORE=1 skips them instead (ignored when CI is set)
 docker build -t ohttp-gateway .  # from this directory
 ```
 
@@ -137,9 +138,15 @@ chain state:
   successor wrote or move the tip back. Followers keep the tip fresh only while the leader
   confirms it (`{chain}tip_seen`); the leader confirms a tip only for 10 minutes after it
   moved (`{chain}tip_at`, whichever process wrote it), so a lightwalletd stuck at or behind the
-  tip cannot keep it fresh, and one that stays behind gives the lock up. A `tip_at` ahead of a
-  new leader's clock counts from its takeover; a tip that moves while `tip_at` stays (a leader
-  that writes neither key, after a rollback) is followed as one without `tip_at`. A tip a
+  tip cannot keep it fresh, and one that stays behind gives the lock up. A tip's age is at
+  least as long as a process has read the same stored record on its own clock, so a `tip_at`
+  ahead of a process's clock delays neither its stale-leader probe nor, after it takes the
+  lock, the end of the confirmations by more than the bound after its first read of that
+  record. A tip that moves while `tip_at` stays (a leader that writes neither key, after a
+  rollback) is followed as one without `tip_at`, unless the stamp the leader writes with
+  every `tip_at` (`{chain}tip_stamp`, in the same script) vouches for the read: it names
+  exactly that tip and time, the process remembers no leftover verdict for that time, and it
+  did not read the same stamp value before next to another stored tip. A tip a
   follower serves from its own lightwalletd ahead of a stale leader is dropped when the stored
   chain forks under it, when the lock is taken while that cannot be checked, and, as leader,
   when it indexes a lower tip of another fork.
@@ -230,7 +237,7 @@ trace ids are never labels. `network` is `NETWORK`.
 | `ohttp_cache_redis_connected` | `network` | Cache Redis connection. |
 | `ohttp_security_redis_connected` | `network` | Security Redis PING (0 also when not configured). |
 | `ohttp_redis_op_timeout_total` | `network, operation` | Redis operation timeouts. |
-| `ohttp_cache_requests_total` | `network, rpc, result` | Cache lookups by result. Also counts answers not stored: `not_positioned`, `not_indexed`. |
+| `ohttp_cache_requests_total` | `network, rpc, result` | Cache lookups by result. Also counts answers not stored: `not_positioned`, `not_indexed`. The pinned backfill and sweep count under `rpc="GetTreeState"` (see `PINNED_BACKFILL_WORKERS` in CONFIG.md), among them `pinned_fetch_detached`: a sweep fill was abandoned while one of its upstream calls was in flight (the call runs to its end, its answer unused). |
 | `ohttp_cache_tip_mismatch_total` | `network, rpc, phase` | Tip-scoped answers not at the tip of their key: `store` (not cached), `lookup` (a stored entry deleted and fetched again; the request counts as a miss above). |
 | `ohttp_cache_tip_height` | `network` | Tip height known to the cache. |
 | `ohttp_local_cache_total` | `network, result` | In-process LRU `hit`, `miss`, `oversized`. |
@@ -243,7 +250,8 @@ trace ids are never labels. `network` is `NETWORK`.
 | `ohttp_permanent_writes_skipped_total` | `network, op` | Permanent tier writes not sent to a replica. |
 | `ohttp_block_permanent_total` | `network, result` | Permanent tier `hit`, `miss`, `stored`, `promoted`, `backfilled`. |
 | `ohttp_chain_leader` | `network` | 1 while this process leads the chain follower. |
-| `ohttp_chain_tip_age_seconds` | `network` | Seconds since the leader last moved the stored tip, as this process sees it (`-1`: unknown). |
+| `ohttp_chain_tip_age_seconds` | `network` | Seconds since the leader last moved the stored tip, as this process sees it (`-1`: unknown); on a follower at least as long as it has read the same stored record (its own clock), so a `tip_at` ahead of its clock does not read as a fresh tip for longer than that. |
+| `ohttp_chain_tip_time_ahead_seconds` | `network` | How far the stored `tip_at` was ahead of this process's clock at its last read as a follower or at a takeover (`0`: not ahead, or no `tip_at`): a discrepancy between the stored time and this clock (a writer clock ahead, this clock behind, or a clock step). |
 | `ohttp_chain_stale_leader_total` | `network, action` | Times this process found the stored tip unmoved past `CHAIN_TIP_STALE_SECS` with its own lightwalletd ahead: `local_tip` (served its own tip), `takeover` (took the leader lock). |
 | `ohttp_chain_reorgs_total` | `network` | Reorgs detected. |
 | `ohttp_chain_reorg_depth` | - | Blocks invalidated per reorg (histogram). |

@@ -194,6 +194,71 @@ keeps its own log in [client/CHANGELOG.md](client/CHANGELOG.md).
   upstream is not taken as a verdict about the height, since lightwalletd answers every
   failure of this call, an unreachable node included, with the same status. A batch whose
   heights are all holes still moves the mark on.
+- A follower bounds the age of the stored tip from below by how long it has read the same
+  stored record (the tip, its `tip_at` and, when the stamp below vouches for the read, the
+  stamp's nonce) on its own monotonic clock. A `tip_at` ahead of a follower's clock (a writer
+  clock ahead, or its own clock behind) read as an age of 0 for the skew, which delayed by as
+  much the stale-leader probe and the takeover after it, the 10-minute bound on following a
+  leader that does not confirm, and, after a takeover, the new leader's confirmation bound. Each
+  of them now comes at the same read as before or at an earlier one: a follower meets the
+  probe condition `CHAIN_TIP_STALE_SECS` after its first read of an unmoved record, whatever
+  the skew, and a process that takes the lock counts the confirmation bound from its first
+  read of that record as a follower (from the takeover without one, as before). Nothing stored
+  changes. Another record starts the count again (also when the stamp key is lost); a read
+  with a tip and no `tip_at` that counts clears it, a read that returns no tip (a store error,
+  no key) leaves it, and a `tip_at` the process writes as leader clears it.
+  `ohttp_chain_tip_age_seconds` on followers reports the larger of the two ages. New gauge
+  `ohttp_chain_tip_time_ahead_seconds{network}`: how far the stored `tip_at` was ahead of the
+  process's clock at its last read as a follower or at a takeover (0 when it was not, or
+  without a `tip_at`): a discrepancy between the stored time and this clock (a writer clock
+  ahead, this clock behind, or a clock step), not a proven cause. One warning per record when
+  the probe condition is met by the local count alone.
+- New chain key `{chain}tip_stamp` =
+  `1:<tip_at, Unix ms>:<nonce, 16 lowercase hex digits>:<lowercase hex of the stored tip value>`,
+  written by the leader in the same fenced script as every `tip_at` it writes (with a new tip,
+  and the pending `tip_at` of the first confirmation of a tip taken over without one), with a
+  new random nonce per write and the TTL of the other chain keys; never without `tip_at`, never
+  for a `tip_at` it only read. Followers (and a process taking the lock) read it in the same
+  `MGET` as the tip and use it as positive evidence only: a stamp that names exactly the stored
+  tip and `tip_at` makes that `tip_at` the tip's time, unless the process remembers a leftover
+  verdict for that `tip_at`, or read this stamp value before next to another stored tip (a
+  leader that writes no `tip_at` moved the tip away and back). Two tips written with the same
+  millisecond, a handover between leaders with skewed clocks and reads a follower missed are
+  thus no longer taken for a tip written without its time while the stamp is there. Any other
+  stamp (absent, unparsable, another tip or time) leaves the inference from two reads as it
+  was. Mixed versions: older followers ignore the key, older leaders do not write it (followers
+  of this version then infer as before); the other keys keep their format, meaning and
+  writers' rules; after a rollback the key expires.
+- A fill of the pinned sweep that is abandoned (another store chosen, its claim lost, or its
+  60 s fill timeout) no longer cancels its upstream `GetTreeState` call in flight: the sweep's
+  calls run in a task of their own and the fill only stops waiting for it; the call runs to
+  its own end and its answer is dropped, no write is started for it (as before, a store
+  command already sent completes on the store it was bound to: an idempotent `SET NX` of a
+  finalized height). A cancelled call can cost the node behind lightwalletd an RPC slot. Each
+  call holds one of 3 permits per cache from before it is spawned until its task is gone
+  (completed, panicked, or dropped at shutdown), so at most 3 sweep-started upstream calls are
+  alive per cache, awaited or abandoned. A fill waits for a permit only while all three are,
+  within its fill timeout (checking every pause whether its store is still the one chosen; the wait is not an
+  attempt), and one that got none ends like a fill that timed out (no answer: the height
+  becomes a hole of the batch, nothing counted against it). A call that panics is a failed
+  attempt. New `ohttp_cache_requests_total{rpc="GetTreeState",result="pinned_fetch_detached"}`:
+  a sweep fill was abandoned while one of its calls was in flight. The backfill workers are
+  unchanged (they never abandon a fill). The fetch given to the backfill must end by itself
+  within a bound; the gateway's (`proxy::forward_to_backend`) is bounded as a whole by
+  `LWD_TIMEOUT_SECS`.
+- The gateway's store-backed tests (the test Redis on `127.0.0.1:6379`) follow one policy:
+  with the store they run; without it they fail, with a message naming the store address, the
+  error of the first connection and the opt-out. New test-only `OHTTP_TEST_ALLOW_NO_STORE=1`
+  makes them return early instead (passed, one line on stderr), and is ignored when `CI` is
+  set. Before, most of them were skipped silently without a store unless `CI` was set. For
+  the cache, store-connection and `tests/set_nx_retry.rs` tests the check is the test's own
+  first connection (bounded to 5 s); the handler tests (`store_up`) probe with a bounded
+  connection of their own, as they connect through their configuration. A store lost during
+  a test fails it. A test store that refuses `CONFIG SET appendonly` (an error reply; needed
+  by the local AOF test) is handled by the same policy (it passed silently); a store lost
+  there fails the test. `tests/store_failover.rs` (opt-in by `OHTTP_FAILOVER_REDIS`, its own
+  primary/replica pair) and `cache_retry_test.rs` (uses the store only if it is there) keep
+  their own rules. No production code changes.
 - Known limits of the chain follower and the pinned backfill after these changes:
   - The drop of a held tip on a scheduled probe without a new observation applies to a held
     tip that is still held when the probe starts (the stored tip is not on its own chain).
@@ -202,21 +267,37 @@ keeps its own log in [client/CHANGELOG.md](client/CHANGELOG.md).
     observation of the process's own lightwalletd tip, as before these changes: a stored tip
     that has not moved for the stale bound while its own lightwalletd is ahead is what the
     stale-leader handling serves.
-  - A `tip_at` ahead of the clocks stays stored until the tip next moves, and a follower's
-    own clock skew is not compensated. The leader stops confirming at the bound counted from
-    its takeover, and followers need every confirmation. (Rewriting `tip_at` with a
-    confirmation would change a key older versions read.)
-  - A stored tip that changes while `tip_at` does not is taken for one written without its
-    time. That is also the case for two tips written with the same millisecond by a leader of
-    a previous version or across a handover between leaders with skewed clocks, and for a
-    follower that missed the reads in between; the tip is then followed as one without
-    `tip_at` until `tip_at` changes. (Telling these apart needs a writer epoch in the store,
-    a change of the protocol between versions.)
-  - A sweep fill abandoned because the store changed cancels its upstream call in flight, as
-    the fill timeout and a lost claim do: at most one call per worker per change of store.
-    (Letting it run would hold the batch's claim for the fetch timeout.)
-  - The store-backed tests fail without a test store only when `CI` is set; elsewhere they
-    are skipped, as the rest of the suite's store-backed tests are.
+  - A `tip_at` ahead of the clocks stays stored until the tip next moves (rewriting it with a
+    confirmation would change a key older versions read): processes of this version bound
+    its age by their own reads of the record, older followers in a mixed fleet keep their
+    uncompensated age. A process restarted during a stall (every process, after a restart of
+    the whole fleet) counts again from its first read while the skew lasts; the store's clock
+    is not used. The local count can exceed the record's age only after a state the process
+    missed: a leader of an earlier version moved the tip away and back to the same block with
+    the same `tip_at` value between two of its reads (the same millisecond again, or no
+    `tip_at` written at all), or the store went back to an older copy of the record (a
+    failover that lost writes); the effects are those of a writer clock behind (probes of its
+    own lightwalletd, a takeover only with that lightwalletd ahead twice, an early end of the
+    refresh under a leader that does not confirm, or of a taken-over tip's confirmations).
+    After a takeover the age origin is a wall-clock value again, so a backward step of the
+    leader's clock extends its confirmation bound by the step, as before.
+  - Without a stamp that vouches for the read the inference from two reads keeps its limits:
+    for tips written by a leader of an earlier version (a rolling upgrade, a rollback) and a
+    tip a leader took over without rewriting `tip_at`, until a leader of this version writes
+    the next tip; when the stamp key alone was lost (evicted) while `tip_at` stays (with
+    writers of this version a wrong verdict then needs the same millisecond twice); a process
+    that starts under a leader that writes no `tip_at` trusts a leftover `tip_at` on its first
+    read, as before (the stamp never says "leftover"); and a leftover verdict stays until
+    `tip_at` changes.
+  - An abandoned sweep call keeps the request-path concurrency permits it holds until it
+    ends (up to 3 sweep calls per cache instead of 1). Upstream calls are still cancelled by
+    the fetch's own timeouts, by the losing attempt of a hedged read, and when the process or
+    runtime stops, as on every request path. A sweep fill that waits for a permit (three
+    sweep-started calls alive) is delayed up to its fill timeout; a fetch that never
+    ended would keep its permit (the gateway's is bounded by `LWD_TIMEOUT_SECS`).
+  - With `OHTTP_TEST_ALLOW_NO_STORE=1` outside CI the store-backed tests pass without
+    running (each prints one line); only their first connection is checked, a store lost
+    later fails the test.
 - A pinned store whose `ROLE` does not answer in time (or fails on the connection) is treated as
   not writable and asked again after 30 s, instead of as writable: pinned writes and the
   backfill wait meanwhile. A store without the `ROLE` command (an error answer) stays writable.

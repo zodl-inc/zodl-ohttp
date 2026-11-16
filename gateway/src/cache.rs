@@ -84,6 +84,11 @@ const PINNED_SWEEP_HOLES_PER_PASS: u64 = 100;
 const PINNED_SWEEP_CLAIM_TTL: Duration = Duration::from_secs(120);
 /// Bound of one height's fill by the sweep (three fetch attempts and their pauses).
 const PINNED_SWEEP_FILL_TIMEOUT: Duration = Duration::from_secs(60);
+/// Upstream calls the pinned sweep of one cache may have alive at a time, awaited or abandoned
+/// (a fill that is abandoned stops waiting for its call and lets it run to its own end, see
+/// `pinned_fill`, `FillMode::Detached`). A fill waits for a permit, within its fill timeout,
+/// only while all of them are alive.
+const PINNED_SWEEP_FETCH_PERMITS: usize = 3;
 /// The unit of the pauses between the attempts of one fill (1, 3 and 5 units after the first,
 /// second and third failed attempt). Shorter in tests, which wait for them in real time.
 const PINNED_FILL_PAUSE: Duration = if cfg!(test) {
@@ -219,6 +224,10 @@ pub struct ResponseCache {
     /// held, so a refresh from the local store and a switch for a bump seen at a peer never
     /// overwrite each other.
     epoch_state: Arc<parking_lot::Mutex<EpochState>>,
+    /// The permits of the upstream calls the pinned sweep starts (PINNED_SWEEP_FETCH_PERMITS,
+    /// shared by the clones): each call holds one from before it is spawned until its task is
+    /// gone (`pinned_fill`, `FillMode::Detached`).
+    pinned_sweep_fetch_permits: Arc<tokio::sync::Semaphore>,
 }
 
 /// The shared epoch's state besides its value (`ResponseCache::epoch`, written under the same
@@ -2939,6 +2948,9 @@ impl ResponseCache {
                 Duration::from_secs(DEFAULT_REPLAY_FALLBACK_HEALTH_WINDOW_SECS),
             )),
             epoch_state: Arc::default(),
+            pinned_sweep_fetch_permits: Arc::new(tokio::sync::Semaphore::new(
+                PINNED_SWEEP_FETCH_PERMITS,
+            )),
         };
 
         if cache.cache_conn.load().is_none() {
@@ -6959,27 +6971,50 @@ enum Fill {
     Superseded,
 }
 
+/// How `pinned_fill` runs its upstream calls.
+#[derive(Clone, Copy)]
+enum FillMode<'a> {
+    /// Awaited in the fill (the backfill workers, which never abandon a fill).
+    Inline,
+    /// In a task of their own under one of these permits (the sweep, whose fills are abandoned
+    /// on a change of store, a lost claim and the fill timeout): abandoning the fill drops only
+    /// the wait, the call runs to its own end and its answer is dropped. Cancelling a call in
+    /// flight can cost the node behind lightwalletd a slot.
+    Detached(&'a Arc<tokio::sync::Semaphore>),
+}
+
 /// Fetch and store the pinned entry of `height` through `writer`: three attempts, with a pause
 /// after each failed one. Stops at once, without a write, when `writer` is superseded. An
 /// error status of the upstream says nothing about the height (lightwalletd answers every
 /// failure of this call with the same status, an unreachable node included), so every failed
-/// height is retried the same way.
+/// height is retried the same way. `mode`: how the upstream calls run (see [`FillMode`]); a
+/// detached call that panicked is a failed attempt.
 async fn pinned_fill<F, Fut>(
     cache: &ResponseCache,
     fetch: &F,
     height: u64,
     writer: &PinnedWriter,
+    mode: FillMode<'_>,
 ) -> Fill
 where
     F: Fn(u64) -> Fut,
-    Fut: std::future::Future<Output = anyhow::Result<Vec<u8>>>,
+    Fut: std::future::Future<Output = anyhow::Result<Vec<u8>>> + Send + 'static,
 {
     let mut answered = false;
     for attempt in 0..3u64 {
         if !cache.pinned_writer_current(writer) {
             return Fill::Superseded;
         }
-        match fetch(height).await {
+        let answer = match mode {
+            FillMode::Inline => fetch(height).await,
+            FillMode::Detached(permits) => {
+                match detached_fetch(cache, fetch, height, writer, permits).await {
+                    Some(answer) => answer,
+                    None => return Fill::Superseded,
+                }
+            }
+        };
+        match answer {
             Ok(resp) => {
                 answered = true;
                 match cache.pinned_put_bound(writer, height, &resp).await {
@@ -6998,6 +7033,83 @@ where
         Fill::Answered
     } else {
         Fill::NoAnswer
+    }
+}
+
+/// One detached attempt of `pinned_fill` (`FillMode::Detached`): wait for a permit, checking
+/// `writer` every PINNED_FILL_PAUSE (the wait is not an attempt), check it again, then run the
+/// call in a task of its own that holds the permit, and wait for it. None when `writer` was
+/// superseded before the call started. When the caller stops waiting (the fill is abandoned)
+/// the call goes on to its own end and nothing uses its answer; that is counted
+/// (`result="pinned_fetch_detached"`).
+async fn detached_fetch<F, Fut>(
+    cache: &ResponseCache,
+    fetch: &F,
+    height: u64,
+    writer: &PinnedWriter,
+    permits: &Arc<tokio::sync::Semaphore>,
+) -> Option<anyhow::Result<Vec<u8>>>
+where
+    F: Fn(u64) -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<Vec<u8>>> + Send + 'static,
+{
+    let permit = loop {
+        if !cache.pinned_writer_current(writer) {
+            return None;
+        }
+        match timeout(PINNED_FILL_PAUSE, permits.clone().acquire_owned()).await {
+            Ok(Ok(permit)) => break permit,
+            Ok(Err(_)) => return Some(Err(anyhow::anyhow!("pinned sweep: no call permits"))),
+            Err(_) => {
+                #[cfg(test)]
+                test_hooks::permit_waited(&cache.network);
+            }
+        }
+    };
+    if !cache.pinned_writer_current(writer) {
+        return None;
+    }
+    let mut waiter = DetachedWaiter {
+        network: &cache.network,
+        call: spawn_with_permit(permit, fetch(height)),
+        armed: true,
+    };
+    let joined = (&mut waiter.call).await;
+    waiter.armed = false;
+    Some(joined.unwrap_or_else(|e| Err(anyhow::anyhow!("pinned sweep: upstream call task: {e}"))))
+}
+
+/// Spawn `fut` holding `permit` until its task is gone: the permit is moved into the future
+/// before the spawn, so it is released exactly once, whether the task completes, panics or is
+/// dropped without ever running (a runtime that shuts down).
+fn spawn_with_permit<T: Send + 'static>(
+    permit: tokio::sync::OwnedSemaphorePermit,
+    fut: impl std::future::Future<Output = T> + Send + 'static,
+) -> tokio::task::JoinHandle<T> {
+    tokio::spawn(async move {
+        let _permit = permit;
+        fut.await
+    })
+}
+
+/// The wait for a detached upstream call: counts the call when the waiter is dropped before
+/// its result arrived while the call is still running (`result="pinned_fetch_detached"`); not
+/// once the result arrived, nor for a call that already ended in the same poll.
+struct DetachedWaiter<'a, T> {
+    network: &'a str,
+    call: tokio::task::JoinHandle<T>,
+    armed: bool,
+}
+
+impl<T> Drop for DetachedWaiter<'_, T> {
+    fn drop(&mut self) {
+        if self.armed && !self.call.is_finished() {
+            crate::health::record_cache_request(
+                self.network,
+                "GetTreeState",
+                "pinned_fetch_detached",
+            );
+        }
     }
 }
 
@@ -7091,6 +7203,12 @@ impl<'a> SweepClaim<'a> {
     /// such command, checked by its token. A renewal that fails once the store was replaced
     /// counts as superseded, not as a lost claim. The two reasons are told apart (`SweepFill`): only a superseded fill is
     /// counted as one.
+    ///
+    /// The upstream calls run detached (`FillMode::Detached`, under the cache's
+    /// PINNED_SWEEP_FETCH_PERMITS): an abandoned fill (superseded, claim lost, fill timeout)
+    /// stops waiting for its call in flight without cancelling it, and writes nothing of its
+    /// answer. A fill that waits for a permit meanwhile is superseded, loses its claim or
+    /// times out (`Fill::NoAnswer`) the same way.
     async fn fill<F, Fut>(
         &self,
         cache: &ResponseCache,
@@ -7100,17 +7218,28 @@ impl<'a> SweepClaim<'a> {
     ) -> SweepFill
     where
         F: Fn(u64) -> Fut,
-        Fut: std::future::Future<Output = anyhow::Result<Vec<u8>>>,
+        Fut: std::future::Future<Output = anyhow::Result<Vec<u8>>> + Send + 'static,
     {
+        #[cfg(test)]
+        let (fill_timeout, renew_every) = test_hooks::sweep_timings(&cache.network)
+            .unwrap_or((PINNED_SWEEP_FILL_TIMEOUT, PINNED_SWEEP_CLAIM_TTL / 4));
+        #[cfg(not(test))]
+        let (fill_timeout, renew_every) = (PINNED_SWEEP_FILL_TIMEOUT, PINNED_SWEEP_CLAIM_TTL / 4);
         if !self.renew().await {
             return self.not_renewed(cache, writer);
         }
         let fill = timeout(
-            PINNED_SWEEP_FILL_TIMEOUT,
-            pinned_fill(cache, fetch, height, writer),
+            fill_timeout,
+            pinned_fill(
+                cache,
+                fetch,
+                height,
+                writer,
+                FillMode::Detached(&cache.pinned_sweep_fetch_permits),
+            ),
         );
         tokio::pin!(fill);
-        let mut renewal = tokio::time::interval(PINNED_SWEEP_CLAIM_TTL / 4);
+        let mut renewal = tokio::time::interval(renew_every);
         renewal.tick().await;
         let mut superseded = tokio::time::interval(PINNED_SWEEP_SUPERSEDED_CHECK);
         superseded.tick().await;
@@ -7248,7 +7377,9 @@ struct SweepPass {
 /// that choice): once another store is chosen, the pass writes nothing more there (no claim,
 /// fill, hole or mark) and ends; the next pass chooses its store again. A fill in flight then
 /// is abandoned within a second plus the bound of one claim command (see `SweepClaim::fill`), counted
-/// (`pinned_sweep_superseded`; a fill whose claim was lost is not), and its claim released.
+/// (`pinned_sweep_superseded`; a fill whose claim was lost is not), and its claim released. The
+/// upstream call of an abandoned fill is not cancelled: it runs to its own end and its answer is
+/// not used (`pinned_fetch_detached`, see `FillMode::Detached`).
 ///
 /// `Err` on a store error: the next pass resumes from the mark.
 async fn pinned_sweep_pass<F, Fut>(
@@ -7260,7 +7391,7 @@ async fn pinned_sweep_pass<F, Fut>(
 ) -> anyhow::Result<SweepPass>
 where
     F: Fn(u64) -> Fut,
-    Fut: std::future::Future<Output = anyhow::Result<Vec<u8>>>,
+    Fut: std::future::Future<Output = anyhow::Result<Vec<u8>>> + Send + 'static,
 {
     let conn = &writer.conn;
     let current = || cache.pinned_writer_current(writer);
@@ -7630,6 +7761,13 @@ where
 /// nothing to the store it no longer belongs to (the worker counts the height it had claimed,
 /// `pinned_backfill_superseded`).
 ///
+/// `fetch` must end by itself within a bound: the sweep does not cancel an upstream call when
+/// it abandons the fill that started it (`FillMode::Detached`), so a call that never ended would
+/// keep one of the cache's PINNED_SWEEP_FETCH_PERMITS for good (with all of them held, the
+/// sweep's fills wait for one and time out as `NoAnswer`; the workers are not affected). The
+/// gateway's fetch (`proxy::forward_to_backend`) is bounded as a whole, connection, response
+/// head and body, by the upstream request timeout (`LWD_TIMEOUT_SECS`).
+///
 /// Returns the handles of the tasks it spawned (the sweep, then the workers).
 pub fn spawn_pinned_backfill<F, Fut>(
     cache: ResponseCache,
@@ -7779,7 +7917,9 @@ where
                     if cache.pinned_exists_at(&conn, height).await {
                         continue;
                     }
-                    let stored = match pinned_fill(&cache, &fetch, height, &writer).await {
+                    let stored = match pinned_fill(&cache, &fetch, height, &writer, FillMode::Inline)
+                        .await
+                    {
                         Fill::Superseded => {
                             // The height was claimed on the store it no longer writes to:
                             // counted (that store's sweep finds it if it is chosen again).
@@ -8392,6 +8532,53 @@ mod test_hooks {
         }
     }
 
+    type SweepTimings = (std::time::Duration, std::time::Duration);
+    static SWEEP_TIMINGS: Mutex<Option<HashMap<String, SweepTimings>>> = Mutex::new(None);
+
+    /// The sweep fills of `network` use `fill_timeout` instead of PINNED_SWEEP_FILL_TIMEOUT and
+    /// renew their claim every `renew_every` (None: the defaults again).
+    pub fn set_sweep_timings(network: &str, timings: Option<SweepTimings>) {
+        let mut all = SWEEP_TIMINGS.lock().unwrap();
+        let all = all.get_or_insert_with(HashMap::new);
+        match timings {
+            Some(t) => {
+                all.insert(network.to_string(), t);
+            }
+            None => {
+                all.remove(network);
+            }
+        }
+    }
+
+    pub fn sweep_timings(network: &str) -> Option<SweepTimings> {
+        SWEEP_TIMINGS
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|m| m.get(network).copied())
+    }
+
+    static PERMIT_WAITS: Mutex<Option<HashMap<String, usize>>> = Mutex::new(None);
+
+    /// A sweep fill of `network` waited one pause for a call permit (none was free).
+    pub fn permit_waited(network: &str) {
+        *PERMIT_WAITS
+            .lock()
+            .unwrap()
+            .get_or_insert_with(HashMap::new)
+            .entry(network.to_string())
+            .or_default() += 1;
+    }
+
+    pub fn permit_waits(network: &str) -> usize {
+        PERMIT_WAITS
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|m| m.get(network).copied())
+            .unwrap_or(0)
+    }
+
     pub fn backfill_resolutions(network: &str) -> usize {
         RESOLVED
             .lock()
@@ -8487,12 +8674,64 @@ mod tests {
                 Duration::from_secs(DEFAULT_REPLAY_FALLBACK_HEALTH_WINDOW_SECS),
             )),
             epoch_state: Arc::default(),
+            pinned_sweep_fetch_permits: Arc::new(tokio::sync::Semaphore::new(
+                PINNED_SWEEP_FETCH_PERMITS,
+            )),
         }
     }
 
+    /// The test store (`store::test_support::TEST_STORE`), or None when the test is to be
+    /// skipped: its absence fails the test unless `OHTTP_TEST_ALLOW_NO_STORE=1` outside CI
+    /// (`store::test_support::store_policy`). The check is this first connection (bounded);
+    /// a store lost later fails the test.
     async fn local_redis() -> Option<ConnectionManager> {
-        let client = redis::Client::open("redis://127.0.0.1:6379").ok()?;
-        ConnectionManager::new(client).await.ok()
+        use crate::store::test_support::{store_missing, STORE_CONNECT_TIMEOUT, TEST_STORE};
+        let url = format!("redis://{TEST_STORE}");
+        let connect = async {
+            let client = redis::Client::open(url.as_str())?;
+            ConnectionManager::new(client).await
+        };
+        let what = format!("the test store {url}");
+        match timeout(STORE_CONNECT_TIMEOUT, connect).await {
+            Ok(Ok(conn)) => Some(conn),
+            Ok(Err(e)) => {
+                store_missing(&what, &e);
+                None
+            }
+            Err(_) => {
+                store_missing(
+                    &what,
+                    &format!("no connection within {STORE_CONNECT_TIMEOUT:?}"),
+                );
+                None
+            }
+        }
+    }
+
+    /// Whether `e` is the store's own answer refusing a command (an error reply), not a lost
+    /// connection, an I/O error or a timeout.
+    fn refused_by_the_store(e: &redis::RedisError) -> bool {
+        e.code().is_some() && !e.is_io_error() && !e.is_timeout() && !e.is_connection_dropped()
+    }
+
+    #[test]
+    fn a_refusal_by_the_store_is_told_from_a_lost_store() {
+        let refused = redis::RedisError::from((
+            redis::ErrorKind::ResponseError,
+            "ERR unknown command 'CONFIG'",
+        ));
+        assert!(refused_by_the_store(&refused));
+        for lost in [
+            std::io::ErrorKind::ConnectionReset,
+            std::io::ErrorKind::BrokenPipe,
+            std::io::ErrorKind::TimedOut,
+            std::io::ErrorKind::ConnectionRefused,
+        ] {
+            let e = redis::RedisError::from(std::io::Error::from(lost));
+            assert!(!refused_by_the_store(&e), "{lost:?}");
+        }
+        let client = redis::RedisError::from((redis::ErrorKind::ClientError, "client side"));
+        assert!(!refused_by_the_store(&client));
     }
 
     /// `cargo test` runs these tests twice (lib and bin targets) against the same Redis, and
@@ -8510,7 +8749,6 @@ mod tests {
     #[tokio::test]
     async fn a_demoted_peer_lends_no_wait_or_retry_connection() {
         if local_redis().await.is_none() {
-            assert!(std::env::var("CI").is_err(), "Redis not reachable in CI");
             return;
         }
         let network = "testnet-demoted-peer";
@@ -8570,7 +8808,6 @@ mod tests {
     #[tokio::test]
     async fn only_an_installed_connection_drops_the_others() {
         if local_redis().await.is_none() {
-            assert!(std::env::var("CI").is_err(), "Redis not reachable in CI");
             return;
         }
         let network = "testnet-failed-on-stale";
@@ -8635,7 +8872,6 @@ mod tests {
     #[tokio::test]
     async fn a_local_refresh_never_overwrites_a_switched_epoch() {
         let Some(conn) = local_redis().await else {
-            assert!(std::env::var("CI").is_err(), "Redis not reachable in CI");
             return;
         };
         let c = Arc::new(test_cache(
@@ -8682,7 +8918,6 @@ mod tests {
     #[tokio::test]
     async fn a_peer_check_of_another_request_is_refused() {
         let Some(conn) = local_redis().await else {
-            assert!(std::env::var("CI").is_err(), "Redis not reachable in CI");
             return;
         };
         let c = test_cache(conn.clone(), Some(conn), "testnet-peercheck-bound");
@@ -8827,7 +9062,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_key_prefixes() {
-        // Skip without a local Redis.
         let Some(conn) = local_redis().await else {
             return;
         };
@@ -9389,8 +9623,17 @@ mod tests {
                     .await
             }
         };
-        if set_aof(false).await.is_err() {
-            return;
+        if let Err(e) = set_aof(false).await {
+            // The test needs `CONFIG SET` on the test store: a refusal by the store follows the
+            // store policy, a store lost meanwhile fails the test.
+            assert!(
+                refused_by_the_store(&e),
+                "the test store was lost during the test: {e}"
+            );
+            return crate::store::test_support::store_unusable(&format!(
+                "the test store {} refused CONFIG SET appendonly: {e}",
+                crate::store::test_support::TEST_STORE
+            ));
         }
 
         let auto = peer_origin()
@@ -10791,7 +11034,7 @@ mod tests {
         assert!(Arc::ptr_eq(&writer.conn, &first));
         let (fetched, switching) = switching_fetch(&cache, &second);
         assert_eq!(
-            pinned_fill(&cache, &switching, 500, &writer).await,
+            pinned_fill(&cache, &switching, 500, &writer, FillMode::Inline).await,
             Fill::Superseded
         );
         assert_eq!(*fetched.lock(), vec![500], "no further attempt");
@@ -10810,7 +11053,10 @@ mod tests {
         let now = cache.pinned_writer_bound().await.unwrap();
         assert!(Arc::ptr_eq(&now.conn, &second));
         let fetch = |h: u64| async move { anyhow::Ok(tree_state_answer(h)) };
-        assert_eq!(pinned_fill(&cache, &fetch, 500, &now).await, Fill::Stored);
+        assert_eq!(
+            pinned_fill(&cache, &fetch, 500, &now, FillMode::Inline).await,
+            Fill::Stored
+        );
         assert!(key_exists(&second_conn, &key).await);
         assert!(!key_exists(&conn, &key).await);
         let mut c = second_conn;
@@ -11495,6 +11741,426 @@ mod tests {
             .unwrap();
     }
 
+    type BoxedFetch =
+        std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<Vec<u8>>> + Send>>;
+
+    /// A fetch whose calls wait at `gate` (one permit lets one call through) and then answer.
+    /// Counts the calls started and the calls that ended.
+    struct Gated {
+        gate: Arc<tokio::sync::Semaphore>,
+        started: Arc<std::sync::atomic::AtomicUsize>,
+        ended: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl Gated {
+        fn new() -> Self {
+            Self {
+                gate: Arc::new(tokio::sync::Semaphore::new(0)),
+                started: Arc::default(),
+                ended: Arc::default(),
+            }
+        }
+
+        fn fetch(&self) -> impl Fn(u64) -> BoxedFetch {
+            let (gate, started, ended) =
+                (self.gate.clone(), self.started.clone(), self.ended.clone());
+            move |h: u64| {
+                let (gate, started, ended) = (gate.clone(), started.clone(), ended.clone());
+                Box::pin(async move {
+                    started.fetch_add(1, Ordering::SeqCst);
+                    gate.acquire().await.unwrap().forget();
+                    ended.fetch_add(1, Ordering::SeqCst);
+                    anyhow::Ok(tree_state_answer(h))
+                }) as BoxedFetch
+            }
+        }
+
+        fn started(&self) -> usize {
+            self.started.load(Ordering::SeqCst)
+        }
+
+        fn ended(&self) -> usize {
+            self.ended.load(Ordering::SeqCst)
+        }
+    }
+
+    /// Wait (real time, at most 10 s) until `done`.
+    async fn wait_until(what: &str, done: impl Fn() -> bool) {
+        for _ in 0..500 {
+            if done() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("timed out waiting: {what}");
+    }
+
+    /// A sweep fill abandoned because another store was chosen while its upstream call is in
+    /// flight: superseded, claim released, counted as detached; the call goes on to its end,
+    /// and nothing of its answer is written to either store.
+    #[tokio::test]
+    async fn a_superseded_sweep_fill_lets_its_upstream_call_end_and_writes_nothing() {
+        let network = unique_network("pinned-sweep-detached-switch");
+        let Some((cache, pinned, c)) =
+            sweep_fixture(&network, (1, 200), (1..=50u64).filter(|h| *h != 17), 50).await
+        else {
+            return;
+        };
+        let (second, second_conn) = second_pinned_store(&network).await;
+        let gated = Gated::new();
+        let fetch = gated.fetch();
+        let writer = bound(&cache, &pinned);
+        let count = |result| crate::health::cache_request_count(&network, "GetTreeState", result);
+        let (pass, ()) = tokio::join!(
+            timeout(
+                PINNED_SWEEP_FILL_TIMEOUT / 4,
+                pinned_sweep_pass(&cache, &writer, (1, 200), 0, &fetch),
+            ),
+            async {
+                wait_until("the call started", || gated.started() == 1).await;
+                cache.pinned_write_conn.store(Some(second.clone()));
+                cache.pinned_writer_gen.fetch_add(1, Ordering::SeqCst);
+            }
+        );
+        let pass = pass
+            .expect("abandoned well before the fill timeout")
+            .unwrap();
+        assert_eq!(pass.filled, 0);
+        assert_eq!(count("pinned_sweep_superseded"), 1);
+        assert_eq!(count("pinned_fetch_detached"), 1);
+        assert!(!key_exists(&c, &cache.pinned_sweep_claim_key(sweep_batch_of(17))).await);
+        assert_eq!((gated.started(), gated.ended()), (1, 0), "still in flight");
+        gated.gate.add_permits(1);
+        wait_until("the call ended", || gated.ended() == 1).await;
+        wait_until("its permit is back", || {
+            cache.pinned_sweep_fetch_permits.available_permits() == PINNED_SWEEP_FETCH_PERMITS
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!key_exists(&c, &cache.pinned_key(17)).await);
+        assert!(!key_exists(&second_conn, &cache.pinned_key(17)).await);
+        assert!(!key_exists(&c, &cache.pinned_holes_key()).await, "no hole");
+        assert!(!key_exists(&c, &cache.pinned_verified_key()).await);
+        assert_eq!(count("pinned_fetch_detached"), 1);
+    }
+
+    /// A sweep fill whose claim is taken over while its upstream call is in flight: the claim
+    /// is lost (not counted as superseded), the fill counted as detached; the call goes on to
+    /// its end and nothing of its answer is written.
+    #[tokio::test]
+    async fn a_sweep_fill_that_loses_its_claim_lets_its_upstream_call_end() {
+        let network = unique_network("pinned-sweep-detached-claim");
+        let Some((cache, pinned, c)) =
+            sweep_fixture(&network, (1, 200), (1..=50u64).filter(|h| *h != 17), 50).await
+        else {
+            return;
+        };
+        // Renewals every 200 ms, so that the loss is seen while the call is in flight.
+        test_hooks::set_sweep_timings(
+            &network,
+            Some((PINNED_SWEEP_FILL_TIMEOUT, Duration::from_millis(200))),
+        );
+        let key = cache.pinned_sweep_claim_key(sweep_batch_of(17));
+        let gated = Gated::new();
+        let fetch = gated.fetch();
+        let count = |result| crate::health::cache_request_count(&network, "GetTreeState", result);
+        let writer = bound(&cache, &pinned);
+        let (pass, ()) = tokio::join!(
+            pinned_sweep_pass(&cache, &writer, (1, 200), 0, &fetch),
+            async {
+                wait_until("the call started", || gated.started() == 1).await;
+                let mut c = c.clone();
+                let _: () = redis::cmd("SET")
+                    .arg(&key)
+                    .arg("another-process")
+                    .arg("PX")
+                    .arg(60_000)
+                    .query_async(&mut c)
+                    .await
+                    .unwrap();
+            }
+        );
+        test_hooks::set_sweep_timings(&network, None);
+        assert_eq!(pass.unwrap().filled, 0);
+        assert_eq!(count("pinned_sweep_superseded"), 0);
+        assert_eq!(count("pinned_sweep_failed"), 0);
+        assert_eq!(count("pinned_fetch_detached"), 1);
+        assert_eq!((gated.started(), gated.ended()), (1, 0), "still in flight");
+        gated.gate.add_permits(1);
+        wait_until("the call ended", || gated.ended() == 1).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!key_exists(&c, &cache.pinned_key(17)).await);
+        assert!(!key_exists(&c, &cache.pinned_holes_key()).await, "no hole");
+        assert!(!key_exists(&c, &cache.pinned_verified_key()).await);
+        assert!(key_exists(&c, &key).await, "the other holder's claim stays");
+        let mut c = c;
+        let _: () = redis::cmd("DEL")
+            .arg(&key)
+            .query_async(&mut c)
+            .await
+            .unwrap();
+    }
+
+    /// A sweep fill that times out while its upstream call is in flight ends as `NoAnswer`,
+    /// counted as detached; the call goes on to its end and nothing of its answer is written.
+    #[tokio::test]
+    async fn a_sweep_fill_that_times_out_lets_its_upstream_call_end() {
+        let network = unique_network("pinned-sweep-detached-timeout");
+        let Some((cache, pinned, c)) = sweep_fixture(&network, (1, 200), 1..=1u64, 50).await else {
+            return;
+        };
+        test_hooks::set_sweep_timings(
+            &network,
+            Some((Duration::from_millis(300), PINNED_SWEEP_CLAIM_TTL / 4)),
+        );
+        let key = cache.pinned_sweep_claim_key(sweep_batch_of(17));
+        let claim = SweepClaim::take(&pinned, key, Duration::from_secs(5))
+            .await
+            .unwrap()
+            .unwrap();
+        let gated = Gated::new();
+        let fetch = gated.fetch();
+        let started = std::time::Instant::now();
+        assert_eq!(
+            claim
+                .fill(&cache, &fetch, 17, &bound(&cache, &pinned))
+                .await,
+            SweepFill::Done(Fill::NoAnswer)
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
+        test_hooks::set_sweep_timings(&network, None);
+        assert_eq!(
+            crate::health::cache_request_count(&network, "GetTreeState", "pinned_fetch_detached"),
+            1
+        );
+        assert_eq!((gated.started(), gated.ended()), (1, 0), "still in flight");
+        gated.gate.add_permits(1);
+        wait_until("the call ended", || gated.ended() == 1).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!key_exists(&c, &cache.pinned_key(17)).await);
+        claim.release().await;
+    }
+
+    /// At most PINNED_SWEEP_FETCH_PERMITS sweep calls are alive: with two abandoned calls still
+    /// running a fill starts the third; with three a fill starts none, leaves when another
+    /// store is chosen, and goes on once a call ended. A worker's fill does not use the permits.
+    #[tokio::test]
+    async fn sweep_calls_are_bounded_by_their_permits() {
+        let network = unique_network("pinned-sweep-detached-permits");
+        let Some((cache, pinned, mut c)) = sweep_fixture(&network, (1, 200), 1..=1u64, 50).await
+        else {
+            return;
+        };
+        assert_eq!(PINNED_SWEEP_FETCH_PERMITS, 3);
+        let key = cache.pinned_sweep_claim_key(sweep_batch_of(101));
+        let claim = SweepClaim::take(&pinned, key, Duration::from_secs(5))
+            .await
+            .unwrap()
+            .unwrap();
+        let permits = || cache.pinned_sweep_fetch_permits.available_permits();
+        let waits = || test_hooks::permit_waits(&network);
+        let gated = Gated::new();
+        let fetch = gated.fetch();
+        // Three fills abandoned at a short fill timeout, each with its call still in flight
+        // (gated: the timeout is the expected end of each).
+        test_hooks::set_sweep_timings(
+            &network,
+            Some((Duration::from_millis(300), PINNED_SWEEP_CLAIM_TTL / 4)),
+        );
+        for n in 1..=3usize {
+            let writer = bound(&cache, &pinned);
+            assert_eq!(
+                claim.fill(&cache, &fetch, 100 + n as u64, &writer).await,
+                SweepFill::Done(Fill::NoAnswer)
+            );
+            assert_eq!(gated.started(), n, "one call per fill");
+            assert_eq!(permits(), PINNED_SWEEP_FETCH_PERMITS - n);
+        }
+        // From here the default fill timeout: every step below waits for an event, not a timer.
+        test_hooks::set_sweep_timings(&network, None);
+        let watchdog = Duration::from_secs(30);
+        // No permit left: the fill waits without starting a call, and leaves once another
+        // store is chosen.
+        let writer = bound(&cache, &pinned);
+        let before = waits();
+        let (outcome, ()) = timeout(watchdog, async {
+            tokio::join!(claim.fill(&cache, &fetch, 104, &writer), async {
+                wait_until("the fill waits for a permit", || waits() > before).await;
+                cache.pinned_writer_gen.fetch_add(1, Ordering::SeqCst);
+            })
+        })
+        .await
+        .expect("watchdog");
+        assert_eq!(outcome, SweepFill::Superseded);
+        assert_eq!(gated.started(), 3, "no call started");
+        // A worker's fill meanwhile: not bound by the sweep's permits.
+        let writer = bound(&cache, &pinned);
+        let answering = |h: u64| async move { anyhow::Ok(tree_state_answer(h)) };
+        assert_eq!(permits(), 0);
+        assert_eq!(
+            pinned_fill(&cache, &answering, 106, &writer, FillMode::Inline).await,
+            Fill::Stored
+        );
+        // Once a call ends, a waiting sweep fill goes on.
+        let before = waits();
+        let (outcome, ()) = timeout(watchdog, async {
+            tokio::join!(claim.fill(&cache, &answering, 105, &writer), async {
+                wait_until("the fill waits for a permit", || waits() > before).await;
+                assert_eq!(gated.ended(), 0);
+                gated.gate.add_permits(1);
+            })
+        })
+        .await
+        .expect("watchdog");
+        assert_eq!(outcome, SweepFill::Done(Fill::Stored));
+        assert_eq!(gated.ended(), 1);
+        assert_eq!(
+            crate::health::cache_request_count(&network, "GetTreeState", "pinned_fetch_detached"),
+            3
+        );
+        gated.gate.add_permits(2);
+        wait_until("every call ended", || gated.ended() == 3).await;
+        wait_until("every permit is back", || {
+            permits() == PINNED_SWEEP_FETCH_PERMITS
+        })
+        .await;
+        claim.release().await;
+        let _: () = redis::cmd("DEL")
+            .arg(cache.pinned_key(105))
+            .arg(cache.pinned_key(106))
+            .query_async(&mut c)
+            .await
+            .unwrap();
+    }
+
+    /// A waiter dropped before taking its result counts the call only while it still runs: not
+    /// once its task finished (nothing is left running), and once while it runs.
+    #[tokio::test]
+    async fn a_dropped_waiter_counts_only_a_call_still_running() {
+        let network = unique_network("pinned-detached-waiter");
+        let count = || {
+            crate::health::cache_request_count(&network, "GetTreeState", "pinned_fetch_detached")
+        };
+        let permits = Arc::new(tokio::sync::Semaphore::new(2));
+        // Finished, its result not taken.
+        let waiter = DetachedWaiter {
+            network: &network,
+            call: spawn_with_permit(permits.clone().try_acquire_owned().unwrap(), async { 1u8 }),
+            armed: true,
+        };
+        timeout(Duration::from_secs(10), async {
+            while !waiter.call.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("watchdog");
+        drop(waiter);
+        assert_eq!(count(), 0, "finished: not counted");
+        // Still running.
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let started = Arc::new(tokio::sync::Notify::new());
+        let (g, s) = (gate.clone(), started.clone());
+        let waiter = DetachedWaiter {
+            network: &network,
+            call: spawn_with_permit(permits.clone().try_acquire_owned().unwrap(), async move {
+                s.notify_one();
+                g.acquire().await.unwrap().forget();
+                2u8
+            }),
+            armed: true,
+        };
+        timeout(Duration::from_secs(10), started.notified())
+            .await
+            .expect("watchdog");
+        assert!(!waiter.call.is_finished());
+        drop(waiter);
+        assert_eq!(count(), 1, "running: counted once");
+        gate.add_permits(1);
+    }
+
+    /// The permit of a sweep call is released when its task completes, panics, or is dropped
+    /// without ever running (its runtime shut down).
+    #[test]
+    fn a_sweep_call_returns_its_permit_however_its_task_ends() {
+        let permits = Arc::new(tokio::sync::Semaphore::new(PINNED_SWEEP_FETCH_PERMITS));
+        let runtime = || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+        };
+        // Dropped unpolled.
+        let rt = runtime();
+        {
+            let _entered = rt.enter();
+            let permit = permits.clone().try_acquire_owned().unwrap();
+            drop(spawn_with_permit(permit, async { 1u8 }));
+        }
+        assert_eq!(permits.available_permits(), PINNED_SWEEP_FETCH_PERMITS - 1);
+        drop(rt);
+        assert_eq!(permits.available_permits(), PINNED_SWEEP_FETCH_PERMITS);
+        // Panicked, and completed.
+        runtime().block_on(async {
+            let permit = permits.clone().try_acquire_owned().unwrap();
+            let panics = true;
+            let panicked = spawn_with_permit(permit, async move {
+                if panics {
+                    panic!("the upstream client panicked");
+                }
+            });
+            assert!(panicked.await.unwrap_err().is_panic());
+            assert_eq!(permits.available_permits(), PINNED_SWEEP_FETCH_PERMITS);
+            let permit = permits.clone().try_acquire_owned().unwrap();
+            assert_eq!(spawn_with_permit(permit, async { 7u8 }).await.unwrap(), 7);
+            assert_eq!(permits.available_permits(), PINNED_SWEEP_FETCH_PERMITS);
+        });
+    }
+
+    /// A sweep call that panics is a failed attempt of its fill (three, then `NoAnswer`), and
+    /// its permit comes back.
+    #[tokio::test]
+    async fn a_panicking_sweep_call_is_a_failed_attempt() {
+        let network = unique_network("pinned-sweep-detached-panic");
+        let Some((cache, pinned, _c)) = sweep_fixture(&network, (1, 200), 1..=1u64, 50).await
+        else {
+            return;
+        };
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let panicking = {
+            let calls = calls.clone();
+            move |h: u64| {
+                let calls = calls.clone();
+                Box::pin(async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    assert_eq!(h, u64::MAX, "the upstream client panicked");
+                    anyhow::Ok(Vec::new())
+                }) as BoxedFetch
+            }
+        };
+        assert_eq!(
+            pinned_fill(
+                &cache,
+                &panicking,
+                17,
+                &bound(&cache, &pinned),
+                FillMode::Detached(&cache.pinned_sweep_fetch_permits),
+            )
+            .await,
+            Fill::NoAnswer
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        assert_eq!(
+            cache.pinned_sweep_fetch_permits.available_permits(),
+            PINNED_SWEEP_FETCH_PERMITS
+        );
+        assert_eq!(
+            crate::health::cache_request_count(&network, "GetTreeState", "pinned_fetch_detached"),
+            0,
+            "waited for to the end: not detached"
+        );
+    }
+
     /// Holes below the lowest height that is filled are counted as dropped only once the
     /// store has removed them: a store that refuses the removal keeps them, uncounted, and
     /// the next pass on a store that takes it drops them.
@@ -11981,14 +12647,10 @@ mod tests {
         crate::store_conn::parse_role(&v).map(|primary| !primary)
     }
 
-    /// The local Redis these tests need; in CI (where it runs as a service) its absence is a
-    /// failure, not a skip.
+    /// The local Redis these tests need: `local_redis`, whose policy covers every test of the
+    /// store (kept as a name for the tests that use it).
     async fn required_redis() -> Option<ConnectionManager> {
-        let conn = local_redis().await;
-        if conn.is_none() && std::env::var("CI").is_ok() {
-            panic!("the local test Redis is expected in CI");
-        }
-        conn
+        local_redis().await
     }
 
     /// The chain follower's fence scripts against a real store (the Lua is the fence): keys of
@@ -12181,6 +12843,96 @@ mod tests {
             .query_async(&mut c)
             .await
             .unwrap();
+    }
+
+    /// The chain follower's tip write against a real store: the tip, `tip_at`, `tip_seen` and
+    /// the stamp binding `tip_at` to the tip are written by one fenced script (all four there,
+    /// the stamp naming the tip and `tip_at` written with it), and refused together while the
+    /// lock is held by another process or by none.
+    #[tokio::test]
+    async fn the_tip_and_its_stamp_are_written_and_refused_together() {
+        use crate::store::{
+            decode_tip_stamp, decode_unix_ms, encode_tip, lock_key, tip_at_key, tip_key,
+            tip_seen_key, tip_stamp_key,
+        };
+        let Some(conn) = required_redis().await else {
+            return;
+        };
+        let network = unique_network("tip-stamp");
+        let cache = Arc::new(test_cache(conn.clone(), None, &network));
+        let lwd = Arc::new(crate::block_cache::test_support::FakeChain::new(500));
+        let f = crate::chain::ChainFollower::new(
+            cache.clone(),
+            Arc::new(crate::chain::test_support::FakeChainSource(lwd)),
+            None,
+            Arc::new(crate::block_cache::PoolKeys::default()),
+            network.clone(),
+        );
+        let prefix = cache.chain_prefix();
+        let keys = [
+            tip_key(&prefix),
+            tip_at_key(&prefix),
+            tip_seen_key(&prefix),
+            tip_stamp_key(&prefix),
+        ];
+        let lock = lock_key(&prefix);
+        let mut c = conn;
+        macro_rules! values {
+            () => {{
+                let mut v = Vec::new();
+                for k in &keys {
+                    v.push(
+                        redis::cmd("GET")
+                            .arg(k)
+                            .query_async::<_, Option<Vec<u8>>>(&mut c)
+                            .await
+                            .unwrap(),
+                    );
+                }
+                v
+            }};
+        }
+        assert_eq!(f.tick().await, crate::chain::Outcome::Cold { tip: 500 });
+        let written = values!();
+        assert!(written.iter().all(Option::is_some), "{written:?}");
+        let stamp = decode_tip_stamp(written[3].as_ref().unwrap()).unwrap();
+        assert_eq!(&stamp.tip, written[0].as_ref().unwrap());
+        assert_eq!(
+            Some(stamp.tip_at_ms),
+            decode_unix_ms(written[1].as_ref().unwrap())
+        );
+        let next = crate::store::Tip {
+            height: 501,
+            hash: vec![5; 32],
+        };
+        assert_ne!(encode_tip(&next).to_vec(), stamp.tip);
+        // Held by another process, then by none: refused, none of the four changed.
+        let _: () = redis::cmd("SET")
+            .arg(&lock)
+            .arg("another-process")
+            .arg("PX")
+            .arg(60_000)
+            .query_async(&mut c)
+            .await
+            .unwrap();
+        assert!(!crate::chain::test_support::write_tip(&f, &next)
+            .await
+            .unwrap());
+        assert_eq!(values!(), written);
+        let _: () = redis::cmd("DEL")
+            .arg(&lock)
+            .query_async(&mut c)
+            .await
+            .unwrap();
+        assert!(!crate::chain::test_support::write_tip(&f, &next)
+            .await
+            .unwrap());
+        assert_eq!(values!(), written);
+        let mut del = redis::cmd("DEL");
+        for k in &keys {
+            del.arg(k);
+        }
+        let _: () = del.arg(&lock).query_async(&mut c).await.unwrap();
     }
 
     /// With the primary and replica of tests/failover (OHTTP_FAILOVER_REDIS=1): a pinned store
