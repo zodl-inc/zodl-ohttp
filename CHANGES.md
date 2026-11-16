@@ -62,6 +62,79 @@ keeps its own log in [client/CHANGELOG.md](client/CHANGELOG.md).
 
 ### Gateway
 
+- The tip a follower holds from its own lightwalletd while the leader's tip stopped moving is
+  served for at most 30 s in total after its lightwalletd last answered with it (it is served
+  as seen then and goes stale at that bound; before, every tick served it anew, so it could
+  stay fresh for up to about 60 s, and it stayed fresh after it was dropped). Once it is dropped
+  and the stored tip is not confirmed, no tip is served (requests go upstream) until the next
+  confirmation. A follower that takes the lock over keeps serving the tip it held while what it
+  indexes is lower, until the hold ends (it stepped back to the lower indexed tip at the
+  takeover). It is dropped earlier by a reorg it indexes, and when it takes the lock and the
+  stored chain is no longer the one the tip was held on, or could not be checked (the index
+  entry at the last stored height it saw is missing or unreadable: a follower checks again on
+  its next read, a process taking the lock drops the held tip), and when it indexes a lower
+  tip that is not a block of the held tip's chain (its lightwalletd moved to another fork that
+  extends the indexed tip without a reorg). That chain is fetched from the follower's own
+  lightwalletd with the held tip (one `GetBlockRange` of at most 100 blocks above the stored
+  tip, only when the held tip changes); without it (more blocks, or the fetch failed) the held
+  tip is served until the hold ends in that case; a fetch that gave nothing is not repeated
+  until the stored tip or the follower's own tip changes. A follower uses that chain too: a
+  stored tip that is not the block the held tip's chain has at that height drops the held tip
+  at once (it waited for the index check or the hold's end), on an ordinary read and on a
+  scheduled probe alike: such a probe asks nothing and starts no new observation, the stored
+  tip is served. A scheduled probe that keeps the held tip
+  keeps the stored tip it is checked against too (it replaced it with the current stored tip
+  unchecked). The held tip is also dropped when the
+  stored chain is seen to fork above the stored tip it was first observed with: another block
+  at or below the last stored height read while holding, or an index entry at that height that
+  no longer names the block read there (only a fork at or below the first observed height
+  dropped it before).
+- The leader confirms the indexed tip (`{chain}tip_seen`) only while the tip moved at most
+  10 minutes ago by `{chain}tip_at`, the time stored with the tip, instead of for 300 ticks with
+  the same tip and 15 ticks behind it in a row: the counters started again on every leader
+  change and on alternating answers (behind, then at the tip), so a tip could stay confirmed
+  indefinitely while no process saw a new block. The 15-tick bound behind the tip still
+  applies, and still hands the lock over. A leader that continues a stored tip without
+  `tip_at` (written by a leader of an older version) counts from when it took it over and
+  writes `tip_at` with its first confirmation. `ohttp_chain_tip_age_seconds` of a leader that
+  took over now reports the stored tip's age (it reported the age of the last tip that process
+  itself wrote, or nothing).
+- Leftover confirmations. A confirmation value is never below the stored `tip_at`, and higher
+  than the previous one per process: above the last value the same process wrote, not
+  necessarily above one another process wrote. A follower that reads a `tip_seen` older than
+  `tip_at` takes it for a leftover of an earlier leader (the tip was moved by a leader that
+  does not confirm) and refreshes the tip on every read at once, but only within the age
+  bound: while the tip moved at most 10 minutes ago by `tip_at`; an older one is refreshed
+  only by a changed `tip_seen` (see below). Before, a follower restarted under such a leader
+  had no tip until the stored tip next moved (up to one block interval).
+- A leader that takes over a stored `tip_at` ahead of its clock (written by a process whose
+  clock is ahead) counts the 10-minute confirmation bound from the takeover at the latest, not
+  from that future time (the bound could last for the skew on top). Its confirmations stay at
+  or above the stored `tip_at` (only the age is clamped), so followers do not take them for
+  leftovers, which they would refresh on every read for as long as that `tip_at` looks recent
+  to them. A leader never writes the same `tip_at` twice in a row (a tip in the same
+  millisecond as the previous one, or as the `tip_at` in the store when it took the tip over,
+  a leftover included, gets the next value); otherwise `tip_at` is its clock, also
+  after the clock stepped back, and the bound counts from that clock.
+- After a rollback to a leader that writes neither `tip_at` nor `tip_seen`, the keys of the
+  newer leader stay behind. A follower that sees the stored tip change while `tip_at` does not
+  treats that `tip_at` as unknown until it changes: the tip is refreshed on every read, as
+  under a leader without `tip_at` (it went stale 10 minutes after the leftover `tip_at`), and
+  no stale-leader probe is based on it. A process that takes the lock in that state counts
+  the tip's age from then and writes `tip_at` with its first confirmation. This is decided per
+  process, from two of its own reads: a process started under such a leader has no earlier
+  read and takes the leftover `tip_at` as the tip's time on its first read, until the stored
+  tip next changes (about one block interval; meanwhile the tip is refreshed only within
+  10 minutes of that `tip_at`, as under a leader of this version). The verdict stays until
+  `tip_at` changes. Only consecutive values differ: a `tip_at` equal to one a follower read
+  several tips earlier (reads missed in between, the same millisecond) is taken for a leftover
+  until it changes.
+- A follower under a leader it takes for one that does not confirm (a `tip_seen` older than
+  `tip_at`, or one that stays the same while the stored tip changes) refreshes the tip on
+  every read only while the tip moved at most 10 minutes ago by `tip_at`; an older tip is
+  refreshed only by a changed `tip_seen` and goes stale otherwise, the same as under a leader
+  of this version (it was refreshed without a bound). Without a stored `tip_at`, or without a
+  `tip_seen` key, such a leader is followed as before.
 - Pinned backfill workers (`PINNED_BACKFILL_WORKERS`) are started also when the store the
   entries go to is a read replica at startup: they wait and start once it takes writes (asked
   again every 5 minutes, as pinned writes are), so a promoted replica gets its backfill without
@@ -72,6 +145,24 @@ keeps its own log in [client/CHANGELOG.md](client/CHANGELOG.md).
   `REDIS_PINNED_WRITE_URL` that is unreachable at startup is connected in the background
   (backoff 1 s up to 60 s) instead of staying off until a restart; once connected, its `ROLE` is
   asked before the first write to it.
+- Known limits of the chain follower after these changes:
+  - The drop of a held tip on a scheduled probe without a new observation applies to a held
+    tip that is still held when the probe starts (the stored tip is not on its own chain).
+    When the index check itself drops the held tip on a probe tick (the stored chain changed
+    at or below the stored tip it was checked against), that probe goes on as an ordinary new
+    observation of the process's own lightwalletd tip, as before these changes: a stored tip
+    that has not moved for the stale bound while its own lightwalletd is ahead is what the
+    stale-leader handling serves.
+  - A `tip_at` ahead of the clocks stays stored until the tip next moves, and a follower's
+    own clock skew is not compensated. The leader stops confirming at the bound counted from
+    its takeover, and followers need every confirmation. (Rewriting `tip_at` with a
+    confirmation would change a key older versions read.)
+  - A stored tip that changes while `tip_at` does not is taken for one written without its
+    time. That is also the case for two tips written with the same millisecond by a leader of
+    a previous version or across a handover between leaders with skewed clocks, and for a
+    follower that missed the reads in between; the tip is then followed as one without
+    `tip_at` until `tip_at` changes. (Telling these apart needs a writer epoch in the store,
+    a change of the protocol between versions.)
 - A pinned store whose `ROLE` does not answer in time (or fails on the connection) is treated as
   not writable and asked again after 30 s, instead of as writable: pinned writes and the
   backfill wait meanwhile. A store without the `ROLE` command (an error answer) stays writable.
