@@ -25,9 +25,10 @@ use ed25519_dalek::{Signer as _, SigningKey};
 use sha2::{Digest as _, Sha256};
 use std::io::{Read, Write};
 use std::net::TcpListener;
+use std::path::Path;
 use std::process::{Command, Output, Stdio};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// The signing key of the tests' envelopes.
 fn signing_key() -> SigningKey {
@@ -172,70 +173,140 @@ fn tool() -> Command {
 /// the tool's own HTTP timeout, so that a stalled exchange is reported by the tool first.
 const DEADLINE: Duration = Duration::from_secs(120);
 
-/// The output of `command` ([`output_within`] the [`DEADLINE`]).
+/// The output of `command` ([`run_captured`] with the [`DEADLINE`], no ready marker and
+/// [`COLLECT`]).
 fn output_of(command: &mut Command) -> Output {
-    output_within(command, DEADLINE)
+    run_captured(command, None, DEADLINE, COLLECT)
 }
 
-/// How long the output of a command that exited (or was killed) is waited for: a descendant
-/// that still holds its standard output or error keeps them open.
+/// How long the output of a command that exited (or was killed) is waited for, both streams
+/// together: a descendant that still holds its standard output or error keeps them open.
 const COLLECT: Duration = Duration::from_secs(5);
 
-/// The output of `command`, run with its standard output and error captured; a run that has
-/// not exited by `deadline` is killed, reaped and fails the test, with what it wrote. Nothing
-/// here waits without a bound: the output is read by threads that hand it over when it ends,
-/// and is waited for [`COLLECT`] at most. A command that exits while a descendant keeps its
-/// output open fails the test too.
-fn output_within(command: &mut Command, deadline: Duration) -> Output {
+/// A pipe read to its end by a thread of its own. What was read so far stays available, so
+/// that a pipe a descendant keeps open can still be shown up to that point.
+struct Collected {
+    bytes: Arc<Mutex<Vec<u8>>>,
+    ended: std::sync::mpsc::Receiver<()>,
+}
+
+impl Collected {
+    fn new(mut pipe: impl Read + Send + 'static) -> Collected {
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let (sender, ended) = std::sync::mpsc::channel();
+        let shared = Arc::clone(&bytes);
+        std::thread::spawn(move || {
+            let mut buffer = [0u8; 4096];
+            loop {
+                match pipe.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(n) => shared.lock().unwrap().extend_from_slice(&buffer[..n]),
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(_) => break,
+                }
+            }
+            let _ = sender.send(());
+        });
+        Collected { bytes, ended }
+    }
+
+    /// Everything the pipe carried if it ends by `until`, otherwise what was read until then.
+    fn until(&self, until: Instant) -> Result<Vec<u8>, Vec<u8>> {
+        let wait = until.saturating_duration_since(Instant::now());
+        let ended = !matches!(
+            self.ended.recv_timeout(wait),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        );
+        let bytes = self.bytes.lock().unwrap().clone();
+        if ended {
+            Ok(bytes)
+        } else {
+            Err(bytes)
+        }
+    }
+}
+
+/// The text of a stream for a failure message; a stream that was still open is marked as
+/// partial.
+fn shown(collected: &Result<Vec<u8>, Vec<u8>>) -> String {
+    match collected {
+        Ok(bytes) => String::from_utf8_lossy(bytes).to_string(),
+        Err(bytes) => format!(
+            "{}<still open, a descendant holds it: the output so far>",
+            String::from_utf8_lossy(bytes)
+        ),
+    }
+}
+
+/// The output of `command`, run with its standard output and error captured, each read by a
+/// thread of its own. A run that has not exited by `deadline` is killed, reaped and fails the
+/// test, with what it wrote. After the exit (or the kill) the output is waited for `collect`
+/// at most; a stream a descendant still holds open then fails the test too (also when the
+/// command itself exited), with the output read up to that point, marked as partial. The
+/// test then no longer waits for such a stream; its reader thread ends only when the
+/// descendant closes it.
+///
+/// With `ready`, the deadline counts from when that path exists (so that a test does not race
+/// the command's own setup); a command that creates neither it nor exits within [`DEADLINE`]
+/// is killed and fails the test.
+fn run_captured(
+    command: &mut Command,
+    ready: Option<&Path>,
+    deadline: Duration,
+    collect: Duration,
+) -> Output {
     let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    let reader = |mut pipe: Box<dyn Read + Send>| {
-        let (done, collected) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let mut bytes = Vec::new();
-            let _ = pipe.read_to_end(&mut bytes);
-            let _ = done.send(bytes);
-        });
-        collected
-    };
-    let stdout = reader(Box::new(child.stdout.take().unwrap()));
-    let stderr = reader(Box::new(child.stderr.take().unwrap()));
-    let started = std::time::Instant::now();
+    let stdout = Collected::new(child.stdout.take().unwrap());
+    let stderr = Collected::new(child.stderr.take().unwrap());
+    let spawned = Instant::now();
+    let mut started = ready.is_none().then_some(spawned);
     let status = loop {
         if let Some(status) = child.try_wait().unwrap() {
             break status;
         }
-        if started.elapsed() > deadline {
+        if started.is_none() && ready.is_some_and(Path::exists) {
+            started = Some(Instant::now());
+        }
+        let late = match started {
+            Some(started) => started.elapsed() > deadline,
+            None => spawned.elapsed() > DEADLINE,
+        };
+        if late {
             let _ = child.kill();
             let _ = child.wait();
             // What it wrote until then, to tell where it stopped.
-            let shown = |collected: std::sync::mpsc::Receiver<Vec<u8>>| match collected
-                .recv_timeout(COLLECT)
-            {
-                Ok(bytes) => String::from_utf8_lossy(&bytes).to_string(),
-                Err(_) => "<still open: a descendant holds it>".to_string(),
+            let until = Instant::now() + collect;
+            let (stderr, stdout) = (stderr.until(until), stdout.until(until));
+            let what = match started {
+                Some(_) => format!("did not exit within {deadline:?}"),
+                None => format!("neither became ready nor exited within {DEADLINE:?}"),
             };
-            let (stderr, stdout) = (shown(stderr), shown(stdout));
             panic!(
-                "the command did not exit within {deadline:?}: killed\n\
-                 stderr: {stderr}\nstdout: {stdout}"
+                "the command {what}: killed\nstderr: {}\nstdout: {}",
+                shown(&stderr),
+                shown(&stdout)
             );
         }
         std::thread::sleep(Duration::from_millis(20));
     };
-    let collect = |collected: std::sync::mpsc::Receiver<Vec<u8>>| {
-        collected.recv_timeout(COLLECT).unwrap_or_else(|_| {
-            panic!("the command exited, but a descendant kept its output open for {COLLECT:?}")
-        })
-    };
-    Output {
-        status,
-        stdout: collect(stdout),
-        stderr: collect(stderr),
+    let until = Instant::now() + collect;
+    match (stdout.until(until), stderr.until(until)) {
+        (Ok(stdout), Ok(stderr)) => Output {
+            status,
+            stdout,
+            stderr,
+        },
+        (stdout, stderr) => panic!(
+            "the command exited, but a descendant kept its output open for {collect:?}\n\
+             stderr: {}\nstdout: {}",
+            shown(&stderr),
+            shown(&stdout)
+        ),
     }
 }
 
@@ -487,70 +558,207 @@ fn a_connection_without_a_request_is_logged_as_such() {
     assert_eq!(server.requests(), [NO_REQUEST]);
 }
 
+/// A new directory of mode 0700 under the temporary directory, with a name of its own;
+/// removed when dropped, so also when a test or its setup fails after creating it.
+#[cfg(unix)]
+struct TempDir(std::path::PathBuf);
+
+#[cfg(unix)]
+impl TempDir {
+    fn new(case: &str) -> TempDir {
+        use std::os::unix::fs::DirBuilderExt as _;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "ohttp-e2e-test-{}-{nanos}-{}-{case}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        // Created here, private to this user, and never an existing path: `create` fails if
+        // there is one, and nothing is removed first.
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&path)
+            .expect("a new private temporary directory");
+        TempDir(path)
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+#[cfg(unix)]
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// The message of the panic `run` ends in.
+#[cfg(unix)]
+fn panic_message(run: impl FnOnce() -> Output + std::panic::UnwindSafe) -> String {
+    let payload = std::panic::catch_unwind(run).unwrap_err();
+    payload
+        .downcast_ref::<String>()
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// `script` run by `sh` with the directory `dir` as its first argument.
+#[cfg(unix)]
+fn sh(script: &str, dir: &TempDir) -> Command {
+    let mut command = Command::new("sh");
+    command.args(["-c", script, "sh"]).arg(dir.path());
+    command
+}
+
+/// Ends, when dropped, the descendant whose pid a script wrote to the file `pid` in a
+/// directory: on every path out of a test, also a failing one. Nothing is signalled when the
+/// file is missing or does not hold a process id above 1, and no error is reported, so that
+/// a failure of the test itself is what is shown.
+#[cfg(unix)]
+struct Descendant(std::path::PathBuf);
+
+#[cfg(unix)]
+impl Descendant {
+    fn of(dir: &TempDir) -> Descendant {
+        Descendant(dir.path().join("pid"))
+    }
+}
+
+#[cfg(unix)]
+impl Drop for Descendant {
+    fn drop(&mut self) {
+        let Ok(written) = std::fs::read_to_string(&self.0) else {
+            return;
+        };
+        let Ok(pid) = written.trim().parse::<u32>() else {
+            return;
+        };
+        if pid > 1 {
+            let _ = Command::new("kill")
+                .arg(pid.to_string())
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+    }
+}
+
+/// A [`TempDir`] is removed when a panic unwinds past it, with what was written in it.
+#[cfg(unix)]
+#[test]
+fn a_temporary_directory_is_removed_on_unwinding() {
+    let created = Mutex::new(None);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let dir = TempDir::new("unwinding");
+        std::fs::write(dir.path().join("file"), b"content").unwrap();
+        assert!(dir.path().join("file").exists());
+        *created.lock().unwrap() = Some(dir.path().to_path_buf());
+        panic!("a step failing after the directory was created");
+    }));
+    assert!(result.is_err());
+    let path = created.lock().unwrap().take().expect("the directory");
+    assert!(!path.exists(), "{} was left behind", path.display());
+}
+
 /// A run that does not exit is killed at the deadline, with a message saying so and what
-/// the run wrote until then.
+/// the run wrote until then. The deadline counts from when the script has written its
+/// output, so a slow start of `sh` does not change the result.
 #[cfg(unix)]
 #[test]
 fn a_run_past_the_deadline_is_killed() {
-    let started = std::time::Instant::now();
-    let result = std::panic::catch_unwind(|| {
-        output_within(
-            Command::new("sh").args(["-c", "echo partial >&2; exec sleep 30"]),
-            Duration::from_millis(1500),
+    let dir = TempDir::new("deadline");
+    let started = Instant::now();
+    let message = panic_message(|| {
+        run_captured(
+            &mut sh(r#"echo partial >&2; : > "$1/ready"; exec sleep 60"#, &dir),
+            Some(&dir.path().join("ready")),
+            Duration::from_millis(100),
+            COLLECT,
         )
     });
-    let message = result.unwrap_err();
-    let message = message
-        .downcast_ref::<String>()
-        .cloned()
-        .unwrap_or_default();
     assert!(message.contains("did not exit within"), "{message}");
-    assert!(message.contains("stderr: partial"), "{message}");
+    assert!(message.contains("stderr: partial\n"), "{message}");
+    assert!(!message.contains("still open"), "{message}");
     assert!(started.elapsed() < Duration::from_secs(20));
 }
 
 /// A descendant that keeps the output open does not make a run wait for it: past the deadline
-/// the run fails within the bound, saying that the output was still open, and a command that
-/// exits while its descendant holds the output fails as well.
+/// the run fails within the bound with the output read so far on both streams, marked as
+/// still open, and a command that exits while its descendant holds the output fails as well,
+/// with its output. The shell starts the descendant and writes its pid before the deadline
+/// counts or the command exits; the test ends the descendant on every path.
 #[cfg(unix)]
 #[test]
 fn a_descendant_holding_the_output_does_not_block() {
-    let panic_message = |script: &'static str, deadline: Duration| {
-        let result = std::panic::catch_unwind(move || {
-            output_within(Command::new("sh").args(["-c", script]), deadline)
+    let collect = Duration::from_secs(1);
+    let started = Instant::now();
+
+    {
+        let dir = TempDir::new("descendant-killed");
+        let _descendant = Descendant::of(&dir);
+        let message = panic_message(|| {
+            run_captured(
+                &mut sh(
+                    r#"sleep 60 & echo $! > "$1/pid"; echo out; echo partial >&2; : > "$1/ready"; wait"#,
+                    &dir,
+                ),
+                Some(&dir.path().join("ready")),
+                Duration::from_millis(100),
+                collect,
+            )
         });
-        let message = result.unwrap_err();
-        message
-            .downcast_ref::<String>()
-            .cloned()
-            .unwrap_or_default()
-    };
-    let started = std::time::Instant::now();
-    let message = panic_message(
-        "echo partial >&2; sleep 30 & wait",
-        Duration::from_millis(1500),
-    );
-    assert!(message.contains("did not exit within"), "{message}");
-    assert!(message.contains("still open"), "{message}");
-    let message = panic_message("sleep 30 & echo done", DEADLINE);
-    assert!(
-        message.contains("a descendant kept its output open"),
-        "{message}"
-    );
+        assert!(message.contains("did not exit within"), "{message}");
+        assert!(
+            message.contains("stderr: partial\n<still open, a descendant holds it"),
+            "{message}"
+        );
+        assert!(
+            message.contains("stdout: out\n<still open, a descendant holds it"),
+            "{message}"
+        );
+    }
+
+    {
+        let dir = TempDir::new("descendant-exited");
+        let _descendant = Descendant::of(&dir);
+        let message = panic_message(|| {
+            run_captured(
+                &mut sh(r#"sleep 60 & echo $! > "$1/pid"; echo done"#, &dir),
+                None,
+                DEADLINE,
+                collect,
+            )
+        });
+        assert!(
+            message.contains("a descendant kept its output open"),
+            "{message}"
+        );
+        assert!(
+            message.contains("stdout: done\n<still open, a descendant holds it"),
+            "{message}"
+        );
+    }
+
     // Both well before either `sleep` ends.
-    assert!(started.elapsed() < Duration::from_secs(25));
+    assert!(started.elapsed() < Duration::from_secs(20));
 }
 
 /// `scripts/test-e2e.sh`, run with bash in a copy of the repository layout it expects, the
 /// e2e client replaced by a fake that records how it was called.
 #[cfg(unix)]
 mod script {
-    use super::{output_of, text};
-    use std::os::unix::fs::DirBuilderExt as _;
-    use std::path::PathBuf;
+    use super::{output_of, text, TempDir};
+    use std::ffi::OsStr;
+    use std::path::{Path, PathBuf};
     use std::process::Command;
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     /// The fake e2e client. It appends one line per run to `record` next to itself (the run's
     /// number, the settings the script exports and its arguments) and answers as the step
@@ -572,31 +780,78 @@ else
 fi
 "#;
 
+    /// Whether the variable `name` is kept from the script: one the script, the tool or the
+    /// fake reads, one that changes how bash runs the script, or a name that is not Unicode.
+    fn cleared(name: &OsStr) -> bool {
+        name.to_str().is_none_or(|name| {
+            name.starts_with("OHTTP_E2E_")
+                || [
+                    "NETWORK",
+                    "GATEWAY_HOST",
+                    "RELAY_URL",
+                    "CONFIGS_URL",
+                    "RELAY_SIMULATOR",
+                    "FAKE_FAIL",
+                    // What would change how bash runs the script (a caller's
+                    // `SHELLOPTS=xtrace` would trace the URLs).
+                    "BASH_ENV",
+                    "ENV",
+                    "SHELLOPTS",
+                    "BASHOPTS",
+                    // The prefix of `set -x` lines, run through expansions.
+                    "PS4",
+                ]
+                .contains(&name)
+                // Exported functions, which bash imports and could run as commands of the
+                // script.
+                || name.starts_with("BASH_FUNC_")
+        })
+    }
+
+    /// The variables that change how bash runs the script are cleared, as are the script's
+    /// own; the rest of the environment is inherited.
+    #[test]
+    fn the_shell_and_script_variables_are_cleared() {
+        use std::os::unix::ffi::OsStrExt as _;
+        for name in [
+            "BASH_ENV",
+            "ENV",
+            "SHELLOPTS",
+            "BASHOPTS",
+            "PS4",
+            "BASH_FUNC_x%%",
+            "BASH_FUNC_echo%%",
+            "OHTTP_E2E_EXPECT_OK",
+            "NETWORK",
+            "RELAY_URL",
+        ] {
+            assert!(cleared(OsStr::new(name)), "{name}");
+        }
+        assert!(cleared(OsStr::from_bytes(b"NOT_UNICODE_\xff")));
+        for name in [
+            "PATH",
+            "HOME",
+            "BASH",
+            "PS1",
+            "ENVIRONMENT",
+            "MY_BASH_FUNC_x",
+        ] {
+            assert!(!cleared(OsStr::new(name)), "{name}");
+        }
+    }
+
     /// A temporary tree with `scripts/test-e2e.sh` and the fake at
-    /// `e2e-client/target/release/ohttp-e2e`, in a new directory of mode 0700 with a name of
-    /// its own; removed when dropped.
+    /// `e2e-client/target/release/ohttp-e2e`, in a [`TempDir`]: removed when dropped, also
+    /// when its setup fails after the directory was created.
     struct Tree {
-        root: PathBuf,
+        dir: TempDir,
     }
 
     impl Tree {
         fn new(case: &str) -> Tree {
-            static COUNTER: AtomicU64 = AtomicU64::new(0);
-            let nanos = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos();
-            let root = std::env::temp_dir().join(format!(
-                "ohttp-e2e-script-test-{}-{nanos}-{}-{case}",
-                std::process::id(),
-                COUNTER.fetch_add(1, Ordering::Relaxed)
-            ));
-            // Created here, private to this user, and never an existing path: `create` fails
-            // if there is one, and nothing is removed first.
-            std::fs::DirBuilder::new()
-                .mode(0o700)
-                .create(&root)
-                .expect("a new private temporary directory");
+            // Owned by the guard from here on: a failing step below removes it on unwinding.
+            let dir = TempDir::new(&format!("script-{case}"));
+            let root = dir.path();
             let bin_dir = root.join("e2e-client/target/release");
             std::fs::create_dir_all(root.join("scripts")).unwrap();
             std::fs::create_dir_all(&bin_dir).unwrap();
@@ -612,7 +867,7 @@ fi
             assert!(copied.status.success());
             use std::os::unix::fs::PermissionsExt as _;
             std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
-            Tree { root }
+            Tree { dir }
         }
 
         /// The script run with `env` (and none of the variables it, the tool or bash's startup
@@ -620,29 +875,13 @@ fi
         fn run(&self, env: &[(&str, &str)]) -> (Option<i32>, String, String) {
             let mut command = Command::new("bash");
             for (name, _) in std::env::vars_os() {
-                let ours = name.to_str().is_none_or(|name| {
-                    name.starts_with("OHTTP_E2E_")
-                        || [
-                            "NETWORK",
-                            "GATEWAY_HOST",
-                            "RELAY_URL",
-                            "CONFIGS_URL",
-                            "RELAY_SIMULATOR",
-                            "FAKE_FAIL",
-                            // What would change how bash runs the script (a caller's
-                            // `SHELLOPTS=xtrace` would trace the URLs).
-                            "BASH_ENV",
-                            "ENV",
-                            "SHELLOPTS",
-                        ]
-                        .contains(&name)
-                });
+                let ours = cleared(&name);
                 if ours {
                     command.env_remove(name);
                 }
             }
             command
-                .arg(self.root.join("scripts/test-e2e.sh"))
+                .arg(self.root().join("scripts/test-e2e.sh"))
                 .arg("trace-not-shown")
                 .env("GATEWAY_HOST", "ohttp-gateway.example");
             for (name, value) in env {
@@ -656,19 +895,17 @@ fi
             )
         }
 
+        fn root(&self) -> &Path {
+            self.dir.path()
+        }
+
         /// The fake's record, one line per run; empty when it never ran.
         fn record(&self) -> Vec<String> {
-            std::fs::read_to_string(self.root.join("e2e-client/target/release/record"))
+            std::fs::read_to_string(self.root().join("e2e-client/target/release/record"))
                 .unwrap_or_default()
                 .lines()
                 .map(str::to_owned)
                 .collect()
-        }
-    }
-
-    impl Drop for Tree {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.root);
         }
     }
 
