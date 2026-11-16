@@ -17,6 +17,10 @@
 //! The client against the gateway's own key configuration, signed envelopes, chunked
 //! decapsulation and streaming response encapsulation (`ohttp-gateway`'s library), served
 //! in-process as relay and gateway in one, in front of an echo backend.
+//!
+//! The test server speaks plain HTTP on the loopback interface, so every client here is built
+//! with `Client::insecure_for_local_testing`; most use the unsigned source (feature
+//! `insecure-plain-key-config`) to exercise the cache rules of `/ohttp-configs`.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -25,7 +29,7 @@ use std::time::Duration;
 
 use axum::body::Bytes;
 use axum::extract::State;
-use axum::http::{header, StatusCode};
+use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response as AxumResponse};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -36,7 +40,9 @@ use ohttp_gateway::hpke::KeyState;
 use ohttp_gateway::ohttp::{self as gateway, InnerResponse};
 use ohttp_gateway::ohttp_chunked::decapsulate_chunked_request;
 use ohttp_gateway::signing::SigningState;
-use zodl_ohttp_client::{Client, Error, KeyConfig, KeyConfigSource, Request};
+use zodl_ohttp_client::{
+    Client, Error, HttpErrorKind, KeyConfig, KeyConfigSource, Network, OuterHeaders, Request,
+};
 
 const TIMEOUT: Duration = Duration::from_secs(10);
 const NETWORK: &str = "testnet";
@@ -121,6 +127,8 @@ struct TestGateway {
     /// How many of the next opened requests the gateway refuses as stale (inner 400,
     /// `ohttp-freshness: rejected`).
     refuse_stale: Mutex<usize>,
+    /// The request headers of every key-configuration fetch and post, with the route.
+    seen_headers: Mutex<Vec<(&'static str, HeaderMap)>>,
 }
 
 impl TestGateway {
@@ -136,8 +144,9 @@ impl TestGateway {
     }
 }
 
-async fn configs(State(gw): State<Arc<TestGateway>>) -> AxumResponse {
+async fn configs(State(gw): State<Arc<TestGateway>>, headers: HeaderMap) -> AxumResponse {
     gw.config_fetches.fetch_add(1, Ordering::SeqCst);
+    gw.seen_headers.lock().unwrap().push(("configs", headers));
     let document = gw.advertises.lock().unwrap().public_config();
     let cache_control = *gw.cache_control.lock().unwrap();
     let mut response =
@@ -150,16 +159,22 @@ async fn configs(State(gw): State<Arc<TestGateway>>) -> AxumResponse {
     response
 }
 
-async fn signed_configs(State(gw): State<Arc<TestGateway>>) -> AxumResponse {
+async fn signed_configs(State(gw): State<Arc<TestGateway>>, headers: HeaderMap) -> AxumResponse {
     gw.config_fetches.fetch_add(1, Ordering::SeqCst);
+    gw.seen_headers.lock().unwrap().push(("signed", headers));
     let document = gw.advertises.lock().unwrap().public_config();
     Json(gw.signing.get_signed_config(&document)).into_response()
 }
 
 /// The gateway's handling of a sealed request, as its `/gateway` route does it: an unknown
 /// key id is `422`, any other failure to open `400`; the inner request goes to `echo`.
-async fn relay(State(gw): State<Arc<TestGateway>>, body: Bytes) -> AxumResponse {
+async fn relay(
+    State(gw): State<Arc<TestGateway>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> AxumResponse {
     gw.posts.fetch_add(1, Ordering::SeqCst);
+    gw.seen_headers.lock().unwrap().push(("relay", headers));
     if let Some(status) = *gw.refuse_with.lock().unwrap() {
         return status.into_response();
     }
@@ -251,6 +266,7 @@ async fn spawn() -> (String, Arc<TestGateway>) {
         config_fetches: AtomicUsize::new(0),
         posts: AtomicUsize::new(0),
         refuse_stale: Mutex::new(0),
+        seen_headers: Mutex::new(Vec::new()),
     });
     let app = Router::new()
         .route("/ohttp-configs", get(configs))
@@ -265,12 +281,13 @@ async fn spawn() -> (String, Arc<TestGateway>) {
 }
 
 fn plain_client(base: &str) -> Client {
-    Client::new(
+    Client::insecure_for_local_testing(
         format!("{base}/relay"),
         KeyConfigSource::Plain {
             url: format!("{base}/ohttp-configs"),
         },
     )
+    .unwrap()
 }
 
 fn json_post() -> Request {
@@ -335,6 +352,129 @@ async fn a_freshness_refusal_is_sent_once_more_and_only_once() {
     )]);
 }
 
+/// `Client::new` refuses plain-HTTP URLs and the unsigned source before anything is sent.
+#[tokio::test]
+async fn a_client_refuses_plain_http() {
+    let (base, gw) = spawn().await;
+    let sources = [
+        KeyConfigSource::Plain {
+            url: format!("{base}/ohttp-configs"),
+        },
+        KeyConfigSource::Signed {
+            url: format!("{base}/ohttp-configs/signed"),
+            network: Network::Testnet,
+            signer: gw.signer(),
+        },
+    ];
+    for keys in sources {
+        let Err(Error::Setup { .. }) = Client::new(format!("{base}/relay"), keys) else {
+            panic!("a plain-HTTP client was built");
+        };
+    }
+    assert_eq!(gw.config_fetches.load(Ordering::SeqCst), 0);
+    assert_eq!(gw.posts.load(Ordering::SeqCst), 0);
+}
+
+/// What the relay sees of `Client`: exactly the headers of `OuterHeaders::LIBRARY` (the set
+/// every preset shares) on the post and the signed fetch, beside those the HTTP stack adds for
+/// the connection and the body; `Accept: application/ohttp-keys` on the unsigned fetch.
+#[tokio::test]
+async fn the_relay_sees_the_presets_headers_and_nothing_more() {
+    let (base, gw) = spawn().await;
+    let signed = Client::insecure_for_local_testing(
+        format!("{base}/relay"),
+        KeyConfigSource::Signed {
+            url: format!("{base}/ohttp-configs/signed"),
+            network: Network::Testnet,
+            signer: gw.signer(),
+        },
+    )
+    .unwrap();
+    signed.send(&json_post(), TIMEOUT).await.unwrap();
+    plain_client(&base)
+        .send(&json_post(), TIMEOUT)
+        .await
+        .unwrap();
+    let expected = |pairs: Vec<(&'static str, String)>| -> Vec<(String, String)> {
+        let mut pairs: Vec<_> = pairs
+            .into_iter()
+            .map(|(k, v)| (k.to_ascii_lowercase(), v))
+            .collect();
+        pairs.sort();
+        pairs
+    };
+    let seen = gw.seen_headers.lock().unwrap();
+    let routes: Vec<_> = seen.iter().map(|(route, _)| *route).collect();
+    assert_eq!(routes, ["signed", "relay", "configs", "relay"]);
+    for (route, headers) in seen.iter() {
+        let mut got: Vec<(String, String)> = headers
+            .iter()
+            .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap().to_string()))
+            .filter(|(k, _)| !matches!(k.as_str(), "host" | "content-length"))
+            .collect();
+        got.sort();
+        let want = match *route {
+            "relay" => expected(OuterHeaders::LIBRARY.relay_post(None)),
+            "signed" => expected(OuterHeaders::LIBRARY.key_fetch_signed(None)),
+            _ => expected(OuterHeaders::LIBRARY.key_fetch_plain(None)),
+        };
+        assert_eq!(got, want, "{route}");
+    }
+}
+
+/// A transport error shows its kind only: no URL, host, address, port or path.
+fn assert_shows_no_peer(error: &Error, base: &str) {
+    let shown = format!("{error} | {error:?}");
+    let authority = base.trim_start_matches("http://");
+    let (host, port) = authority.split_once(':').unwrap();
+    for part in [
+        base,
+        authority,
+        host,
+        port,
+        "/ohttp-configs",
+        "/relay",
+        "http:",
+    ] {
+        assert!(!shown.contains(part), "{shown} shows {part}");
+    }
+}
+
+#[tokio::test]
+async fn a_transport_error_shows_its_kind_only() {
+    // A port reserved for this test (bound, never listening), so a connection is refused and no
+    // other test can take the port meanwhile.
+    let reserved = tokio::net::TcpSocket::new_v4().unwrap();
+    reserved.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let base = format!("http://{}", reserved.local_addr().unwrap());
+    let Err(error @ Error::Http(_)) = plain_client(&base).send(&json_post(), TIMEOUT).await else {
+        panic!("a closed port answered");
+    };
+    let Error::Http(http) = &error else {
+        unreachable!()
+    };
+    assert_eq!(http.kind(), HttpErrorKind::Connect);
+    assert_shows_no_peer(&error, &base);
+
+    // An error status on the key-configuration fetch.
+    let (base, _gw) = spawn().await;
+    let missing = Client::insecure_for_local_testing(
+        format!("{base}/relay"),
+        KeyConfigSource::Plain {
+            url: format!("{base}/ohttp-configs/missing"),
+        },
+    )
+    .unwrap();
+    let Err(error @ Error::Http(_)) = missing.send(&json_post(), TIMEOUT).await else {
+        panic!("a 404 key configuration was used");
+    };
+    let Error::Http(http) = &error else {
+        unreachable!()
+    };
+    assert_eq!(http.kind(), HttpErrorKind::Status(404));
+    assert_shows_no_peer(&error, &base);
+}
+
 #[tokio::test]
 async fn a_backend_error_is_an_answer() {
     let (base, _gw) = spawn().await;
@@ -347,14 +487,15 @@ async fn a_backend_error_is_an_answer() {
 async fn a_signed_configuration_is_checked_against_the_pinned_key() {
     let (base, gw) = spawn().await;
     let signed = |signer| {
-        Client::new(
+        Client::insecure_for_local_testing(
             format!("{base}/relay"),
             KeyConfigSource::Signed {
                 url: format!("{base}/ohttp-configs/signed"),
-                network: NETWORK.to_string(),
+                network: Network::Testnet,
                 signer,
             },
         )
+        .unwrap()
     };
     let response = signed(gw.signer())
         .send(&json_post(), TIMEOUT)
@@ -453,12 +594,13 @@ async fn a_rate_limited_relay_is_not_posted_to_until_its_pause_has_run() {
     // Its own relay path: the pause lives in the process-wide table, keyed by relay URL, and
     // outlives this test, while a later test may get the same ephemeral port.
     let rate_limited_client = || {
-        Client::new(
+        Client::insecure_for_local_testing(
             format!("{base}/relay-rate-limited"),
             KeyConfigSource::Plain {
                 url: format!("{base}/ohttp-configs"),
             },
         )
+        .unwrap()
     };
     let client = rate_limited_client();
     *gw.refuse_once.lock().unwrap() = Some((StatusCode::TOO_MANY_REQUESTS, Vec::new()));

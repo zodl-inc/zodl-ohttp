@@ -20,10 +20,10 @@
 use anyhow::{bail, Result};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use zodl_ohttp_client::{
-    decode_bhttp_response, doh_query_url, encapsulate_chunked_request, encode_request,
-    envelope_from_doh_json, open_signed_config, verify_signed_config, DecodeOptions, KeyConfig,
-    Network, OhttpConfig, OhttpConfigParams, OhttpNetworks, Request, SignedConfigPolicy,
-    VerifyingKey, CONTENT_TYPE_CHUNKED_REQ, CONTENT_TYPE_CHUNKED_RES, DOH_RESOLVERS,
+    canonical_relay_url, decode_bhttp_response, doh_query_url, encapsulate_chunked_request,
+    encode_request, envelope_from_doh_json, open_signed_config, verify_signed_config,
+    DecodeOptions, KeyConfig, Network, OhttpConfig, OhttpConfigParams, OhttpNetworks, OuterHeaders,
+    Request, SignedConfigPolicy, VerifyingKey, CONTENT_TYPE_CHUNKED_RES, DOH_RESOLVERS,
 };
 
 /// The runtime OHTTP configuration of each network, from the environment: the four variables
@@ -121,8 +121,22 @@ fn main() -> Result<()> {
     if a.len() < 6 {
         usage()
     }
-    let (config_url, relay_url, authority, method, path) = (&a[1], &a[2], &a[3], &a[4], &a[5]);
+    let (config_url, relay_arg, authority, method, path) = (&a[1], &a[2], &a[3], &a[4], &a[5]);
+    // Posted to as a wallet would: the relay URL in its canonical form (`OhttpConfig::relay_url`).
+    // A URL the configuration rules refuse (a plain-HTTP origin checked directly) is used as
+    // given, saying which rule it breaks.
+    let relay_url = &match canonical_relay_url(relay_arg) {
+        Ok(canonical) => canonical,
+        Err(e) => {
+            println!("    relay URL used as given: {e}");
+            relay_arg.clone()
+        }
+    };
+    let signed_source = config_url.contains("/signed");
+    // The exact header sets of `zodl-ohttp-client` 2.0.0, as every wallet preset sends them.
+    let headers = OuterHeaders::LIBRARY;
     let trace_id = a.get(6).cloned().unwrap_or_default();
+    let trace = (!trace_id.is_empty()).then_some(trace_id.as_str());
     let kind = a.get(7).cloned().unwrap_or_else(|| "grpc".into());
     let body: Vec<u8> = match a.get(8) {
         Some(h) => hex::decode(h)?,
@@ -135,36 +149,41 @@ fn main() -> Result<()> {
         }
     };
 
-    let http = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(60))
-        .build()?;
+    let http = http_client(60)?;
 
     // 1. key config (application/ohttp-keys, length-prefixed OR signed JSON)
     let t = Instant::now();
     // OHTTP_E2E_EXTRA_HEADERS go on this GET too: an origin checked directly (no relay in front)
     // with RELAY_SECRET_ON_KEY_CONFIG=require wants X-Relay-Secret on the key configuration.
     let mut kb = http.get(config_url);
+    let fetch_headers = if signed_source {
+        headers.key_fetch_signed(None)
+    } else {
+        headers.key_fetch_plain(None)
+    };
+    for (k, v) in fetch_headers {
+        kb = kb.header(k, v)
+    }
     for (k, v) in extra_headers() {
         kb = kb.header(k, v)
     }
-    let resp = kb.send()?.error_for_status()?;
+    let resp = net(not_redirected(net(kb.send())?)?.error_for_status())?;
     let content_type = resp
         .headers()
         .get("content-type")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string();
-    let kc_raw = resp.bytes()?;
+    let kc_raw = net(resp.bytes())?;
 
     // If the config URL contains /signed or the content-type contains application/json, verify
     // the signature
-    let kc = if config_url.contains("/signed") || content_type.contains("application/json") {
+    let kc = if signed_source || content_type.contains("application/json") {
         let network = std::env::var("NETWORK").unwrap_or_else(|_| "mainnet".to_string());
         println!(
-            "[1] signed config {} bytes in {:?} from {} (network={})",
+            "[1] signed config {} bytes in {:?} (network={})",
             kc_raw.len(),
             t.elapsed(),
-            config_url,
             network
         );
         let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
@@ -173,19 +192,13 @@ fn main() -> Result<()> {
         println!("signed-configs: OK not_after={}", keys.not_after);
         keys.document
     } else {
-        println!(
-            "[1] key config {} bytes in {:?} from {}",
-            kc_raw.len(),
-            t.elapsed(),
-            config_url
-        );
+        println!("[1] key config {} bytes in {:?}", kc_raw.len(), t.elapsed());
         kc_raw.to_vec()
     };
     let config = KeyConfig::select(&kc)?;
     println!(
-        "    key_id={} kem=0x0020 kdf=0x0001 aead=0x0001 pk={}",
-        config.key_id(),
-        hex::encode(config.public_key())
+        "    key_id={} kem=0x0020 kdf=0x0001 aead=0x0001",
+        config.key_id()
     );
 
     // 2. BHTTP known-length request
@@ -204,17 +217,23 @@ fn main() -> Result<()> {
 
     // 3. HPKE seal as a chunked request (draft-ietf-ohai-chunked-ohttp-08 §6.1)
     let (req, opener) = encapsulate_chunked_request(&config, &plain)?;
-    println!("[2] inner {method} https://{authority}{path} ({} B bhttp, {} B body) -> {} B ohttp-chunked-req", plain.len(), body.len(), req.len());
+    println!(
+        "[2] inner request ({} B bhttp, {} B body) -> {} B ohttp-chunked-req",
+        plain.len(),
+        body.len(),
+        req.len()
+    );
 
     // 4. POST to relay
     let t = Instant::now();
-    let mut rb = http
-        .post(relay_url)
-        .header("content-type", CONTENT_TYPE_CHUNKED_REQ)
-        .body(req.clone());
-    if !trace_id.is_empty() {
-        rb = rb.header("X-Client-Trace-Id", &trace_id)
-    }
+    let post = |url: &str, trace: Option<&str>| {
+        let mut rb = http.post(url).body(req.clone());
+        for (k, v) in headers.relay_post(trace) {
+            rb = rb.header(k, v)
+        }
+        rb
+    };
+    let mut rb = post(relay_url, trace);
     // Optional: send a client-chosen X-Request-Id to check that the relay replaces it (it MUST).
     if let Ok(rid) = std::env::var("OHTTP_E2E_REQUEST_ID") {
         rb = rb.header("X-Request-Id", rid)
@@ -242,30 +261,20 @@ fn main() -> Result<()> {
             if i > 0 && gap > 0 {
                 std::thread::sleep(std::time::Duration::from_millis(gap));
             }
-            let mut r = http
-                .post(url)
-                .header("content-type", CONTENT_TYPE_CHUNKED_REQ)
-                .body(req.clone());
-            if !trace_id.is_empty() {
-                r = r.header("X-Client-Trace-Id", format!("{trace_id}-r{i}"))
-            }
+            let replay_trace = trace.map(|t| format!("{t}-r{i}"));
+            let mut r = post(url, replay_trace.as_deref());
             for (k, v) in extra_headers() {
                 r = r.header(k, v)
             }
             let t = Instant::now();
-            let resp = r.send()?;
+            let resp = net(r.send())?;
             let status = resp.status();
-            let body = resp.bytes()?;
+            let body = net(resp.bytes())?;
             println!(
-                "[XREPLAY {i}] {url} -> HTTP {} in {:?} ({} B) {}",
+                "[XREPLAY {i}] -> HTTP {} in {:?} ({} B)",
                 status,
                 t.elapsed(),
-                body.len(),
-                if status.is_success() {
-                    String::new()
-                } else {
-                    String::from_utf8_lossy(&body).to_string()
-                }
+                body.len()
             );
         }
         return Ok(());
@@ -274,18 +283,10 @@ fn main() -> Result<()> {
     // Replay test: send the same request twice if OHTTP_E2E_REPLAY=1
     if std::env::var("OHTTP_E2E_REPLAY").ok().as_deref() == Some("1") {
         println!("[REPLAY TEST] Sending request twice to test replay protection");
-        let resp1 = http
-            .post(relay_url)
-            .header("content-type", CONTENT_TYPE_CHUNKED_REQ)
-            .body(req.clone())
-            .send()?;
+        let resp1 = net(post(relay_url, trace).send())?;
         println!("[REPLAY 1] HTTP {}", resp1.status());
         std::thread::sleep(std::time::Duration::from_millis(100));
-        let resp2 = http
-            .post(relay_url)
-            .header("content-type", CONTENT_TYPE_CHUNKED_REQ)
-            .body(req.clone())
-            .send()?;
+        let resp2 = net(post(relay_url, trace).send())?;
         let status2 = resp2.status();
         println!("[REPLAY 2] HTTP {}", status2);
         if status2.as_u16() == 409 {
@@ -296,33 +297,39 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    let resp = rb.send()?;
+    let resp = net(rb.send())?;
     let status = resp.status();
     let hdrs = resp.headers().clone();
-    let rbody = resp.bytes()?;
+    let rbody = net(resp.bytes())?;
+    let sealed_answer = hdrs
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|ct| ct.contains(CONTENT_TYPE_CHUNKED_RES));
+    // Kinds and counts only: neither the relay's request id nor any header value.
     println!(
-        "[3] relay {relay_url} -> HTTP {} in {:?}, {} B, content-type={:?}, x-request-id={:?}",
+        "[3] relay -> HTTP {} in {:?}, {} B, {}, x-request-id {}",
         status,
         t.elapsed(),
         rbody.len(),
-        hdrs.get("content-type").map(|v| v.to_str().unwrap_or("?")),
-        hdrs.get("x-request-id").map(|v| v.to_str().unwrap_or("?"))
+        if sealed_answer {
+            "a sealed response"
+        } else {
+            "not a sealed response"
+        },
+        if hdrs.contains_key("x-request-id") {
+            "present"
+        } else {
+            "absent"
+        }
     );
     if std::env::var("OHTTP_E2E_DUMP_HEADERS").is_ok() {
-        println!("    Response headers:");
-        for (k, v) in hdrs.iter() {
-            println!("      {}: {}", k, v.to_str().unwrap_or("?"));
-        }
+        println!("    {} response headers", hdrs.len());
     }
     if !status.is_success() {
         bail!("relay returned {status}")
     }
-    let ct = hdrs
-        .get("content-type")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    if !ct.contains(CONTENT_TYPE_CHUNKED_RES) {
-        bail!("wrong content-type: {ct}")
+    if !sealed_answer {
+        bail!("the relay's answer is not labelled {CONTENT_TYPE_CHUNKED_RES}")
     }
 
     // 5. Open the chunked response (§6.2) and parse the indeterminate-length BHTTP inner response
@@ -372,21 +379,20 @@ fn dns_key_config_test(network_str: &str) -> Result<()> {
     let network = network_named(network_str)?;
     let networks = networks()?;
 
-    let http = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()?;
+    let http = http_client(30)?;
 
     println!("DNS key config test for {}", network.as_str());
     // Fails without a configuration for the network.
     signer(&networks, network)?;
-    println!("Resolvers: {:?}", DOH_RESOLVERS);
+    // The query URL names the network's keys DNS name, so neither it nor a transport error
+    // that would repeat it is printed: a resolver is named by its host, a failure by its kind.
+    println!("Resolvers: {}", DOH_RESOLVERS.len());
 
     for (i, resolver) in DOH_RESOLVERS.iter().enumerate() {
-        println!("\n[{}] Trying resolver: {}", i + 1, resolver);
+        println!("\n[{}] Trying resolver {}", i + 1, resolver_label(resolver));
         let Some(url) = doh_query_url(&networks, resolver, network) else {
             bail!("no key-configuration DNS name for {}", network.as_str());
         };
-        println!("    URL: {}", url);
 
         let t = Instant::now();
         let resp = match http
@@ -396,11 +402,15 @@ fn dns_key_config_test(network_str: &str) -> Result<()> {
         {
             Ok(r) => r,
             Err(e) => {
-                println!("    ERROR: {}", e);
+                println!("    ERROR: {}", transport_failure(&e));
                 continue;
             }
         };
 
+        if resp.status().is_redirection() {
+            println!("    ERROR: redirected");
+            continue;
+        }
         if !resp.status().is_success() {
             println!("    ERROR: HTTP {}", resp.status());
             continue;
@@ -409,7 +419,7 @@ fn dns_key_config_test(network_str: &str) -> Result<()> {
         let body = match resp.bytes() {
             Ok(b) => b,
             Err(e) => {
-                println!("    ERROR reading response body: {}", e);
+                println!("    ERROR reading response body: {}", transport_failure(&e));
                 continue;
             }
         };
@@ -454,6 +464,58 @@ fn dns_key_config_test(network_str: &str) -> Result<()> {
     }
 
     bail!("All DNS resolvers failed")
+}
+
+/// A resolver as printed: the host of its URL only (`https://dns.example:8443/dns-query` is
+/// `dns.example`), as the URL parser reads it.
+fn resolver_label(resolver: &str) -> String {
+    url::Url::parse(resolver)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_owned))
+        .unwrap_or_else(|| "(unparsable resolver URL)".to_string())
+}
+
+/// What kind of transport failure `error` is, without its URL (which would name the relay, the
+/// key-configuration host or the keys DNS name), host, address, port or message.
+fn transport_failure(error: &reqwest::Error) -> String {
+    if error.is_timeout() {
+        "timed out".into()
+    } else if error.is_connect() {
+        "could not connect".into()
+    } else if let Some(status) = error.status() {
+        format!("status {}", status.as_u16())
+    } else if error.is_body() || error.is_decode() {
+        "the response body broke off".into()
+    } else if error.is_redirect() {
+        "redirected".into()
+    } else {
+        "request failed".into()
+    }
+}
+
+/// The HTTP stack of every exchange: as a wallet's, it follows no redirect (a 3xx is an answer,
+/// and a failure of the run). Unlike a wallet's it speaks plain HTTP too, for an origin checked
+/// directly.
+fn http_client(timeout_secs: u64) -> Result<reqwest::blocking::Client> {
+    Ok(reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(timeout_secs))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?)
+}
+
+/// `response`, unless it is a redirect: a wallet follows none, so the run fails, naming the
+/// kind only (never the `Location`).
+fn not_redirected(response: reqwest::blocking::Response) -> Result<reqwest::blocking::Response> {
+    if response.status().is_redirection() {
+        bail!("transport: redirected")
+    }
+    Ok(response)
+}
+
+/// `result` with a transport error reduced to its kind ([`transport_failure`]), so that no URL
+/// reaches the output through `?`.
+fn net<T>(result: reqwest::Result<T>) -> Result<T> {
+    result.map_err(|e| anyhow::anyhow!("transport: {}", transport_failure(&e)))
 }
 
 /// `OHTTP_E2E_EXTRA_HEADERS="Name: value|Name2: value2"` as (name, value) pairs.
@@ -503,6 +565,84 @@ mod tests {
             ),
             ("OHTTP_E2E_SIGNING_PUBKEY_TESTNET", key_hex(1)),
         ]
+    }
+
+    #[test]
+    fn a_resolver_is_printed_as_its_host_only() {
+        assert_eq!(
+            resolver_label("https://dns.example/dns-query?x=1"),
+            "dns.example"
+        );
+        assert_eq!(resolver_label("https://dns.example:8443"), "dns.example");
+        assert_eq!(
+            resolver_label("https://user:pw@dns.example/resolve"),
+            "dns.example"
+        );
+        assert_eq!(
+            resolver_label("dns.example/resolve"),
+            "(unparsable resolver URL)"
+        );
+        for resolver in DOH_RESOLVERS {
+            let label = resolver_label(resolver);
+            assert!(
+                !label.is_empty() && !label.contains(['/', ':', '?']),
+                "{label}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_transport_failure_is_printed_without_its_url() {
+        let http = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap();
+        // Port 0, which no server listens on (a connection to it is refused, and no other test
+        // can take it), and a query naming a DNS name.
+        let error = http
+            .get("http://127.0.0.1:0/q?name=keys.example&type=TXT")
+            .send()
+            .unwrap_err();
+        let shown = transport_failure(&error);
+        assert_eq!(shown, "could not connect");
+        let through_question_mark = net(Err::<(), _>(error)).unwrap_err().to_string();
+        assert_eq!(through_question_mark, "transport: could not connect");
+        for part in ["keys.example", "127.0.0.1", "/q"] {
+            assert!(!through_question_mark.contains(part));
+        }
+    }
+
+    /// A redirect is not followed and fails the fetch, naming neither status nor `Location`.
+    #[test]
+    fn a_redirect_is_refused_not_followed() {
+        use std::io::{Read, Write};
+        let target = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        target.set_nonblocking(true).unwrap();
+        let location = format!("http://{}/elsewhere", target.local_addr().unwrap());
+        let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!(
+            "http://{}/ohttp-configs/signed",
+            server.local_addr().unwrap()
+        );
+        let answer = format!(
+            "HTTP/1.1 302 Found\r\nlocation: {location}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+        );
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = server.accept().unwrap();
+            let mut head = Vec::new();
+            let mut byte = [0u8; 1];
+            while !head.ends_with(b"\r\n\r\n") && stream.read(&mut byte).unwrap_or(0) == 1 {
+                head.push(byte[0]);
+            }
+            stream.write_all(answer.as_bytes()).unwrap();
+        });
+        let response = net(http_client(5).unwrap().get(&url).send()).unwrap();
+        handle.join().unwrap();
+        let error = not_redirected(response).unwrap_err().to_string();
+        assert_eq!(error, "transport: redirected");
+        assert!(!error.contains("elsewhere") && !error.contains("127.0.0.1"));
+        // The redirect's target was never contacted.
+        assert!(target.accept().is_err());
     }
 
     #[test]

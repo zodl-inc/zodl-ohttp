@@ -20,7 +20,8 @@
 //! on the cryptography and differ in a dozen details around it. Each detail is an explicit
 //! option of the function that has it; a [`ClientProfile`] is the bundle one client passes,
 //! so that moving a client onto this crate keeps what it does, except where a preset notes a
-//! deliberate change (size caps, cache handling, the static network binding).
+//! deliberate change (size caps, cache handling, the static network binding, the headers sent
+//! to the relay, which are the same for every preset).
 //! `client/INTEGRATION.md` shows where each option is used.
 
 use crate::bhttp_codec::{DecodeOptions, EncodeOptions};

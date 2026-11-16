@@ -73,9 +73,10 @@ impl SuccessStatus {
 pub struct OuterPolicy {
     /// Which statuses are success.
     pub success: SuccessStatus,
-    /// How many bytes of a non-success answer's body are quoted in
-    /// [`OuterOutcome::Refused`]; `None` for all of it. (An outer `400` or `422` is retried
-    /// whatever its body says: see [`classify_outer_response`].)
+    /// How many bytes of a non-success answer's body are read for the quote in
+    /// [`OuterOutcome::Refused`]; `None` for all of it. The quote itself is at most
+    /// [`MAX_REFUSED_DETAIL_CHARS`] characters of printable ASCII, whatever the window. (An outer
+    /// `400` or `422` is retried whatever its body says: see [`classify_outer_response`].)
     pub body_window: Option<usize>,
     /// Whether a success answer must be labelled `message/ohttp-chunked-res`.
     pub require_response_media_type: bool,
@@ -90,21 +91,22 @@ impl OuterPolicy {
         body_window: None,
         require_response_media_type: false,
     };
-    /// The Android SDK (`OhttpTransport.roundTrip`): 200 only, the first 200 bytes of an
-    /// error body quoted.
+    /// The Android SDK (`OhttpTransport.roundTrip`): 200 only, a window of the first 200 bytes
+    /// of an error body (quoted as at most 120 characters).
     pub const ANDROID: OuterPolicy = OuterPolicy {
         success: SuccessStatus::Exactly200,
         body_window: Some(200),
         require_response_media_type: false,
     };
-    /// The Swift SDK (`OHTTPTransport.roundTrip`): 200 only, the first 200 bytes of an error
-    /// body quoted.
+    /// The Swift SDK (`OHTTPTransport.roundTrip`): 200 only, a window of the first 200 bytes of
+    /// an error body (quoted as at most 120 characters).
     pub const IOS: OuterPolicy = OuterPolicy {
         success: SuccessStatus::Exactly200,
         body_window: Some(200),
         require_response_media_type: false,
     };
-    /// Slipstream (`OhttpClient::round_trip`): 200 only, the whole error body quoted.
+    /// Slipstream (`OhttpClient::round_trip`): 200 only, the whole error body as the window
+    /// (quoted as at most 120 characters).
     pub const SLIPSTREAM: OuterPolicy = OuterPolicy {
         success: SuccessStatus::Exactly200,
         body_window: None,
@@ -126,6 +128,13 @@ pub struct OuterResponse<'a> {
     pub body: &'a [u8],
 }
 
+/// The most characters of a `Content-Type` [`OuterOutcome::WrongMediaType`] (and
+/// `Error::MediaType`) quotes.
+pub const MAX_MEDIA_TYPE_CHARS: usize = 64;
+
+/// The most characters of an outer error body [`OuterOutcome::Refused`] quotes.
+pub const MAX_REFUSED_DETAIL_CHARS: usize = 120;
+
 /// What an outer answer means.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum OuterOutcome {
@@ -139,12 +148,19 @@ pub enum OuterOutcome {
     Refused {
         /// The outer status.
         status: u16,
-        /// The body, up to the policy's window, invalid UTF-8 replaced.
+        /// The body, up to the policy's window, as at most [`MAX_REFUSED_DETAIL_CHARS`]
+        /// characters of printable ASCII: anything else (invalid UTF-8, any non-ASCII character,
+        /// newlines and other controls) replaced by `?`. Safe to log in format only (one short
+        /// line, which cannot inject log lines): the content is whatever the relay sent and may
+        /// itself name an address or an identifier, so a privacy-sensitive log records the
+        /// status and drops this.
         detail: String,
     },
     /// A success status, but not labelled `message/ohttp-chunked-res`.
     WrongMediaType {
-        /// The `Content-Type` received.
+        /// The `Content-Type` received, as at most [`MAX_MEDIA_TYPE_CHARS`] characters of
+        /// printable ASCII, anything else replaced by `?`: one short line, whose content is the
+        /// relay's choice.
         content_type: String,
     },
 }
@@ -173,7 +189,7 @@ pub fn classify_outer_response(
     if !policy.success.accepts(response.status) {
         return OuterOutcome::Refused {
             status: response.status,
-            detail: String::from_utf8_lossy(window).into_owned(),
+            detail: crate::sanitized(&String::from_utf8_lossy(window), MAX_REFUSED_DETAIL_CHARS),
         };
     }
     if policy.require_response_media_type {
@@ -181,7 +197,7 @@ pub fn classify_outer_response(
         let essence = content_type.split(';').next().unwrap_or_default().trim();
         if !essence.eq_ignore_ascii_case(RESPONSE_MEDIA_TYPE) {
             return OuterOutcome::WrongMediaType {
-                content_type: content_type.to_string(),
+                content_type: crate::sanitized(content_type, MAX_MEDIA_TYPE_CHARS),
             };
         }
     }
@@ -189,14 +205,56 @@ pub fn classify_outer_response(
 }
 
 /// The `User-Agent` every [`OuterHeaders`] preset sends to the relay, on the post and on the
-/// key-configuration fetch. The relay sees the client address, so one fixed value keeps it from
-/// telling the clients apart by their HTTP stack or application. It is part of this crate's
+/// key-configuration fetch. The relay sees the client address, so one fixed value keeps the
+/// `User-Agent` from telling the clients apart by their HTTP stack or application (other
+/// properties of the transport still can; see [`OuterHeaders`]). It is part of this crate's
 /// public surface: changing it is a breaking change.
 pub const RELAY_USER_AGENT: &str = "zodl-ohttp/1";
 
+/// The `Accept-Language` every [`OuterHeaders`] preset sends to the relay, on the post and on the
+/// key-configuration fetch. Set explicitly so that a platform HTTP stack does not add the
+/// device's language list, which would tell the relay about the user. Nothing the relay or the
+/// gateway answers depends on it.
+pub const RELAY_ACCEPT_LANGUAGE: &str = "en";
+
+/// The `Accept` of the fetch of the signed key configuration (`/ohttp-configs/signed`), the
+/// media type the gateway labels the envelope with.
+pub const SIGNED_CONFIG_MEDIA_TYPE: &str = "application/json";
+
+/// The media type of an unsigned key-configuration document (`/ohttp-configs`, RFC 9458 §3).
+pub const KEY_CONFIG_MEDIA_TYPE: &str = "application/ohttp-keys";
+
 /// The headers the client sets on its own requests to the relay (those the HTTP stack adds
-/// by itself, `Host` and `Content-Length`, are not listed). Every preset sets the fixed
-/// [`RELAY_USER_AGENT`], so the stack's default `User-Agent` is never sent.
+/// by itself, `Host` and `Content-Length`, are not listed).
+///
+/// Every preset is the same, [`OuterHeaders::LIBRARY`], and lists, in this order:
+///
+/// | Header | Post ([`relay_post`]) | Signed fetch ([`key_fetch_signed`], [`key_fetch`]) | Unsigned fetch ([`key_fetch_plain`]) |
+/// |---|---|---|---|
+/// | `Content-Type` | `message/ohttp-chunked-req` | | |
+/// | `Accept` | `message/ohttp-chunked-res` | `application/json` | `application/ohttp-keys` |
+/// | `Accept-Encoding` | `identity` | `identity` | `identity` |
+/// | `Accept-Language` | `en` ([`RELAY_ACCEPT_LANGUAGE`]) | `en` | `en` |
+/// | `User-Agent` | `zodl-ohttp/1` ([`RELAY_USER_AGENT`]) | `zodl-ohttp/1` | `zodl-ohttp/1` |
+/// | `X-Client-Trace-Id` | the caller's, if it passes one | never | never |
+///
+/// A client that sends exactly these headers (setting each one explicitly, so that its HTTP
+/// stack adds no `User-Agent`, `Accept-Language` or `Accept-Encoding` of its own, and adding
+/// nothing else) sends the relay the same header names and values whichever preset it uses. That
+/// removes the differences this crate controls. It does not hide what the transport itself
+/// shows the relay (TLS and HTTP/2 parameters, header order and compression, connection reuse,
+/// timing), which differs between HTTP stacks; nor a debug build's trace ids, whose format
+/// differs per [`crate::TracePolicy`]; nor the key-configuration URL where the presets'
+/// [`SignedConfigUrlRule`]s derive different ones. They agree only when the relay URL's path is
+/// exactly `/relay` or empty (`/ohttp-configs/signed` at the host's root either way); for any
+/// other path, nested ones such as `/testnet/relay` included, the replacing rules keep the rest
+/// of the path (`/testnet/ohttp-configs/signed`) while [`SignedConfigUrlRule::RelayHostRoot`]
+/// fetches the host's root.
+///
+/// [`relay_post`]: Self::relay_post
+/// [`key_fetch`]: Self::key_fetch
+/// [`key_fetch_signed`]: Self::key_fetch_signed
+/// [`key_fetch_plain`]: Self::key_fetch_plain
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OuterHeaders {
     /// `Accept: message/ohttp-chunked-res` on the post.
@@ -205,53 +263,38 @@ pub struct OuterHeaders {
     pub post_accept_encoding_identity: bool,
     /// A fixed `User-Agent` on every request ([`RELAY_USER_AGENT`] in every preset).
     pub user_agent: Option<&'static str>,
-    /// The `Accept` of the key-configuration fetch, if set.
-    pub key_fetch_accept: Option<&'static str>,
+    /// A fixed `Accept-Language` on every request ([`RELAY_ACCEPT_LANGUAGE`] in every preset).
+    /// Set, so that a platform HTTP stack does not send the device's language list.
+    pub accept_language: Option<&'static str>,
+    /// An `Accept` on the key-configuration fetch: [`SIGNED_CONFIG_MEDIA_TYPE`] for the signed
+    /// envelope, [`KEY_CONFIG_MEDIA_TYPE`] for the unsigned document.
+    pub key_fetch_accept: bool,
     /// `Accept-Encoding: identity` on the key-configuration fetch.
     pub key_fetch_accept_encoding_identity: bool,
-    /// Whether the key-configuration fetch carries `X-Client-Trace-Id` as the post does.
+    /// Whether the key-configuration fetch carries `X-Client-Trace-Id` as the post does (no
+    /// preset does).
     pub trace_on_key_fetch: bool,
 }
 
 impl OuterHeaders {
-    /// This library's `Client`: the post's content type, `Accept` and identity encoding.
+    /// The headers of every preset, as the table above lists them.
     pub const LIBRARY: OuterHeaders = OuterHeaders {
         post_accept: true,
         post_accept_encoding_identity: true,
         user_agent: Some(RELAY_USER_AGENT),
-        key_fetch_accept: None,
-        key_fetch_accept_encoding_identity: false,
-        trace_on_key_fetch: false,
-    };
-    /// The Android SDK: `Accept` and identity encoding on the post, `Accept:
-    /// application/json` on the fetch.
-    pub const ANDROID: OuterHeaders = OuterHeaders {
-        post_accept: true,
-        post_accept_encoding_identity: true,
-        user_agent: Some(RELAY_USER_AGENT),
-        key_fetch_accept: Some("application/json"),
-        key_fetch_accept_encoding_identity: false,
-        trace_on_key_fetch: false,
-    };
-    /// The Swift SDK: as Android, but the fetch asks for `application/ohttp-keys` (though it
-    /// gets JSON) and carries the trace id.
-    pub const IOS: OuterHeaders = OuterHeaders {
-        post_accept: true,
-        post_accept_encoding_identity: true,
-        user_agent: Some(RELAY_USER_AGENT),
-        key_fetch_accept: Some("application/ohttp-keys"),
-        key_fetch_accept_encoding_identity: false,
-        trace_on_key_fetch: true,
-    };
-    /// Slipstream: identity encoding on the fetch too.
-    pub const SLIPSTREAM: OuterHeaders = OuterHeaders {
-        post_accept: true,
-        post_accept_encoding_identity: true,
-        user_agent: Some(RELAY_USER_AGENT),
-        key_fetch_accept: Some("application/json"),
+        accept_language: Some(RELAY_ACCEPT_LANGUAGE),
+        key_fetch_accept: true,
         key_fetch_accept_encoding_identity: true,
         trace_on_key_fetch: false,
     };
+    /// The Android SDK: as [`OuterHeaders::LIBRARY`] (its fetch had no `Accept-Encoding`).
+    pub const ANDROID: OuterHeaders = OuterHeaders::LIBRARY;
+    /// The Swift SDK: as [`OuterHeaders::LIBRARY`] (its fetch asked for
+    /// `application/ohttp-keys` while it got JSON, had no `Accept-Encoding`, and carried the
+    /// trace id).
+    pub const IOS: OuterHeaders = OuterHeaders::LIBRARY;
+    /// Slipstream: as [`OuterHeaders::LIBRARY`].
+    pub const SLIPSTREAM: OuterHeaders = OuterHeaders::LIBRARY;
 
     /// The headers of the post of a sealed request; `trace` is the `X-Client-Trace-Id` value,
     /// if one is being sent.
@@ -263,31 +306,59 @@ impl OuterHeaders {
         if self.post_accept_encoding_identity {
             headers.push(("Accept-Encoding", "identity".to_string()));
         }
-        if let Some(agent) = self.user_agent {
-            headers.push(("User-Agent", agent.to_string()));
-        }
+        self.push_fixed(&mut headers);
         if let Some(trace) = trace {
             headers.push(("X-Client-Trace-Id", trace.to_string()));
         }
         headers
     }
 
-    /// The headers of the fetch of the signed key configuration.
+    /// The headers of the fetch of the signed key configuration (`/ohttp-configs/signed`):
+    /// [`key_fetch_signed`](Self::key_fetch_signed).
     pub fn key_fetch(&self, trace: Option<&str>) -> Vec<(&'static str, String)> {
+        self.key_fetch_signed(trace)
+    }
+
+    /// The headers of the fetch of the signed key configuration (`/ohttp-configs/signed`),
+    /// asking for [`SIGNED_CONFIG_MEDIA_TYPE`].
+    pub fn key_fetch_signed(&self, trace: Option<&str>) -> Vec<(&'static str, String)> {
+        self.key_fetch_for(SIGNED_CONFIG_MEDIA_TYPE, trace)
+    }
+
+    /// The headers of the fetch of the unsigned key-configuration document (`/ohttp-configs`),
+    /// asking for [`KEY_CONFIG_MEDIA_TYPE`]. Only tests fetch it: a wallet trusts a key only
+    /// through the signed envelope.
+    pub fn key_fetch_plain(&self, trace: Option<&str>) -> Vec<(&'static str, String)> {
+        self.key_fetch_for(KEY_CONFIG_MEDIA_TYPE, trace)
+    }
+
+    fn key_fetch_for(
+        &self,
+        media_type: &'static str,
+        trace: Option<&str>,
+    ) -> Vec<(&'static str, String)> {
         let mut headers = Vec::new();
-        if let Some(accept) = self.key_fetch_accept {
-            headers.push(("Accept", accept.to_string()));
+        if self.key_fetch_accept {
+            headers.push(("Accept", media_type.to_string()));
         }
         if self.key_fetch_accept_encoding_identity {
             headers.push(("Accept-Encoding", "identity".to_string()));
         }
-        if let Some(agent) = self.user_agent {
-            headers.push(("User-Agent", agent.to_string()));
-        }
+        self.push_fixed(&mut headers);
         if let (true, Some(trace)) = (self.trace_on_key_fetch, trace) {
             headers.push(("X-Client-Trace-Id", trace.to_string()));
         }
         headers
+    }
+
+    /// The fixed `Accept-Language` and `User-Agent`.
+    fn push_fixed(&self, headers: &mut Vec<(&'static str, String)>) {
+        if let Some(language) = self.accept_language {
+            headers.push(("Accept-Language", language.to_string()));
+        }
+        if let Some(agent) = self.user_agent {
+            headers.push(("User-Agent", agent.to_string()));
+        }
     }
 }
 
@@ -541,26 +612,43 @@ pub enum SignedConfigUrlRule {
 }
 
 /// The URL of the signed key configuration of the relay at `relay_url`, under `rule`.
+///
+/// The relay URL is split into its origin (scheme and authority) and its path, and only the
+/// path is rewritten: a final `/relay` segment is replaced, so `https://relay` (a single-label
+/// host, empty path) gives `https://relay/ohttp-configs/signed`, never another host.
+///
+/// `relay_url` is taken as text, not parsed: pass the canonical form
+/// ([`crate::OhttpConfig::relay_url`] or [`crate::canonical_relay_url`]). For other text the
+/// rule applies to it as written, so a trailing `/`, a default `:443` or a dot segment gives a
+/// URL other than the canonical form's (`https://relay.example/relay/` under
+/// [`SignedConfigUrlRule::ReplaceRelaySuffix`] gives `.../relay//ohttp-configs/signed`).
 pub fn signed_config_url(relay_url: &str, rule: SignedConfigUrlRule) -> Result<String, Error> {
     const SIGNED: &str = "/ohttp-configs/signed";
-    let replace = |base: &str| match base.strip_suffix("/relay") {
-        Some(root) => format!("{root}{SIGNED}"),
-        None => format!("{base}{SIGNED}"),
+    // The origin ends where the path (or a query or fragment) starts after `scheme://`; a value
+    // without `://` is all path.
+    let (origin, path) = match relay_url.find("://") {
+        Some(scheme_end) => {
+            let rest = &relay_url[scheme_end + 3..];
+            let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+            relay_url.split_at(scheme_end + 3 + end)
+        }
+        None => ("", relay_url),
+    };
+    let replace = |path: &str| match path.strip_suffix("/relay") {
+        Some(root) => format!("{origin}{root}{SIGNED}"),
+        None => format!("{origin}{path}{SIGNED}"),
     };
     match rule {
-        SignedConfigUrlRule::TrimThenReplaceRelaySuffix => {
-            Ok(replace(relay_url.trim_end_matches('/')))
-        }
-        SignedConfigUrlRule::ReplaceRelaySuffix => Ok(replace(relay_url)),
+        SignedConfigUrlRule::TrimThenReplaceRelaySuffix => Ok(replace(path.trim_end_matches('/'))),
+        SignedConfigUrlRule::ReplaceRelaySuffix => Ok(replace(path)),
         SignedConfigUrlRule::RelayHostRoot => {
-            let rest = relay_url
+            let authority = origin
                 .strip_prefix("https://")
                 .ok_or_else(|| Error::KeyConfig("relay URL must be https".into()))?;
-            let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
             if authority.is_empty() {
                 return Err(Error::KeyConfig("relay URL without host".into()));
             }
-            Ok(format!("https://{authority}{SIGNED}"))
+            Ok(format!("{origin}{SIGNED}"))
         }
     }
 }
@@ -647,7 +735,68 @@ mod tests {
             else {
                 panic!("a 503 was not refused");
             };
-            assert_eq!(detail.len(), window);
+            assert_eq!(detail.len(), window.min(MAX_REFUSED_DETAIL_CHARS));
+        }
+        // A narrower window than the quote cap bounds it.
+        let narrow = OuterPolicy {
+            body_window: Some(10),
+            ..OuterPolicy::LIBRARY
+        };
+        let OuterOutcome::Refused { detail, .. } =
+            classify_outer_response(&narrow, &outer(503, None, &body), 0)
+        else {
+            panic!("a 503 was not refused");
+        };
+        assert_eq!(detail, "x".repeat(10));
+    }
+
+    /// The relay's `Content-Type` is quoted as one short line of printable ASCII.
+    #[test]
+    fn a_wrong_media_type_is_quoted_short_and_printable() {
+        let policy = OuterPolicy {
+            require_response_media_type: true,
+            ..OuterPolicy::LIBRARY
+        };
+        let long = format!("text/html\r\nX-Injected: 1; {}", "a".repeat(200));
+        let OuterOutcome::WrongMediaType { content_type } =
+            classify_outer_response(&policy, &outer(200, Some(&long), &[]), 0)
+        else {
+            panic!("a wrong label was accepted");
+        };
+        assert_eq!(content_type.chars().count(), MAX_MEDIA_TYPE_CHARS);
+        assert!(content_type.starts_with("text/html??X-Injected: 1; "));
+        assert!(content_type
+            .chars()
+            .all(|c| c.is_ascii_graphic() || c == ' '));
+    }
+
+    /// The relay's error body is quoted as one short line of printable ASCII.
+    #[test]
+    fn a_quoted_body_is_one_short_printable_line() {
+        let mut body = b"bad\r\nInjected: header\x00\x1b[31m".to_vec();
+        body.extend_from_slice("é€".as_bytes());
+        body.extend_from_slice(&[0xff, 0xfe]);
+        body.extend_from_slice(&[b'y'; 500]);
+        for policy in [
+            OuterPolicy::LIBRARY,
+            OuterPolicy::ANDROID,
+            OuterPolicy::IOS,
+            OuterPolicy::SLIPSTREAM,
+        ] {
+            let OuterOutcome::Refused { detail, .. } =
+                classify_outer_response(&policy, &outer(502, None, &body), 0)
+            else {
+                panic!("a 502 was not refused");
+            };
+            assert!(detail.chars().count() <= MAX_REFUSED_DETAIL_CHARS);
+            assert!(
+                detail.chars().all(|c| c.is_ascii_graphic() || c == ' '),
+                "{detail:?}"
+            );
+            assert!(
+                detail.starts_with("bad??Injected: header??[31m??"),
+                "{detail:?}"
+            );
         }
     }
 
@@ -907,6 +1056,78 @@ mod tests {
         .is_err());
     }
 
+    /// Only the path is rewritten: a single-label host at the root keeps its host.
+    #[test]
+    fn the_signed_url_rewrites_the_path_only() {
+        for rule in [
+            SignedConfigUrlRule::TrimThenReplaceRelaySuffix,
+            SignedConfigUrlRule::ReplaceRelaySuffix,
+            SignedConfigUrlRule::RelayHostRoot,
+        ] {
+            for relay in ["https://relay", "https://relay/", "https://relay/relay"] {
+                let url = signed_config_url(relay, rule).unwrap();
+                if rule == SignedConfigUrlRule::ReplaceRelaySuffix && relay == "https://relay/" {
+                    assert_eq!(url, "https://relay//ohttp-configs/signed");
+                } else {
+                    assert_eq!(
+                        url, "https://relay/ohttp-configs/signed",
+                        "{relay} {rule:?}"
+                    );
+                }
+            }
+            assert_eq!(
+                signed_config_url("https://relay:8443", rule).unwrap(),
+                "https://relay:8443/ohttp-configs/signed"
+            );
+        }
+    }
+
+    /// The shapes a configured relay URL takes (`OhttpConfig::relay_url` is canonical: no
+    /// trailing `/`), under every rule.
+    #[test]
+    fn the_signed_url_of_each_shipped_shape() {
+        use SignedConfigUrlRule::*;
+        for (relay, replaced, root) in [
+            (
+                "https://relay.example/relay",
+                "https://relay.example/ohttp-configs/signed",
+                "https://relay.example/ohttp-configs/signed",
+            ),
+            (
+                "https://relay.example/testnet",
+                "https://relay.example/testnet/ohttp-configs/signed",
+                "https://relay.example/ohttp-configs/signed",
+            ),
+            (
+                "https://relay.example/testnet/relay",
+                "https://relay.example/testnet/ohttp-configs/signed",
+                "https://relay.example/ohttp-configs/signed",
+            ),
+            (
+                "https://relay.example",
+                "https://relay.example/ohttp-configs/signed",
+                "https://relay.example/ohttp-configs/signed",
+            ),
+            (
+                "https://relay.example:8443/mainnet/relay",
+                "https://relay.example:8443/mainnet/ohttp-configs/signed",
+                "https://relay.example:8443/ohttp-configs/signed",
+            ),
+        ] {
+            for (rule, want) in [
+                (TrimThenReplaceRelaySuffix, replaced),
+                (ReplaceRelaySuffix, replaced),
+                (RelayHostRoot, root),
+            ] {
+                assert_eq!(
+                    signed_config_url(relay, rule).unwrap(),
+                    want,
+                    "{relay} {rule:?}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn retry_after_is_delay_seconds_capped() {
         assert_eq!(retry_after_delay(None), None);
@@ -955,41 +1176,89 @@ mod tests {
         );
     }
 
+    const HEADER_PRESETS: [OuterHeaders; 4] = [
+        OuterHeaders::LIBRARY,
+        OuterHeaders::ANDROID,
+        OuterHeaders::IOS,
+        OuterHeaders::SLIPSTREAM,
+    ];
+
     #[test]
-    fn the_headers_differ_per_client() {
-        fn names(h: Vec<(&'static str, String)>) -> Vec<&'static str> {
-            h.into_iter().map(|(k, _)| k).collect()
+    fn every_preset_sends_the_relay_the_same_headers() {
+        for preset in HEADER_PRESETS {
+            assert_eq!(preset, OuterHeaders::LIBRARY);
+            for trace in [None, Some("t")] {
+                assert_eq!(
+                    preset.relay_post(trace),
+                    OuterHeaders::LIBRARY.relay_post(trace)
+                );
+                assert_eq!(
+                    preset.key_fetch(trace),
+                    OuterHeaders::LIBRARY.key_fetch(trace)
+                );
+                assert_eq!(
+                    preset.key_fetch_plain(trace),
+                    OuterHeaders::LIBRARY.key_fetch_plain(trace)
+                );
+            }
         }
-        assert_eq!(
-            names(OuterHeaders::LIBRARY.relay_post(None)),
-            ["Content-Type", "Accept", "Accept-Encoding", "User-Agent"]
-        );
-        assert_eq!(
-            names(OuterHeaders::ANDROID.relay_post(Some("t"))),
-            [
-                "Content-Type",
-                "Accept",
-                "Accept-Encoding",
-                "User-Agent",
-                "X-Client-Trace-Id"
-            ]
-        );
-        assert_eq!(
-            names(OuterHeaders::ANDROID.key_fetch(Some("t"))),
-            ["Accept", "User-Agent"]
-        );
-        assert_eq!(
-            names(OuterHeaders::IOS.key_fetch(Some("t"))),
-            ["Accept", "User-Agent", "X-Client-Trace-Id"]
-        );
-        assert_eq!(
-            names(OuterHeaders::SLIPSTREAM.key_fetch(Some("t"))),
-            ["Accept", "Accept-Encoding", "User-Agent"]
-        );
-        assert_eq!(
-            names(OuterHeaders::LIBRARY.key_fetch(Some("t"))),
-            ["User-Agent"]
-        );
+        // Through the profiles too, which is what a foreign-function boundary hands out.
+        for id in 1..=5 {
+            let profile = crate::ClientProfile::by_id(id).unwrap();
+            assert_eq!(profile.headers, OuterHeaders::LIBRARY, "profile {id}");
+        }
+    }
+
+    #[test]
+    fn the_header_sets_are_exactly_these() {
+        let owned = |pairs: &[(&'static str, &str)]| -> Vec<(&'static str, String)> {
+            pairs.iter().map(|&(k, v)| (k, v.to_string())).collect()
+        };
+        for preset in HEADER_PRESETS {
+            assert_eq!(
+                preset.relay_post(None),
+                owned(&[
+                    ("Content-Type", "message/ohttp-chunked-req"),
+                    ("Accept", "message/ohttp-chunked-res"),
+                    ("Accept-Encoding", "identity"),
+                    ("Accept-Language", "en"),
+                    ("User-Agent", "zodl-ohttp/1"),
+                ])
+            );
+            assert_eq!(
+                preset.relay_post(Some("t")),
+                owned(&[
+                    ("Content-Type", "message/ohttp-chunked-req"),
+                    ("Accept", "message/ohttp-chunked-res"),
+                    ("Accept-Encoding", "identity"),
+                    ("Accept-Language", "en"),
+                    ("User-Agent", "zodl-ohttp/1"),
+                    ("X-Client-Trace-Id", "t"),
+                ])
+            );
+            // No trace id on a key fetch, whether or not the posts carry one; one `Accept` per
+            // endpoint.
+            for trace in [None, Some("t")] {
+                let signed = owned(&[
+                    ("Accept", "application/json"),
+                    ("Accept-Encoding", "identity"),
+                    ("Accept-Language", "en"),
+                    ("User-Agent", "zodl-ohttp/1"),
+                ]);
+                assert_eq!(preset.key_fetch(trace), signed);
+                assert_eq!(preset.key_fetch_signed(trace), signed);
+                assert_eq!(
+                    preset.key_fetch_plain(trace),
+                    owned(&[
+                        ("Accept", "application/ohttp-keys"),
+                        ("Accept-Encoding", "identity"),
+                        ("Accept-Language", "en"),
+                        ("User-Agent", "zodl-ohttp/1"),
+                    ])
+                );
+            }
+            assert_eq!(preset.accept_language, Some(RELAY_ACCEPT_LANGUAGE));
+        }
     }
 
     #[test]
@@ -1001,12 +1270,7 @@ mod tests {
                 .collect()
         }
         assert_eq!(RELAY_USER_AGENT, "zodl-ohttp/1");
-        for preset in [
-            OuterHeaders::LIBRARY,
-            OuterHeaders::ANDROID,
-            OuterHeaders::IOS,
-            OuterHeaders::SLIPSTREAM,
-        ] {
+        for preset in HEADER_PRESETS {
             assert_eq!(preset.user_agent, Some(RELAY_USER_AGENT));
             for trace in [None, Some("t")] {
                 assert_eq!(agents(preset.relay_post(trace)), ["zodl-ohttp/1"]);

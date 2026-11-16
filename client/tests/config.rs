@@ -19,7 +19,8 @@
 
 use ed25519_dalek::SigningKey;
 use zodl_ohttp_client::{
-    ConfigError, ConfigField, Network, OhttpConfig, OhttpConfigParams, OhttpNetworks,
+    signed_config_url, ConfigError, ConfigField, Network, OhttpConfig, OhttpConfigParams,
+    OhttpNetworks, SignedConfigUrlRule,
 };
 
 /// The four values of one network, in the field order of `OhttpConfigParams`.
@@ -87,11 +88,13 @@ fn a_complete_configuration_is_accepted_as_given() {
     for relay in [
         "https://relay.example:8443/relay",
         "https://relay.example",
-        "https://relay.example/",
         "https://Relay.Example/relay",
         "https://192.0.2.1/relay",
         "https://[2001:db8::1]:443/relay",
         "https://[::ffff:192.0.2.1]/relay",
+        "https://[::1]/relay",
+        "https://[2001:DB8::1]/relay",
+        "https://relay.example/a/relay",
     ] {
         build(&with(mainnet(), 1, relay)).unwrap();
     }
@@ -173,6 +176,24 @@ fn malformed_values_are_refused_naming_the_field_only() {
                 "https://relay_mainnet.example/relay",
                 "https://relay-mainnet.example%2e/relay",
                 "https://relé.example/relay",
+                "https://relay-mainnet.example/relay//",
+                "https://relay-mainnet.example//relay",
+                "https://relay-mainnet.example/a%2Frelay",
+                "https://relay-mainnet.example/a/..//relay",
+                "https://relay-mainnet.example/%2e%2e/%2F",
+                "https://relay-mainnet.example/re%+aay",
+                "https://relay-mainnet.example/relay%",
+                "https://relay-mainnet.example/relay%4",
+                "https://relay-mainnet.example/a%5crelay",
+                "https://[:]/relay",
+                "https://[:::]/relay",
+                "https://[::g]/relay",
+                "https://[1:2:3:4:5:6:7:8:9]/relay",
+                "https://[::1%25eth0]/relay",
+                "https://192.0.2.300/relay",
+                "https://1.2.3.4.5/relay",
+                "https://0x100000000/relay",
+                "https://ohttp-gateway.example/relay",
             ],
         ),
         (
@@ -278,6 +299,115 @@ fn the_relay_url_rules_are_specific() {
     assert_eq!(
         rule("https://re_lay.example/relay"),
         "must have a valid host"
+    );
+    // An empty path segment, or an encoded slash or backslash.
+    for relay in [
+        "https://relay.example/relay//",
+        "https://relay.example//relay",
+    ] {
+        assert_eq!(
+            rule(relay),
+            "must not contain an empty path segment ('//')",
+            "{relay}"
+        );
+    }
+    for relay in [
+        "https://relay.example/a%2Frelay",
+        "https://relay.example/a%2frelay",
+        "https://relay.example/a%5Crelay",
+    ] {
+        assert_eq!(
+            rule(relay),
+            "must not contain an encoded '/' or '\\'",
+            "{relay}"
+        );
+    }
+    // IPv6 literals are parsed, not just checked for their characters.
+    for relay in [
+        "https://[:]/relay",
+        "https://[:::]/relay",
+        "https://[1:2:3:4:5:6:7:8:9]/relay",
+    ] {
+        assert_eq!(rule(relay), "must have a valid host", "{relay}");
+    }
+    // A relay on the gateway's own host would hand the gateway the client's address.
+    for relay in [
+        "https://ohttp-gateway.example/relay",
+        "https://OHTTP-Gateway.example:8443/relay",
+        "https://ohttp-gateway.example",
+    ] {
+        assert_eq!(rule(relay), "must not be on a gateway host", "{relay}");
+    }
+}
+
+#[test]
+fn a_relay_is_compared_by_host_port_and_path() {
+    let main = || build(&mainnet()).unwrap();
+    let shared = |relay: &str| {
+        OhttpNetworks::new(
+            Some(main()),
+            Some(build(&with(testnet(), 1, relay)).unwrap()),
+        )
+    };
+    // The same relay, spelled differently: the default port, the host's case, the path's case.
+    for relay in [
+        "https://relay-mainnet.example:443/relay",
+        "https://Relay-Mainnet.example/relay",
+        "https://relay-mainnet.example/Relay",
+    ] {
+        assert_eq!(
+            shared(relay).unwrap_err(),
+            ConfigError::SharedAcrossNetworks {
+                field: ConfigField::RelayUrl
+            },
+            "{relay}"
+        );
+    }
+    // Another port or path is another relay.
+    for relay in [
+        "https://relay-mainnet.example:8443/relay",
+        "https://relay-mainnet.example/relay-testnet",
+        "https://relay-mainnet.example",
+    ] {
+        shared(relay).unwrap();
+    }
+    // An IPv6 literal in any of its spellings.
+    let at = |relay: &str| build(&with(mainnet(), 1, relay)).unwrap();
+    let test_at = |relay: &str| build(&with(testnet(), 1, relay)).unwrap();
+    assert_eq!(
+        OhttpNetworks::new(
+            Some(at("https://[2001:db8::1]/relay")),
+            Some(test_at("https://[2001:DB8:0:0::1]:443/relay")),
+        )
+        .unwrap_err(),
+        ConfigError::SharedAcrossNetworks {
+            field: ConfigField::RelayUrl
+        }
+    );
+    // Nor may one network's relay be on the other network's gateway host.
+    for relay in [
+        "https://ohttp-gateway.example/relay",
+        "https://ohttp-gateway.example:8443/other",
+    ] {
+        assert_eq!(
+            shared(relay).unwrap_err(),
+            ConfigError::Invalid {
+                field: ConfigField::RelayUrl,
+                rule: "must not be on a gateway host"
+            },
+            "{relay}"
+        );
+    }
+    assert_eq!(
+        OhttpNetworks::new(
+            Some(at("https://ohttp-gateway-testnet.example/relay")),
+            Some(build(&testnet()).unwrap()),
+        )
+        .unwrap_err(),
+        ConfigError::Invalid {
+            field: ConfigField::RelayUrl,
+            rule: "must not be on a gateway host"
+        }
     );
 }
 
@@ -408,5 +538,213 @@ fn debug_output_shows_no_value() {
     let shown = format!("{params:#?}");
     for value in &main_values {
         assert!(!shown.contains(value.as_str()), "{shown}");
+    }
+}
+
+/// The relay URL is kept in its canonical form: what the client posts to, and what the
+/// comparison between networks reads.
+#[test]
+fn a_relay_url_is_kept_canonical() {
+    let canonical = |relay: &str| {
+        build(&with(mainnet(), 1, relay))
+            .unwrap()
+            .relay_url()
+            .to_string()
+    };
+    for (given, kept) in [
+        // One trailing slash is removed, so configurations that ended in one keep working.
+        (
+            "https://relay.example/relay/",
+            "https://relay.example/relay",
+        ),
+        ("https://relay.example/", "https://relay.example"),
+        ("https://relay.example", "https://relay.example"),
+        // Host case and the default port.
+        (
+            "https://Relay.Example:443/relay",
+            "https://relay.example/relay",
+        ),
+        (
+            "https://relay.example:8443/relay",
+            "https://relay.example:8443/relay",
+        ),
+        // Dot segments and percent-encoding.
+        (
+            "https://relay.example/a/../relay",
+            "https://relay.example/relay",
+        ),
+        (
+            "https://relay.example/./relay",
+            "https://relay.example/relay",
+        ),
+        (
+            "https://relay.example/%72elay",
+            "https://relay.example/relay",
+        ),
+        (
+            "https://relay.example/re%7elay",
+            "https://relay.example/re~lay",
+        ),
+        ("https://relay.example/a%3aB", "https://relay.example/a%3AB"),
+        // Every IPv4 form the URL standard reads: hex, octal, a single integer, fewer parts.
+        (
+            "https://0xc0.0x00.0x02.0x01/relay",
+            "https://192.0.2.1/relay",
+        ),
+        ("https://0300.0.02.01/relay", "https://192.0.2.1/relay"),
+        ("https://3221225985/relay", "https://192.0.2.1/relay"),
+        ("https://192.0.513/relay", "https://192.0.2.1/relay"),
+        // IPv6 in its standard form.
+        (
+            "https://[2001:DB8:0:0::1]:443/relay",
+            "https://[2001:db8::1]/relay",
+        ),
+    ] {
+        assert_eq!(canonical(given), kept, "{given}");
+    }
+}
+
+/// Two spellings of one relay are one relay: an IPv4 address in any form, an IPv4-mapped IPv6
+/// address, dot segments, percent-encoding and a trailing slash.
+#[test]
+fn equivalent_relay_urls_are_shared() {
+    let main = |relay: &str| build(&with(mainnet(), 1, relay)).unwrap();
+    let test = |relay: &str| build(&with(testnet(), 1, relay)).unwrap();
+    for (a, b) in [
+        ("https://192.0.2.1/relay", "https://0xc0000201/relay"),
+        ("https://192.0.2.1/relay", "https://0300.0.2.1/relay"),
+        ("https://192.0.2.1/relay", "https://3221225985/relay"),
+        (
+            "https://192.0.2.1/relay",
+            "https://[::ffff:192.0.2.1]/relay",
+        ),
+        (
+            "https://192.0.2.1:443/relay",
+            "https://[::ffff:c000:201]/relay",
+        ),
+        (
+            "https://relay.example/relay",
+            "https://relay.example/a/../relay",
+        ),
+        (
+            "https://relay.example/relay",
+            "https://relay.example/%72elay",
+        ),
+        (
+            "https://relay.example/relay",
+            "https://relay.example/relay/",
+        ),
+        (
+            "https://relay.example/relay",
+            "https://RELAY.example/RELAY/",
+        ),
+    ] {
+        assert_eq!(
+            OhttpNetworks::new(Some(main(a)), Some(test(b))).unwrap_err(),
+            ConfigError::SharedAcrossNetworks {
+                field: ConfigField::RelayUrl
+            },
+            "{a} {b}"
+        );
+    }
+    // Distinct hosts, ports and paths stay distinct.
+    for (a, b) in [
+        ("https://192.0.2.1/relay", "https://192.0.2.2/relay"),
+        (
+            "https://192.0.2.1/relay",
+            "https://[::ffff:192.0.2.2]/relay",
+        ),
+        (
+            "https://relay.example/relay",
+            "https://relay.example:8443/relay",
+        ),
+        (
+            "https://relay.example/relay",
+            "https://relay.example/a/relay",
+        ),
+    ] {
+        OhttpNetworks::new(Some(main(a)), Some(test(b))).unwrap();
+    }
+}
+
+/// The forbidden path syntax is found as written, before the parser resolves dot segments or
+/// decodes anything.
+#[test]
+fn the_path_is_checked_as_written() {
+    let rule = |relay: &str| match build(&with(mainnet(), 1, relay)) {
+        Err(ConfigError::Invalid { rule, .. }) => rule,
+        other => panic!("{relay}: {other:?}"),
+    };
+    for relay in [
+        "https://relay.example/a/..//relay",
+        "https://relay.example//../relay",
+        "https://relay.example/a//../relay",
+    ] {
+        assert_eq!(
+            rule(relay),
+            "must not contain an empty path segment ('//')",
+            "{relay}"
+        );
+    }
+    for relay in [
+        "https://relay.example/%2e%2e/%2F",
+        "https://relay.example/a/%2f../relay",
+        "https://relay.example/%5C/relay",
+    ] {
+        assert_eq!(
+            rule(relay),
+            "must not contain an encoded '/' or '\\'",
+            "{relay}"
+        );
+    }
+    for relay in [
+        "https://relay.example/re%+aay",
+        "https://relay.example/re%g1ay",
+        "https://relay.example/relay%",
+        "https://relay.example/relay%4",
+    ] {
+        assert_eq!(
+            rule(relay),
+            "must not contain a '%' not followed by two hex digits",
+            "{relay}"
+        );
+    }
+}
+
+/// The shapes shipped configurations use are kept as written, and derive the signed
+/// configuration's URL under every rule as before.
+#[test]
+fn the_shipped_shapes_are_unchanged() {
+    use SignedConfigUrlRule::*;
+    for (relay, replaced, root) in [
+        (
+            "https://relay-mainnet.example/relay",
+            "https://relay-mainnet.example/ohttp-configs/signed",
+            "https://relay-mainnet.example/ohttp-configs/signed",
+        ),
+        (
+            "https://relay-mainnet.example/mainnet",
+            "https://relay-mainnet.example/mainnet/ohttp-configs/signed",
+            "https://relay-mainnet.example/ohttp-configs/signed",
+        ),
+        (
+            "https://relay.example/mainnet/relay",
+            "https://relay.example/mainnet/ohttp-configs/signed",
+            "https://relay.example/ohttp-configs/signed",
+        ),
+    ] {
+        let config = build(&with(mainnet(), 1, relay)).unwrap();
+        assert_eq!(config.relay_url(), relay);
+        for (rule, want) in [
+            (TrimThenReplaceRelaySuffix, replaced),
+            (ReplaceRelaySuffix, replaced),
+            (RelayHostRoot, root),
+        ] {
+            assert_eq!(
+                signed_config_url(config.relay_url(), rule).unwrap(),
+                want,
+                "{relay} {rule:?}"
+            );
+        }
     }
 }

@@ -313,28 +313,34 @@ pub fn verify_signed_config_with(
     if policy.unknown_fields == UnknownFields::Reject
         || policy.duplicate_keys == DuplicateKeys::AnyTopLevel
     {
-        let keys =
-            top_level_keys(json).map_err(|e| refused(format!("not a signed envelope: {e}")))?;
+        let keys = top_level_keys(json).map_err(|e| refused(not_an_envelope(&e)))?;
         for (i, key) in keys.iter().enumerate() {
+            // The key is named only when it is one of the envelope's own fields: anything else
+            // is text the relay chose.
+            let named = ENVELOPE_FIELDS
+                .iter()
+                .find(|&&field| field == key.as_str())
+                .copied();
             if policy.duplicate_keys == DuplicateKeys::AnyTopLevel && keys[..i].contains(key) {
-                return Err(refused(format!("duplicate JSON key {key}")));
+                return Err(refused(match named {
+                    Some(field) => format!("duplicate JSON key {field}"),
+                    None => "duplicate JSON key".into(),
+                }));
             }
-            if policy.unknown_fields == UnknownFields::Reject
-                && !ENVELOPE_FIELDS.contains(&key.as_str())
-            {
-                return Err(refused(format!("unknown envelope field {key}")));
+            if policy.unknown_fields == UnknownFields::Reject && named.is_none() {
+                return Err(refused("unknown envelope field".into()));
             }
         }
     }
     let envelope: Envelope =
-        serde_json::from_slice(json).map_err(|e| refused(format!("not a signed envelope: {e}")))?;
+        serde_json::from_slice(json).map_err(|e| refused(not_an_envelope(&e)))?;
     if envelope.v != 1 {
         return Err(refused(format!("envelope version {}", envelope.v)));
     }
     if envelope.network != network {
+        // The envelope's network is the relay's text; only the expected one is named.
         return Err(refused(format!(
-            "signed for {}, not {network}",
-            envelope.network
+            "signed for another network, not {network}"
         )));
     }
     if envelope.not_before >= envelope.not_after {
@@ -362,10 +368,9 @@ pub fn verify_signed_config_with(
     // time; the signature below is checked by `ed25519-dalek`, which does its own.
     let key_id = hex::encode(&Sha256::digest(signer.as_bytes())[..4]);
     if envelope.key_id != key_id {
-        return Err(refused(format!(
-            "signed by key {}, not {key_id}",
-            envelope.key_id
-        )));
+        // Neither key id is named: the pinned one would tell a log reader which deployment
+        // the client is configured for, the envelope's is the relay's text.
+        return Err(refused("signed by another key".into()));
     }
     let decode = |field: &str, text: &str| {
         match policy.base64 {
@@ -413,6 +418,27 @@ pub fn verify_signed_config_with(
 }
 
 /// The top-level keys of the JSON object `json`, repeats included.
+/// Why `json` is not an envelope, without quoting it.
+fn not_an_envelope(error: &serde_json::Error) -> String {
+    format!("not a signed envelope: {}", json_error(error))
+}
+
+/// A JSON error as its kind and position only: serde's messages repeat the offending text
+/// (`invalid type: string "..."`), which here is whatever a peer sent.
+pub(crate) fn json_error(error: &serde_json::Error) -> String {
+    let category = match error.classify() {
+        serde_json::error::Category::Io => "I/O",
+        serde_json::error::Category::Syntax => "syntax",
+        serde_json::error::Category::Data => "data",
+        serde_json::error::Category::Eof => "end of input",
+    };
+    format!(
+        "{category} error at line {} column {}",
+        error.line(),
+        error.column()
+    )
+}
+
 fn top_level_keys(json: &[u8]) -> Result<Vec<String>, serde_json::Error> {
     struct Keys;
     impl<'de> Visitor<'de> for Keys {
@@ -441,8 +467,9 @@ fn top_level_keys(json: &[u8]) -> Result<Vec<String>, serde_json::Error> {
 mod tests {
     use super::*;
 
-    /// `docs/signed-configs-test-vector.json`.
-    const VECTOR: &str = include_str!("../../docs/signed-configs-test-vector.json");
+    /// `docs/signed-configs-test-vector.json`, as the crate ships it (`tests/workspace.rs` checks
+    /// that the two are the same).
+    const VECTOR: &str = include_str!("../testdata/signed-configs-test-vector.json");
 
     #[derive(Deserialize)]
     struct Vector {

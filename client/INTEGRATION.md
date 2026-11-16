@@ -49,15 +49,20 @@ impl OhttpNetworks {
 | Value | Rule |
 |---|---|
 | `gateway_host` | the gateway host name, which is also the inner `:authority` of light client server requests; a lower-case bare DNS host name (no scheme, port, path or trailing dot) |
-| `relay_url` | the relay URL sealed requests are posted to; `https://`, a host (DNS name or IP literal), an optional numeric port and an optional path; no userinfo, query, fragment, backslash, whitespace or control characters |
+| `relay_url` | the relay URL sealed requests are posted to; `https://`, a host (DNS name or IP address, not a gateway host), an optional numeric port and an optional path; ASCII, no userinfo, query, fragment, backslash, whitespace, control characters, encoded `/` or `\\` (`%2F`, `%5C`) or empty path segment (`//`). Kept canonical: one trailing `/` removed, host in lower case, IP addresses in standard form, no `:443`, dot segments resolved, percent-encoding normalized |
 | `keys_dns_name` | the DNS TXT name of the signed key configuration, a last-resort source (section 2); a lower-case bare DNS host name |
 | `signing_pubkey` | the gateway's key-configuration signing key, raw Ed25519 as 64 hex digits, a valid point not of small order |
 
 The values are named fields of `OhttpConfigParams`, so two of the same form (the gateway host
 and the keys DNS name) cannot be swapped by position. `OhttpConfig::new` requires all four
 values and checks each, copying them; `OhttpNetworks::new` also requires
-that mainnet and testnet share no gateway host, relay URL or keys DNS name (compared ignoring
-ASCII case) and no signing key. Values are taken as given: surrounding whitespace, such as a
+that mainnet and testnet share no gateway host or keys DNS name (compared ignoring ASCII case),
+no relay (the same canonical host, port and path, the path compared ignoring case:
+`https://relay.example/relay`, `https://Relay.example:443/a/../relay/` and
+`https://relay.example/%72elay` are one relay, and so are `https://192.0.2.1/relay`,
+`https://0xc0000201/relay` and `https://[::ffff:192.0.2.1]/relay`) and no signing key, and that
+neither network's relay is on a gateway host. `relay_url()` returns the canonical form, which is
+what the client posts to. Other values are taken as given: surrounding whitespace, such as a
 trailing newline from a secret store, is refused, not trimmed. A refusal is a `ConfigError`
 (`Empty`, `Invalid` or `SharedAcrossNetworks`) that names the field (`ConfigField`) and the
 rule, never the value, and the `Debug` output of a configuration shows only which fields are
@@ -95,8 +100,9 @@ assert!(networks.get(Network::Mainnet).is_none());
 
 1. Fetch the signed envelope through the relay: `signed_config_url(relay_url, rule)` derives its
    URL from the relay URL (`.../relay` becomes `.../ohttp-configs/signed` under the default
-   rules). Do not follow redirects. Read at most `MAX_KEY_CONFIG_BYTES` (64 KiB, enforce it while
-   reading with `Limits::key_config_guard()`).
+   rules), with exactly the headers `profile.headers.key_fetch_signed(None)` lists. Do not follow
+   redirects. Read at most `MAX_KEY_CONFIG_BYTES` (64 KiB, enforce it while reading with
+   `Limits::key_config_guard()`).
 2. Only if that fails, read the envelope from DNS over HTTPS: for each resolver in
    `DOH_RESOLVERS`, in order, `GET doh_query_url(&networks, resolver, network)` (the network's
    `keys_dns_name`) with `accept: application/dns-json`, and pass the body to
@@ -105,7 +111,13 @@ assert!(networks.get(Network::Mainnet).is_none());
    `\\` and `\DDD` decimal escapes), requires exactly one distinct TXT value, base64-decodes it
    (standard alphabet, padded) and refuses an envelope over 64 KiB. The TXT value is the base64
    of the exact bytes `GET /ohttp-configs/signed` returns. Use the same transport as for the
-   relay (over Tor when the wallet is in Tor mode).
+   relay (over Tor when the wallet is in Tor mode). The resolver sees the client's address and
+   the name it asks for, which says that the client is looking for this gateway's keys, so send
+   it no more than the relay: exactly `Accept: application/dns-json`,
+   `Accept-Encoding: identity`, `Accept-Language: en` (`RELAY_ACCEPT_LANGUAGE`) and
+   `User-Agent: zodl-ohttp/1` (`RELAY_USER_AGENT`), each set explicitly, no cookies, no other
+   header, no redirect followed, and the query URL exactly as `doh_query_url` builds it (it asks
+   the resolver not to forward the client's subnet where the resolver supports that).
 3. Either way, verify the envelope with `verify_signed_config(&networks, json, network, now,
    &profile.signed_config)` (or `open_signed_config(json, network, &key, now)` for the library
    policy). It checks version 1, the network, the key id and Ed25519 signature against the
@@ -123,19 +135,13 @@ The network of a gateway host comes from the configuration
 
 ```rust
 use std::time::Duration;
-use zodl_ohttp_client::{signed_config_url, Client, KeyConfigSource, Network, Request, SignedConfigUrlRule};
+use zodl_ohttp_client::{Client, NetworkRule, Request, SignedConfigUrlRule};
 
 // `networks` as in section 1; `host` is the light client server host.
-let network = zodl_ohttp_client::NetworkRule::KnownHosts.network_for(&networks, host)?;
-let config = networks.get(network).expect("a known host has a configuration");
-let client = Client::new(
-    config.relay_url(),
-    KeyConfigSource::Signed {
-        url: signed_config_url(config.relay_url(), SignedConfigUrlRule::ReplaceRelaySuffix)?,
-        network: network.as_str().into(),
-        signer: *config.signing_pubkey(),
-    },
-);
+let network = NetworkRule::KnownHosts.network_for(&networks, host)?;
+// The configured relay, and the gateway's signed envelope fetched through it and checked
+// against the configured signing key (`.../relay` becomes `.../ohttp-configs/signed`).
+let client = Client::for_network(&networks, network, SignedConfigUrlRule::ReplaceRelaySuffix)?;
 let request = Request::new("POST", host, "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetLatestBlock")
     .header("content-type", "application/grpc")
     .header("te", "trailers")
@@ -156,7 +162,26 @@ let response = client.send(&request, Duration::from_secs(30)).await?;
   cap;
 - holds every request through a relay while a `Retry-After` from an outer 429 runs
   (`Error::Backoff`);
-- follows no redirect.
+- follows no redirect;
+- speaks `https://` only.
+
+The signed envelope must be served where the `SignedConfigUrlRule` derives it from the relay URL
+(`ReplaceRelaySuffix`: `https://relay.example/relay` gives
+`https://relay.example/ohttp-configs/signed`; `RelayHostRoot`: `/ohttp-configs/signed` on the
+relay's host). For a relay that serves it elsewhere, build the client with
+`Client::new(relay_url, KeyConfigSource::Signed { url, network, signer })` (`network` a `Network`).
+
+`Client::new` refuses (`Error::Setup`, naming the URL and the rule, never the value) a relay URL
+that breaks the rules of `relay_url` above (and uses it in its canonical form) and an envelope
+URL that is not `https://` with a host (an empty authority, `https:///host/`, included), or
+that has userinfo (an empty one, `https://@host/`, included), a backslash, whitespace or a
+control character; it does not know the gateway host, so a relay on the gateway's own host is
+refused only through `OhttpConfig::new` (`Client::for_network`). The unsigned `KeyConfigSource::Plain`
+exists only with the cargo feature `insecure-plain-key-config` and is accepted only by
+`Client::insecure_for_local_testing`, which exists only with that feature too and also allows
+`http://`: for tests against a local gateway, never in a wallet. `KeyConfigSource::Signed` names
+its network as a `Network`. No constructor panics: a TLS backend that cannot be initialized is
+`Error::Setup`.
 
 ## 4. The sans-IO loop
 
@@ -187,7 +212,17 @@ Rules that matter for privacy and correctness:
   zero padding after the trailer section (RFC 9292 §3.8): a `SendTransaction` to 16 KiB, 32 KiB
   if larger and then the next multiple of 32 KiB; every other request to the next multiple of
   4 KiB; never past what fits under the 10 MiB sealed-request cap. Seal the encoded bytes as they
-  are; do not trim them.
+  are; do not trim them. The classes hide which of the small calls a request is and the exact
+  size of a transaction. For typical light-wallet traffic they leave a strong statistical
+  fingerprint of a broadcast: a request in the 16 KiB class or above is very likely a `SendTransaction` (calls to
+  third-party APIs through the gateway are padded the same way and can land in the same classes
+  or others), so the relay learns that the client's address very likely sent a transaction at
+  that moment, and by matching the time against transactions arriving in the mempool it can link
+  the address to a transaction id with a probability that depends on how many arrive in that
+  window (a rejected transaction never arrives). The relay also sees the timing and number of all
+  requests and the size of each response to within a chunk. Only a transport that hides the
+  address from the relay (Tor) removes that link
+  (`../docs/architecture.md`, "Request padding").
 - **Seal every attempt afresh.** Never resend a sealed body: the gateway refuses a repeated
   ciphertext as a replay (409). Each sealing returns its own `ChunkedResponseOpener` (neither
   `Clone` nor `Copy`); keep one sealing per post, the type does not enforce it. A transport error before an answer is just another iteration.
@@ -202,8 +237,27 @@ Rules that matter for privacy and correctness:
   + 16-byte tag) with `BhttpFormat` as soon as its length prefix is read (or, for the final
   chunk, as soon as it grows past it); stop reading the body on that error too. A gateway must
   keep `CHUNK_SIZE` at or below 65536 (default 16384).
+- **Send the relay exactly the listed headers.** `relay_post`, `key_fetch_signed` (also
+  `key_fetch`) and `key_fetch_plain` return the same names and values, in the same order, for
+  every preset: the content type and `Accept` (one per endpoint: `message/ohttp-chunked-res` on
+  the post, `application/json` on the signed envelope, `application/ohttp-keys` on the unsigned
+  document), `Accept-Encoding: identity`, `Accept-Language: en` (`RELAY_ACCEPT_LANGUAGE`, the
+  `accept_language` field) and `User-Agent: zodl-ohttp/1` (`RELAY_USER_AGENT`). Set every one of
+  them explicitly, so that the platform HTTP stack does not add its own `User-Agent`,
+  `Accept-Language` (the device's language list) or `Accept-Encoding`, and add nothing else (no
+  cookies, no cache validators, no application headers). The headers are then identical across
+  presets and do not tell the relay which wallet or platform sent a request. What remains
+  visible: the TLS and HTTP/2 parameters, header order and compression of the HTTP stack,
+  connection reuse and timing, which differ between stacks; a debug build's trace ids (below);
+  and the key-configuration URL where the presets' `SignedConfigUrlRule`s derive different ones.
+  The rules agree only when the relay URL's path is exactly `/relay` or empty: every rule then
+  fetches `/ohttp-configs/signed` at the relay host's root. For any other path, nested ones such
+  as `/testnet/relay` included, `ReplaceRelaySuffix` and `TrimThenReplaceRelaySuffix` keep the rest
+  of the path (`/testnet/ohttp-configs/signed`) while `RelayHostRoot` (Slipstream) fetches the
+  host's root, so the relay can tell those clients apart by the URL they fetch.
 - **Trace ids.** `X-Client-Trace-Id` (`ClientTrace`) links the relay's and the gateway's view of a
-  request; send it only in debug builds, never by default.
+  request; send it only in debug builds, never by default, and only on the post (no key fetch
+  lists it). Its format differs per `TracePolicy`, so a trace id also names the platform.
 
 ## 5. Errors
 
@@ -211,11 +265,37 @@ Rules that matter for privacy and correctness:
 `BhttpFormat` and `NotAResponse` are permanent for that request; `Truncated` (the answer ended
 before its final chunk) and `Http` are transport failures and may be retried with a fresh
 sealing; `Open` means a chunk did not authenticate; `Backoff { wait }` means the relay asked for
-a pause.
+a pause; `Setup` means a `Client` constructor refused its arguments.
+
+What may be logged and what may not:
+
+- **Log-safe.** The `Display` and `Debug` of every `Error` and `ConfigError`, and of
+  `OhttpConfigParams`, `OhttpConfig` and `OhttpNetworks` (which show only which fields are set).
+  The library itself never puts a URL, host name, address, port or key id of the configuration
+  or of the transport into an error. `Http` holds an `HttpError` that shows only its
+  `HttpErrorKind` (`Connect`, `Tls`, `Timeout`, `Status(n)`, `RedirectRefused`, `Body`,
+  `Request`, `Other`) and has no `source()`. What a peer chose appears as numbers (an outer or
+  DoH status, a length, a KEM or framing identifier) and in the two quotes below.
+- **Format-safe, content the relay's.** Two quotes of relay-chosen text: the relay's
+  `Content-Type` in `Error::MediaType` and `OuterOutcome::WrongMediaType { content_type }` (at
+  most 64 characters, `MAX_MEDIA_TYPE_CHARS`) and the relay's error body in
+  `OuterOutcome::Refused { detail }` (at most 120, `MAX_REFUSED_DETAIL_CHARS`). Each is one
+  short line of printable ASCII (anything else `?`), so it cannot inject log lines; but its
+  content is whatever the relay sent, and a relay's error body may itself name things (the
+  client's own address, a request or node identifier). A privacy-sensitive log records the
+  status and drops the quote.
+- **Not log-safe.** `HttpError::transport_error_not_log_safe()` (the HTTP stack's own error,
+  with URLs, hosts and addresses); the `Debug` of a `KeyConfigSource` (derived: it shows the
+  envelope URL and the signing key); the values behind the `OhttpConfig` accessors (relay URL,
+  gateway host, keys DNS name, signing key: they identify the deployment); a `Request`, a
+  `Response`, `ResponseEvent`s and decoded Binary HTTP messages (the user's request and the
+  backend's answer); key configurations, envelopes and `SignedKeys`; and trace ids, which link
+  the relay's and the gateway's logs.
 
 ## 6. Testing an integration
 
-The crate's own tests run against the gateway's code (`tests/gateway.rs`,
-`tests/gateway_core.rs`) and need no network; they use example configurations (`*.example`
-names, RFC 2606) of their own. Against a running deployment, `e2e-client/` and
+The crate's own tests need no network and use example configurations (`*.example` names,
+RFC 2606) of their own. Those that run against the gateway's code (`tests/gateway.rs`,
+`tests/gateway_core.rs`, `tests/chunked.rs`, `tests/workspace.rs`) need the repository and are
+not in the published crate; the rest run with `cargo test` on the published crate too. Against a running deployment, `e2e-client/` and
 `scripts/test-e2e.sh` perform real exchanges (`../docs/testing.md`).

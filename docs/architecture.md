@@ -56,7 +56,7 @@ needs are injected by the gateway (`BACKEND_HEADERS`) and never come from the cl
 
 | Party | Sees | Does not see |
 |---|---|---|
-| Relay | client IP, timing, sizes of sealed requests and responses | request or response content, which upstream is called |
+| Relay | client IP, timing, sizes of sealed requests and responses (for typical light-wallet traffic a strong hint of which requests are transaction broadcasts, see "Request padding"), the outer headers and the URLs it is asked for | request or response content, which upstream is called |
 | Gateway | request and response content, timing, sizes, the relay's address | client IP |
 | Upstream (lightwalletd, third-party API) | the request the gateway forwards, the gateway's address | client IP, relay |
 
@@ -70,7 +70,16 @@ operator to combine their records. The gateway is built so that its own records 
   memory of the running process; after a restart nobody can map relay ids to gateway log lines.
 - Only `X-Client-Trace-Id`, which a client sends only when deliberately debugging, appears in
   both the relay's and the gateway's logs.
-- Response padding (below) coarsens the answer sizes the relay sees.
+- Response padding (below) coarsens the answer sizes the relay sees, and request padding the
+  request sizes; neither reliably hides a transaction broadcast or timing ("Request padding").
+- Every client preset sends the relay the same outer headers, with a fixed `User-Agent` and
+  `Accept-Language` (`client/INTEGRATION.md`, section 4), so the headers do not tell wallets or
+  platforms apart. The HTTP stack's TLS and HTTP/2 behaviour, connection reuse and timing still
+  can, and so can the key-configuration URL where the presets derive different ones. They agree
+  only when the relay URL's path is exactly `/relay` or empty: every preset then fetches
+  `/ohttp-configs/signed` at the relay host's root. For any other path, nested ones such as
+  `/testnet/relay` included, the other presets keep the rest of the path
+  (`/testnet/ohttp-configs/signed`) while Slipstream fetches the host's root.
 
 What remains is timing and size correlation by colluding operators, which OHTTP does not
 address.
@@ -251,13 +260,45 @@ few small, uninformative answers unpadded.
 The client pads every request to a fixed size class with zero bytes after the trailer section
 of its Binary HTTP message (RFC 9292 §3.8), before sealing it: a `SendTransaction` to 16 KiB
 (32 KiB if larger, then the next multiple of 32 KiB), every other request to the next multiple
-of 4 KiB, never past what fits under the 10 MiB sealed-request cap. The relay and the network see
-only these sizes: not which of the small calls was made, nor how large a transaction is (a send
-is still told apart from the other calls by its size class). The padding is part of the encoding (`encode_bhttp_request`), so every client
-sharing the crate has the same size classes. The gateway skips zero padding and refuses any
-non-zero byte after the message. Measured cost: none measurable for 4 and 8 KiB requests, a few
-milliseconds (up to about 20 ms at the median over long paths) for 16 KiB, where the request
-needs a second network round of packets.
+of 4 KiB, never past what fits under the 10 MiB sealed-request cap. The padding is part of the
+encoding (`encode_bhttp_request`), so every client sharing the crate has the same size classes.
+The gateway skips zero padding and refuses any non-zero byte after the message. Measured cost:
+none measurable for 4 and 8 KiB requests, a few milliseconds (up to about 20 ms at the median
+over long paths) for 16 KiB, where the request needs a second network round of packets.
+
+What the size classes hide from the relay (and from anyone on the network path):
+
+- which of the small light-client calls a request is (`GetLatestBlock`, `GetTreeState`,
+  `GetBlockRange` and the rest are 4 KiB each), and the exact size of what it carries;
+- the exact size of a transaction: a send of up to about 16 KiB is one class, a larger one is
+  known only to within 32 KiB.
+
+What they do not hide, for typical light-wallet traffic (none of this is a guaranteed
+identification; it is a strong statistical fingerprint):
+
+- **That a request is very likely a transaction broadcast.** No other lightwalletd call comes
+  near 16 KiB, so a request in the 16 KiB class or above is very likely a `SendTransaction`,
+  and the relay, which knows the client's address, learns that this address very likely sent a
+  transaction at that moment. It is not a certain classifier: calls to third-party APIs through
+  the gateway (`BACKENDS`) are padded like every other call and can land in the same classes, or
+  in others, depending on their size. Padding every request to 16 KiB would remove the size
+  hint, at four times the upload of every other request on mobile connections, and would still
+  leave the timing, so the classes are kept.
+- **Timing.** The relay sees when each request is posted. An accepted transaction reaches the
+  mempool of every node moments later, so a relay that runs a node, or anyone it shares its logs
+  with, can match the time of a likely broadcast against transactions arriving in the mempool
+  and so link the client's address to a transaction id with a probability that grows the fewer
+  transactions arrive in that window. A transaction the node rejects never arrives, so a post is
+  not always matched. The sequence and spacing of a session's requests (a sync, a send) is
+  visible in the same way.
+- **Response sizes and counts.** The gateway pads the final chunk of a response
+  (`RESPONSE_PADDING`), so a response's size says little about which blocks were fetched, but
+  the relay still sees how large each response is to within a chunk and how many requests a
+  session makes.
+
+Hiding the client's address from the relay itself, and so the link between an address and a
+send, is the job of the transport below OHTTP (a wallet in Tor mode reaches the relay over Tor),
+not of the padding.
 
 ## Multiple origins
 

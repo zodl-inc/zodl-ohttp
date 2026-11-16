@@ -589,7 +589,7 @@ fn the_pinned_keys_are_the_configured_ones() {
     let config = |host: &str, seed: u8| {
         OhttpConfig::new(OhttpConfigParams {
             gateway_host: host,
-            relay_url: &format!("https://{host}/relay"),
+            relay_url: &format!("https://relay.{host}/relay"),
             keys_dns_name: &format!("keys.{host}"),
             signing_pubkey: &key_hex(seed).to_ascii_uppercase(),
         })

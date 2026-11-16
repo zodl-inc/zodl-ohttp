@@ -23,6 +23,7 @@ use sha2::{Digest, Sha256};
 use zodl_ohttp_client::{
     open_signed_config, verify_signed_config, verify_signed_config_with, ClientProfile, Error,
     Network, NetworkRule, OhttpConfig, OhttpConfigParams, OhttpNetworks, SignedConfigPolicy,
+    UnknownFields,
 };
 
 const NOW: u64 = 1_800_000_000;
@@ -517,4 +518,63 @@ fn a_wrong_version_or_a_non_integer_timestamp_is_refused_by_every_preset() {
         assert_ne!(bad, good);
         assert!(accepting(bad.as_bytes(), NOW).is_empty(), "{bad}");
     }
+}
+
+/// A refusal never quotes the envelope: its network, key id, field names and values are the
+/// relay's text (up to 64 KiB, newlines included), so the error names the rule only.
+#[test]
+fn a_refusal_does_not_quote_the_envelope() {
+    let good = String::from_utf8(envelope(&Spec::default())).unwrap();
+    let key = signer().verifying_key();
+    let id = key_id(&key);
+    const MARK: &str = "RELAY-TEXT";
+    let strict = SignedConfigPolicy {
+        unknown_fields: UnknownFields::Reject,
+        ..SignedConfigPolicy::LIBRARY
+    };
+    let cases = [
+        good.replace(
+            r#""network":"testnet""#,
+            &format!(r#""network":"{MARK}\n""#),
+        ),
+        good.replace(&id, &format!("{MARK}\\n")),
+        good.replace(r#""v":1"#, &format!(r#""v":"{MARK}\n""#)),
+        good.replace(r#""v":1"#, &format!(r#""{MARK}":1,"{MARK}":2,"v":1"#)),
+        format!(r#"{{"{MARK}"#),
+        format!("[\"{MARK}\"]"),
+    ];
+    // An unknown field is refused only where the policy says so.
+    let unknown = good.replace(r#""v":1"#, &format!(r#""{MARK}\n":1,"v":1"#));
+    let every = || PROFILES.iter().map(|(_, policy)| *policy).chain([strict]);
+    let checks = cases
+        .iter()
+        .flat_map(|json| every().map(move |policy| (json, policy)))
+        .chain([(&unknown, strict)]);
+    for (json, policy) in checks {
+        assert_ne!(json, &good);
+        let Err(Error::KeyConfig(why)) =
+            verify_signed_config_with(json.as_bytes(), "testnet", &key, NOW, &policy)
+        else {
+            panic!("{json} was not refused");
+        };
+        assert!(!why.contains(MARK), "{why}");
+        assert!(!why.contains('\n'), "{why}");
+        assert!(why.len() < 100, "{why}");
+    }
+    // The envelope's own field names are still named; no key id is.
+    let duplicate = good.replace(r#""v":1"#, r#""v":1,"v":1"#);
+    let Err(Error::KeyConfig(why)) =
+        verify_signed_config_with(duplicate.as_bytes(), "testnet", &key, NOW, &strict)
+    else {
+        panic!("a duplicate field was not refused");
+    };
+    assert_eq!(why, "duplicate JSON key v");
+    let other = SigningKey::from_bytes(&[8; 32]).verifying_key();
+    let Err(Error::KeyConfig(why)) =
+        verify_signed_config_with(good.as_bytes(), "testnet", &other, NOW, &strict)
+    else {
+        panic!("an envelope of another key was opened");
+    };
+    assert_eq!(why, "signed by another key");
+    assert!(!why.contains(&key_id(&other)) && !why.contains(&key_id(&key)));
 }

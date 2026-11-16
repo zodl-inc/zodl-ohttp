@@ -108,25 +108,11 @@ pub fn decode_response(encoded: &[u8]) -> Result<Response, Error> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn a_request_encodes_as_the_gateway_reads_it() {
-        let request = Request::new("POST", "backend.example", "/v1/slots/ab/entries?since=3")
-            .header("content-type", "application/json")
-            .body(br#"{"a":1}"#.to_vec());
-        let encoded = encode_request(&request).unwrap();
-        let inner = ohttp_gateway::ohttp::parse_inner_request(&encoded).unwrap();
-        assert_eq!(inner.method, "POST");
-        assert_eq!(inner.authority, "backend.example");
-        assert_eq!(inner.path, "/v1/slots/ab/entries?since=3");
-        assert_eq!(inner.body, br#"{"a":1}"#);
-        assert!(inner
-            .headers
-            .iter()
-            .any(|(k, v)| k == "content-type" && v == "application/json"));
-    }
+    // How the gateway reads these encodings is checked against its own parser in
+    // `tests/workspace.rs`.
 
     #[test]
-    fn the_gateway_reads_a_padded_request_as_the_unpadded_one() {
+    fn a_request_is_its_unpadded_encoding_and_zeros() {
         for (path, body) in [
             (
                 "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetLatestBlock",
@@ -148,29 +134,6 @@ mod tests {
             .unwrap();
             assert!(padded.len() > end);
             assert!(padded[end..].iter().all(|&b| b == 0));
-            let with = ohttp_gateway::ohttp::parse_inner_request(&padded).unwrap();
-            let without = ohttp_gateway::ohttp::parse_inner_request(&padded[..end]).unwrap();
-            assert_eq!(
-                (
-                    &with.method,
-                    &with.authority,
-                    &with.path,
-                    &with.headers,
-                    &with.body
-                ),
-                (
-                    &without.method,
-                    &without.authority,
-                    &without.path,
-                    &without.headers,
-                    &without.body
-                )
-            );
-            assert_eq!(with.body, request.body);
-            // Non-zero bytes after the message are refused.
-            let mut junk = padded.clone();
-            *junk.last_mut().unwrap() = 1;
-            assert!(ohttp_gateway::ohttp::parse_inner_request(&junk).is_err());
         }
     }
 
