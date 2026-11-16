@@ -2749,17 +2749,25 @@ mod handler_tests {
     /// A port nothing listens on: the replay peer never connects.
     const NO_PEER: &str = "redis://127.0.0.1:1";
 
-    /// Whether the store at `url` answers. In CI a missing store fails the test instead of
-    /// skipping it.
+    /// Whether the store at `url` answers (a bounded first connection). A missing store fails
+    /// the test, unless `OHTTP_TEST_ALLOW_NO_STORE=1` outside CI (`store_policy`); with the
+    /// failover topology on (`OHTTP_FAILOVER_REDIS`) always.
     async fn store_up(url: &str, what: &str) -> bool {
-        let ok = match redis::Client::open(url) {
-            Ok(c) => redis::aio::ConnectionManager::new(c).await.is_ok(),
-            Err(_) => false,
+        use crate::store::test_support::{store_missing, STORE_CONNECT_TIMEOUT};
+        let connect = async {
+            let client = redis::Client::open(url)?;
+            redis::aio::ConnectionManager::new(client).await
         };
-        if !ok && (std::env::var("CI").is_ok() || std::env::var("OHTTP_FAILOVER_REDIS").is_ok()) {
-            panic!("{what} not reachable in CI");
+        let error = match tokio::time::timeout(STORE_CONNECT_TIMEOUT, connect).await {
+            Ok(Ok(_)) => return true,
+            Ok(Err(e)) => e.to_string(),
+            Err(_) => format!("no connection within {STORE_CONNECT_TIMEOUT:?}"),
+        };
+        if std::env::var("OHTTP_FAILOVER_REDIS").is_ok() {
+            panic!("{what} ({url}) not reachable with OHTTP_FAILOVER_REDIS set: {error}");
         }
-        ok
+        store_missing(&format!("{what} ({url})"), &error);
+        false
     }
 
     /// An upstream mock: the third-party one counts the requests it gets and answers `200 ok`,

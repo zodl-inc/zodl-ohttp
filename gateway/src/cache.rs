@@ -8680,9 +8680,58 @@ mod tests {
         }
     }
 
+    /// The test store (`store::test_support::TEST_STORE`), or None when the test is to be
+    /// skipped: its absence fails the test unless `OHTTP_TEST_ALLOW_NO_STORE=1` outside CI
+    /// (`store::test_support::store_policy`). The check is this first connection (bounded);
+    /// a store lost later fails the test.
     async fn local_redis() -> Option<ConnectionManager> {
-        let client = redis::Client::open("redis://127.0.0.1:6379").ok()?;
-        ConnectionManager::new(client).await.ok()
+        use crate::store::test_support::{store_missing, STORE_CONNECT_TIMEOUT, TEST_STORE};
+        let url = format!("redis://{TEST_STORE}");
+        let connect = async {
+            let client = redis::Client::open(url.as_str())?;
+            ConnectionManager::new(client).await
+        };
+        let what = format!("the test store {url}");
+        match timeout(STORE_CONNECT_TIMEOUT, connect).await {
+            Ok(Ok(conn)) => Some(conn),
+            Ok(Err(e)) => {
+                store_missing(&what, &e);
+                None
+            }
+            Err(_) => {
+                store_missing(
+                    &what,
+                    &format!("no connection within {STORE_CONNECT_TIMEOUT:?}"),
+                );
+                None
+            }
+        }
+    }
+
+    /// Whether `e` is the store's own answer refusing a command (an error reply), not a lost
+    /// connection, an I/O error or a timeout.
+    fn refused_by_the_store(e: &redis::RedisError) -> bool {
+        e.code().is_some() && !e.is_io_error() && !e.is_timeout() && !e.is_connection_dropped()
+    }
+
+    #[test]
+    fn a_refusal_by_the_store_is_told_from_a_lost_store() {
+        let refused = redis::RedisError::from((
+            redis::ErrorKind::ResponseError,
+            "ERR unknown command 'CONFIG'",
+        ));
+        assert!(refused_by_the_store(&refused));
+        for lost in [
+            std::io::ErrorKind::ConnectionReset,
+            std::io::ErrorKind::BrokenPipe,
+            std::io::ErrorKind::TimedOut,
+            std::io::ErrorKind::ConnectionRefused,
+        ] {
+            let e = redis::RedisError::from(std::io::Error::from(lost));
+            assert!(!refused_by_the_store(&e), "{lost:?}");
+        }
+        let client = redis::RedisError::from((redis::ErrorKind::ClientError, "client side"));
+        assert!(!refused_by_the_store(&client));
     }
 
     /// `cargo test` runs these tests twice (lib and bin targets) against the same Redis, and
@@ -8700,7 +8749,6 @@ mod tests {
     #[tokio::test]
     async fn a_demoted_peer_lends_no_wait_or_retry_connection() {
         if local_redis().await.is_none() {
-            assert!(std::env::var("CI").is_err(), "Redis not reachable in CI");
             return;
         }
         let network = "testnet-demoted-peer";
@@ -8760,7 +8808,6 @@ mod tests {
     #[tokio::test]
     async fn only_an_installed_connection_drops_the_others() {
         if local_redis().await.is_none() {
-            assert!(std::env::var("CI").is_err(), "Redis not reachable in CI");
             return;
         }
         let network = "testnet-failed-on-stale";
@@ -8825,7 +8872,6 @@ mod tests {
     #[tokio::test]
     async fn a_local_refresh_never_overwrites_a_switched_epoch() {
         let Some(conn) = local_redis().await else {
-            assert!(std::env::var("CI").is_err(), "Redis not reachable in CI");
             return;
         };
         let c = Arc::new(test_cache(
@@ -8872,7 +8918,6 @@ mod tests {
     #[tokio::test]
     async fn a_peer_check_of_another_request_is_refused() {
         let Some(conn) = local_redis().await else {
-            assert!(std::env::var("CI").is_err(), "Redis not reachable in CI");
             return;
         };
         let c = test_cache(conn.clone(), Some(conn), "testnet-peercheck-bound");
@@ -9017,7 +9062,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_key_prefixes() {
-        // Skip without a local Redis.
         let Some(conn) = local_redis().await else {
             return;
         };
@@ -9579,8 +9623,17 @@ mod tests {
                     .await
             }
         };
-        if set_aof(false).await.is_err() {
-            return;
+        if let Err(e) = set_aof(false).await {
+            // The test needs `CONFIG SET` on the test store: a refusal by the store follows the
+            // store policy, a store lost meanwhile fails the test.
+            assert!(
+                refused_by_the_store(&e),
+                "the test store was lost during the test: {e}"
+            );
+            return crate::store::test_support::store_unusable(&format!(
+                "the test store {} refused CONFIG SET appendonly: {e}",
+                crate::store::test_support::TEST_STORE
+            ));
         }
 
         let auto = peer_origin()
@@ -12594,14 +12647,10 @@ mod tests {
         crate::store_conn::parse_role(&v).map(|primary| !primary)
     }
 
-    /// The local Redis these tests need; in CI (where it runs as a service) its absence is a
-    /// failure, not a skip.
+    /// The local Redis these tests need: `local_redis`, whose policy covers every test of the
+    /// store (kept as a name for the tests that use it).
     async fn required_redis() -> Option<ConnectionManager> {
-        let conn = local_redis().await;
-        if conn.is_none() && std::env::var("CI").is_ok() {
-            panic!("the local test Redis is expected in CI");
-        }
-        conn
+        local_redis().await
     }
 
     /// The chain follower's fence scripts against a real store (the Lua is the fence): keys of

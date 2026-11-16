@@ -813,6 +813,78 @@ pub(crate) mod test_support {
         }
     }
 
+    /// The test store of every store-backed test of the crate.
+    pub const TEST_STORE: &str = "127.0.0.1:6379";
+    /// Set to exactly `1`, outside CI, to let the store-backed tests pass without a test store.
+    pub const ALLOW_NO_STORE: &str = "OHTTP_TEST_ALLOW_NO_STORE";
+    /// Bound of the first connection of a store-backed test.
+    pub const STORE_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+    /// What a store-backed test does after its first connection to the test store.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum StorePolicy {
+        Run,
+        /// Returns early (passes), with one line on stderr.
+        Skip,
+        Fail,
+    }
+
+    /// The policy for the test store: run when it is reachable; otherwise fail, unless `CI` is
+    /// not set and the opt-out (`OHTTP_TEST_ALLOW_NO_STORE=1`) is (it is ignored in CI).
+    pub fn store_policy(reachable: bool, ci: bool, allow_no_store: bool) -> StorePolicy {
+        match (reachable, ci, allow_no_store) {
+            (true, _, _) => StorePolicy::Run,
+            (false, false, true) => StorePolicy::Skip,
+            (false, _, _) => StorePolicy::Fail,
+        }
+    }
+
+    /// A store-backed test could not make its first connection to `what` (`error`: why):
+    /// fails the test, or returns after one line on stderr when the policy says skip (the
+    /// caller then returns).
+    #[track_caller]
+    pub fn store_missing(what: &str, error: &dyn std::fmt::Display) {
+        store_unusable(&format!("{what} is not reachable: {error}"));
+    }
+
+    /// A store-backed test cannot use the test store (`problem`: what failed, e.g. a command
+    /// the store refused that the test needs): the same policy as [`store_missing`].
+    #[track_caller]
+    pub fn store_unusable(problem: &str) {
+        let ci = std::env::var_os("CI").is_some();
+        let allowed = std::env::var(ALLOW_NO_STORE).is_ok_and(|v| v == "1");
+        if store_policy(false, ci, allowed) == StorePolicy::Skip {
+            eprintln!("test skipped: {problem} ({ALLOW_NO_STORE}=1)");
+            return;
+        }
+        panic!(
+            "{problem}. Run a Redis on {TEST_STORE} (CI has one as a service), or set \
+             {ALLOW_NO_STORE}=1 outside CI to skip the tests that need it"
+        );
+    }
+
+    #[test]
+    fn the_test_store_policy() {
+        use StorePolicy::*;
+        // (reachable, CI set, opt-out set) -> policy
+        for (reachable, ci, allowed, policy) in [
+            (true, false, false, Run),
+            (true, true, false, Run),
+            (true, false, true, Run),
+            (true, true, true, Run),
+            (false, false, false, Fail),
+            (false, true, false, Fail),
+            (false, true, true, Fail),
+            (false, false, true, Skip),
+        ] {
+            assert_eq!(
+                store_policy(reachable, ci, allowed),
+                policy,
+                "reachable {reachable}, CI {ci}, opt-out {allowed}"
+            );
+        }
+    }
+
     #[test]
     fn tip_stamp_codec() {
         let tip = Tip {

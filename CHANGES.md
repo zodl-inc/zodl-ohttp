@@ -246,6 +246,19 @@ keeps its own log in [client/CHANGELOG.md](client/CHANGELOG.md).
   unchanged (they never abandon a fill). The fetch given to the backfill must end by itself
   within a bound; the gateway's (`proxy::forward_to_backend`) is bounded as a whole by
   `LWD_TIMEOUT_SECS`.
+- The gateway's store-backed tests (the test Redis on `127.0.0.1:6379`) follow one policy:
+  with the store they run; without it they fail, with a message naming the store address, the
+  error of the first connection and the opt-out. New test-only `OHTTP_TEST_ALLOW_NO_STORE=1`
+  makes them return early instead (passed, one line on stderr), and is ignored when `CI` is
+  set. Before, most of them were skipped silently without a store unless `CI` was set. For
+  the cache, store-connection and `tests/set_nx_retry.rs` tests the check is the test's own
+  first connection (bounded to 5 s); the handler tests (`store_up`) probe with a bounded
+  connection of their own, as they connect through their configuration. A store lost during
+  a test fails it. A test store that refuses `CONFIG SET appendonly` (an error reply; needed
+  by the local AOF test) is handled by the same policy (it passed silently); a store lost
+  there fails the test. `tests/store_failover.rs` (opt-in by `OHTTP_FAILOVER_REDIS`, its own
+  primary/replica pair) and `cache_retry_test.rs` (uses the store only if it is there) keep
+  their own rules. No production code changes.
 - Known limits of the chain follower and the pinned backfill after these changes:
   - The drop of a held tip on a scheduled probe without a new observation applies to a held
     tip that is still held when the probe starts (the stored tip is not on its own chain).
@@ -282,8 +295,9 @@ keeps its own log in [client/CHANGELOG.md](client/CHANGELOG.md).
     runtime stops, as on every request path. A sweep fill that waits for a permit (three
     sweep-started calls alive) is delayed up to its fill timeout; a fetch that never
     ended would keep its permit (the gateway's is bounded by `LWD_TIMEOUT_SECS`).
-  - The store-backed tests fail without a test store only when `CI` is set; elsewhere they
-    are skipped, as the rest of the suite's store-backed tests are.
+  - With `OHTTP_TEST_ALLOW_NO_STORE=1` outside CI the store-backed tests pass without
+    running (each prints one line); only their first connection is checked, a store lost
+    later fails the test.
 - A pinned store whose `ROLE` does not answer in time (or fails on the connection) is treated as
   not writable and asked again after 30 s, instead of as writable: pinned writes and the
   backfill wait meanwhile. A store without the `ROLE` command (an error answer) stays writable.
