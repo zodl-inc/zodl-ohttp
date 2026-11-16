@@ -2,6 +2,27 @@
 
 [Keep a Changelog](https://keepachangelog.com).
 
+## Unreleased
+
+No API or wire-format change.
+
+### Fixed
+
+- `OhttpConfig::new` and `OhttpNetworks::new` read the IPv4 address an IPv6 relay host names,
+  besides the IPv4-mapped form (`::ffff:a.b.c.d`) already compared: an IPv4-compatible address
+  (`[::192.0.2.1]`, a deprecated form, read as one only when the high 16 bits of the IPv4
+  address are not zero) and one under the NAT64 well-known prefix (`[64:ff9b::c000:201]`)
+  count as on the gateway host of that IPv4 address (in any of its numeric spellings), so such
+  a relay URL is now refused (`ConfigError::Invalid`, field `relay_url`, rule `must not be on
+  a gateway host`). `::`, `::1` to `::ffff`, the IPv4-translated form (`::ffff:0:a.b.c.d`),
+  other prefixes (6to4, Teredo, a network-specific NAT64 prefix) and a gateway host that is a
+  name are not affected. The relay URL keeps its IPv6 form (`relay_url()` is unchanged).
+- `OhttpNetworks::new` tells relays apart the same way: a relay on such an IPv6 literal is the
+  relay on the IPv4 address it embeds (`https://192.0.2.1/relay` and
+  `https://[64:ff9b::c000:201]/relay` are one relay), so mainnet and testnet relays that differ
+  only in this spelling are now `SharedAcrossNetworks` for `relay_url`.
+- A configuration that passed only because of such a literal is now refused.
+
 ## 2.0.1
 
 No API or wire-format change.

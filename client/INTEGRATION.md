@@ -60,9 +60,13 @@ that mainnet and testnet share no gateway host or keys DNS name (compared ignori
 no relay (the same canonical host, port and path, the path compared ignoring case:
 `https://relay.example/relay`, `https://Relay.example:443/a/../relay/` and
 `https://relay.example/%72elay` are one relay, and so are `https://192.0.2.1/relay`,
-`https://0xc0000201/relay` and `https://[::ffff:192.0.2.1]/relay`) and no signing key, and that
-neither network's relay is on a gateway host. `relay_url()` returns the canonical form, which is
-what the client posts to. Other values are taken as given: surrounding whitespace, such as a
+`https://0xc0000201/relay`, `https://[::ffff:192.0.2.1]/relay`, `https://[::192.0.2.1]/relay`
+and `https://[64:ff9b::c000:201]/relay`) and no signing key, and that
+neither network's relay is on a gateway host (a relay on an IPv6 literal that embeds an IPv4
+address, `[::ffff:192.0.2.1]`, `[64:ff9b::c000:201]` or `[::192.0.2.1]` (`::a.b.c.d` only when
+`a` and `b` are not both zero: `[::]` to `[::ffff]` are plain IPv6 addresses), is on a gateway
+host `192.0.2.1`, in any of its numeric spellings). `relay_url()` returns the canonical form,
+which is what the client posts to. Other values are taken as given: surrounding whitespace, such as a
 trailing newline from a secret store, is refused, not trimmed. A refusal is a `ConfigError`
 (`Empty`, `Invalid` or `SharedAcrossNetworks`) that names the field (`ConfigField`) and the
 rule, never the value, and the `Debug` output of a configuration shows only which fields are

@@ -36,16 +36,20 @@ const CONFIG_VARS: [&str; 4] = [
     "OHTTP_E2E_SIGNING_PUBKEY",
 ];
 
-/// The OHTTP configuration of both networks, read through `var` (the process environment, or a
-/// map in tests). A network is configured with all four of its variables or none (an empty
-/// variable counts as unset); none leaves it off. Errors name variables and rules, never values.
-fn networks_from(var: impl Fn(&str) -> Option<String>) -> Result<OhttpNetworks> {
+/// The OHTTP configuration of both networks, read through `var` (`std::env::var`, or a map in
+/// tests) as [`setting`]s. A network is configured with all four of its variables or none (an
+/// empty variable counts as unset); none leaves it off. A value that is not Unicode is an error,
+/// as for the other settings. Errors name variables and rules, never values.
+fn networks_from(
+    var: impl Fn(&str) -> Result<String, std::env::VarError>,
+) -> Result<OhttpNetworks> {
     let network = |network: Network| -> Result<Option<OhttpConfig>> {
         let names =
             CONFIG_VARS.map(|prefix| format!("{prefix}_{}", network.as_str().to_ascii_uppercase()));
-        let values = names
-            .clone()
-            .map(|name| var(&name).filter(|value| !value.is_empty()));
+        let mut values: [Option<String>; 4] = Default::default();
+        for (value, name) in values.iter_mut().zip(&names) {
+            *value = setting(name, var(name))?;
+        }
         if values.iter().all(Option::is_none) {
             return Ok(None);
         }
@@ -78,9 +82,30 @@ fn networks_from(var: impl Fn(&str) -> Option<String>) -> Result<OhttpNetworks> 
     )?)
 }
 
+/// The names of the eight per-network variables (`OHTTP_E2E_*_<NET>`).
+fn config_var_names() -> Vec<String> {
+    [Network::Mainnet, Network::Testnet]
+        .into_iter()
+        .flat_map(|network| {
+            CONFIG_VARS.map(|prefix| format!("{prefix}_{}", network.as_str().to_ascii_uppercase()))
+        })
+        .collect()
+}
+
+/// The check every run makes of the per-network variables before anything is sent, whatever
+/// the key-configuration source: one that is not Unicode is an error naming it ([`setting`]).
+/// Nothing else is checked here: whether a network's configuration is complete and valid
+/// matters only to a run that uses it ([`networks_from`]).
+fn config_vars_are_unicode(var: impl Fn(&str) -> Result<String, std::env::VarError>) -> Result<()> {
+    for name in config_var_names() {
+        setting(&name, var(&name))?;
+    }
+    Ok(())
+}
+
 /// [`networks_from`] the process environment.
 fn networks() -> Result<OhttpNetworks> {
-    networks_from(|name| std::env::var(name).ok())
+    networks_from(|name| std::env::var(name))
 }
 
 /// The network named `name`.
@@ -112,6 +137,17 @@ fn setting(name: &str, value: Result<String, std::env::VarError>) -> Result<Opti
     }
 }
 
+/// A setting whose empty value is a value, `value` being what `std::env::var(name)` gave: not
+/// present is unset (`None`), empty is `Some("")`; a value that is not Unicode is an error
+/// naming the variable, never the value, as for [`setting`].
+fn raw_setting(name: &str, value: Result<String, std::env::VarError>) -> Result<Option<String>> {
+    match value {
+        Ok(value) => Ok(Some(value)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => bail!("{name} is not valid Unicode"),
+    }
+}
+
 /// [`setting`] of the process environment.
 fn env_setting(name: &str) -> Result<Option<String>> {
     setting(name, std::env::var(name))
@@ -128,13 +164,37 @@ fn network_setting(value: Option<&str>) -> Result<Network> {
     }
 }
 
-/// Whether the setting `OHTTP_E2E_PLAIN_HTTP_RELAY` opts in to `http://` relay URLs: `1` does,
-/// unset does not, any other value is an error.
-fn plain_http_setting(value: Option<&str>) -> Result<bool> {
+/// Whether the switch `name` is on: `1` is, unset is not, any other value is an error naming
+/// `name` (never the value).
+fn switch_setting(name: &str, value: Option<&str>) -> Result<bool> {
     match value {
         None => Ok(false),
         Some("1") => Ok(true),
-        Some(_) => bail!("OHTTP_E2E_PLAIN_HTTP_RELAY must be 1 or unset"),
+        Some(_) => bail!("{name} must be 1 or unset"),
+    }
+}
+
+/// Whether the setting `OHTTP_E2E_PLAIN_HTTP_RELAY` opts in to `http://` relay URLs
+/// ([`switch_setting`]).
+fn plain_http_setting(value: Option<&str>) -> Result<bool> {
+    switch_setting("OHTTP_E2E_PLAIN_HTTP_RELAY", value)
+}
+
+/// Whether the setting `OHTTP_E2E_DUMP_HEADERS` asks for the number of outer response headers
+/// ([`switch_setting`]: `0`, like any value but `1`, is an error, not off).
+fn dump_headers_setting(value: Option<&str>) -> Result<bool> {
+    switch_setting("OHTTP_E2E_DUMP_HEADERS", value)
+}
+
+/// The pause between the sends of `OHTTP_E2E_REPLAY_URLS`, in milliseconds, from the setting
+/// `OHTTP_E2E_REPLAY_GAP_MS`: 0 when unset, else the number it gives in decimal digits; any
+/// other value is an error naming the variable, never the value.
+fn replay_gap_setting(value: Option<&str>) -> Result<u64> {
+    let Some(value) = value else { return Ok(0) };
+    let digits = value.bytes().all(|b| b.is_ascii_digit());
+    match value.parse::<u64>() {
+        Ok(gap) if digits => Ok(gap),
+        _ => bail!("OHTTP_E2E_REPLAY_GAP_MS must be a number of milliseconds (digits) or unset"),
     }
 }
 
@@ -150,7 +210,8 @@ enum KeySource {
 /// The key-configuration source: the setting `OHTTP_E2E_KEY_CONFIG_SOURCE` (`signed` or
 /// `plain`) when it is set; otherwise, for compatibility with older invocations, the guess this
 /// tool used to make: signed when the config URL contains `/signed`. The flag `guessed` is true
-/// for the guess ([`verified_as_signed`] then looks at the answer too).
+/// for the guess ([`verified_as_signed`] then looks at the answer too). The guess is
+/// deprecated ([`GUESS_DEPRECATED`]): a later version will require the setting.
 fn key_source(explicit: Option<&str>, config_url: &str) -> Result<(KeySource, bool)> {
     match explicit {
         Some("signed") => Ok((KeySource::Signed, false)),
@@ -160,6 +221,11 @@ fn key_source(explicit: Option<&str>, config_url: &str) -> Result<(KeySource, bo
         None => Ok((KeySource::Plain, true)),
     }
 }
+
+/// The warning, on standard error, of a run whose key-configuration source is guessed.
+const GUESS_DEPRECATED: &str = "warning: guessing the key-configuration source from the URL and \
+     the answer's Content-Type is deprecated and will be removed in a later version; set \
+     OHTTP_E2E_KEY_CONFIG_SOURCE=signed or OHTTP_E2E_KEY_CONFIG_SOURCE=plain";
 
 /// Whether the fetched key configuration is verified as a signed envelope: a signed source
 /// always, whatever the answer's `Content-Type`; a guessed source also when the answer is
@@ -173,9 +239,21 @@ fn verified_as_signed(source: KeySource, guessed: bool, content_type: &str) -> b
 /// value. With `plain_http` (`OHTTP_E2E_PLAIN_HTTP_RELAY=1`, for a relay or an origin checked
 /// over plain HTTP inside a test network) an `http://` URL is accepted too, under the same rules
 /// but the scheme, and canonical the same way (no `:80` instead of no `:443`). Without it an
-/// `http://` URL is refused with an error that names the variable.
+/// `http://` URL is refused with an error that names the variable. The scheme is read as
+/// written, as the configuration rules read `https://`: in lower case only, so `HTTP://` is
+/// refused (with or without the opt-in) like `HTTPS://`.
 fn relay_url_arg(what: &str, value: &str, plain_http: bool) -> Result<String> {
     let refused = |e: ConfigError| anyhow::anyhow!("{what}: {e}");
+    let scheme_is = |scheme: &str| {
+        value
+            .get(..scheme.len())
+            .is_some_and(|start| start.eq_ignore_ascii_case(scheme))
+    };
+    if (scheme_is("http://") || scheme_is("https://"))
+        && !(value.starts_with("http://") || value.starts_with("https://"))
+    {
+        bail!("{what}: the scheme must be written in lower case (http:// or https://)");
+    }
     let Some(rest) = value.strip_prefix("http://") else {
         return canonical_relay_url(value).map_err(refused);
     };
@@ -200,14 +278,17 @@ fn relay_url_arg(what: &str, value: &str, plain_http: bool) -> Result<String> {
 
 /// `OHTTP_E2E_REPLAY_URLS` (comma-separated, blanks around and empty entries ignored), each URL
 /// checked and canonical as [`relay_url_arg`] makes it; every entry is checked before anything
-/// is sent, and the first one refused fails the run, named by its position. A value without
+/// is sent, and the first one refused fails the run, named by its position in the value as
+/// written (from 0, empty entries counted: in `a,,b` the entry `b` is entry 2). The run's
+/// output (`[XREPLAY i]`, the trace suffix `-r{i}`) numbers the sends instead, in the order
+/// sent: there `b` is 1. A value without
 /// any URL (only commas and blanks) is an error too: the run would send nothing and succeed.
 fn replay_urls(value: &str, plain_http: bool) -> Result<Vec<String>> {
     let urls: Vec<String> = value
         .split(',')
         .map(str::trim)
-        .filter(|url| !url.is_empty())
         .enumerate()
+        .filter(|(_, url)| !url.is_empty())
         .map(|(i, url)| relay_url_arg(&format!("OHTTP_E2E_REPLAY_URLS entry {i}"), url, plain_http))
         .collect::<Result<_>>()?;
     if urls.is_empty() {
@@ -242,9 +323,21 @@ fn usage() -> ! {
     eprintln!(
         "       unset: signed if <config_url> contains /signed or the answer is application/json"
     );
+    eprintln!("       (deprecated: the guess will be removed; set the variable)");
     eprintln!("  env: NETWORK=mainnet|testnet (for signed config verification, default mainnet)");
-    eprintln!("  empty counts as unset for: OHTTP_E2E_KEY_CONFIG_SOURCE, NETWORK,");
-    eprintln!("       OHTTP_E2E_PLAIN_HTTP_RELAY, OHTTP_E2E_REPLAY_URLS and OHTTP_E2E_*_<NET>");
+    eprintln!("  env: OHTTP_E2E_DUMP_HEADERS=1: print the number of outer response headers");
+    eprintln!("  env: OHTTP_E2E_REPLAY=1, OHTTP_E2E_EXPECT_OK=1: 1 or unset/empty only");
+    eprintln!("  env: OHTTP_E2E_REPLAY_GAP_MS=<digits>: pause between OHTTP_E2E_REPLAY_URLS sends");
+    eprintln!("  an exchange run reads these before anything is sent (the DNS mode reads only");
+    eprintln!("  OHTTP_E2E_*_<NET>). Empty counts as unset for OHTTP_E2E_KEY_CONFIG_SOURCE,");
+    eprintln!("  NETWORK, OHTTP_E2E_PLAIN_HTTP_RELAY, OHTTP_E2E_DUMP_HEADERS, OHTTP_E2E_REPLAY,");
+    eprintln!("  OHTTP_E2E_EXPECT_OK, OHTTP_E2E_REPLAY_GAP_MS, OHTTP_E2E_REPLAY_URLS,");
+    eprintln!("  OHTTP_E2E_EXTRA_HEADERS and OHTTP_E2E_*_<NET>; a refused value of the first");
+    eprintln!("  eight, or a non-Unicode value of any of them or of OHTTP_E2E_REQUEST_ID (sent,");
+    eprintln!("  even when empty, only without the replay settings), fails the run.");
+    eprintln!("  OHTTP_E2E_EXTRA_HEADERS, OHTTP_E2E_REQUEST_ID and OHTTP_E2E_*_<NET> (unless");
+    eprintln!("  used) are checked for Unicode only: an extra header entry without ':' is");
+    eprintln!("  ignored, a header HTTP refuses fails at the send");
     eprintln!("  env: OHTTP_E2E_{{GATEWAY_HOST,RELAY_URL,KEYS_DNS_NAME,SIGNING_PUBKEY}}_{{MAINNET,TESTNET}}:");
     eprintln!("       the OHTTP configuration of each network, needed for signed configs and DNS");
     eprintln!("  --key-config-source dns: fetch and verify envelope from DNS-over-HTTPS");
@@ -263,8 +356,9 @@ fn main() -> Result<()> {
         usage()
     }
     let (config_url, relay_arg, authority, method, path) = (&a[1], &a[2], &a[3], &a[4], &a[5]);
-    // The settings below are read and checked before anything is sent: an empty variable is
-    // unset, a bad or non-Unicode value fails the run.
+    // The settings below are read before anything is sent, each checked as its reader says
+    // (an empty variable is unset, a refused or non-Unicode value fails the run). This is the
+    // exchange run only: the DNS mode reads none of them but the per-network variables.
     // The opt-in to http:// relay and replay URLs.
     let plain_http = plain_http_setting(env_setting("OHTTP_E2E_PLAIN_HTTP_RELAY")?.as_deref())?;
     // Posted to as a wallet would: the relay URL in its canonical form (`OhttpConfig::relay_url`).
@@ -278,13 +372,39 @@ fn main() -> Result<()> {
         env_setting("OHTTP_E2E_KEY_CONFIG_SOURCE")?.as_deref(),
         config_url,
     )?;
+    let network = network_setting(env_setting("NETWORK")?.as_deref())?;
+    let dump_headers = dump_headers_setting(env_setting("OHTTP_E2E_DUMP_HEADERS")?.as_deref())?;
+    let replay_twice = switch_setting(
+        "OHTTP_E2E_REPLAY",
+        env_setting("OHTTP_E2E_REPLAY")?.as_deref(),
+    )?;
+    let expect_ok = switch_setting(
+        "OHTTP_E2E_EXPECT_OK",
+        env_setting("OHTTP_E2E_EXPECT_OK")?.as_deref(),
+    )?;
+    let replay_gap = replay_gap_setting(env_setting("OHTTP_E2E_REPLAY_GAP_MS")?.as_deref())?;
+    // These two are checked for Unicode only. An extra-headers entry without a `:` is ignored;
+    // a name or value HTTP does not allow is refused when a request carrying it is built, not
+    // here: for the extra headers that is the key-configuration request, before anything is
+    // sent. The request id goes, as given (an empty value as an empty X-Request-Id), only on
+    // the relay request of a run without the replay settings; with OHTTP_E2E_REPLAY=1 or
+    // OHTTP_E2E_REPLAY_URLS it is neither sent nor refused.
+    let request_id = raw_setting(
+        "OHTTP_E2E_REQUEST_ID",
+        std::env::var("OHTTP_E2E_REQUEST_ID"),
+    )?;
+    let extra = extra_headers(env_setting("OHTTP_E2E_EXTRA_HEADERS")?.as_deref());
+    // Their contents are checked only by a run that uses them (a signed source, below).
+    config_vars_are_unicode(|name| std::env::var(name))?;
+    // After the checks above (not the arguments, read below): an exchange run that fails on
+    // one of them does not warn about the guess.
     if guessed {
+        eprintln!("{GUESS_DEPRECATED}");
         println!(
             "    key configuration source guessed: OHTTP_E2E_KEY_CONFIG_SOURCE is not set \
              (signed|plain)"
         );
     }
-    let network = network_setting(env_setting("NETWORK")?.as_deref())?;
     // The exact header sets of `zodl-ohttp-client`, as every wallet preset sends them.
     let headers = OuterHeaders::LIBRARY;
     let trace_id = a.get(6).cloned().unwrap_or_default();
@@ -315,7 +435,7 @@ fn main() -> Result<()> {
     for (k, v) in fetch_headers {
         kb = kb.header(k, v)
     }
-    for (k, v) in extra_headers() {
+    for (k, v) in &extra {
         kb = kb.header(k, v)
     }
     let resp = net(not_redirected(net(kb.send())?)?.error_for_status())?;
@@ -381,11 +501,11 @@ fn main() -> Result<()> {
     };
     let mut rb = post(relay_url, trace);
     // Optional: send a client-chosen X-Request-Id to check that the relay replaces it (it MUST).
-    if let Ok(rid) = std::env::var("OHTTP_E2E_REQUEST_ID") {
+    if let Some(rid) = &request_id {
         rb = rb.header("X-Request-Id", rid)
     }
     // Optional arbitrary outer headers for relay hardening tests: "Name: value|Name2: value2".
-    for (k, v) in extra_headers() {
+    for (k, v) in &extra {
         rb = rb.header(k, v)
     }
 
@@ -395,17 +515,14 @@ fn main() -> Result<()> {
     // every later one 409 when the origins share replay state.
     // Each URL is canonicalized and checked like the relay URL, before the first send.
     if let Some(urls) = replay {
-        let gap: u64 = std::env::var("OHTTP_E2E_REPLAY_GAP_MS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0);
+        let gap = replay_gap;
         for (i, url) in urls.iter().enumerate() {
             if i > 0 && gap > 0 {
                 std::thread::sleep(std::time::Duration::from_millis(gap));
             }
             let replay_trace = trace.map(|t| format!("{t}-r{i}"));
             let mut r = post(url.as_str(), replay_trace.as_deref());
-            for (k, v) in extra_headers() {
+            for (k, v) in &extra {
                 r = r.header(k, v)
             }
             let t = Instant::now();
@@ -423,7 +540,7 @@ fn main() -> Result<()> {
     }
 
     // Replay test: send the same request twice if OHTTP_E2E_REPLAY=1
-    if std::env::var("OHTTP_E2E_REPLAY").ok().as_deref() == Some("1") {
+    if replay_twice {
         println!("[REPLAY TEST] Sending request twice to test replay protection");
         let resp1 = net(post(relay_url, trace).send())?;
         println!("[REPLAY 1] HTTP {}", resp1.status());
@@ -464,7 +581,7 @@ fn main() -> Result<()> {
             "absent"
         }
     );
-    if std::env::var("OHTTP_E2E_DUMP_HEADERS").is_ok() {
+    if dump_headers {
         println!("    {} response headers", hdrs.len());
     }
     if !status.is_success() {
@@ -502,7 +619,7 @@ fn main() -> Result<()> {
     }
     // OHTTP_E2E_EXPECT_OK=1 (periodic checks): fail unless the inner response is a success,
     // i.e. inner 200 and, for gRPC, grpc-status 0.
-    if std::env::var("OHTTP_E2E_EXPECT_OK").ok().as_deref() == Some("1") {
+    if expect_ok {
         if inner.status != 200 {
             bail!("inner status {}", inner.status)
         }
@@ -660,9 +777,11 @@ fn net<T>(result: reqwest::Result<T>) -> Result<T> {
     result.map_err(|e| anyhow::anyhow!("transport: {}", transport_failure(&e)))
 }
 
-/// `OHTTP_E2E_EXTRA_HEADERS="Name: value|Name2: value2"` as (name, value) pairs.
-fn extra_headers() -> Vec<(String, String)> {
-    std::env::var("OHTTP_E2E_EXTRA_HEADERS")
+/// The setting `OHTTP_E2E_EXTRA_HEADERS="Name: value|Name2: value2"` as (name, value) pairs;
+/// unset is none. An entry without a `:` is ignored, and neither names nor values are checked
+/// here: one HTTP does not allow fails the run when the request is built.
+fn extra_headers(value: Option<&str>) -> Vec<(String, String)> {
+    value
         .unwrap_or_default()
         .split('|')
         .filter_map(|kv| kv.split_once(':'))
@@ -683,12 +802,12 @@ mod tests {
         }
     }
 
-    fn env(pairs: &[(&str, String)]) -> impl Fn(&str) -> Option<String> {
+    fn env(pairs: &[(&str, String)]) -> impl Fn(&str) -> Result<String, std::env::VarError> {
         let map: HashMap<String, String> = pairs
             .iter()
             .map(|(name, value)| (name.to_string(), value.clone()))
             .collect();
-        move |name| map.get(name).cloned()
+        move |name| map.get(name).cloned().ok_or(std::env::VarError::NotPresent)
     }
 
     fn testnet() -> Vec<(&'static str, String)> {
@@ -895,6 +1014,109 @@ mod tests {
         }
     }
 
+    /// `OHTTP_E2E_DUMP_HEADERS` through [`setting`], as `main` reads it: on with `1` only.
+    #[test]
+    fn header_counts_are_dumped_with_1_only() {
+        use std::env::VarError;
+        let dump = |value: Result<String, VarError>| -> Result<bool> {
+            dump_headers_setting(setting("OHTTP_E2E_DUMP_HEADERS", value)?.as_deref())
+        };
+        assert!(!dump(Err(VarError::NotPresent)).unwrap());
+        assert!(!dump(Ok(String::new())).unwrap());
+        assert!(dump(Ok("1".into())).unwrap());
+        for invalid in ["0", "true", " 1", "yes-not-shown"] {
+            let error = dump(Ok(invalid.into())).unwrap_err().to_string();
+            assert_eq!(error, "OHTTP_E2E_DUMP_HEADERS must be 1 or unset");
+        }
+        let error = dump(Err(VarError::NotUnicode("not-shown".into())))
+            .unwrap_err()
+            .to_string();
+        assert_eq!(error, "OHTTP_E2E_DUMP_HEADERS is not valid Unicode");
+    }
+
+    /// `OHTTP_E2E_REPLAY` and `OHTTP_E2E_EXPECT_OK` through [`setting`], as `main` reads them.
+    #[test]
+    fn replay_and_expect_ok_are_on_with_1_only() {
+        use std::env::VarError;
+        for name in ["OHTTP_E2E_REPLAY", "OHTTP_E2E_EXPECT_OK"] {
+            let on = |value: Result<String, VarError>| -> Result<bool> {
+                switch_setting(name, setting(name, value)?.as_deref())
+            };
+            assert!(!on(Err(VarError::NotPresent)).unwrap());
+            assert!(!on(Ok(String::new())).unwrap());
+            assert!(on(Ok("1".into())).unwrap());
+            for invalid in ["0", "true", "yes-not-shown"] {
+                let error = on(Ok(invalid.into())).unwrap_err().to_string();
+                assert_eq!(error, format!("{name} must be 1 or unset"));
+            }
+            let error = on(Err(VarError::NotUnicode("not-shown".into())))
+                .unwrap_err()
+                .to_string();
+            assert_eq!(error, format!("{name} is not valid Unicode"));
+        }
+    }
+
+    /// `OHTTP_E2E_REPLAY_GAP_MS` through [`setting`], as `main` reads it.
+    #[test]
+    fn the_replay_gap_is_a_number_of_milliseconds_or_unset() {
+        use std::env::VarError;
+        let gap = |value: Result<String, VarError>| -> Result<u64> {
+            replay_gap_setting(setting("OHTTP_E2E_REPLAY_GAP_MS", value)?.as_deref())
+        };
+        assert_eq!(gap(Err(VarError::NotPresent)).unwrap(), 0);
+        assert_eq!(gap(Ok(String::new())).unwrap(), 0);
+        assert_eq!(gap(Ok("0".into())).unwrap(), 0);
+        assert_eq!(gap(Ok("250".into())).unwrap(), 250);
+        for invalid in ["-1", "+5", "1.5", "10ms", " 10", "99999999999999999999999"] {
+            let error = gap(Ok(invalid.into())).unwrap_err().to_string();
+            assert_eq!(
+                error, "OHTTP_E2E_REPLAY_GAP_MS must be a number of milliseconds (digits) or unset",
+                "{invalid}"
+            );
+        }
+        let error = gap(Err(VarError::NotUnicode("not-shown".into())))
+            .unwrap_err()
+            .to_string();
+        assert_eq!(error, "OHTTP_E2E_REPLAY_GAP_MS is not valid Unicode");
+    }
+
+    #[test]
+    fn the_request_id_and_extra_headers_are_refused_when_not_unicode() {
+        use std::env::VarError;
+        let rid = |value| raw_setting("OHTTP_E2E_REQUEST_ID", value);
+        assert_eq!(rid(Err(VarError::NotPresent)).unwrap(), None);
+        // An empty request id is still sent, as before.
+        assert_eq!(rid(Ok(String::new())).unwrap().as_deref(), Some(""));
+        assert_eq!(rid(Ok("abc".into())).unwrap().as_deref(), Some("abc"));
+        let error = rid(Err(VarError::NotUnicode("not-shown".into())))
+            .unwrap_err()
+            .to_string();
+        assert_eq!(error, "OHTTP_E2E_REQUEST_ID is not valid Unicode");
+        let error = setting(
+            "OHTTP_E2E_EXTRA_HEADERS",
+            Err(VarError::NotUnicode("not-shown".into())),
+        )
+        .unwrap_err()
+        .to_string();
+        assert_eq!(error, "OHTTP_E2E_EXTRA_HEADERS is not valid Unicode");
+        assert!(extra_headers(None).is_empty());
+        assert_eq!(
+            extra_headers(Some("A: 1| B :2|junk")),
+            [
+                ("A".to_string(), "1".to_string()),
+                ("B".to_string(), "2".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn the_guess_warning_names_the_setting_and_its_removal() {
+        assert!(GUESS_DEPRECATED.contains("deprecated"));
+        assert!(GUESS_DEPRECATED.contains("OHTTP_E2E_KEY_CONFIG_SOURCE=signed"));
+        assert!(GUESS_DEPRECATED.contains("OHTTP_E2E_KEY_CONFIG_SOURCE=plain"));
+        assert!(!GUESS_DEPRECATED.contains("  "), "{GUESS_DEPRECATED}");
+    }
+
     #[test]
     fn only_a_signed_or_guessed_json_answer_is_verified_as_signed() {
         let (json, keys) = ("application/json; charset=utf-8", "application/ohttp-keys");
@@ -941,7 +1163,8 @@ mod tests {
             .unwrap(),
             ["https://a.example/relay", "https://b.example/relay"]
         );
-        // Set, but naming no URL: an error, not a run that sends nothing.
+        // Naming no URL: an error, not a run that sends nothing. (`main` reads an empty
+        // variable as unset and never passes "" here; the function refuses it all the same.)
         for empty in ["", ",", " , ", ",,"] {
             let error = replay_urls(empty, false).unwrap_err().to_string();
             assert_eq!(error, "OHTTP_E2E_REPLAY_URLS names no URL");
@@ -961,6 +1184,60 @@ mod tests {
             error,
             "OHTTP_E2E_REPLAY_URLS entry 1: an http:// URL needs OHTTP_E2E_PLAIN_HTTP_RELAY=1"
         );
+        // Entries are numbered by their position as written, empty ones counted.
+        for (value, position) in [
+            ("https://a.example/relay,,http://b.example/relay", 2),
+            (" , https://a.example/relay , ,http://b.example/relay", 3),
+            (",http://b.example/relay", 1),
+        ] {
+            let error = replay_urls(value, false).unwrap_err().to_string();
+            assert_eq!(
+                error,
+                format!(
+                    "OHTTP_E2E_REPLAY_URLS entry {position}: an http:// URL needs \
+                     OHTTP_E2E_PLAIN_HTTP_RELAY=1"
+                ),
+                "{value}"
+            );
+        }
+    }
+
+    /// The scheme in lower case only, `http://` as `https://`: an upper-case scheme is refused
+    /// with or without the opt-in, without the URL.
+    #[test]
+    fn an_upper_case_scheme_is_refused_like_https() {
+        for value in [
+            "HTTP://sim.example/relay",
+            "Http://sim.example/relay",
+            "HTTPS://relay.example/relay",
+            "hTtPs://relay.example/relay",
+        ] {
+            for plain_http in [false, true] {
+                let error = relay_url_arg("relay URL", value, plain_http)
+                    .unwrap_err()
+                    .to_string();
+                assert_eq!(
+                    error,
+                    "relay URL: the scheme must be written in lower case (http:// or https://)",
+                    "{value} {plain_http}"
+                );
+            }
+        }
+        let error = replay_urls("https://a.example/relay,HTTP://sim.example/relay", true)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            error,
+            "OHTTP_E2E_REPLAY_URLS entry 1: the scheme must be written in lower case \
+             (http:// or https://)"
+        );
+        // A short or non-ASCII value is not mistaken for one.
+        for value in ["HTTP", "httpé://x", ""] {
+            let error = relay_url_arg("relay URL", value, true)
+                .unwrap_err()
+                .to_string();
+            assert!(!error.contains("lower case"), "{error}");
+        }
     }
 
     #[test]
@@ -1051,6 +1328,47 @@ mod tests {
             "{error}"
         );
         assert!(!error.contains("example"), "{error}");
+
+        // A value that is not Unicode is an error naming the variable, not an unset variable.
+        for (i, name) in testnet().iter().map(|(name, _)| *name).enumerate() {
+            let set = env(&testnet());
+            let var = |asked: &str| -> Result<String, std::env::VarError> {
+                if asked == name {
+                    Err(std::env::VarError::NotUnicode("not-shown".into()))
+                } else {
+                    set(asked)
+                }
+            };
+            let error = networks_from(var).unwrap_err().to_string();
+            assert_eq!(error, format!("{name} is not valid Unicode"), "{i}");
+        }
+        // The preflight of every run refuses it too, and checks nothing else: an incomplete
+        // or invalid configuration passes it.
+        for name in config_var_names() {
+            let var = |asked: &str| -> Result<String, std::env::VarError> {
+                if asked == name {
+                    Err(std::env::VarError::NotUnicode("not-shown".into()))
+                } else {
+                    Err(std::env::VarError::NotPresent)
+                }
+            };
+            let error = config_vars_are_unicode(var).unwrap_err().to_string();
+            assert_eq!(error, format!("{name} is not valid Unicode"));
+        }
+        assert_eq!(config_var_names().len(), 8);
+        let mut incomplete = testnet();
+        incomplete.remove(1);
+        incomplete[0].1 = "Not A Host".into();
+        assert!(config_vars_are_unicode(env(&incomplete)).is_ok());
+        // An empty variable is unset: all four empty is no configuration.
+        let empty: Vec<(&str, String)> = testnet()
+            .into_iter()
+            .map(|(name, _)| (name, String::new()))
+            .collect();
+        assert_eq!(
+            networks_from(env(&empty)).unwrap(),
+            OhttpNetworks::default()
+        );
 
         let mut invalid = testnet();
         invalid[1].1 = "http://relay-testnet.example/relay".into();
