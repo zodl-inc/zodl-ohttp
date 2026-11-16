@@ -265,12 +265,15 @@ Rules that matter for privacy and correctness:
 `BhttpFormat` and `NotAResponse` are permanent for that request; `Truncated` (the answer ended
 before its final chunk) and `Http` are transport failures and may be retried with a fresh
 sealing; `Open` means a chunk did not authenticate; `Backoff { wait }` means the relay asked for
-a pause; `Setup` means a `Client` constructor refused its arguments.
+a pause; `Setup` means a `Client` constructor refused its arguments or could not initialize its
+TLS backend.
 
 What may be logged and what may not:
 
-- **Log-safe.** The `Display` and `Debug` of every `Error` and `ConfigError`, and of
-  `OhttpConfigParams`, `OhttpConfig` and `OhttpNetworks` (which show only which fields are set).
+- **Log-safe.** The `Display` and `Debug` of the errors the library produces (`Error`,
+  `ConfigError`), and the `Debug` of `OhttpConfigParams`, `OhttpConfig` and `OhttpNetworks`
+  (which show only which fields are set), `KeyConfigSource` (the variant and the network only)
+  and `RelayBackoff` (the number of relays only).
   The library itself never puts a URL, host name, address, port or key id of the configuration
   or of the transport into an error. `Http` holds an `HttpError` that shows only its
   `HttpErrorKind` (`Connect`, `Tls`, `Timeout`, `Status(n)`, `RedirectRefused`, `Body`,

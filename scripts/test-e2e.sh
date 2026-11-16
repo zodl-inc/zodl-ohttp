@@ -7,13 +7,18 @@
 # GATEWAY_HOST (the gateway's inner authority) and RELAY_URL are required; there are no built-in
 # endpoints. NETWORK defaults to testnet. Exits non-zero if GetLatestBlock does not come back
 # with inner status 200 / grpc-status 0, or if an unknown :authority is not rejected with inner 403.
-# With CONFIGS_URL pointing at a signed configuration (.../ohttp-configs/signed) the e2e client
-# also needs the network's OHTTP configuration, OHTTP_E2E_*_<NET> (e2e-client/README.md).
+# The key configuration is read as the unsigned document (OHTTP_E2E_KEY_CONFIG_SOURCE=plain,
+# the default here). With CONFIGS_URL pointing at a signed configuration, set
+# OHTTP_E2E_KEY_CONFIG_SOURCE=signed and the network's OHTTP configuration, OHTTP_E2E_*_<NET>
+# (e2e-client/README.md). A relay simulator is reached over plain HTTP, which the script allows
+# for it (OHTTP_E2E_PLAIN_HTTP_RELAY=1); any other http:// RELAY_URL needs the caller to set it.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-NETWORK="${NETWORK:-testnet}"
+# Exported: the e2e client reads NETWORK too (the network a signed configuration is verified
+# for), and would otherwise fall back to mainnet when the caller did not export it.
+export NETWORK="${NETWORK:-testnet}"
 TRACE="${1:-e2e-$(date -u +%Y%m%d-%H%M%S)}"
 
 case "$NETWORK" in
@@ -22,10 +27,14 @@ case "$NETWORK" in
 esac
 GW="${GATEWAY_HOST:?set GATEWAY_HOST to the gateway host name}"
 RELAY_URL="${RELAY_URL:?set RELAY_URL to the relay URL}"
+# The key-configuration source is always explicit, never the e2e client's guess from the URL.
+export OHTTP_E2E_KEY_CONFIG_SOURCE="${OHTTP_E2E_KEY_CONFIG_SOURCE:-plain}"
 
 # Derive CONFIGS_URL: if relay-simulator, fetch config via relay; otherwise direct from gateway
 if [[ "$RELAY_URL" == *"relay-simulator"* ]]; then
   RELAY_BASE="${RELAY_URL%/relay}"
+  # The simulator listens on plain HTTP; the e2e client refuses http:// relay URLs without this.
+  export OHTTP_E2E_PLAIN_HTTP_RELAY="${OHTTP_E2E_PLAIN_HTTP_RELAY:-1}"
   CONFIGS_URL="${CONFIGS_URL:-$RELAY_BASE/ohttp-configs}"
 else
   CONFIGS_URL="${CONFIGS_URL:-https://$GW/ohttp-configs}"

@@ -46,8 +46,10 @@ use crate::{
 /// hand out a key of its own and read every request sealed to it.
 // A `VerifyingKey` keeps its decompressed point, so `Signed` is the larger variant; a source is
 // built once per client.
+///
+/// Its `Debug` output names the variant and the network only, never the URL or the key.
 #[allow(clippy::large_enum_variant)]
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 #[non_exhaustive]
 pub enum KeyConfigSource {
     /// An `application/ohttp-keys` document (RFC 9458 §3), authenticated by the HTTPS
@@ -69,6 +71,24 @@ pub enum KeyConfigSource {
         /// The gateway's configuration-signing key.
         signer: VerifyingKey,
     },
+}
+
+impl std::fmt::Debug for KeyConfigSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            #[cfg(feature = "insecure-plain-key-config")]
+            KeyConfigSource::Plain { .. } => f
+                .debug_struct("Plain")
+                .field("url", &format_args!("<set>"))
+                .finish(),
+            KeyConfigSource::Signed { network, .. } => f
+                .debug_struct("Signed")
+                .field("url", &format_args!("<set>"))
+                .field("network", network)
+                .field("signer", &format_args!("<set>"))
+                .finish(),
+        }
+    }
 }
 
 impl KeyConfigSource {
@@ -536,6 +556,39 @@ fn unix_now() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_key_configuration_source_debug_shows_no_value() {
+        let signer = ed25519_dalek::SigningKey::from_bytes(&[3; 32]).verifying_key();
+        let source = KeyConfigSource::Signed {
+            url: "https://keys.example/ohttp-configs/signed".into(),
+            network: Network::Testnet,
+            signer,
+        };
+        let shown = format!("{source:?}");
+        assert_eq!(
+            shown,
+            "Signed { url: <set>, network: Testnet, signer: <set> }"
+        );
+        let key_hex = hex::encode(signer.as_bytes());
+        for part in ["keys.example", "ohttp-configs", key_hex.as_str()] {
+            assert!(!shown.contains(part), "{shown}");
+        }
+        assert!(!format!("{source:#?}").contains("keys.example"));
+    }
+
+    #[cfg(feature = "insecure-plain-key-config")]
+    #[test]
+    fn an_unsigned_source_debug_shows_no_url() {
+        let source = KeyConfigSource::Plain {
+            url: "https://keys.example/ohttp-configs".into(),
+        };
+        let shown = format!("{source:?}");
+        assert_eq!(shown, "Plain { url: <set> }");
+        for shown in [shown, format!("{source:#?}")] {
+            assert!(!shown.contains("keys.example") && !shown.contains("ohttp-configs"));
+        }
+    }
 
     #[test]
     fn a_signed_configuration_is_used_until_it_expires() {

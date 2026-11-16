@@ -2,7 +2,34 @@
 
 [Keep a Changelog](https://keepachangelog.com).
 
-## 2.0.0 (unreleased)
+## 2.0.1
+
+No API or wire-format change.
+
+### Fixed
+
+- `OhttpConfig::new` and `OhttpNetworks::new` compare a gateway host with relay hosts (and the
+  two gateway hosts with each other) as the URL parser reads it: a gateway host written as a
+  numeric IPv4 alias (`0xc0000201`, `0300.0.2.1`, `3221225985`, `192.0.513`) is the address it
+  names, so a relay URL on that address is now refused (`ConfigError::Invalid`, field
+  `relay_url`), as a relay on the gateway's dotted-decimal address already was, and two such
+  spellings of one gateway host are `SharedAcrossNetworks`. A configuration that passed only
+  because of the alias is now refused.
+- The `Debug` of `KeyConfigSource` shows the variant and the network only (`url` and `signer`
+  are `<set>`), and that of `RelayBackoff` the number of relays in the table only, instead of
+  URLs, keys and pauses. Formatting a `RelayBackoff` never waits for its table: while the table
+  is in use it shows `relays: <locked>`.
+
+### Documentation
+
+- `INTEGRATION.md`: what is log-safe is the output of the errors the library produces (a caller
+  can build an `Error` with any text); `Error::Setup` lists `TLS backend` among its `what`
+  values; the request-padding fingerprint ("no other lightwalletd call comes near 16 KiB") holds
+  for typical traffic only (`docs/architecture.md`).
+- `Cargo.toml` no longer sets `homepage` to the repository URL (cargo warns that it is
+  redundant).
+
+## 2.0.0
 
 A breaking release: the client refuses configurations and sources that let the relay read
 requests or tell clients apart. The migration list comes first; the sections after it describe

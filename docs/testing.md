@@ -115,6 +115,10 @@ It sends `GetLatestBlock` and expects inner status 200 with `grpc-status: 0`, th
 same request to an unknown `:authority` and expects inner 403. `GATEWAY_HOST` and `RELAY_URL`
 are required; `CONFIGS_URL` overrides where the key configuration is fetched (by default through
 the relay when `RELAY_URL` points at a relay simulator, else `https://$GATEWAY_HOST/ohttp-configs`).
+The script reads the key configuration as the unsigned document unless
+`OHTTP_E2E_KEY_CONFIG_SOURCE=signed` is set (with a signed `CONFIGS_URL` and the
+`OHTTP_E2E_*_<NET>` variables). It sets `OHTTP_E2E_PLAIN_HTTP_RELAY=1` itself only for a relay
+simulator; for any other `http://` relay URL the caller sets it.
 
 The e2e client can also be run directly (`e2e-client/README.md`): signed or unsigned key
 configurations, gRPC or plain HTTP inner requests, the DNS key-configuration source
@@ -131,7 +135,9 @@ the OHTTP configuration of the network in its environment (`OHTTP_E2E_*_MAINNET`
 cd relay-simulator
 GATEWAY_URL=http://localhost:8080/gateway RELAY_SECRET=<secret> NETWORK=testnet cargo run
 # 3. one exchange through it
-cd ../e2e-client && cargo run --release -- \
+# (plain HTTP and the unsigned key configuration: local testing only)
+cd ../e2e-client && OHTTP_E2E_PLAIN_HTTP_RELAY=1 OHTTP_E2E_KEY_CONFIG_SOURCE=plain \
+  cargo run --release -- \
   http://localhost:8081/ohttp-configs http://localhost:8081/relay \
   ohttp-gateway.example POST /cash.z.wallet.sdk.rpc.CompactTxStreamer/GetLatestBlock local-1
 ```

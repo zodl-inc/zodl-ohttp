@@ -276,8 +276,9 @@ What the size classes hide from the relay (and from anyone on the network path):
 What they do not hide, for typical light-wallet traffic (none of this is a guaranteed
 identification; it is a strong statistical fingerprint):
 
-- **That a request is very likely a transaction broadcast.** No other lightwalletd call comes
-  near 16 KiB, so a request in the 16 KiB class or above is very likely a `SendTransaction`,
+- **That a request is very likely a transaction broadcast.** In typical traffic no other
+  lightwalletd call comes near 16 KiB (one that lists many addresses or transaction ids can),
+  so a request in the 16 KiB class or above is very likely a `SendTransaction`,
   and the relay, which knows the client's address, learns that this address very likely sent a
   transaction at that moment. It is not a certain classifier: calls to third-party APIs through
   the gateway (`BACKENDS`) are padded like every other call and can land in the same classes, or
