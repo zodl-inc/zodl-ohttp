@@ -62,6 +62,138 @@ keeps its own log in [client/CHANGELOG.md](client/CHANGELOG.md).
 
 ### Gateway
 
+- Pinned backfill workers (`PINNED_BACKFILL_WORKERS`) are started also when the store the
+  entries go to is a read replica at startup: they wait and start once it takes writes (asked
+  again every 5 minutes, as pinned writes are), so a promoted replica gets its backfill without
+  a restart. Every worker, and the sweep behind the cursor, uses the same store, bound to the
+  generation of that choice: when the store changes (the write store connected, the store found
+  read-only or writable again) or its cursor fails, the workers choose again and wait while none
+  takes writes; the sweep skips its passes meanwhile. A
+  `REDIS_PINNED_WRITE_URL` that is unreachable at startup is connected in the background
+  (backoff 1 s up to 60 s) instead of staying off until a restart; once connected, its `ROLE` is
+  asked before the first write to it.
+- A pinned store whose `ROLE` does not answer in time (or fails on the connection) is treated as
+  not writable and asked again after 30 s, instead of as writable: pinned writes and the
+  backfill wait meanwhile. A store without the `ROLE` command (an error answer) stays writable.
+- Pooled third-party HTTPS connections are kept idle for 30 s instead of 60 s, below the 60 s
+  idle timeout common for servers and load balancers: with equal timeouts a request could be
+  written to a connection the server was closing at that moment and fail.
+- Tip-scoped `GetLatestTreeState` answers are cached and served only when their height and hash
+  are the tip of their key, `GetLightdInfo` answers only when their `blockHeight` is at least
+  the tip height (it carries no hash: this catches an instance that is behind, not one on
+  another fork at the same height), on the client path and in the prefetch. An instance one
+  block behind, or on a losing fork, could fill the entry of the new tip for its whole lifetime,
+  and the prefetch never corrected it. An answer that does not match is not cached; a stored
+  entry that does not match (written by an older gateway during a rolling upgrade) is deleted
+  on read, answered as a miss and fetched again. Both are counted in the new
+  `ohttp_cache_tip_mismatch_total{phase="store|lookup"}`; `ohttp_cache_requests_total` keeps one
+  result per request. In normal operation every instance answers at the tip, so the hit rate
+  does not change.
+- The prefetch fetches a `GetTreeState` or `GetTransaction` entry again when the stored one is
+  no longer current against the index (left from before a reorg), instead of treating any
+  stored value as present.
+- A `GetSubtreeRoots` end marker is never lowered for the same tip: a Client's fetch answered
+  by an instance that is behind no longer replaces the prefetch's count from the tip block with
+  a smaller one, which hid the roots above it from every request at that tip. The marker is
+  written by one compare-and-set script on the cache Redis (after the epoch check); a store
+  error writes nothing.
+- The lightwalletd protocol files the gateway's hand-written messages follow
+  (`compact_formats.proto`, `service.proto`) are vendored in `gateway/proto/lightwalletd` from a
+  pinned upstream tag, and tests check the field numbers the gateway decodes against them.
+- The prefetch's "one run at a time" flag is cleared however a run ends (a panic or a
+  cancelled task included), so one failed run no longer stops every later prefetch.
+- **Hedged lightwalletd reads** replace the retry at half of the head deadline: a read without
+  a response head after `LWD_HEDGE_DELAY_MS` (new, default half of the head deadline, the old
+  cut-off; `0` turns it off) is sent to a *different* `LWD_ENDPOINTS` instance as well, while the
+  first attempt keeps running; the first head wins and the other attempt is cancelled. Both
+  share the call's whole head deadline, so a read that takes 6 s of a 10 s deadline no longer
+  fails on both attempts. Without `LWD_ENDPOINTS` (or with one instance) reads are not hedged,
+  and the one attempt keeps the whole deadline (before, it was cut at half and retried on a new
+  connection to `LWD_ADDR`). Never hedged: `SendTransaction` and any path that is not a
+  `CompactTxStreamer` read, heavy calls (long block ranges, transactions, transparent-address
+  and subtree queries), `GetMempoolStream`, and calls to other backends; a call is still
+  retried after a connect error (any call) or a transport error (reads) as before, but never
+  after a hedge was sent. The loser of a hedge race is not a failure (not counted as a timeout
+  or as a failed call, no pool replacement); an attempt that fails is settled as failed even
+  when the other one answers. An instance that loses two hedges in a row, without a response
+  head from it in between, is skipped for 30 s at that and each further loss
+  (`event="loser_skipped"`), so one that accepts calls and never answers leaves the rotation
+  after its second slow read (it was skipped after the first before) and is tried again every
+  30 s. Two bounds: a hedge takes a permit of `LWD_HEDGE_MAX_INFLIGHT` (new, default an eighth
+  of `MAX_INFLIGHT_LWD`, at most 16, at least 1; up to the semaphore maximum) on top of the
+  caller's lightwalletd permit (hedges are not counted in `MAX_INFLIGHT_LWD`), taken when the
+  hedge is sent and held until the race ends (a read that is not hedged holds none); and a rate cap: six hedges a minute are always allowed, above that
+  hedges stay at most one in ten of the hedgeable reads of the last minute. New metric
+  `ohttp_lwd_hedges_total{event="started|won|no_permit|rate_limited|loser_skipped"}`;
+  `ohttp_lwd_read_retries_total{reason="timeout"}` is no longer produced.
+- The call's head deadline is fixed before `LWD_ENDPOINTS` is resolved and covers the
+  resolution and every attempt (a slow resolution extended it). One resolution runs at a time
+  (abandoned after 30 s); callers use the previous list meanwhile and wait (at most 1 s) only
+  for the first one, instead of every caller resolving again when the list expired.
+- Log lines at warn and info level no longer carry lightwalletd instance addresses or the
+  resolved names: the instance of a failed attempt, the target of a retry or hedge, the
+  `LWD_ENDPOINTS` name and `LWD_ADDR` (the startup line's `lwd` field, the backend of the
+  cache connection line, the permanent tier backfill line) are logged at debug level only.
+- `SendTransaction` has its own deadline class again: `LWD_SEND_TIMEOUT_SECS` (new, default
+  `LWD_TIMEOUT_SECS`, as before the unary deadline existed) instead of `LWD_UNARY_TIMEOUT_SECS`
+  (10 s), which cut slow broadcasts and showed the client an error for a transaction that may
+  have been sent. Counted as `class="send"` in `ohttp_lwd_timeouts_total`. A slow broadcast can
+  thus hold its request up to `LWD_TIMEOUT_SECS` (default 80 s) again: relay and client
+  timeouts must allow that, or `LWD_SEND_TIMEOUT_SECS` must be set lower.
+- Transparent-address streams (`GetTaddressTxids`, `GetTaddressTransactions`,
+  `GetAddressUtxosStream`) keep the rest of `LWD_TIMEOUT_SECS` until their first complete
+  message (its 5-byte prefix and the whole length it declares), not only for the response head:
+  a lightwalletd that sends the head, or part of the first message, before the node's address
+  query ends is no longer cut after `LWD_STREAM_IDLE_SECS`.
+- A late response head of `GetMempoolStream` (an empty mempool) or of a transparent-address RPC
+  (a slow node query) no longer counts as a lightwalletd failure in the `/healthz` error window
+  and no longer ejects the instance; only connect and transport errors do. A `GetMempoolStream`
+  without a head within its deadline ends cleanly (grpc-status 0) and is counted in the new
+  `ohttp_lwd_mempool_no_head_total`, so an instance that does not answer stays visible.
+- With `LWD_CONNECTION_POOL`, the pooled client is replaced after three calls within 10 s ran
+  into a deadline (at most once per 5 s), instead of after any single one.
+- Chain follower fencing: every index entry is now written together with its cached block, and
+  every deletion of a reorg (index entries and the cached blocks, nullifiers, tree states and
+  subtree roots above the fork), only while the writer holds the leader lock with its own token,
+  in the same kind of script as the tip (they were plain writes, and only the tip was fenced).
+  A leader replaced while a tick was in flight (a slow block fetch, a pause) could otherwise
+  write the index and blocks of another fork, or delete what its successor wrote, before its
+  tip write was refused; now the refused batch and every later one are not written and it
+  stops leading. The fenced writes no longer accept an absent lock: a paused leader cannot
+  write an older tip after the process that replaced it released or lost the lock again; one
+  whose own lock lapsed acquires it again on its next tick. A store error or timeout in a fenced
+  write (after a timeout its outcome is unknown) now stops the tick and hands the lock over,
+  instead of going on without it. One script carries
+  at most 32 blocks and 1 MiB of block payload (a larger block goes alone), so large blocks do
+  not make a script outlast the store's operation timeout.
+- Leader work that runs longer than the lock TTL (a cold start, a catch-up) keeps renewing the
+  lock with its own token, and is cancelled as soon as a renewal finds the lock held by another
+  process (or no renewal succeeded for a whole TTL), instead of running on until its next write
+  was refused.
+- The leader confirms the stored tip on every tick its lightwalletd answers with it, in a new
+  key `{chain}tip_seen`, and followers refresh their tip only when that value changed (no
+  clock comparison between processes), so a tip the leader no longer confirms goes stale on
+  every gateway after 30 s; before, followers refreshed whatever was stored on every read. The
+  leader stops confirming after 300 ticks with the same tip (at least 10 minutes: a
+  lightwalletd stuck at the tip height; at a 75 s block spacing such a gap is rarer than one
+  block in a thousand, and during one requests are answered from upstream). A leader whose
+  lightwalletd stays below the indexed tip for 15 ticks in a row (about 30 s) gives the lock up
+  and does not try to take it again for 5 ticks, so a process with another lightwalletd leads.
+  During a rolling upgrade, a leader of the previous version does not write `tip_seen`: its
+  followers of this version refresh on every read as before, both while the key is absent and
+  while a key left by an earlier leader of this version stays unchanged as the stored tip moves
+  (until the value changes again). Older followers ignore the key.
+- Stale-leader takeover: a follower takes the lock over only on a second probe in a row with
+  the same stored tip (height and hash) and the same lock holder, re-read on every probe, in one
+  script that checks both; a refused takeover or another holder starts the observation again.
+  Two followers that saw the same stale tip no longer take it from each other, and a holder
+  change between probes no longer blocks the takeover forever.
+- What a follower serves while its own lightwalletd is ahead of a stale leader follows one
+  rule: the highest tip its own lightwalletd answered, for at most 30 s after it last did, while
+  the stored tip stays below it on the same chain. A failed or lower probe never makes it step
+  back (it used to fall back to the lower stored tip and back up again between probes); it
+  serves the stored tip again once the held tip ages out, the stored tip catches up, or the
+  stored chain changes at or below the observed height.
 - `REPLAY_WRITE_WAIT_MS` and `REPLAY_PEER_WAIT_MS` must stay below about 1.25 s (the budget of a
   housekeeping check of a `WAIT` connection); a pool of one `WAIT` connection is not PINGed
   while it hands out its connection exclusively. A reopen of a `WAIT` connection that starts
@@ -289,14 +421,22 @@ keeps its own log in [client/CHANGELOG.md](client/CHANGELOG.md).
   buckets: 0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.15, 0.25, 0.35, 0.5, 0.75, 1, 1.5, 2.5, 5 and
   10 s (were 0.01, 0.05, 0.1, 0.25, 0.5, 1, 2.5 and 5 s). Calls that cross a long network path
   took one or a few round trips of 50 to 300 ms each, and their quantiles were interpolated
-  across buckets up to 0.5 s wide. Every old bound is kept, so queries over a range that spans
-  the upgrade still work. The number of series of both histograms roughly doubles.
+  across buckets up to 0.5 s wide. Every old bound is kept, but rates and quantiles across the
+  upgrade are not comparable: the new bounds have no history before a process's upgrade, so
+  over a range that reaches back before it (even for a single process) a rate of a new bound
+  covers only the part after the upgrade while `+Inf` and the old bounds cover all of it. During
+  a rolling upgrade an aggregate such as
+  `histogram_quantile(0.99, sum by (le) (rate(..._bucket[5m])))` also adds processes with and
+  without the new bounds, with the same effect. Until every process runs the new version and
+  the query range starts after that, compute quantiles over the old bounds only
+  (`le=~"0.01|0.05|0.1|0.25|0.5|1|2.5|5|\\+Inf"`) or per version. The number of series of both
+  histograms roughly doubles.
 - **`GATEWAY_HOSTS` is required in `ohttp` mode:** the gateway refuses to start when it is unset
   or empty, instead of warning and sending every unknown authority to lightwalletd. A deployment
   that already sets it is unaffected; one that does not must set it to the gateway's own host
   names before upgrading.
 - Third-party backend calls (`BACKENDS`, `https://`) reuse pooled HTTPS connections (idle
-  60 s, at most 16 idle per host) instead of a new connection per request, which saves the TCP
+  30 s, at most 16 idle per host) instead of a new connection per request, which saves the TCP
   and TLS handshake on every call after the first. Same TLS connector, roots and HTTP/1.1 as
   before; headers, credentials and timeouts stay per request, and a response body that is not
   read to its end (an event stream cut at its timeout) closes its connection instead of

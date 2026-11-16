@@ -167,10 +167,12 @@ pub trait CacheStore: Send + Sync {
         value: String,
         ttl_ms: u64,
     ) -> BoxFuture<'_, Option<bool>>;
-    /// `SET key value PX ttl_ms` (whoever holds it) only while `guard_key` still holds `guard`
-    /// (one atomic script): Some(true) when taken, Some(false) when the guard changed, None on
-    /// error. The chain follower takes over a leader whose tip stopped moving this way, so that
-    /// it never takes over from a leader that has just moved it.
+    /// `SET key value PX ttl_ms` only while `guard_key` still holds `guard` and `key` is still
+    /// held by `holder` (`None`: not held at all), in one atomic script: Some(true) when taken,
+    /// Some(false) when the guard or the holder changed, None on error. The chain follower takes
+    /// over a leader whose tip stopped moving this way: it never takes over from a leader that
+    /// has just moved it, nor from another follower that took over from the same stale leader
+    /// a moment before.
     fn take_lock_if(
         &self,
         key: String,
@@ -178,18 +180,44 @@ pub trait CacheStore: Send + Sync {
         ttl_ms: u64,
         guard_key: String,
         guard: Bytes,
+        holder: Option<String>,
     ) -> BoxFuture<'_, Option<bool>>;
-    /// Write `entries` (key, value, TTL in seconds) unless `lock` is held by another value
+    /// Write `entries` (key, value, TTL in seconds; 0 = no expiry) only while `lock` holds exactly `value`
     /// (one atomic script), and hold `lock` for `ttl_ms` again: Some(true) when written,
-    /// Some(false) when another value holds the lock, None on error. A leader replaced while a
-    /// tick was in flight cannot overwrite the tip of the process that replaced it; one whose
-    /// lock merely lapsed during a long tick, with nobody taking it, still writes.
+    /// Some(false) when the lock is held by another value or by nobody, None on error. A leader
+    /// replaced while a tick was in flight cannot overwrite the index or the tip of the process
+    /// that replaced it, also not after that one released the lock again; one whose lock lapsed
+    /// stops leading and acquires it again on its next tick.
     fn set_if_lock_held(
         &self,
         lock: String,
         value: String,
         ttl_ms: u64,
         entries: Vec<(String, Bytes, u64)>,
+    ) -> BoxFuture<'_, Option<bool>>;
+    /// Delete `keys` only while `lock` holds exactly `value` (one atomic script): Some(true)
+    /// when deleted, Some(false) when the lock is not held by `value`, None on error.
+    fn del_if_lock_held(
+        &self,
+        lock: String,
+        value: String,
+        keys: Vec<String>,
+    ) -> BoxFuture<'_, Option<bool>>;
+    /// The value `key` (a lock) holds: Some(None) when it is not held, None on error.
+    fn lock_holder(&self, key: String) -> BoxFuture<'_, Option<Option<String>>>;
+    /// Whether the shared epoch still equals `epoch` (the check an epoch-checked `set` makes
+    /// before its write): None on error.
+    fn epoch_current(&self, epoch: u64) -> BoxFuture<'_, Option<bool>>;
+    /// Store the big-endian `value` under `key` with `ttl_secs`, only if the stored value is
+    /// lower (or absent, or not a 4-byte value), in one atomic step; the epoch is checked
+    /// before (as an epoch-checked `set`). Some(true) when written, Some(false) when the stored
+    /// value is as high or the epoch changed, None on error (nothing written).
+    fn set_max_u32(
+        &self,
+        key: String,
+        value: u32,
+        ttl_secs: u64,
+        epoch: u64,
     ) -> BoxFuture<'_, Option<bool>>;
     /// Delete `key` only if it still holds `value` (one atomic script).
     fn release_lock(&self, key: String, value: String) -> BoxFuture<'_, Option<bool>>;
@@ -209,6 +237,15 @@ pub fn tip_key(chain_prefix: &str) -> String {
 /// that a gateway that does not know it still reads the tip as before.
 pub fn tip_at_key(chain_prefix: &str) -> String {
     format!("{chain_prefix}tip_at")
+}
+
+/// When the leader last confirmed the stored tip (its lightwalletd answered with it, or it
+/// moved it): Unix milliseconds, decimal, rewritten on every such leader tick. Followers keep
+/// the tip fresh only while this value changes, so a leader that stops confirming (a stuck
+/// lightwalletd) lets the tip go stale everywhere. Absent (an older leader): followers refresh
+/// on every read, as before.
+pub fn tip_seen_key(chain_prefix: &str) -> String {
+    format!("{chain_prefix}tip_seen")
 }
 
 pub fn encode_unix_ms(ms: u64) -> Bytes {
@@ -303,6 +340,11 @@ pub(crate) mod test_support {
         pub data: Mutex<HashMap<String, (Bytes, Option<u64>)>>,
         pub locks: Mutex<HashMap<String, (String, tokio::time::Instant)>>,
         pub mgets: Mutex<Vec<Vec<String>>>,
+        /// `Some((n, holder))`: the n-th fenced write from now succeeds, then `holder` takes the
+        /// lock (a process replaced between two batches of one tick).
+        pub steal_lock_after: Mutex<Option<(usize, String)>>,
+        /// The keys of every accepted fenced write (`set_if_lock_held`), one list per script.
+        pub fenced_writes: Mutex<Vec<Vec<String>>>,
         pub tip: TipCell,
         pub epoch: u64,
         /// When set, every read answers "nothing" and every write is dropped (Redis down).
@@ -315,6 +357,8 @@ pub(crate) mod test_support {
                 data: Mutex::new(HashMap::new()),
                 locks: Mutex::new(HashMap::new()),
                 mgets: Mutex::new(Vec::new()),
+                steal_lock_after: Mutex::new(None),
+                fenced_writes: Mutex::new(Vec::new()),
                 tip: TipCell::new(),
                 epoch: 42,
                 down: std::sync::atomic::AtomicBool::new(false),
@@ -454,6 +498,7 @@ pub(crate) mod test_support {
             ttl_ms: u64,
             guard_key: String,
             guard: Bytes,
+            holder: Option<String>,
         ) -> BoxFuture<'_, Option<bool>> {
             Box::pin(async move {
                 if self.is_down() {
@@ -464,11 +509,96 @@ pub(crate) mod test_support {
                     return Some(false);
                 }
                 let now = tokio::time::Instant::now();
-                self.locks
+                let mut locks = self.locks.lock().unwrap();
+                let current = locks
+                    .get(&key)
+                    .filter(|(_, exp)| *exp > now)
+                    .map(|(v, _)| v.clone());
+                if current != holder {
+                    return Some(false);
+                }
+                locks.insert(key, (value, now + Duration::from_millis(ttl_ms)));
+                Some(true)
+            })
+        }
+        fn del_if_lock_held(
+            &self,
+            lock: String,
+            value: String,
+            keys: Vec<String>,
+        ) -> BoxFuture<'_, Option<bool>> {
+            Box::pin(async move {
+                if self.is_down() {
+                    return None;
+                }
+                let now = tokio::time::Instant::now();
+                let held = self
+                    .locks
                     .lock()
                     .unwrap()
-                    .insert(key, (value, now + Duration::from_millis(ttl_ms)));
+                    .get(&lock)
+                    .is_some_and(|(v, exp)| *v == value && *exp > now);
+                if !held {
+                    return Some(false);
+                }
+                let mut data = self.data.lock().unwrap();
+                for k in keys {
+                    data.remove(&k);
+                }
                 Some(true)
+            })
+        }
+        fn set_max_u32(
+            &self,
+            key: String,
+            value: u32,
+            ttl_secs: u64,
+            epoch: u64,
+        ) -> BoxFuture<'_, Option<bool>> {
+            Box::pin(async move {
+                if self.is_down() {
+                    return None;
+                }
+                if epoch != self.epoch {
+                    return Some(false);
+                }
+                let mut data = self.data.lock().unwrap();
+                let current = data
+                    .get(&key)
+                    .and_then(|(v, _)| <[u8; 4]>::try_from(&v[..]).ok())
+                    .map(u32::from_be_bytes);
+                if current.is_some_and(|c| c >= value) {
+                    return Some(false);
+                }
+                data.insert(
+                    key,
+                    (Bytes::copy_from_slice(&value.to_be_bytes()), Some(ttl_secs)),
+                );
+                Some(true)
+            })
+        }
+        fn epoch_current(&self, epoch: u64) -> BoxFuture<'_, Option<bool>> {
+            Box::pin(async move {
+                if self.is_down() {
+                    return None;
+                }
+                Some(epoch == self.epoch)
+            })
+        }
+        fn lock_holder(&self, key: String) -> BoxFuture<'_, Option<Option<String>>> {
+            Box::pin(async move {
+                if self.is_down() {
+                    return None;
+                }
+                let now = tokio::time::Instant::now();
+                Some(
+                    self.locks
+                        .lock()
+                        .unwrap()
+                        .get(&key)
+                        .filter(|(_, exp)| *exp > now)
+                        .map(|(v, _)| v.clone()),
+                )
             })
         }
         fn set_if_lock_held(
@@ -484,16 +614,30 @@ pub(crate) mod test_support {
                 }
                 let now = tokio::time::Instant::now();
                 let mut locks = self.locks.lock().unwrap();
-                let other = locks
+                let held = locks
                     .get(&lock)
-                    .is_some_and(|(v, exp)| *v != value && *exp > now);
-                if other {
+                    .is_some_and(|(v, exp)| *v == value && *exp > now);
+                if !held {
                     return Some(false);
                 }
-                locks.insert(lock, (value, now + Duration::from_millis(ttl_ms)));
+                locks.insert(lock.clone(), (value, now + Duration::from_millis(ttl_ms)));
+                self.fenced_writes
+                    .lock()
+                    .unwrap()
+                    .push(entries.iter().map(|(k, _, _)| k.clone()).collect());
                 let mut data = self.data.lock().unwrap();
                 for (k, v, ttl) in entries {
-                    data.insert(k, (v, Some(ttl)));
+                    data.insert(k, (v, (ttl > 0).then_some(ttl)));
+                }
+                // Test hook: another process takes the lock right after this write.
+                let mut steal = self.steal_lock_after.lock().unwrap();
+                if let Some((n, thief)) = steal.as_mut() {
+                    if *n <= 1 {
+                        locks.insert(lock, (thief.clone(), now + Duration::from_secs(3600)));
+                        *steal = None;
+                    } else {
+                        *n -= 1;
+                    }
                 }
                 Some(true)
             })

@@ -130,6 +130,14 @@ struct TxHead {
     hash: Vec<u8>,
 }
 
+/// Field number of `ironwoodCommitmentTreeSize` in `ChainMetadata`; the `prost` tag below must
+/// match it (a test checks both against the vendored `compact_formats.proto`).
+const IRONWOOD_TREE_SIZE_FIELD: u32 = 3;
+
+/// `ChainMetadata` of lightwalletd's `compact_formats.proto` (vendored in `proto/lightwalletd`):
+/// saplingCommitmentTreeSize 1, orchardCommitmentTreeSize 2, ironwoodCommitmentTreeSize
+/// [`IRONWOOD_TREE_SIZE_FIELD`]. A block from a lightwalletd without the Ironwood field decodes
+/// with size 0, which writes no marker for that pool.
 #[derive(Clone, PartialEq, prost::Message)]
 struct ChainMetadata {
     #[prost(uint32, tag = "1")]
@@ -236,8 +244,16 @@ impl TipPrefetch {
             debug!(network = %inner.network, height = tip.height, "prefetch still running, tip skipped");
             return;
         }
+        // Cleared however the run ends (a panic or a cancelled task included), so one failed
+        // run does not stop every later prefetch.
+        struct Running<'a>(&'a AtomicBool);
+        impl Drop for Running<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::Release);
+            }
+        }
+        let _running = Running(&inner.running);
         inner.run(tip).await;
-        inner.running.store(false, Ordering::Release);
     }
 }
 
@@ -330,14 +346,13 @@ impl Inner {
             if count == 0 {
                 continue;
             }
-            self.store
-                .set(
-                    crate::subtree_cache::subtree_end_key(prefix, protocol, &tip.hash),
-                    bytes::Bytes::copy_from_slice(&count.to_be_bytes()),
-                    Some(rpc_cache::TIP_SCOPED_TTL_SECS),
-                    Some(epoch),
-                )
-                .await;
+            crate::subtree_cache::write_end_marker(
+                &*self.store,
+                crate::subtree_cache::subtree_end_key(prefix, protocol, &tip.hash),
+                count,
+                epoch,
+            )
+            .await;
         }
     }
 
@@ -382,7 +397,10 @@ impl Inner {
     }
 
     /// Fetch `rpc` once and store it under the key a Client's identical request has, unless it
-    /// is cached already. Returns the response size when an upstream call completed.
+    /// is cached already (a validated entry only while it is current against the index: one
+    /// left from before a reorg is fetched again; a tip-scoped one only while it matches `tip`).
+    /// A tip-scoped answer is stored only when it matches `tip` (`rpc_cache::matches_tip`). Returns the response size when an upstream call
+    /// completed.
     async fn prefetch(
         &self,
         prefix: &str,
@@ -398,16 +416,24 @@ impl Inner {
                 Policy::Validated { key, source } => (key, None, Some(source)),
                 _ => return None,
             };
-        if self
+        if let Some(existing) = self
             .store
             .mget(vec![key.clone()])
             .await
             .into_iter()
             .next()
             .flatten()
-            .is_some()
         {
-            return None;
+            let current = match validate {
+                None => rpc_cache::tip_scoped_entry_matches(&path, &existing, tip),
+                Some(_) => {
+                    rpc_cache::validated_entry_validity(&*self.store, &existing, Some(tip)).await
+                        == Some(crate::store::Validity::Current)
+                }
+            };
+            if current {
+                return None;
+            }
         }
         let miss = CacheMiss {
             key,
@@ -418,6 +444,7 @@ impl Inner {
             path: path.clone(),
             rpc: rpc.to_string(),
             pinned_height: None,
+            tip: ttl.is_some().then(|| tip.clone()),
         };
         let store = self.store.clone();
         let network = self.network.clone();
@@ -484,6 +511,8 @@ mod tests {
         fail: bool,
         /// When set, every call waits for a permit before it answers (a slow lightwalletd).
         gate: Option<Arc<tokio::sync::Semaphore>>,
+        /// The tip height its `GetLightdInfo` and `GetLatestTreeState` answers are at.
+        tip_height: AtomicU64,
     }
 
     #[derive(Clone, PartialEq, prost::Message)]
@@ -517,6 +546,20 @@ mod tests {
                 // The TreeState of the requested height, on the chain of every block 0xab..
                 rpc_cache::TreeStateHead {
                     height: rpc_cache::BlockId::decode(&body[5..]).unwrap().height,
+                    hash: hex::encode([0xab; 32]),
+                }
+                .encode_to_vec()
+            } else if path.ends_with("GetLightdInfo") {
+                // LightdInfo { blockHeight }: field 7.
+                let mut m = vec![0x38];
+                prost::encoding::encode_varint(
+                    self.tip_height.load(std::sync::atomic::Ordering::SeqCst),
+                    &mut m,
+                );
+                m
+            } else if path.ends_with("GetLatestTreeState") {
+                rpc_cache::TreeStateHead {
+                    height: self.tip_height.load(std::sync::atomic::Ordering::SeqCst),
                     hash: hex::encode([0xab; 32]),
                 }
                 .encode_to_vec()
@@ -594,6 +637,7 @@ mod tests {
             tx_height: 1000,
             fail,
             gate,
+            tip_height: AtomicU64::new(1000),
         });
         let flights = Arc::new(RpcFlights::new(lwd.clone(), "testnet".to_string()));
         let prefetch = TipPrefetch::new(store.clone(), flights, "testnet".to_string(), config);
@@ -948,5 +992,168 @@ mod tests {
         .await;
         r.prefetch.run(&r.tip).await;
         assert!(tree_state_calls(&r.lwd).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_lagging_instance_does_not_fill_the_tip_entries() {
+        let r = rig(
+            PrefetchConfig {
+                tip: true,
+                block_txs: None,
+                tree_state: false,
+            },
+            false,
+        )
+        .await;
+        // The instance that answers is one block behind the tip.
+        r.lwd.tip_height.store(999, Ordering::SeqCst);
+        r.prefetch.run(&r.tip).await;
+        for rpc in TIP_RPCS {
+            assert!(!is_hit(&r.store, rpc, &grpc_frame(&[])).await, "{rpc}");
+        }
+        // An entry of another tip already under the key (an older gateway): replaced too.
+        let prefix = r.store.key_prefix(r.store.epoch);
+        let key = match rpc_cache::policy(
+            &prefix,
+            "POST",
+            CT,
+            &path("GetLightdInfo"),
+            &grpc_frame(&[]),
+            Some(&r.tip.hash),
+        ) {
+            Policy::TipScoped { key } => key,
+            other => panic!("{other:?}"),
+        };
+        let lagging = crate::ohttp::InnerResponse {
+            status: 200,
+            headers: vec![("grpc-status".to_string(), "0".to_string())],
+            body: grpc_frame(&[0x38, 0x80, 0x07]),
+        };
+        r.store.put(&key, bincode::serialize(&lagging).unwrap());
+        // Nothing poisoned: the next run (or a Client) caches the right answer.
+        r.lwd.tip_height.store(1000, Ordering::SeqCst);
+        r.prefetch.run(&r.tip).await;
+        for rpc in TIP_RPCS {
+            assert!(is_hit(&r.store, rpc, &grpc_frame(&[])).await, "{rpc}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_stale_validated_entry_is_fetched_again() {
+        let r = rig(
+            PrefetchConfig {
+                tip: false,
+                block_txs: None,
+                tree_state: true,
+            },
+            false,
+        )
+        .await;
+        // A tree state of height 1000 from another fork (left from before a reorg).
+        let prefix = r.store.key_prefix(r.store.epoch);
+        let stale = rpc_cache::encode_validated(1000, &[0xee; 32], b"old");
+        r.store.put(
+            &rpc_cache::height_key(&prefix, "treestate", 1000),
+            stale.clone(),
+        );
+        r.prefetch.run(&r.tip).await;
+        assert_eq!(tree_state_calls(&r.lwd), vec![1000]);
+        let body = rpc_cache::grpc_block_id(1000, &[]);
+        assert!(is_hit(&r.store, "GetTreeState", &body).await);
+        // A current entry is not fetched again.
+        r.prefetch.run(&r.tip).await;
+        assert_eq!(tree_state_calls(&r.lwd), vec![1000]);
+    }
+
+    #[tokio::test]
+    async fn a_failed_run_does_not_stop_later_ones() {
+        // A run that is dropped half-way (as a panicking or cancelled task would be).
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let blocked = rig_with_gate(
+            PrefetchConfig {
+                tip: true,
+                block_txs: None,
+                tree_state: false,
+            },
+            false,
+            Some(gate),
+        )
+        .await;
+        let prefetch = TipPrefetch {
+            inner: blocked.prefetch.inner.clone(),
+        };
+        let tip = blocked.tip.clone();
+        let run = tokio::spawn(async move { prefetch.run(&tip).await });
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+        assert!(blocked.prefetch.inner.running.load(Ordering::SeqCst));
+        run.abort();
+        let _ = run.await;
+        assert!(!blocked.prefetch.inner.running.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn chain_metadata_fields_match_the_vendored_proto() {
+        use crate::rpc_cache::vendored_proto::{field_number, COMPACT_FORMATS};
+        assert_eq!(
+            field_number(
+                COMPACT_FORMATS,
+                "ChainMetadata",
+                "ironwoodCommitmentTreeSize"
+            ),
+            Some(IRONWOOD_TREE_SIZE_FIELD)
+        );
+        assert_eq!(
+            field_number(
+                COMPACT_FORMATS,
+                "ChainMetadata",
+                "saplingCommitmentTreeSize"
+            ),
+            Some(1)
+        );
+        assert_eq!(
+            field_number(
+                COMPACT_FORMATS,
+                "ChainMetadata",
+                "orchardCommitmentTreeSize"
+            ),
+            Some(2)
+        );
+        assert_eq!(
+            field_number(COMPACT_FORMATS, "CompactBlock", "vtx"),
+            Some(7)
+        );
+        assert_eq!(
+            field_number(COMPACT_FORMATS, "CompactBlock", "chainMetadata"),
+            Some(8)
+        );
+        assert_eq!(field_number(COMPACT_FORMATS, "CompactTx", "txid"), Some(2));
+        // The prost tag is the same number.
+        let encoded = ChainMetadata {
+            sapling_commitment_tree_size: 0,
+            orchard_commitment_tree_size: 0,
+            ironwood_commitment_tree_size: 1,
+        }
+        .encode_to_vec();
+        assert_eq!(encoded, vec![(IRONWOOD_TREE_SIZE_FIELD << 3) as u8, 1]);
+    }
+
+    #[test]
+    fn chain_metadata_tags_match_the_compact_formats_proto() {
+        // ChainMetadata { saplingCommitmentTreeSize: 1 = 131072, orchardCommitmentTreeSize: 2 = 5,
+        // ironwoodCommitmentTreeSize: 3 = 196608 }, encoded by hand.
+        let bytes = [0x08, 0x80, 0x80, 0x08, 0x10, 0x05, 0x18, 0x80, 0x80, 0x0c];
+        let m = ChainMetadata::decode(&bytes[..]).unwrap();
+        assert_eq!(m.sapling_commitment_tree_size, 2 * SUBTREE_LEAVES);
+        assert_eq!(m.orchard_commitment_tree_size, 5);
+        assert_eq!(m.ironwood_commitment_tree_size, 3 * SUBTREE_LEAVES);
+        // Without the Ironwood field (an older lightwalletd): size 0, no marker for that pool.
+        let m = ChainMetadata::decode(&bytes[..6]).unwrap();
+        assert_eq!(m.ironwood_commitment_tree_size, 0);
+        assert_eq!(
+            completed_subtrees(m.sapling_commitment_tree_size, 5, 0)[2],
+            (2, 0)
+        );
     }
 }

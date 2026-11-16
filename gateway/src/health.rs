@@ -517,6 +517,9 @@ pub fn init_metrics() {
         &*OHTTP_LWD_READ_RETRIES_TOTAL,
         &*OHTTP_REPLAY_WAIT_SATURATED_TOTAL,
         &*OHTTP_EPOCH_BUMP_SEEN_AT_PEER_TOTAL,
+        &*OHTTP_LWD_HEDGES_TOTAL,
+        &*OHTTP_LWD_MEMPOOL_NO_HEAD_TOTAL,
+        &*OHTTP_CACHE_TIP_MISMATCH_TOTAL,
     ] {
         REGISTRY.register(Box::new(c.clone())).ok();
     }
@@ -1331,7 +1334,7 @@ lazy_static::lazy_static! {
     )
     .unwrap();
     static ref OHTTP_LWD_READ_RETRIES_TOTAL: IntCounterVec = IntCounterVec::new(
-        Opts::new("ohttp_lwd_read_retries_total", "Idempotent lightwalletd calls sent a second time (to another instance when LWD_ENDPOINTS has one) because the first attempt got no response head. reason: timeout (half of the head deadline passed) | error (transport error)"),
+        Opts::new("ohttp_lwd_read_retries_total", "Idempotent lightwalletd calls sent a second time (to another instance when LWD_ENDPOINTS has one) because the first attempt failed before its response head. reason: error (transport error); timeout is no longer produced (reads without a head in time are hedged, see ohttp_lwd_hedges_total)"),
         &["network", "reason"]
     )
     .unwrap();
@@ -1422,6 +1425,87 @@ pub fn record_lwd_timeout(network: &str, class: &str, phase: &str) {
     OHTTP_LWD_TIMEOUTS_TOTAL
         .with_label_values(&[network, class, phase])
         .inc();
+}
+
+lazy_static::lazy_static! {
+    static ref OHTTP_LWD_HEDGES_TOTAL: IntCounterVec = IntCounterVec::new(
+        Opts::new("ohttp_lwd_hedges_total", "Hedged lightwalletd reads (lwd_endpoints): event started (a read without a head after LWD_HEDGE_DELAY_MS was sent to another instance as well), won (the hedge's head came first), no_permit (no hedge: LWD_HEDGE_MAX_INFLIGHT hedges in flight), rate_limited (no hedge: six or more hedges in the last minute already, and one more would exceed one in ten of its hedgeable reads), loser_skipped (an instance lost its second or a later hedge in a row and is skipped for a while)"),
+        &["network", "event"]
+    )
+    .unwrap();
+}
+
+lazy_static::lazy_static! {
+    static ref OHTTP_LWD_MEMPOOL_NO_HEAD_TOTAL: IntCounterVec = IntCounterVec::new(
+        Opts::new("ohttp_lwd_mempool_no_head_total", "GetMempoolStream calls to lightwalletd that got no response head within their deadline and were ended cleanly (an empty mempool, or an instance that does not answer)"),
+        &["network"]
+    )
+    .unwrap();
+}
+
+lazy_static::lazy_static! {
+    static ref OHTTP_CACHE_TIP_MISMATCH_TOTAL: IntCounterVec = IntCounterVec::new(
+        Opts::new("ohttp_cache_tip_mismatch_total", "Tip-scoped answers (GetLightdInfo, GetLatestTreeState) not at the tip of their key: phase store (not cached), lookup (a stored entry deleted and fetched again; the request counts as a miss in ohttp_cache_requests_total)"),
+        &["network", "rpc", "phase"]
+    )
+    .unwrap();
+}
+
+/// `phase`: store | lookup.
+pub fn record_cache_tip_mismatch(network: &str, rpc: &str, phase: &str) {
+    OHTTP_CACHE_TIP_MISMATCH_TOTAL
+        .with_label_values(&[network, rpc, phase])
+        .inc();
+}
+
+#[cfg(test)]
+pub fn cache_tip_mismatches(network: &str, rpc: &str, phase: &str) -> u64 {
+    OHTTP_CACHE_TIP_MISMATCH_TOTAL
+        .with_label_values(&[network, rpc, phase])
+        .get()
+}
+
+pub fn record_lwd_mempool_no_head(network: &str) {
+    OHTTP_LWD_MEMPOOL_NO_HEAD_TOTAL
+        .with_label_values(&[network])
+        .inc();
+}
+
+#[cfg(test)]
+pub fn lwd_mempool_no_head(network: &str) -> u64 {
+    OHTTP_LWD_MEMPOOL_NO_HEAD_TOTAL
+        .with_label_values(&[network])
+        .get()
+}
+
+/// `event`: started | won | no_permit | rate_limited | loser_skipped.
+pub fn record_lwd_hedge(network: &str, event: &str) {
+    OHTTP_LWD_HEDGES_TOTAL
+        .with_label_values(&[network, event])
+        .inc();
+}
+
+#[cfg(test)]
+pub fn lwd_timeouts(network: &str, class: &str, phase: &str) -> u64 {
+    OHTTP_LWD_TIMEOUTS_TOTAL
+        .with_label_values(&[network, class, phase])
+        .get()
+}
+
+/// (ok, failed) calls to the own lightwalletd recorded for `network` in the last minute.
+#[cfg(test)]
+pub fn lwd_call_totals(network: &str) -> (u64, u64) {
+    LWD_CALLS
+        .lock()
+        .get(network)
+        .map_or((0, 0), |w| w.totals(lwd_calls_now(), 60))
+}
+
+#[cfg(test)]
+pub fn lwd_hedges(network: &str, event: &str) -> u64 {
+    OHTTP_LWD_HEDGES_TOTAL
+        .with_label_values(&[network, event])
+        .get()
 }
 
 pub fn record_lwd_pool_reset(network: &str) {

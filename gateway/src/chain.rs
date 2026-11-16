@@ -18,26 +18,52 @@
 //! every cached block, tree state and transaction; the other gateway processes follow its index.
 //!
 //! - **Leader lock**: `SET {chain}leader {token} NX PX 10000`, renewed every tick with an
-//!   atomic "extend if still mine" script. A process that loses Redis stops leading; another
-//!   takes over once the TTL lapses. Non-leaders read the tip from Redis every tick.
+//!   atomic "extend if still mine" script, and every third of the TTL while leader work runs
+//!   (a cold start or a catch-up can take longer than the TTL). Work whose renewal finds the lock
+//!   held by another process, or that could not renew it for a whole TTL, is cancelled. A
+//!   process that loses Redis stops leading; another takes over once the TTL lapses.
+//!   Non-leaders read the tip from Redis every tick.
+//! - **Confirmation**: on every tick its lightwalletd answers with the indexed tip (or moves
+//!   it), the leader rewrites `{chain}tip_seen` under the lock. Followers refresh their tip only
+//!   when that value changed since their last read (no clock comparison between processes), so a
+//!   tip the leader stops confirming goes stale everywhere after `store::TIP_STALE_AFTER`. The
+//!   leader stops confirming after [`MAX_IDLE_TICKS`] ticks with the same tip (a lightwalletd
+//!   stuck at the tip height) and after [`MAX_BEHIND_TICKS`] ticks behind it. A leader that
+//!   does not write `tip_seen` (an older version) is followed as before, every read refreshing
+//!   the tip: that is the case when the key is absent, and when its value stays the same while
+//!   the stored tip changes (the key outlives the leader that wrote it), until the value changes
+//!   again.
 //! - **Stale leader**: a leader can keep its lock and still stop moving the tip (its
 //!   lightwalletd answers with an old tip, or keeps failing the block fetch). With every tip it
 //!   writes, the leader also stores when it moved it (`{chain}tip_at`). A follower that finds
 //!   the stored tip unmoved for longer than [`DEFAULT_TIP_STALE_AFTER`]
 //!   (`CHAIN_TIP_STALE_SECS`) asks its own lightwalletd every [`STALE_PROBE_EVERY`] ticks.
 //!   If that is ahead, it serves its own tip at once, and if it is still ahead on the next
-//!   probe it takes the lock over (only while the stored tip is still the unmoved one) and
-//!   continues the index from there in the same tick. A chain that really has no new block
-//!   leaves every lightwalletd at the stored tip, so nothing happens. The tip is written only
-//!   while the writer holds the lock (one script), so a leader that was replaced while a tick
-//!   was in flight cannot move the stored tip back. The age is wall-clock time between
-//!   processes: clock skew beyond the bound makes followers probe more often, never take over
-//!   from a leader whose tip moves. A leader that does not store the time (an older version)
-//!   is never treated as stale. Metrics `ohttp_chain_tip_age_seconds`,
-//!   `ohttp_chain_stale_leader_total`.
+//!   probe, with the same stored tip (height and hash) and the same lock holder, it takes the
+//!   lock over (one script that checks both) and continues the index from there in the same
+//!   tick. So two followers that saw the same stale tip cannot take it from each other; a
+//!   refused takeover, or another holder, starts the observation again. What a follower serves
+//!   meanwhile follows one rule (`ChainFollower::follow_stored`): the highest tip its own
+//!   lightwalletd answered, for at most [`HELD_TIP_MAX_AGE`] after it last did, while the stored
+//!   tip stays below it on the same chain; a lower or failed probe never makes it step back;
+//!   the stored tip again once it ages out, catches up, or changes at or below the observed
+//!   height. A chain that really has no new block leaves every lightwalletd at the stored tip,
+//!   so nothing happens. The age is wall-clock time between processes: clock skew beyond the
+//!   bound makes followers probe more often, never take over from a leader whose tip moves. A
+//!   leader that does not store the time (an older version) is never treated as stale.
+//!   Metrics `ohttp_chain_tip_age_seconds`, `ohttp_chain_stale_leader_total`.
+//! - **Fencing**: the tip, every index entry with its block (one script per batch of at most
+//!   [`BLOCK_WRITE_BATCH`] blocks and [`BLOCK_WRITE_BATCH_BYTES`] of payload), the confirmation and every deletion of a reorg are written
+//!   only while the writer holds the lock with its own token (an absent lock refuses too). A
+//!   leader that was replaced while a tick was in flight (a slow block fetch, a pause) thus
+//!   cannot write the index or blocks of another fork, delete what its successor wrote, or move
+//!   the stored tip back; it stops leading. A store error in one of these writes stops the tick
+//!   (and hands the lock over).
 //! - **Lagging backend**: a leader whose lightwalletd answers with a lower tip that is on the
 //!   indexed chain (the index has that block) treats it as behind, not as a reorg: the tip and
-//!   the index stay.
+//!   the index stay. After [`MAX_BEHIND_TICKS`] such ticks in a row it gives the lock up and
+//!   does not try to take it again for [`BEHIND_COOLDOWN_TICKS`], so a process with another
+//!   lightwalletd leads.
 //! - **Polling**: the leader calls `GetLatestBlock` once per tick, with a 2 s pause after each
 //!   tick. On a new tip it fetches the new blocks once (`GetBlockRange`, at most
 //!   [`MAX_CATCHUP`] per tick when advancing), checks `prevHash`
@@ -58,15 +84,15 @@
 //!   of the cache Redis, and on every advance the heights that just became final are moved
 //!   from the cache Redis (every pool filter seen, index-matched) to the permanent tier.
 //!
-//! Everything is fail-open: a Redis error demotes the leader and leaves the tip unknown, and
-//! the request paths then answer from upstream.
+//! Everything is fail-open: a Redis error demotes the leader (or stops its tick) and leaves the
+//! tip unknown, and the request paths then answer from upstream.
 
 use crate::block_cache::{block_key, grpc_frame, FetchedBlock, PoolKeys};
 use crate::local::LocalCache;
 use crate::store::{
     decode_tip, decode_unix_ms, encode_tip, encode_unix_ms, index_key, lock_key,
-    permanent_block_key, tip_at_key, tip_key, unix_ms_now, CacheStore, PermanentStore, Tip,
-    INDEX_WINDOW, PERMANENT_DEPTH,
+    permanent_block_key, tip_at_key, tip_key, tip_seen_key, unix_ms_now, CacheStore,
+    PermanentStore, Tip, INDEX_WINDOW, PERMANENT_DEPTH,
 };
 use anyhow::Result;
 use bytes::Bytes;
@@ -101,6 +127,36 @@ pub const DEFAULT_TIP_STALE_AFTER: Duration = Duration::from_secs(150);
 /// While the stored tip is older than the bound, followers ask their own lightwalletd every this
 /// many ticks; a takeover needs two such probes in a row that are ahead.
 pub const STALE_PROBE_EVERY: u64 = 5;
+/// A follower that found its own lightwalletd ahead of an unmoved stored tip serves that tip for
+/// at most this long after a probe last confirmed it (three probe intervals). Meanwhile it never
+/// falls back to the lower stored tip (a failed probe or a lagging answer does not count), so the
+/// tip it serves does not go back and forth; once the bound passes without a confirmation it
+/// serves the stored tip again.
+pub const HELD_TIP_MAX_AGE: Duration = Duration::from_secs(30);
+/// A leader whose lightwalletd answers below the indexed tip (on the indexed chain) keeps
+/// serving and confirming the indexed tip for at most this many ticks in a row (about 30 s at
+/// the poll interval). On the next one it stops confirming it, releases the lock and does not
+/// try to take it again for [`BEHIND_COOLDOWN_TICKS`], so that a process with another
+/// lightwalletd leads; the unconfirmed tip goes stale everywhere after `store::TIP_STALE_AFTER`
+/// and the request paths answer from upstream meanwhile. Any other outcome resets the count.
+pub const MAX_BEHIND_TICKS: u64 = 15;
+/// Ticks a leader that gave the lock up after [`MAX_BEHIND_TICKS`] waits before it tries to
+/// take it again.
+pub const BEHIND_COOLDOWN_TICKS: u64 = 5;
+/// A leader whose lightwalletd keeps answering with the indexed tip confirms it for at most
+/// this many ticks in a row (at least 10 minutes at the poll interval), then stops: a
+/// lightwalletd stuck at the tip height cannot keep an old tip fresh either. A gap of 10
+/// minutes between blocks is rare (well below 0.1 % of blocks at a 75 s target spacing), and
+/// during one the request paths only answer from upstream. A new tip resets the count.
+pub const MAX_IDLE_TICKS: u64 = 300;
+/// Blocks written per fenced script at most (two entries each: index and block).
+const BLOCK_WRITE_BATCH: usize = 32;
+/// Block payload bytes per fenced script at most: a script ends before the block that would
+/// take it past this, so one script stays well inside the store's operation timeout whatever
+/// the block sizes. A single block above it is written alone.
+const BLOCK_WRITE_BATCH_BYTES: usize = 1 << 20;
+/// Keys deleted per fenced script.
+const DELETE_BATCH: usize = 256;
 
 /// Where the follower reads the chain: lightwalletd, or a fake in tests.
 pub trait ChainSource: Send + Sync {
@@ -170,11 +226,69 @@ pub struct ChainFollower {
     permanent_min_height: u64,
     /// See [`DEFAULT_TIP_STALE_AFTER`].
     stale_after: Duration,
-    /// Follower: the stored tip height that its own lightwalletd was last found ahead of, and
-    /// the tip it serves meanwhile.
-    stale: parking_lot::Mutex<Option<(u64, Tip)>>,
+    /// Follower: what the last probes of its own lightwalletd found (see [`HeldTip`]).
+    stale: parking_lot::Mutex<Option<HeldTip>>,
     /// Unix milliseconds of the last tip this process wrote as leader (0 = none).
     moved_at_ms: AtomicU64,
+    /// Consecutive leader ticks whose lightwalletd was behind the indexed tip.
+    behind_ticks: AtomicU64,
+    /// Consecutive leader ticks whose lightwalletd answered with the indexed tip.
+    idle_ticks: AtomicU64,
+    /// No attempt to take the lock before this tick (after giving it up, see
+    /// [`MAX_BEHIND_TICKS`]).
+    cooldown_until: AtomicU64,
+    /// Follower: the last `tip_seen` value read and the stored tip read with it (see
+    /// [`SeenTip`]); the tip is refreshed only when the value changes.
+    last_seen: parking_lot::Mutex<Option<SeenTip>>,
+}
+
+/// A follower's last read of the leader's confirmation.
+#[derive(Clone, Debug)]
+struct SeenTip {
+    /// The `tip_seen` value.
+    seen: Bytes,
+    /// The stored tip read with it.
+    tip: Tip,
+    /// The stored tip changed while `seen` did not: the leader does not write `tip_seen` (a
+    /// leader of this version writes both in one script), and `seen` is a leftover of an
+    /// earlier one. The confirmation is treated as absent (every read refreshes) until `seen`
+    /// changes again.
+    unconfirming_leader: bool,
+}
+
+/// A follower's view of a leader whose tip stopped moving (see [`ChainFollower::follow_stored`]
+/// for the exact rule of what it serves).
+#[derive(Clone, Debug)]
+struct HeldTip {
+    /// The stored tip (height and hash) the observation is bound to.
+    stored: Tip,
+    /// The tip it serves meanwhile: the highest its own lightwalletd answered since the
+    /// observation began (a lower answer does not replace it).
+    own: Tip,
+    /// When a probe last answered `own` (or higher): the held tip is served for at most
+    /// [`HELD_TIP_MAX_AGE`] after it.
+    confirmed_at: tokio::time::Instant,
+    /// The last probe found its own lightwalletd ahead of `stored` with the lock held by
+    /// `holder`: the next such probe is a second one in a row. A probe that failed changes
+    /// nothing; one that was not ahead, a refused takeover or another holder clears it.
+    ahead: bool,
+    /// The lock holder when the observation was made (`""` = not held; None = it could not be
+    /// read, no takeover): a takeover requires the lock to still be held by it, so that two
+    /// followers that saw the same stale tip do not take the lock from each other.
+    holder: Option<String>,
+}
+
+impl HeldTip {
+    /// Whether the observation still applies to `stored`: the same stored tip, or one higher
+    /// on the leader's chain (it moves again, below `own`). A stored tip at the same height with
+    /// another hash, or a lower one, is a reorg of the stored chain: the observation is dropped.
+    fn applies_to(&self, stored: &Tip) -> bool {
+        stored == &self.stored || stored.height > self.stored.height
+    }
+
+    fn fresh(&self) -> bool {
+        self.confirmed_at.elapsed() <= HELD_TIP_MAX_AGE
+    }
 }
 
 impl ChainFollower {
@@ -202,6 +316,10 @@ impl ChainFollower {
             stale_after: DEFAULT_TIP_STALE_AFTER,
             stale: parking_lot::Mutex::new(None),
             moved_at_ms: AtomicU64::new(0),
+            behind_ticks: AtomicU64::new(0),
+            idle_ticks: AtomicU64::new(0),
+            cooldown_until: AtomicU64::new(0),
+            last_seen: parking_lot::Mutex::new(None),
         }
     }
 
@@ -282,16 +400,20 @@ impl ChainFollower {
     }
 
     async fn read_stored_tip(&self) -> Option<Tip> {
-        self.read_stored_tip_and_age().await.0
+        self.read_stored().await.0
     }
 
-    /// The stored tip and how long ago the leader moved it (None: not stored, e.g. by a leader
-    /// that does not write it).
-    async fn read_stored_tip_and_age(&self) -> (Option<Tip>, Option<Duration>) {
+    /// The stored tip, how long ago the leader moved it (None: not stored, e.g. by a leader
+    /// that does not write it) and the leader's last confirmation (`tip_seen`, None: not stored).
+    async fn read_stored(&self) -> (Option<Tip>, Option<Duration>, Option<Bytes>) {
         let chain = self.store.chain_prefix();
         let mut values = self
             .store
-            .mget(vec![tip_key(&chain), tip_at_key(&chain)])
+            .mget(vec![
+                tip_key(&chain),
+                tip_at_key(&chain),
+                tip_seen_key(&chain),
+            ])
             .await
             .into_iter();
         let tip = values.next().flatten().and_then(|b| decode_tip(&b));
@@ -300,33 +422,22 @@ impl ChainFollower {
             .flatten()
             .and_then(|b| decode_unix_ms(&b))
             .map(|ms| Duration::from_millis(unix_ms_now().saturating_sub(ms)));
-        (tip, age)
+        let seen = values.next().flatten();
+        (tip, age, seen)
     }
 
     /// Follower tick with a stored tip that has not moved for `age`: compare it with this
     /// process's own lightwalletd (every [`STALE_PROBE_EVERY`] ticks). None = nothing to do
-    /// (serve the stored tip). See the module docs, "Stale leader".
+    /// (the caller serves the stored tip, or the tip held from an earlier probe, see
+    /// [`Self::follow_stored`]). See the module docs, "Stale leader".
     async fn check_stale_leader(
         &self,
         n: u64,
         stored: &Tip,
         age: Option<Duration>,
     ) -> Option<Outcome> {
-        if age.is_none_or(|a| a <= self.stale_after) {
-            *self.stale.lock() = None;
+        if age.is_none_or(|a| a <= self.stale_after) || !n.is_multiple_of(STALE_PROBE_EVERY) {
             return None;
-        }
-        if !n.is_multiple_of(STALE_PROBE_EVERY) {
-            // Between probes keep serving the tip the last probe found, never an older one.
-            let held = self.stale.lock().clone();
-            return match held {
-                Some((height, own)) if height == stored.height && own.height > stored.height => {
-                    self.store.tip_cell().set(own.clone());
-                    crate::health::record_cache_tip_height(&self.network, own.height);
-                    Some(Outcome::Follower)
-                }
-                _ => None,
-            };
         }
         let own = match self.source.latest().await {
             Ok(t) => {
@@ -340,27 +451,54 @@ impl ChainFollower {
             }
         };
         if own.height <= stored.height || own.hash.is_empty() {
-            *self.stale.lock() = None;
+            // Not ahead (now): no takeover on the next probe. A tip held from an earlier probe
+            // is kept until it ages out (see `follow_stored`).
+            if let Some(held) = self.stale.lock().as_mut() {
+                held.ahead = false;
+            }
             return None;
         }
-        let seen_before = self
-            .stale
-            .lock()
-            .replace((stored.height, own.clone()))
-            .is_some_and(|(height, _)| height == stored.height);
-        self.store.tip_cell().set(own.clone());
-        crate::health::record_cache_tip_height(&self.network, own.height);
+        // Bind the observation to the current holder of the lock.
+        let chain = self.store.chain_prefix();
+        let holder = self
+            .store
+            .lock_holder(lock_key(&chain))
+            .await
+            .map(|h| h.unwrap_or_default());
+        let now = tokio::time::Instant::now();
+        let (served, seen_before) = {
+            let mut held = self.stale.lock();
+            let previous = held.take().filter(|h| h.applies_to(stored) && h.fresh());
+            // Never lower than a held tip that is still fresh: a lower answer (another instance
+            // behind the same name, a lagging one) does not replace it, nor reset its age.
+            let (served, confirmed_at) = match &previous {
+                Some(p) if p.own.height > own.height => (p.own.clone(), p.confirmed_at),
+                _ => (own.clone(), now),
+            };
+            let seen_before = previous.as_ref().is_some_and(|p| {
+                p.ahead && p.stored == *stored && p.holder.is_some() && p.holder == holder
+            });
+            *held = Some(HeldTip {
+                stored: stored.clone(),
+                own: served.clone(),
+                confirmed_at,
+                ahead: holder.is_some(),
+                holder: holder.clone(),
+            });
+            (served, seen_before)
+        };
+        self.store.tip_cell().set(served.clone());
+        crate::health::record_cache_tip_height(&self.network, served.height);
         let age_secs = age.map_or(0, |a| a.as_secs());
-        if !seen_before {
+        let Some(holder) = holder.filter(|_| seen_before) else {
             warn!(network = %self.network, stored = stored.height, own = own.height, age_secs, "chain tip has not moved and this process's lightwalletd is ahead: serving its tip");
             crate::health::record_chain_stale_leader(&self.network, "local_tip");
             return Some(Outcome::StaleLeader {
                 from: stored.height,
-                to: own.height,
+                to: served.height,
                 took_over: false,
             });
-        }
-        let chain = self.store.chain_prefix();
+        };
         let took_over = self
             .store
             .take_lock_if(
@@ -369,6 +507,7 @@ impl ChainFollower {
                 LOCK_TTL_MS,
                 tip_key(&chain),
                 encode_tip(stored),
+                (!holder.is_empty()).then_some(holder),
             )
             .await
             == Some(true);
@@ -379,12 +518,74 @@ impl ChainFollower {
             *self.last.lock() = Some(stored.clone());
             *self.backfill_cursor.lock() = None;
             *self.stale.lock() = None;
+        } else if let Some(held) = self.stale.lock().as_mut() {
+            // Refused (the tip or the holder changed meanwhile): start the observation again.
+            held.ahead = false;
         }
         Some(Outcome::StaleLeader {
             from: stored.height,
-            to: own.height,
+            to: served.height,
             took_over,
         })
+    }
+
+    /// Follower: what to serve for the stored tip `stored`. The rule:
+    ///
+    /// - A held tip (its own lightwalletd ahead, see [`HeldTip`]) is served while it is fresh
+    ///   (confirmed less than [`HELD_TIP_MAX_AGE`] ago), still above `stored`, and the
+    ///   observation applies to `stored` (the same stored tip, or a higher one: the leader moves
+    ///   again but is still below). It never steps back meanwhile, whatever probes answer.
+    /// - Otherwise the held tip is dropped (aged out, caught up, or the stored chain changed at
+    ///   or below its height) and the stored tip is served: one step back at most, after the age
+    ///   bound.
+    /// - The stored tip is refreshed only when the leader confirmed it since the last read
+    ///   (`seen` changed), so a tip the leader stopped confirming goes stale here too. A leader
+    ///   that does not write `seen` is followed as before, every read refreshing the tip: that
+    ///   is the case without `seen`, and with a `seen` that stays the same while the stored tip
+    ///   changes (the key left by an earlier leader; see [`SeenTip`]), until `seen` changes
+    ///   again.
+    fn follow_stored(&self, stored: &Tip, seen: Option<Bytes>) {
+        let held = {
+            let mut held = self.stale.lock();
+            let keep = held
+                .as_ref()
+                .filter(|h| h.applies_to(stored) && h.own.height > stored.height && h.fresh())
+                .map(|h| h.own.clone());
+            if keep.is_none() {
+                *held = None;
+            }
+            keep
+        };
+        let confirmed = match seen {
+            None => {
+                *self.last_seen.lock() = None;
+                true
+            }
+            Some(seen) => {
+                let mut last = self.last_seen.lock();
+                let (confirmed, unconfirming_leader) = match last.as_ref() {
+                    Some(prev) if prev.seen == seen => {
+                        let unconfirming = prev.unconfirming_leader || prev.tip != *stored;
+                        (unconfirming, unconfirming)
+                    }
+                    // First read, or a new confirmation: the strict rule applies (again).
+                    _ => (true, false),
+                };
+                *last = Some(SeenTip {
+                    seen,
+                    tip: stored.clone(),
+                    unconfirming_leader,
+                });
+                confirmed
+            }
+        };
+        let tip = match held {
+            Some(own) => own,
+            None if confirmed => stored.clone(),
+            None => return,
+        };
+        crate::health::record_cache_tip_height(&self.network, tip.height);
+        self.store.tip_cell().set(tip);
     }
 
     /// One poll. Public so tests drive the follower deterministically.
@@ -395,6 +596,9 @@ impl ChainFollower {
             self.store
                 .pexpire_if_equal(lock, self.token.clone(), LOCK_TTL_MS)
                 .await
+        } else if n < self.cooldown_until.load(Ordering::Relaxed) {
+            // Gave the lock up a moment ago (its lightwalletd stays behind): let another lead.
+            Some(false)
         } else {
             self.store
                 .set_nx_px(lock, self.token.clone(), LOCK_TTL_MS)
@@ -406,7 +610,7 @@ impl ChainFollower {
         if !self.is_leader() {
             // Follow the leader's tip unless it stopped moving while this process's own
             // lightwalletd moved on; probe lightwalletd now and then for the health gauge.
-            let (stored, age) = self.read_stored_tip_and_age().await;
+            let (stored, age, seen) = self.read_stored().await;
             crate::health::record_chain_tip_age(&self.network, age);
             let mut took_over = false;
             if let Some(tip) = stored {
@@ -417,10 +621,7 @@ impl ChainFollower {
                         took_over: true, ..
                     }) => took_over = true,
                     Some(outcome) => return outcome,
-                    None => {
-                        self.store.tip_cell().set(tip.clone());
-                        crate::health::record_cache_tip_height(&self.network, tip.height);
-                    }
+                    None => self.follow_stored(&tip, seen),
                 }
             }
             if !took_over {
@@ -434,13 +635,18 @@ impl ChainFollower {
             }
         }
 
-        // The lock is renewed while the tick runs; a tick that fails (lightwalletd unreachable,
-        // an answer that does not chain) releases it, so another process, maybe with another
-        // lightwalletd, can lead from its next tick instead of after the TTL.
+        // The lock is renewed (exact token) while the tick runs, so leader work longer than the
+        // TTL (a cold start, a catch-up) keeps it. When a renewal finds the lock held by another
+        // process, or renewals fail for a whole TTL (the lease may have lapsed), the work is
+        // cancelled at once: it could only be refused at its next fenced write. A tick that
+        // fails (lightwalletd unreachable, an answer that does not chain) releases the lock,
+        // so another process, maybe with another lightwalletd, can lead from its next tick
+        // instead of after the TTL.
         let renew = async {
+            let mut renewed_at = tokio::time::Instant::now();
             loop {
                 tokio::time::sleep(LOCK_RENEW_EVERY).await;
-                if self
+                match self
                     .store
                     .pexpire_if_equal(
                         lock_key(&self.store.chain_prefix()),
@@ -448,16 +654,23 @@ impl ChainFollower {
                         LOCK_TTL_MS,
                     )
                     .await
-                    == Some(false)
                 {
-                    break;
+                    Some(true) => renewed_at = tokio::time::Instant::now(),
+                    Some(false) => return "the lock is held by another process",
+                    None if renewed_at.elapsed() >= Duration::from_millis(LOCK_TTL_MS) => {
+                        return "the lock could not be renewed for its whole TTL"
+                    }
+                    None => {}
                 }
             }
-            std::future::pending::<()>().await
         };
         let outcome = tokio::select! {
-            o = self.lead(became_leader) => o,
-            _ = renew => unreachable!("the renewal never ends"),
+            o = self.lead(n, became_leader) => o,
+            why = renew => {
+                info!(network = %self.network, why, "chain follower: leader work cancelled");
+                self.set_leader(false);
+                Outcome::Follower
+            }
         };
         if let Outcome::Error(e) = &outcome {
             if self.is_leader() {
@@ -471,12 +684,47 @@ impl ChainFollower {
         outcome
     }
 
-    /// The leader's part of a tick.
-    async fn lead(&self, became_leader: bool) -> Outcome {
+    /// Confirm the indexed tip `tip` (the lightwalletd answered with it, or the leader keeps it
+    /// while its lightwalletd is behind): rewrite `tip_seen` under the lock, then refresh the
+    /// tip here. False when the lock is held by another process (the caller stops leading). A
+    /// store error only skips this confirmation.
+    async fn confirm(&self, tip: &Tip) -> bool {
+        let chain = self.store.chain_prefix();
+        match self
+            .store
+            .set_if_lock_held(
+                lock_key(&chain),
+                self.token.clone(),
+                LOCK_TTL_MS,
+                vec![(
+                    tip_seen_key(&chain),
+                    encode_unix_ms(unix_ms_now()),
+                    INDEX_TTL_SECS,
+                )],
+            )
+            .await
+        {
+            Some(true) => {
+                self.store.tip_cell().set(tip.clone());
+                true
+            }
+            Some(false) => {
+                self.lost_lock("tip confirmation");
+                false
+            }
+            None => true,
+        }
+    }
+
+    /// The leader's part of tick `n`.
+    async fn lead(&self, n: u64, became_leader: bool) -> Outcome {
         if became_leader {
             // Continue from the previous leader's index.
             *self.last.lock() = self.read_stored_tip().await;
             *self.backfill_cursor.lock() = None;
+            *self.stale.lock() = None;
+            self.idle_ticks.store(0, Ordering::Relaxed);
+            self.behind_ticks.store(0, Ordering::Relaxed);
         }
 
         let latest = match self.source.latest().await {
@@ -500,7 +748,14 @@ impl ChainFollower {
         let outcome = match last {
             None => self.index_cold(&latest).await,
             Some(last) if last == latest => {
-                self.store.tip_cell().set(latest.clone());
+                let idle = self.idle_ticks.fetch_add(1, Ordering::Relaxed) + 1;
+                if idle <= MAX_IDLE_TICKS {
+                    if !self.confirm(&last).await {
+                        return Outcome::Follower;
+                    }
+                } else if idle == MAX_IDLE_TICKS + 1 {
+                    warn!(network = %self.network, tip = last.height, ticks = idle, "chain follower: lightwalletd keeps answering with the same tip; it is no longer confirmed");
+                }
                 Ok(Outcome::Idle)
             }
             Some(last) if latest.height > last.height => self.advance(&last, &latest).await,
@@ -508,7 +763,20 @@ impl ChainFollower {
                 // A lightwalletd that is behind (e.g. one of several behind a load-balanced
                 // address), not a reorg: keep the tip and the index.
                 debug!(network = %self.network, backend = latest.height, tip = last.height, "chain follower: lightwalletd behind the indexed tip");
-                self.store.tip_cell().set(last.clone());
+                let behind = self.behind_ticks.fetch_add(1, Ordering::Relaxed) + 1;
+                if behind <= MAX_BEHIND_TICKS {
+                    if !self.confirm(&last).await {
+                        return Outcome::Follower;
+                    }
+                } else {
+                    warn!(network = %self.network, backend = latest.height, tip = last.height, ticks = behind, "chain follower: lightwalletd stays behind the indexed tip; giving the lock up");
+                    self.store
+                        .release_lock(lock_key(&self.store.chain_prefix()), self.token.clone())
+                        .await;
+                    self.set_leader(false);
+                    self.cooldown_until
+                        .store(n + 1 + BEHIND_COOLDOWN_TICKS, Ordering::Relaxed);
+                }
                 Ok(Outcome::Behind {
                     backend: latest.height,
                     tip: last.height,
@@ -516,9 +784,15 @@ impl ChainFollower {
             }
             Some(last) => self.reorg(&last, &latest, latest.height).await,
         };
+        if !matches!(outcome, Ok(Outcome::Behind { .. })) {
+            self.behind_ticks.store(0, Ordering::Relaxed);
+        }
+        if !matches!(outcome, Ok(Outcome::Idle)) {
+            self.idle_ticks.store(0, Ordering::Relaxed);
+        }
         match outcome {
             Ok(o) => {
-                if matches!(o, Outcome::Idle) {
+                if matches!(o, Outcome::Idle) && self.is_leader() {
                     self.backfill_step().await;
                 }
                 o
@@ -537,8 +811,10 @@ impl ChainFollower {
             },
             _ => latest.clone(),
         };
-        self.store_blocks(&blocks, tip.height).await;
-        if !self.write_tip(&tip).await {
+        if !self.store_blocks(&blocks, tip.height).await? {
+            return Ok(Outcome::Follower);
+        }
+        if !self.write_tip(&tip).await? {
             return Ok(Outcome::Follower);
         }
         *self.backfill_cursor.lock() = Some(tip.height.saturating_sub(1));
@@ -564,8 +840,10 @@ impl ChainFollower {
             anyhow::bail!("GetBlockRange({from},{to}) is not a chain");
         }
         let new_tip = tip_of(&blocks).unwrap_or_else(|| latest.clone());
-        self.store_blocks(&blocks, new_tip.height).await;
-        if !self.write_tip(&new_tip).await {
+        if !self.store_blocks(&blocks, new_tip.height).await? {
+            return Ok(Outcome::Follower);
+        }
+        if !self.write_tip(&new_tip).await? {
             return Ok(Outcome::Follower);
         }
         self.promote_final(last.height, &new_tip).await;
@@ -620,7 +898,11 @@ impl ChainFollower {
         );
         crate::health::record_chain_reorg(&self.network, depth);
 
-        // Invalidate fork+1 ..= old tip (and anything above, up to the new tip).
+        // Invalidate fork+1 ..= old tip (and anything above, up to the new tip): the index
+        // entries and the payload (cached blocks of every pool filter seen, nullifiers, tree
+        // states, non-final subtree roots), only while this process still holds the lock: a
+        // leader replaced while this tick was in flight must not delete what the one that
+        // replaced it wrote. A refusal or a store error stops the tick.
         let upper = last.height.max(latest.height);
         let epoch = self.store.epoch().await;
         let prefix = self.store.key_prefix(epoch);
@@ -636,13 +918,26 @@ impl ChainFollower {
         }
         // Non-final subtree roots completing above the fork (and their height pointers).
         keys.extend(crate::subtree_cache::reorg_keys(&*self.store, &prefix, fork + 1, upper).await);
-        if let Some(local) = &self.local {
-            for k in &keys {
-                local.invalidate(k);
+        for chunk in keys.chunks(DELETE_BATCH) {
+            match self
+                .store
+                .del_if_lock_held(lock_key(&chain), self.token.clone(), chunk.to_vec())
+                .await
+            {
+                Some(true) => {}
+                Some(false) => {
+                    self.lost_lock("reorg invalidation");
+                    return Ok(Outcome::Follower);
+                }
+                None => anyhow::bail!(
+                    "reorg invalidation: store error or timeout (after a timeout the outcome is unknown)"
+                ),
             }
-        }
-        for chunk in keys.chunks(256) {
-            self.store.del(chunk.to_vec()).await;
+            if let Some(local) = &self.local {
+                for k in chunk {
+                    local.invalidate(k);
+                }
+            }
         }
 
         // Refetch the canonical chain above the fork and rewrite the index.
@@ -652,8 +947,10 @@ impl ChainFollower {
             anyhow::bail!("GetBlockRange({},{to}) is not a chain", fork + 1);
         }
         let new_tip = tip_of(&blocks).unwrap_or_else(|| latest.clone());
-        self.store_blocks(&blocks, new_tip.height).await;
-        if !self.write_tip(&new_tip).await {
+        if !self.store_blocks(&blocks, new_tip.height).await? {
+            return Ok(Outcome::Follower);
+        }
+        if !self.write_tip(&new_tip).await? {
             return Ok(Outcome::Follower);
         }
         self.promote_final(last.height, &new_tip).await;
@@ -666,47 +963,94 @@ impl ChainFollower {
 
     /// Store `blocks` (pool filter none) and their index entries: final blocks against
     /// `tip_height` go to the permanent tier, the rest to the block cache.
-    async fn store_blocks(&self, blocks: &[FetchedBlock], tip_height: u64) {
+    ///
+    /// The index entry and the cache-tier block of every block are written together, in
+    /// scripts that write only while this process holds the lock with its own token (the same
+    /// fence as the tip, [`Self::write_tip`]), at most [`BLOCK_WRITE_BATCH`] blocks and
+    /// [`BLOCK_WRITE_BATCH_BYTES`] of block payload per script (see [`write_batches`]). The
+    /// epoch is checked once before (as an epoch-checked write does); while it is not current
+    /// only the index is written. Ok(false) when the lock is held by another process (or by
+    /// none): this one was replaced while its tick was in flight, so the batch and every later
+    /// one are not written and it stops leading; a fetch of another fork that was in flight
+    /// cannot overwrite the new leader's index or blocks. Err on a store error or timeout
+    /// (after a timeout the script may or may not have run): the tick stops (and hands the lock
+    /// over). Final blocks go to the permanent tier after the
+    /// fenced batches (they are below any reorg depth).
+    async fn store_blocks(&self, blocks: &[FetchedBlock], tip_height: u64) -> Result<bool> {
+        let chain = self.store.chain_prefix();
         let epoch = self.store.epoch().await;
         let prefix = self.store.key_prefix(epoch);
-        let chain = self.store.chain_prefix();
-        let mut writes = Vec::with_capacity(blocks.len() * 2);
+        let blocks_current = self.store.epoch_current(epoch).await == Some(true);
         let mut permanent: Vec<(String, Bytes)> = Vec::new();
-        for b in blocks {
-            let Some(h) = b.height else { continue };
-            if b.hash.is_empty() {
-                continue;
-            }
-            writes.push(self.store.set(
-                index_key(&chain, h),
-                Bytes::from(b.hash.clone()),
-                Some(INDEX_TTL_SECS),
-                None,
-            ));
-            if self.permanent_height(h, tip_height) {
-                let pk = permanent_block_key(&self.network, "", h);
-                if let Some(local) = &self.local {
-                    local.insert(pk.clone(), b.message());
+        let usable: Vec<&FetchedBlock> = blocks
+            .iter()
+            .filter(|b| b.height.is_some() && !b.hash.is_empty())
+            .collect();
+        // The payload a block adds to its script: nothing when it goes to the permanent tier
+        // or is not written (only its index entry is).
+        let payload = |b: &&FetchedBlock| match b.height {
+            Some(h) if blocks_current && !self.permanent_height(h, tip_height) => b.message().len(),
+            _ => 0,
+        };
+        let sizes: Vec<usize> = usable.iter().map(payload).collect();
+        for range in write_batches(&sizes, BLOCK_WRITE_BATCH, BLOCK_WRITE_BATCH_BYTES) {
+            let batch = &usable[range];
+            let mut entries: Vec<(String, Bytes, u64)> = Vec::with_capacity(batch.len() * 2);
+            let mut cached: Vec<(String, Bytes)> = Vec::new();
+            for b in batch {
+                let Some(h) = b.height else { continue };
+                entries.push((
+                    index_key(&chain, h),
+                    Bytes::from(b.hash.clone()),
+                    INDEX_TTL_SECS,
+                ));
+                if self.permanent_height(h, tip_height) {
+                    permanent.push((permanent_block_key(&self.network, "", h), b.message()));
+                } else if blocks_current {
+                    let bk = block_key(&prefix, "", h);
+                    entries.push((bk.clone(), b.message(), 0));
+                    cached.push((bk, b.message()));
                 }
-                permanent.push((pk, b.message()));
-                continue;
             }
-            let bk = block_key(&prefix, "", h);
+            match self
+                .store
+                .set_if_lock_held(lock_key(&chain), self.token.clone(), LOCK_TTL_MS, entries)
+                .await
+            {
+                Some(true) => {}
+                Some(false) => {
+                    self.lost_lock("block write");
+                    return Ok(false);
+                }
+                None => anyhow::bail!(
+                    "fenced block write: store error or timeout (after a timeout the outcome is unknown)"
+                ),
+            }
             if let Some(local) = &self.local {
-                local.insert(bk.clone(), b.message());
+                for (k, v) in cached {
+                    local.insert(k, v);
+                }
             }
-            writes.push(self.store.set(bk, b.message(), None, Some(epoch)));
-        }
-        for chunk in writes.chunks_mut(64) {
-            futures_util::future::join_all(chunk.iter_mut()).await;
         }
         if let (Some(perm), false) = (&self.permanent, permanent.is_empty()) {
+            if let Some(local) = &self.local {
+                for (k, v) in &permanent {
+                    local.insert(k.clone(), v.clone());
+                }
+            }
             let n = permanent.len() as u64;
             if perm.set_many(permanent).await {
                 crate::health::record_block_permanent(&self.network, "stored", n);
             }
         }
         crate::health::record_upstream_blocks(&self.network, blocks.len() as u64);
+        Ok(true)
+    }
+
+    /// A fenced write found the lock held by another process (or by none): stop leading.
+    fn lost_lock(&self, what: &str) {
+        info!(network = %self.network, what, "chain follower: the lock is no longer held, write refused");
+        self.set_leader(false);
     }
 
     /// Move the blocks that became final with the advance from `old_tip` to `new_tip` from the
@@ -792,10 +1136,11 @@ impl ChainFollower {
             .is_some_and(|h| h.as_ref() == tip.hash.as_slice())
     }
 
-    /// Store `tip` and when it moved, only while this process holds the lock. False when it
-    /// does not any more (replaced by another process during this tick): it stops leading and
-    /// leaves the stored tip alone. A store error keeps the tip in memory (fail-open, as before).
-    async fn write_tip(&self, tip: &Tip) -> bool {
+    /// Store `tip`, when it moved and that it is confirmed, only while this process holds the
+    /// lock. Ok(false) when it does not any more (replaced by another process during this
+    /// tick): it stops leading and leaves the stored tip alone. Err when the store did not
+    /// answer: the tick stops (the tip is not taken over in memory either).
+    async fn write_tip(&self, tip: &Tip) -> Result<bool> {
         let chain = self.store.chain_prefix();
         let now = unix_ms_now();
         let written = self
@@ -807,18 +1152,25 @@ impl ChainFollower {
                 vec![
                     (tip_key(&chain), encode_tip(tip), INDEX_TTL_SECS),
                     (tip_at_key(&chain), encode_unix_ms(now), INDEX_TTL_SECS),
+                    (tip_seen_key(&chain), encode_unix_ms(now), INDEX_TTL_SECS),
                 ],
             )
             .await;
-        if written == Some(false) {
-            warn!(network = %self.network, height = tip.height, "chain follower lost the leader lock during this tick: tip not written");
-            self.set_leader(false);
-            return false;
+        match written {
+            Some(true) => {}
+            Some(false) => {
+                warn!(network = %self.network, height = tip.height, "chain follower lost the leader lock during this tick: tip not written");
+                self.set_leader(false);
+                return Ok(false);
+            }
+            None => anyhow::bail!(
+                "tip write: store error or timeout (after a timeout the outcome is unknown)"
+            ),
         }
         self.moved_at_ms.store(now, Ordering::Relaxed);
         *self.last.lock() = Some(tip.clone());
         self.notify_new_block(tip);
-        true
+        Ok(true)
     }
 
     /// Fill index gaps inside the window, one batch per idle tick.
@@ -856,7 +1208,14 @@ impl ChainFollower {
             match self.source.blocks(s, e).await {
                 Ok(blocks) => {
                     debug!(network = %self.network, start = s, end = e, n = blocks.len(), "chain index backfill");
-                    self.store_blocks(&blocks, tip).await;
+                    match self.store_blocks(&blocks, tip).await {
+                        Ok(true) => {}
+                        Ok(false) => return,
+                        Err(err) => {
+                            warn!(network = %self.network, error = %err, "chain index backfill write failed");
+                            return;
+                        }
+                    }
                 }
                 Err(err) => {
                     warn!(network = %self.network, start = s, end = e, error = %err, "chain index backfill fetch failed");
@@ -866,6 +1225,29 @@ impl ChainFollower {
         }
         *self.backfill_cursor.lock() = Some(start.saturating_sub(1));
     }
+}
+
+/// Split items of `sizes` bytes into consecutive batches of at most `max_items` items and
+/// `max_bytes` bytes each; an item larger than `max_bytes` is a batch of its own.
+fn write_batches(
+    sizes: &[usize],
+    max_items: usize,
+    max_bytes: usize,
+) -> Vec<std::ops::Range<usize>> {
+    let mut batches = Vec::new();
+    let (mut start, mut bytes) = (0, 0usize);
+    for (i, size) in sizes.iter().enumerate() {
+        if i > start && (i - start >= max_items || bytes.saturating_add(*size) > max_bytes) {
+            batches.push(start..i);
+            start = i;
+            bytes = 0;
+        }
+        bytes = bytes.saturating_add(*size);
+    }
+    if start < sizes.len() {
+        batches.push(start..sizes.len());
+    }
+    batches
 }
 
 /// Whether consecutive blocks chain (`prev_hash` of each equals the hash of the previous and the
@@ -1356,7 +1738,7 @@ mod tests {
             height: 1000,
             hash: hash_at(1000, 0),
         };
-        assert!(!leader.write_tip(&stale_tip).await);
+        assert!(!leader.write_tip(&stale_tip).await.unwrap());
         assert!(!leader.is_leader());
         assert_eq!(
             store
@@ -1599,5 +1981,651 @@ mod tests {
             }
         );
         assert!(b.is_leader());
+    }
+
+    fn stored_tip(store: &MemStore) -> Option<u64> {
+        store
+            .get(&tip_key(&store.chain_prefix()))
+            .and_then(|b| decode_tip(&b))
+            .map(|t| t.height)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_displaced_leader_with_a_fetch_in_flight_writes_no_index() {
+        let store = Arc::new(MemStore::default());
+        // The leader's lightwalletd is stuck at 1000 and then answers with another fork above
+        // it, slowly; the follower's is ahead on the canonical chain.
+        let stuck = Arc::new(FakeChain::new(1000));
+        let live = Arc::new(FakeChain::new(1000));
+        let (leader, follower) = pair(&store, &stuck, &live);
+        assert_eq!(leader.tick().await, Outcome::Cold { tip: 1000 });
+        live.set_tip(1006);
+        age_the_tip();
+        assert!(matches!(
+            follower.tick().await,
+            Outcome::StaleLeader {
+                took_over: false,
+                ..
+            }
+        ));
+        // The leader's next tick fetches fork-1 blocks 1001..=1003 for 20 s; meanwhile the
+        // follower's second probe takes the lock over and indexes the canonical chain.
+        stuck.reorg_from(1001, 1);
+        stuck.set_tip(1003);
+        stuck.blocks_delay_ms.store(20_000, Ordering::SeqCst);
+        let other = async {
+            let mut outcomes = Vec::new();
+            for _ in 1..=STALE_PROBE_EVERY {
+                tokio::time::sleep(POLL_INTERVAL).await;
+                outcomes.push(follower.tick().await);
+            }
+            outcomes
+        };
+        let (displaced, outcomes) = tokio::join!(leader.tick(), other);
+        assert_eq!(
+            outcomes.last(),
+            Some(&Outcome::Advanced {
+                from: 1001,
+                to: 1006
+            }),
+            "{outcomes:?}"
+        );
+        assert_eq!(displaced, Outcome::Follower);
+        assert!(!leader.is_leader() && follower.is_leader());
+        for h in 1001..=1006 {
+            assert_eq!(index_of(&store, h), Some(hash_at(h, 0)), "height {h}");
+        }
+        assert_eq!(stored_tip(&store), Some(1006));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_released_lock_does_not_let_a_paused_leader_write() {
+        let store = Arc::new(MemStore::default());
+        let chain = Arc::new(FakeChain::new(800));
+        let f = follower(store.clone(), chain.clone(), None);
+        assert_eq!(f.tick().await, Outcome::Cold { tip: 800 });
+        // Another process took the lock over, wrote a newer tip and released the lock again.
+        store.locks.lock().unwrap().clear();
+        let newer = Tip {
+            height: 805,
+            hash: hash_at(805, 0),
+        };
+        store.put(&tip_key(&store.chain_prefix()), encode_tip(&newer));
+        let older = Tip {
+            height: 801,
+            hash: hash_at(801, 0),
+        };
+        assert!(
+            !f.write_tip(&older).await.unwrap(),
+            "an absent lock refuses the write"
+        );
+        assert!(!f.is_leader());
+        assert_eq!(stored_tip(&store), Some(805));
+        let block = FetchedBlock::from_frame(grpc_frame(&chain.msg(801)));
+        assert!(!f.store_blocks(&[block], 801).await.unwrap());
+        assert_eq!(index_of(&store, 801), None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn two_followers_do_not_take_the_lock_from_each_other() {
+        let store = Arc::new(MemStore::default());
+        let stuck = Arc::new(FakeChain::new(1000));
+        let live_b = Arc::new(FakeChain::new(1000));
+        let live_c = Arc::new(FakeChain::new(1000));
+        let (leader, b) = pair(&store, &stuck, &live_b);
+        let (_, c) = pair(&store, &stuck, &live_c);
+        assert_eq!(leader.tick().await, Outcome::Cold { tip: 1000 });
+        live_b.set_tip(1006);
+        live_c.set_tip(1006);
+        age_the_tip();
+        // Both see the stale tip on their first probe.
+        for f in [&b, &c] {
+            assert!(matches!(
+                f.tick().await,
+                Outcome::StaleLeader {
+                    took_over: false,
+                    ..
+                }
+            ));
+        }
+        for _ in 1..STALE_PROBE_EVERY {
+            assert_eq!(b.tick().await, Outcome::Follower);
+            assert_eq!(c.tick().await, Outcome::Follower);
+            assert_eq!(leader.tick().await, Outcome::Idle);
+        }
+        // b takes over and is still fetching its blocks when c probes the same stale tip.
+        live_b.blocks_delay_ms.store(5_000, Ordering::SeqCst);
+        let (outcome_b, outcome_c) = tokio::join!(b.tick(), c.tick());
+        assert_eq!(
+            outcome_b,
+            Outcome::Advanced {
+                from: 1001,
+                to: 1006
+            }
+        );
+        assert_eq!(
+            outcome_c,
+            Outcome::StaleLeader {
+                from: 1000,
+                to: 1006,
+                took_over: false
+            }
+        );
+        assert!(b.is_leader() && !c.is_leader());
+        assert_eq!(stored_tip(&store), Some(1006));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_probe_does_not_send_the_served_tip_back() {
+        let store = Arc::new(MemStore::default());
+        let stuck = Arc::new(FakeChain::new(1000));
+        let live = Arc::new(FakeChain::new(1000));
+        let (leader, follower) = pair(&store, &stuck, &live);
+        assert_eq!(leader.tick().await, Outcome::Cold { tip: 1000 });
+        live.set_tip(1006);
+        age_the_tip();
+        assert!(matches!(
+            follower.tick().await,
+            Outcome::StaleLeader {
+                took_over: false,
+                ..
+            }
+        ));
+        assert_eq!(follower.tip().unwrap().height, 1006);
+        // Its own lightwalletd fails from now on: every tick, the probes included, keeps 1006.
+        live.down.store(true, Ordering::SeqCst);
+        for _ in 0..(2 * STALE_PROBE_EVERY) {
+            assert_eq!(follower.tick().await, Outcome::Follower);
+            assert_eq!(follower.tip().unwrap().height, 1006);
+            assert_eq!(leader.tick().await, Outcome::Idle);
+        }
+        // Bounded: without a confirmation for HELD_TIP_MAX_AGE it serves the stored tip again.
+        let mut waited = Duration::ZERO;
+        while waited <= HELD_TIP_MAX_AGE {
+            tokio::time::advance(Duration::from_secs(3)).await;
+            waited += Duration::from_secs(3);
+            assert_eq!(leader.tick().await, Outcome::Idle);
+            follower.tick().await;
+        }
+        assert_eq!(follower.tip().unwrap().height, 1000);
+        assert!(leader.is_leader() && !follower.is_leader());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_lightwalletd_stuck_behind_gives_the_lock_up() {
+        let store = Arc::new(MemStore::default());
+        let stuck = Arc::new(FakeChain::new(4000));
+        let fine = Arc::new(FakeChain::new(4000));
+        let f = follower(store.clone(), stuck.clone(), None);
+        let other = follower(store.clone(), fine.clone(), None);
+        assert_eq!(f.tick().await, Outcome::Cold { tip: 4000 });
+        assert_eq!(f.tick().await, Outcome::Idle);
+        assert_eq!(other.tick().await, Outcome::Follower);
+        stuck.set_tip(3995);
+        for _ in 0..MAX_BEHIND_TICKS {
+            assert!(matches!(f.tick().await, Outcome::Behind { .. }));
+            assert!(f.is_leader());
+        }
+        assert_eq!(f.tip().unwrap().height, 4000);
+        // One more: it gives the lock up and stays away from it for the cooldown.
+        assert!(matches!(f.tick().await, Outcome::Behind { .. }));
+        assert!(!f.is_leader());
+        for _ in 0..BEHIND_COOLDOWN_TICKS {
+            assert_eq!(f.tick().await, Outcome::Follower);
+        }
+        // Nobody confirms the tip any more: it goes stale on both.
+        tokio::time::advance(crate::store::TIP_STALE_AFTER + Duration::from_secs(1)).await;
+        assert_eq!(f.tip(), None);
+        assert_eq!(other.tip(), None);
+        // The other process leads from its next tick and moves on.
+        fine.set_tip(4001);
+        assert_eq!(
+            other.tick().await,
+            Outcome::Advanced {
+                from: 4001,
+                to: 4001
+            }
+        );
+        assert_eq!(f.tick().await, Outcome::Follower);
+        assert_eq!(f.tip().unwrap().height, 4001);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn followers_keep_the_tip_fresh_only_while_the_leader_confirms_it() {
+        let store = Arc::new(MemStore::default());
+        let chain = Arc::new(FakeChain::new(9000));
+        let leader = follower(store.clone(), chain.clone(), None);
+        let f = follower(store.clone(), chain.clone(), None);
+        assert_eq!(leader.tick().await, Outcome::Cold { tip: 9000 });
+        // Normal operation: a chain without a new block for a while, every tick confirmed.
+        for _ in 0..12 {
+            tokio::time::advance(Duration::from_secs(5)).await;
+            assert_eq!(leader.tick().await, Outcome::Idle);
+            assert_eq!(f.tick().await, Outcome::Follower);
+            assert_eq!(f.tip().unwrap().height, 9000);
+        }
+        // The lightwalletd is stuck at the tip height: after MAX_IDLE_TICKS the leader stops
+        // confirming, and the followers' tip ages out although they still read it every tick.
+        for _ in 0..MAX_IDLE_TICKS {
+            leader.tick().await;
+        }
+        assert_eq!(leader.tick().await, Outcome::Idle);
+        f.tick().await;
+        for _ in 0..7 {
+            tokio::time::advance(Duration::from_secs(5)).await;
+            assert_eq!(leader.tick().await, Outcome::Idle);
+            assert_eq!(f.tick().await, Outcome::Follower);
+        }
+        assert_eq!(f.tip(), None);
+        assert_eq!(leader.tip(), None);
+        // A new block: confirmed and fresh again.
+        chain.set_tip(9001);
+        assert!(matches!(leader.tick().await, Outcome::Advanced { .. }));
+        f.tick().await;
+        assert_eq!(f.tip().unwrap().height, 9001);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn leader_work_longer_than_the_lease_keeps_it_without_another_process() {
+        let store = Arc::new(MemStore::default());
+        let chain = Arc::new(FakeChain::new(6500));
+        let f = follower(store.clone(), chain.clone(), None);
+        // A cold start whose block fetch takes three lock TTLs.
+        chain
+            .blocks_delay_ms
+            .store(3 * LOCK_TTL_MS, Ordering::SeqCst);
+        assert_eq!(f.tick().await, Outcome::Cold { tip: 6500 });
+        assert!(f.is_leader());
+        assert_eq!(stored_tip(&store), Some(6500));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn leader_work_is_cancelled_when_its_lease_is_taken() {
+        let store = Arc::new(MemStore::default());
+        let chain = Arc::new(FakeChain::new(6600));
+        let f = follower(store.clone(), chain.clone(), None);
+        assert_eq!(f.tick().await, Outcome::Cold { tip: 6600 });
+        chain.set_tip(6610);
+        chain
+            .blocks_delay_ms
+            .store(10 * LOCK_TTL_MS, Ordering::SeqCst);
+        let lock = lock_key(&store.chain_prefix());
+        let thief = async {
+            tokio::time::sleep(Duration::from_millis(LOCK_TTL_MS / 2)).await;
+            store.locks.lock().unwrap().insert(
+                lock.clone(),
+                (
+                    "other".to_string(),
+                    tokio::time::Instant::now() + Duration::from_secs(3600),
+                ),
+            );
+        };
+        let start = tokio::time::Instant::now();
+        let (outcome, _) = tokio::join!(f.tick(), thief);
+        assert_eq!(outcome, Outcome::Follower);
+        assert!(!f.is_leader());
+        assert!(
+            start.elapsed() < Duration::from_millis(2 * LOCK_TTL_MS),
+            "cancelled at the next renewal, not after the fetch"
+        );
+        assert_eq!(stored_tip(&store), Some(6600));
+        assert_eq!(index_of(&store, 6601), None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_displacement_between_two_batches_stops_the_rest() {
+        let store = Arc::new(MemStore::default());
+        let chain = Arc::new(FakeChain::new(1000));
+        let f = follower(store.clone(), chain.clone(), None);
+        assert_eq!(f.tick().await, Outcome::Cold { tip: 1000 });
+        chain.set_tip(1100);
+        // The first block batch of the next tick is accepted, then another process takes the
+        // lock before the second batch.
+        *store.steal_lock_after.lock().unwrap() = Some((1, "other".to_string()));
+        assert_eq!(f.tick().await, Outcome::Follower);
+        assert!(!f.is_leader());
+        let prefix = store.key_prefix(store.epoch);
+        let last_written = 1000 + BLOCK_WRITE_BATCH as u64;
+        for h in 1001..=last_written {
+            assert_eq!(index_of(&store, h), Some(hash_at(h, 0)), "height {h}");
+            assert!(store.get(&block_key(&prefix, "", h)).is_some(), "block {h}");
+        }
+        for h in last_written + 1..=1100 {
+            assert_eq!(index_of(&store, h), None, "height {h}");
+            assert!(store.get(&block_key(&prefix, "", h)).is_none(), "block {h}");
+        }
+        assert_eq!(stored_tip(&store), Some(1000));
+    }
+
+    #[test]
+    fn write_batches_end_at_the_item_or_the_byte_bound() {
+        assert!(write_batches(&[], 4, 100).is_empty());
+        assert_eq!(
+            write_batches(&[1, 1, 1, 1, 1], 2, 100),
+            vec![0..2, 2..4, 4..5]
+        );
+        // 40 + 40 fit, the third would pass 100; an item above the bound goes alone.
+        assert_eq!(
+            write_batches(&[40, 40, 40, 250, 10, 10], 32, 100),
+            vec![0..2, 2..3, 3..4, 4..6]
+        );
+        assert_eq!(write_batches(&[60, 40, 1], 32, 100), vec![0..2, 2..3]);
+        assert_eq!(write_batches(&[0, 0, 0], 32, 0), vec![0..3]);
+    }
+
+    /// A block at `height` whose message is `size` bytes (the follower stores it as it is).
+    fn sized_block(height: u64, size: usize) -> FetchedBlock {
+        FetchedBlock {
+            height: Some(height),
+            hash: hash_at(height, 0),
+            prev_hash: Vec::new(),
+            frame: Bytes::from(vec![0u8; 5 + size]),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn large_blocks_are_written_in_scripts_bounded_by_bytes() {
+        let store = Arc::new(MemStore::default());
+        let chain = Arc::new(FakeChain::new(1000));
+        let f = follower(store.clone(), chain.clone(), None);
+        assert_eq!(f.tick().await, Outcome::Cold { tip: 1000 });
+        let third = BLOCK_WRITE_BATCH_BYTES * 2 / 5;
+        let sizes = [third, third, third, 2 * BLOCK_WRITE_BATCH_BYTES, 10, 10];
+        let blocks: Vec<FetchedBlock> = sizes
+            .iter()
+            .enumerate()
+            .map(|(i, size)| sized_block(1001 + i as u64, *size))
+            .collect();
+        store.fenced_writes.lock().unwrap().clear();
+        assert!(f.store_blocks(&blocks, 1006).await.unwrap());
+        // Two blocks fit, the third would pass the bound, the large one goes alone, then the
+        // rest: the index entry and the block of a height always in the same script.
+        let chain_prefix = store.chain_prefix();
+        let prefix = store.key_prefix(store.epoch);
+        let script = |heights: std::ops::RangeInclusive<u64>| -> Vec<String> {
+            heights
+                .flat_map(|h| [index_key(&chain_prefix, h), block_key(&prefix, "", h)])
+                .collect()
+        };
+        assert_eq!(
+            *store.fenced_writes.lock().unwrap(),
+            vec![
+                script(1001..=1002),
+                script(1003..=1003),
+                script(1004..=1004),
+                script(1005..=1006)
+            ]
+        );
+        for (i, size) in sizes.iter().enumerate() {
+            let h = 1001 + i as u64;
+            assert_eq!(store.get(&block_key(&prefix, "", h)).unwrap().len(), *size);
+        }
+
+        // Displaced between two such scripts: the rest is not written.
+        let blocks: Vec<FetchedBlock> = sizes
+            .iter()
+            .enumerate()
+            .map(|(i, size)| sized_block(2001 + i as u64, *size))
+            .collect();
+        *store.steal_lock_after.lock().unwrap() = Some((1, "other".to_string()));
+        assert!(!f.store_blocks(&blocks, 2006).await.unwrap());
+        assert!(!f.is_leader());
+        for h in 2001..=2002 {
+            assert!(index_of(&store, h).is_some(), "height {h}");
+            assert!(store.get(&block_key(&prefix, "", h)).is_some(), "block {h}");
+        }
+        for h in 2003..=2006 {
+            assert_eq!(index_of(&store, h), None, "height {h}");
+            assert!(store.get(&block_key(&prefix, "", h)).is_none(), "block {h}");
+        }
+    }
+
+    /// A leader simulated by its keys only: it holds the lock and writes the stored tip, so
+    /// the follower's tip cell is written by the follower alone.
+    struct KeysOnlyLeader {
+        store: Arc<MemStore>,
+    }
+
+    impl KeysOnlyLeader {
+        fn new(store: &Arc<MemStore>) -> Self {
+            store.locks.lock().unwrap().insert(
+                lock_key(&store.chain_prefix()),
+                (
+                    "another-process".to_string(),
+                    tokio::time::Instant::now() + Duration::from_secs(86_400),
+                ),
+            );
+            Self {
+                store: store.clone(),
+            }
+        }
+
+        /// Move the stored tip to `height`, as every version does.
+        fn move_tip(&self, height: u64) {
+            let chain = self.store.chain_prefix();
+            let tip = Tip {
+                height,
+                hash: hash_at(height, 0),
+            };
+            self.store.put(&tip_key(&chain), encode_tip(&tip));
+            self.store
+                .put(&tip_at_key(&chain), encode_unix_ms(unix_ms_now()));
+        }
+
+        /// Confirm the stored tip (`tip_seen`), as this version does; `n` makes the value new.
+        fn confirm(&self, n: u64) {
+            self.store
+                .put(&tip_seen_key(&self.store.chain_prefix()), encode_unix_ms(n));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_leader_that_does_not_confirm_is_followed_as_before() {
+        let store = Arc::new(MemStore::default());
+        let chain = Arc::new(FakeChain::new(100));
+        let f = follower(store.clone(), chain, None);
+        let leader = KeysOnlyLeader::new(&store);
+        // A leader of this version: it moves the tip and confirms it.
+        leader.move_tip(100);
+        leader.confirm(1);
+        assert_eq!(f.tick().await, Outcome::Follower);
+        assert_eq!(f.tip().unwrap().height, 100);
+        // Then one that does not write the confirmation leads: the key stays as it was while
+        // the tip moves. The follower follows it ...
+        for height in [101, 102] {
+            leader.move_tip(height);
+            tokio::time::advance(Duration::from_secs(5)).await;
+            assert_eq!(f.tick().await, Outcome::Follower);
+            assert_eq!(f.tip().unwrap().height, height);
+        }
+        // ... and keeps the tip fresh while that leader idles, as with no key at all.
+        let mut idle = Duration::ZERO;
+        while idle <= crate::store::TIP_STALE_AFTER * 2 {
+            tokio::time::advance(Duration::from_secs(5)).await;
+            idle += Duration::from_secs(5);
+            assert_eq!(f.tick().await, Outcome::Follower);
+            assert_eq!(f.tip().unwrap().height, 102);
+        }
+
+        // A leader that confirms again: the strict rule applies again.
+        leader.move_tip(103);
+        leader.confirm(2);
+        assert_eq!(f.tick().await, Outcome::Follower);
+        assert_eq!(f.tip().unwrap().height, 103);
+        // It stops confirming (and moving): the tip goes stale although it is read every tick.
+        let mut idle = Duration::ZERO;
+        while idle <= crate::store::TIP_STALE_AFTER {
+            assert_eq!(f.tip().unwrap().height, 103);
+            tokio::time::advance(Duration::from_secs(5)).await;
+            idle += Duration::from_secs(5);
+            assert_eq!(f.tick().await, Outcome::Follower);
+        }
+        assert_eq!(f.tip(), None);
+        // The next confirmation makes it fresh again.
+        leader.confirm(3);
+        assert_eq!(f.tick().await, Outcome::Follower);
+        assert_eq!(f.tip().unwrap().height, 103);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_store_error_in_a_fenced_write_stops_the_tick() {
+        let store = Arc::new(MemStore::default());
+        let chain = Arc::new(FakeChain::new(2000));
+        let f = follower(store.clone(), chain.clone(), None);
+        let block = FetchedBlock::from_frame(grpc_frame(&chain.msg(2000)));
+        assert_eq!(f.tick().await, Outcome::Cold { tip: 2000 });
+        store.down.store(true, Ordering::SeqCst);
+        assert!(f.store_blocks(&[block], 2000).await.is_err());
+        assert!(f
+            .write_tip(&Tip {
+                height: 2001,
+                hash: hash_at(2001, 0)
+            })
+            .await
+            .is_err());
+        store.down.store(false, Ordering::SeqCst);
+        assert_eq!(stored_tip(&store), Some(2000));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_lower_probe_does_not_replace_a_higher_held_tip() {
+        let store = Arc::new(MemStore::default());
+        let stuck = Arc::new(FakeChain::new(1000));
+        let live = Arc::new(FakeChain::new(1000));
+        let (leader, follower) = pair(&store, &stuck, &live);
+        assert_eq!(leader.tick().await, Outcome::Cold { tip: 1000 });
+        live.set_tip(1006);
+        age_the_tip();
+        assert!(matches!(
+            follower.tick().await,
+            Outcome::StaleLeader { to: 1006, .. }
+        ));
+        // Another instance behind the same name answers lower, still ahead of the stored tip
+        // (and another holder, so that this probe is a new observation, not a takeover).
+        live.set_tip(1003);
+        store.locks.lock().unwrap().insert(
+            lock_key(&store.chain_prefix()),
+            (
+                "third".to_string(),
+                tokio::time::Instant::now() + Duration::from_secs(3600),
+            ),
+        );
+        for _ in 1..STALE_PROBE_EVERY {
+            follower.tick().await;
+            assert_eq!(follower.tip().unwrap().height, 1006);
+        }
+        assert_eq!(
+            follower.tick().await,
+            Outcome::StaleLeader {
+                from: 1000,
+                to: 1006,
+                took_over: false
+            }
+        );
+        assert_eq!(follower.tip().unwrap().height, 1006);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_held_tip_rule() {
+        let store = Arc::new(MemStore::default());
+        let stuck = Arc::new(FakeChain::new(1000));
+        let live = Arc::new(FakeChain::new(1000));
+        let (_leader, follower) = pair(&store, &stuck, &live);
+        let chain = store.chain_prefix();
+        let tip = |h: u64, f: u8| Tip {
+            height: h,
+            hash: hash_at(h, f),
+        };
+        let put_stored = |t: &Tip| store.put(&tip_key(&chain), encode_tip(t));
+        // A leader that holds the lock and does not move (it never ticks here).
+        store.locks.lock().unwrap().insert(
+            lock_key(&chain),
+            (
+                "stuck-leader".to_string(),
+                tokio::time::Instant::now() + Duration::from_secs(3600),
+            ),
+        );
+        put_stored(&tip(1000, 0));
+        store.put(&tip_at_key(&chain), encode_unix_ms(1));
+        live.set_tip(1006);
+        assert!(matches!(
+            follower.tick().await,
+            Outcome::StaleLeader { to: 1006, .. }
+        ));
+        // The stored tip moves but stays below: the held tip is kept (no step back).
+        put_stored(&tip(1002, 0));
+        follower.tick().await;
+        assert_eq!(follower.tip().unwrap().height, 1006);
+        // The stored chain changes at the held observation's height (a reorg of the stored
+        // chain): the held tip is dropped and the stored tip served.
+        put_stored(&tip(1000, 7));
+        follower.tick().await;
+        assert_eq!(follower.tip(), Some(tip(1000, 7)));
+        // A fresh observation; then it ages out without a confirmation: one step back to the
+        // stored tip, not before.
+        put_stored(&tip(1000, 0));
+        for _ in 0..STALE_PROBE_EVERY {
+            follower.tick().await;
+        }
+        assert_eq!(follower.tip().unwrap().height, 1006);
+        live.down.store(true, Ordering::SeqCst);
+        tokio::time::advance(HELD_TIP_MAX_AGE - Duration::from_secs(1)).await;
+        follower.tick().await;
+        assert_eq!(follower.tip().unwrap().height, 1006);
+        tokio::time::advance(Duration::from_secs(2)).await;
+        follower.tick().await;
+        assert_eq!(follower.tip(), Some(tip(1000, 0)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_holder_change_between_probes_starts_a_new_observation() {
+        let store = Arc::new(MemStore::default());
+        let stuck = Arc::new(FakeChain::new(1000));
+        let live = Arc::new(FakeChain::new(1000));
+        let (leader, follower) = pair(&store, &stuck, &live);
+        assert_eq!(leader.tick().await, Outcome::Cold { tip: 1000 });
+        live.set_tip(1006);
+        age_the_tip();
+        assert!(matches!(
+            follower.tick().await,
+            Outcome::StaleLeader {
+                took_over: false,
+                ..
+            }
+        ));
+        // Another process holds the lock now (the stale leader's lapsed, a third one took it,
+        // and it is stuck too).
+        let lock = lock_key(&store.chain_prefix());
+        store.locks.lock().unwrap().insert(
+            lock.clone(),
+            (
+                "third".to_string(),
+                tokio::time::Instant::now() + Duration::from_secs(3600),
+            ),
+        );
+        for _ in 1..STALE_PROBE_EVERY {
+            follower.tick().await;
+        }
+        // Second probe: another holder than observed, no takeover yet (a new observation).
+        assert!(matches!(
+            follower.tick().await,
+            Outcome::StaleLeader {
+                took_over: false,
+                ..
+            }
+        ));
+        assert!(!follower.is_leader());
+        for _ in 1..STALE_PROBE_EVERY {
+            follower.tick().await;
+        }
+        // Third probe, the same holder twice in a row: it takes over.
+        assert_eq!(
+            follower.tick().await,
+            Outcome::Advanced {
+                from: 1001,
+                to: 1006
+            }
+        );
+        assert!(follower.is_leader());
     }
 }
