@@ -301,6 +301,10 @@ keep what is held, the bootstrap list if nothing was fetched yet.
 The list tells a wallet where the gateway will forward. It does not authenticate the hosts:
 which servers a wallet uses still comes from the service's own discovery and its checks.
 
+The client crate implements these rules (`zodl-ohttp-client` from 2.1.0: `ThirdPartyHosts`,
+`third_party_hosts_request`, `read_third_party_hosts`; `client/INTEGRATION.md`, section 5), so
+a wallet built on it calls the crate instead of implementing them again.
+
 ## Metrics
 
 All metrics are registered in `src/health.rs` and served on `:9090/metrics`. Request ids and

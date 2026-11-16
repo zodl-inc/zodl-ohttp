@@ -95,6 +95,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "client_third_party_hosts"
+path = "fuzz_targets/client_third_party_hosts.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "client_outer"
 path = "fuzz_targets/client_outer.rs"
 test = false

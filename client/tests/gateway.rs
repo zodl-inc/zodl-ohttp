@@ -23,7 +23,7 @@
 //! `insecure-plain-key-config`) to exercise the cache rules of `/ohttp-configs`.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -34,14 +34,17 @@ use axum::response::{IntoResponse, Response as AxumResponse};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use ed25519_dalek::{SigningKey, VerifyingKey};
-use ohttp_gateway::chunked_stream::{collected_upstream, encode_response_stream};
+use futures_util::stream::BoxStream;
+use futures_util::StreamExt;
+use ohttp_gateway::chunked_stream::{collected_upstream, encode_response_stream, UpFrame};
 use ohttp_gateway::config::Config;
 use ohttp_gateway::hpke::KeyState;
 use ohttp_gateway::ohttp::{self as gateway, InnerResponse};
 use ohttp_gateway::ohttp_chunked::decapsulate_chunked_request;
 use ohttp_gateway::signing::SigningState;
 use zodl_ohttp_client::{
-    Client, Error, HttpErrorKind, KeyConfig, KeyConfigSource, Network, OuterHeaders, Request,
+    is_unknown_authority, Client, Error, HostListAnswer, HostListScope, HttpErrorKind, KeyConfig,
+    KeyConfigSource, Network, NoHostList, OuterHeaders, RefreshOutcome, Request, ThirdPartyHosts,
 };
 
 const TIMEOUT: Duration = Duration::from_secs(10);
@@ -131,6 +134,13 @@ struct TestGateway {
     refuse_stale: Mutex<usize>,
     /// The request headers of every key-configuration fetch and post, with the route.
     seen_headers: Mutex<Vec<(&'static str, HeaderMap)>>,
+    /// The gateway configuration the third-party host list is answered from, by the gateway's
+    /// own `host_list` code. `None`: every request goes to the echo backend.
+    third_party: Mutex<Option<Config>>,
+    /// The gateway answers the host list request with a body larger than a wallet accepts.
+    oversized_host_list: AtomicBool,
+    /// The relay does not answer a post for a long time.
+    stall: AtomicBool,
 }
 
 impl TestGateway {
@@ -177,6 +187,9 @@ async fn relay(
 ) -> AxumResponse {
     gw.posts.fetch_add(1, Ordering::SeqCst);
     gw.seen_headers.lock().unwrap().push(("relay", headers));
+    if gw.stall.load(Ordering::SeqCst) {
+        tokio::time::sleep(Duration::from_secs(60)).await;
+    }
     if let Some(status) = *gw.refuse_with.lock().unwrap() {
         return status.into_response();
     }
@@ -214,14 +227,27 @@ async fn relay(
             ],
             body: b"Request timestamp outside the freshness window".to_vec(),
         }
+    } else if let Some(answer) = third_party_answer(&gw, &inner) {
+        answer
     } else {
         echo(&inner)
+    };
+    // The oversized host list never ends: after more than a wallet reads, nothing follows,
+    // not even the final chunk. A client that waited for the end would run into its timeout.
+    let never_ends =
+        gw.oversized_host_list.load(Ordering::SeqCst) && answer.body.len() > OVERSIZED_BYTES / 2;
+    let upstream: BoxStream<'static, anyhow::Result<UpFrame>> = if never_ends {
+        collected_upstream(answer.body, vec![])
+            .chain(futures_util::stream::pending())
+            .boxed()
+    } else {
+        collected_upstream(answer.body, vec![]).boxed()
     };
     let sealed = encode_response_stream(
         context,
         answer.status,
         answer.headers,
-        collected_upstream(answer.body, vec![]),
+        upstream,
         16384,
         Duration::from_millis(50),
         "test".to_string(),
@@ -232,6 +258,40 @@ async fn relay(
         axum::body::Body::from_stream(sealed),
     )
         .into_response()
+}
+
+/// What the gateway itself answers when it has third-party hosts configured: the host list
+/// (its own `host_list::is_request` / `host_list::answer`), and the refusal of an authority it
+/// does not carry. `None`: forwarded (here: to the echo backend).
+fn third_party_answer(gw: &TestGateway, inner: &gateway::InnerRequest) -> Option<InnerResponse> {
+    let guard = gw.third_party.lock().unwrap();
+    let config = guard.as_ref()?;
+    if ohttp_gateway::host_list::is_request(config, inner) {
+        if gw.oversized_host_list.load(Ordering::SeqCst) {
+            // What the gateway itself never sends: more than a wallet reads.
+            return Some(InnerResponse {
+                status: 200,
+                headers: vec![("content-type".into(), "application/json".into())],
+                body: vec![b' '; OVERSIZED_BYTES],
+            });
+        }
+        return Some(ohttp_gateway::host_list::answer(config, inner));
+    }
+    let refusal = |status: u16, body: &[u8]| {
+        Some(InnerResponse {
+            status,
+            headers: vec![("content-type".into(), "text/plain".into())],
+            body: body.to_vec(),
+        })
+    };
+    use ohttp_gateway::proxy::BackendTarget;
+    match ohttp_gateway::proxy::resolve_backend(config, inner) {
+        BackendTarget::Upstream { .. } => None,
+        BackendTarget::Rejected => refusal(403, b"unknown authority"),
+        // A malformed authority (upper case, for one) or path: refused, not forwarded.
+        BackendTarget::MalformedAuthority(_) => refusal(403, b"forbidden"),
+        BackendTarget::MalformedPath(_) => refusal(400, b"bad request"),
+    }
 }
 
 /// The backend: answers with the status the `x-status` header asks for, the request's
@@ -269,6 +329,9 @@ async fn spawn() -> (String, Arc<TestGateway>) {
         posts: AtomicUsize::new(0),
         refuse_stale: Mutex::new(0),
         seen_headers: Mutex::new(Vec::new()),
+        third_party: Mutex::new(None),
+        oversized_host_list: AtomicBool::new(false),
+        stall: AtomicBool::new(false),
     });
     let app = Router::new()
         .route("/ohttp-configs", get(configs))
@@ -676,4 +739,350 @@ async fn the_gateways_preferred_key_is_used_and_either_opens() {
         .await
         .unwrap();
     assert_eq!(gw.posts.load(Ordering::SeqCst), 2);
+}
+
+const GATEWAY_HOST: &str = "ohttp-gateway.example";
+/// The body of the oversized host list of the test gateway: several times what a wallet reads.
+const OVERSIZED_BYTES: usize = 2 * 1024 * 1024;
+
+/// A gateway configuration that carries `aliases` (each on `GET /*`) and publishes its host
+/// list in `mode`.
+fn third_party_config(aliases: &[&str], mode: ohttp_gateway::host_list::PublishMode) -> Config {
+    let mut config = gateway_config(1, &private_key(1));
+    config.gateway_hosts = vec![GATEWAY_HOST.to_string()];
+    config.lwd_addr = "lwd.example:9067".to_string();
+    for alias in aliases {
+        config
+            .backends
+            .insert(alias.to_string(), format!("https://upstream-of-{alias}"));
+        config.backends_policy.insert(
+            alias.to_string(),
+            vec![("GET".to_string(), "/*".to_string())],
+        );
+    }
+    config.host_list = ohttp_gateway::host_list::HostListSettings {
+        mode,
+        max_age_secs: 300,
+    };
+    config
+}
+
+#[tokio::test]
+async fn the_gateways_host_list_is_fetched_revalidated_and_followed() {
+    use ohttp_gateway::host_list::PublishMode;
+    let (base, gw) = spawn().await;
+    let client = plain_client(&base);
+    *gw.third_party.lock().unwrap() = Some(third_party_config(
+        &["api.example.org", "query.example.org:8443"],
+        PublishMode::All,
+    ));
+
+    // The list, as the gateway's own code writes it.
+    let answer = client
+        .third_party_hosts(GATEWAY_HOST, None, TIMEOUT)
+        .await
+        .unwrap();
+    let HostListAnswer::List(list) = answer else {
+        panic!("a list");
+    };
+    assert_eq!(list.scope, HostListScope::All);
+    assert_eq!(list.max_age_secs, 300);
+    assert_eq!(list.revision.len(), 16);
+    let names: Vec<&str> = list.hosts.iter().map(|h| h.host.as_str()).collect();
+    assert_eq!(names, ["api.example.org", "query.example.org:8443"]);
+    assert_eq!(list.hosts[0].routes, ["GET /*"]);
+    // The alias targets are the gateway's business.
+    assert!(!format!("{list:?}").contains("upstream"));
+
+    // Revalidated with the revision held: not modified.
+    assert_eq!(
+        client
+            .third_party_hosts(GATEWAY_HOST, Some(&list.revision), TIMEOUT)
+            .await
+            .unwrap(),
+        HostListAnswer::NotModified
+    );
+
+    // The holder: the bootstrap list until the first fetch, then the gateway's list.
+    let hosts = ThirdPartyHosts::new(["compiled-only.example.org", "api.example.org"]);
+    assert!(hosts.is_carried("compiled-only.example.org"));
+    assert!(!hosts.is_carried("query.example.org:8443"));
+    assert_eq!(
+        hosts.refresh(&client, GATEWAY_HOST, TIMEOUT).await,
+        RefreshOutcome::Updated
+    );
+    assert_eq!(hosts.revision().as_deref(), Some(list.revision.as_str()));
+    assert!(hosts.is_carried("api.example.org") && hosts.is_carried("QUERY.example.org:8443"));
+    assert!(
+        !hosts.is_carried("compiled-only.example.org"),
+        "scope all: exactly the list"
+    );
+    // Fresh: nothing is sent.
+    let posts = gw.posts.load(Ordering::SeqCst);
+    assert_eq!(
+        hosts.refresh(&client, GATEWAY_HOST, TIMEOUT).await,
+        RefreshOutcome::NotDue
+    );
+    assert_eq!(gw.posts.load(Ordering::SeqCst), posts);
+
+    // Servers of a service: the ones the gateway carries are used, the rest dropped.
+    let servers = hosts.filter_servers([
+        "https://api.example.org",
+        "https://added-later.example.org",
+        "https://query.example.org:8443/",
+    ]);
+    let kept: Vec<(&str, &str)> = servers
+        .carried
+        .iter()
+        .map(|server| (server.url, server.authority.as_str()))
+        .collect();
+    assert_eq!(
+        kept,
+        [
+            ("https://api.example.org", "api.example.org"),
+            ("https://query.example.org:8443/", "query.example.org:8443"),
+        ]
+    );
+    // The authority returned is the one the gateway knows: a request with it is forwarded.
+    let forwarded = client
+        .send(&Request::new("GET", kept[1].1, "/v1/info"), TIMEOUT)
+        .await
+        .unwrap();
+    assert_eq!(forwarded.status, 200);
+    assert_eq!(servers.dropped, 1);
+
+    // The gateway adds a host. A request for it is refused by the gateway until then with
+    // `403 unknown authority`; the old revision now gets the new document.
+    let refused = client
+        .send(
+            &Request::new("GET", "added-later.example.org", "/v1/info"),
+            TIMEOUT,
+        )
+        .await
+        .unwrap();
+    assert!(is_unknown_authority(&refused));
+    *gw.third_party.lock().unwrap() = Some(third_party_config(
+        &[
+            "api.example.org",
+            "query.example.org:8443",
+            "added-later.example.org",
+        ],
+        PublishMode::All,
+    ));
+    let HostListAnswer::List(grown) = client
+        .third_party_hosts(GATEWAY_HOST, Some(&list.revision), TIMEOUT)
+        .await
+        .unwrap()
+    else {
+        panic!("the new list");
+    };
+    assert_ne!(grown.revision, list.revision);
+    assert_eq!(grown.hosts.len(), 3);
+    // The holder learns it with one refresh before refusing (its list is seconds old here, so
+    // the refresh is asked for through a reported unknown authority of a listed host instead).
+    assert!(!hosts.is_carried("added-later.example.org"));
+    assert!(hosts.report_unknown_authority("api.example.org"));
+    assert_eq!(
+        hosts.refresh(&client, GATEWAY_HOST, TIMEOUT).await,
+        RefreshOutcome::Updated
+    );
+    assert!(hosts.is_carried("added-later.example.org"));
+    assert_eq!(hosts.revision().as_deref(), Some(grown.revision.as_str()));
+    let carried = client
+        .send(
+            &Request::new("GET", "added-later.example.org", "/v1/info"),
+            TIMEOUT,
+        )
+        .await
+        .unwrap();
+    assert_eq!(carried.status, 200);
+}
+
+#[tokio::test]
+async fn a_dynamic_scope_list_adds_to_the_bootstrap_list() {
+    use ohttp_gateway::host_list::PublishMode;
+    let (base, gw) = spawn().await;
+    let client = plain_client(&base);
+    // `dynamic`: the static aliases are not published; this gateway has no dynamic source.
+    *gw.third_party.lock().unwrap() = Some(third_party_config(
+        &["api.example.org"],
+        PublishMode::Dynamic,
+    ));
+    let hosts = ThirdPartyHosts::new(["api.example.org"]);
+    assert_eq!(
+        hosts.refresh(&client, GATEWAY_HOST, TIMEOUT).await,
+        RefreshOutcome::Updated
+    );
+    let held = hosts.held().unwrap();
+    assert_eq!(held.scope, HostListScope::Dynamic);
+    assert!(held.hosts.is_empty());
+    assert!(
+        hosts.is_carried("api.example.org"),
+        "the compiled list stays in force"
+    );
+}
+
+#[tokio::test]
+async fn a_gateway_without_a_list_leaves_what_is_held() {
+    use ohttp_gateway::dynamic_hosts::{DynamicHosts, Reserved, Settings};
+    use ohttp_gateway::host_list::PublishMode;
+    let (base, gw) = spawn().await;
+    let client = plain_client(&base);
+    let hosts = ThirdPartyHosts::new(["compiled.example.org"]);
+
+    // Publishing off: the path is not the gateway's (here it reaches the echo backend, whose
+    // answer is no host list document).
+    *gw.third_party.lock().unwrap() =
+        Some(third_party_config(&["api.example.org"], PublishMode::Off));
+    let error = client
+        .third_party_hosts(GATEWAY_HOST, None, TIMEOUT)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, Error::NoHostList(NoHostList::Malformed)),
+        "{error}"
+    );
+    assert_eq!(
+        hosts.refresh(&client, GATEWAY_HOST, TIMEOUT).await,
+        RefreshOutcome::Kept(Some(NoHostList::Malformed))
+    );
+    assert!(hosts.held().is_none() && hosts.is_carried("compiled.example.org"));
+
+    // Publishing on, but a source of the gateway was not read yet: the gateway's own 503.
+    let mut starting = third_party_config(&["api.example.org"], PublishMode::All);
+    starting.dynamic_hosts = DynamicHosts::parse(
+        r#"[{"name":"servers","url":"https://config.example.org/servers.json",
+             "lists":[{"pointer":"/servers","routes":"GET /*"}]}]"#,
+        Reserved::default(),
+        Settings::new(NETWORK, 4),
+    )
+    .unwrap();
+    *gw.third_party.lock().unwrap() = Some(starting);
+    let error = client
+        .third_party_hosts(GATEWAY_HOST, None, TIMEOUT)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, Error::NoHostList(NoHostList::Status(503))),
+        "{error}"
+    );
+    // The error names the status, not the gateway or a host.
+    let shown = format!("{error} {error:?}");
+    assert!(
+        !shown.contains("example") && !shown.contains("127.0.0.1"),
+        "{shown}"
+    );
+    // The holder is in its backoff after the first failure: nothing is sent, nothing changes.
+    let posts = gw.posts.load(Ordering::SeqCst);
+    assert_eq!(
+        hosts.refresh(&client, GATEWAY_HOST, TIMEOUT).await,
+        RefreshOutcome::NotDue
+    );
+    assert_eq!(gw.posts.load(Ordering::SeqCst), posts);
+    assert!(hosts.is_carried("compiled.example.org") && !hosts.is_carried("api.example.org"));
+
+    // An unreachable relay: the exchange fails, the holder keeps its list.
+    let unreachable = plain_client("http://127.0.0.1:1");
+    let fresh = ThirdPartyHosts::new(["compiled.example.org"]);
+    assert_eq!(
+        fresh.refresh(&unreachable, GATEWAY_HOST, TIMEOUT).await,
+        RefreshOutcome::Kept(None)
+    );
+    assert!(fresh.is_carried("compiled.example.org"));
+}
+
+#[tokio::test]
+async fn an_oversized_host_list_is_refused_while_it_streams() {
+    use ohttp_gateway::host_list::PublishMode;
+    let (base, gw) = spawn().await;
+    let client = plain_client(&base);
+    *gw.third_party.lock().unwrap() =
+        Some(third_party_config(&["api.example.org"], PublishMode::All));
+    gw.oversized_host_list.store(true, Ordering::SeqCst);
+    // The answer never ends (the test gateway stalls after its oversized body), so only a
+    // client that stops reading at the cap answers before the timeout, and with `TooLarge`.
+    let started = std::time::Instant::now();
+    let error = client
+        .third_party_hosts(GATEWAY_HOST, None, TIMEOUT)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, Error::NoHostList(NoHostList::TooLarge)),
+        "{error}"
+    );
+    assert!(started.elapsed() < TIMEOUT / 2, "{:?}", started.elapsed());
+    let hosts = ThirdPartyHosts::new(["compiled.example.org"]);
+    assert_eq!(
+        hosts.refresh(&client, GATEWAY_HOST, TIMEOUT).await,
+        RefreshOutcome::Kept(Some(NoHostList::TooLarge))
+    );
+    assert!(hosts.held().is_none() && hosts.is_carried("compiled.example.org"));
+    // Any other request through the same client is unaffected by that limit.
+    gw.oversized_host_list.store(false, Ordering::SeqCst);
+    let answer = client
+        .third_party_hosts(GATEWAY_HOST, None, TIMEOUT)
+        .await
+        .unwrap();
+    assert!(matches!(answer, HostListAnswer::List(_)));
+}
+
+#[tokio::test]
+async fn a_refresh_that_stalls_or_is_dropped_does_not_block_the_next() {
+    use ohttp_gateway::host_list::PublishMode;
+    let (base, gw) = spawn().await;
+    let client = plain_client(&base);
+    *gw.third_party.lock().unwrap() =
+        Some(third_party_config(&["api.example.org"], PublishMode::All));
+    // One exchange first, so that the client holds the key configuration and a connection.
+    client
+        .third_party_hosts(GATEWAY_HOST, None, TIMEOUT)
+        .await
+        .unwrap();
+    gw.stall.store(true, Ordering::SeqCst);
+
+    // The exchange runs into its timeout: a failure, what is held stays, nothing is running.
+    let hosts = ThirdPartyHosts::new(["compiled.example.org"]);
+    assert_eq!(
+        hosts
+            .refresh(&client, GATEWAY_HOST, Duration::from_millis(300))
+            .await,
+        RefreshOutcome::Kept(None)
+    );
+    assert!(!hosts.is_refreshing() && hosts.is_carried("compiled.example.org"));
+
+    // While one refresh runs, another sends nothing and says that one is running.
+    let busy = ThirdPartyHosts::new(["compiled.example.org"]);
+    let posts = gw.posts.load(Ordering::SeqCst);
+    let (first, second) = tokio::join!(
+        busy.refresh(&client, GATEWAY_HOST, Duration::from_secs(4)),
+        async {
+            // Not before the first one's request is at the relay (which then stalls it), and
+            // not for ever should that request never get there.
+            while gw.posts.load(Ordering::SeqCst) == posts && busy.is_refreshing() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert!(busy.is_refreshing());
+            busy.refresh(&client, GATEWAY_HOST, TIMEOUT).await
+        }
+    );
+    assert_eq!(first, RefreshOutcome::Kept(None));
+    assert_eq!(second, RefreshOutcome::Running);
+    assert_eq!(gw.posts.load(Ordering::SeqCst), posts + 1, "one exchange");
+
+    // The caller drops the refresh while its exchange runs: given up at once, counted as a
+    // failure (the backoff runs), and the next refresh is not blocked behind it.
+    let dropped = ThirdPartyHosts::new(["compiled.example.org"]);
+    let cancelled = tokio::time::timeout(
+        Duration::from_millis(300),
+        dropped.refresh(&client, GATEWAY_HOST, TIMEOUT),
+    )
+    .await;
+    assert!(cancelled.is_err(), "the refresh was still running");
+    assert!(!dropped.is_refreshing());
+    gw.stall.store(false, Ordering::SeqCst);
+    assert_eq!(
+        dropped.refresh(&client, GATEWAY_HOST, TIMEOUT).await,
+        RefreshOutcome::NotDue
+    );
+    assert!(dropped.held().is_none() && dropped.is_carried("compiled.example.org"));
 }

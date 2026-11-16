@@ -24,6 +24,9 @@ Wallet → Relay (independent operator) → OHTTP Gateway → lightwalletd / all
   10 MiB sealed-request cap.
 - `Client` (default feature `client`, over reqwest): relay posting, key refetch and one retry
   after an outer `400`/`422`.
+- The third-party hosts a gateway carries, as the gateway publishes them (`ThirdPartyHosts`):
+  which hosts may be sent through the gateway and which servers of a service to use, with a
+  compiled list as the bootstrap. No I/O of its own.
 - A sans-IO core for callers that do their own I/O (for example over a Tor-capable transport):
   `cargo build --no-default-features` builds it without reqwest or tokio.
 
@@ -49,8 +52,8 @@ let relay = networks.relay_for("ohttp-gateway-testnet.example");
 ```
 
 [INTEGRATION.md](https://github.com/zodl-inc/zodl-ohttp/blob/main/client/INTEGRATION.md) explains
-configuration, key configuration sources, `Client`, the sans-IO loop, errors and testing an
-integration; [CHANGELOG.md](https://github.com/zodl-inc/zodl-ohttp/blob/main/client/CHANGELOG.md)
+configuration, key configuration sources, `Client`, the sans-IO loop, the gateway's third-party
+hosts, errors and testing an integration; [CHANGELOG.md](https://github.com/zodl-inc/zodl-ohttp/blob/main/client/CHANGELOG.md)
 lists the changes. The protocol background and threat model are in
 [docs/architecture.md](https://github.com/zodl-inc/zodl-ohttp/blob/main/docs/architecture.md).
 

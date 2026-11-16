@@ -13,6 +13,9 @@ The crate has two layers:
   classification of the relay's answer and streaming decryption. `cargo build
   --no-default-features` builds the core alone, without reqwest or tokio.
 
+Beside both, `ThirdPartyHosts` (section 5): which third-party hosts the gateway carries, as the
+gateway publishes them, for either layer.
+
 ## 1. Configuration
 
 The crate carries no endpoint, host name or key. The application passes the OHTTP
@@ -263,19 +266,136 @@ Rules that matter for privacy and correctness:
   request; send it only in debug builds, never by default, and only on the post (no key fetch
   lists it). Its format differs per `TracePolicy`, so a trace id also names the platform.
 
-## 5. Errors
+## 5. The gateway's third-party hosts
+
+A wallet sends a request for a third-party host through the gateway only when it knows the
+gateway carries the host. Everything else it refuses, and it never falls back to a direct
+connection. The gateway publishes the hosts it carries (`gateway/README.md`, "Third-party host
+list: wallet integration"); `ThirdPartyHosts` is that note as code, so an SDK needs no logic of
+its own beyond calling it. It does no I/O, starts no task and no timer.
+
+One `ThirdPartyHosts` per gateway (so one per network), created once with the list compiled
+into the wallet and shared (`Arc`). It is always refreshed from that one gateway.
+
+```text
+hosts = ThirdPartyHosts::new(compiled_hosts)          // "name" or "name:port", as in :authority
+
+// Before a request to a third-party host (host = what the request would put in :authority):
+authority = hosts.carried_authority(host)
+if authority is none and hosts.refresh_before_refusing():
+    refresh(hosts)                                    // below; then ask once more
+    authority = hosts.carried_authority(host)
+if authority is none and hosts.is_refreshing():       // a refresh, whoever began it, has not
+    fail("try again shortly")                         // ended: or wait briefly and ask again
+if authority is none:
+    fail("the gateway does not carry this host")      // never send it another way
+send the request with :authority = authority          // exactly this value
+
+// Choosing among the servers a service's own discovery offers:
+servers = hosts.filter_servers(discovered_urls)
+if !servers.any() and hosts.refresh_before_refusing():
+    refresh(hosts)
+    servers = hosts.filter_servers(discovered_urls)
+if !servers.any() and hosts.is_refreshing():          // as above: not a final answer yet
+    fail("try again shortly")
+if !servers.any():
+    fail("no server of this service is carried")      // only now
+for server in servers.carried:                        // the others are simply not used
+    send to server.url with :authority = server.authority
+
+// After an inner response from a third-party host:
+if is_unknown_authority(response):                    // 403, body "unknown authority"
+    hosts.report_unknown_authority(authority)         // asks for a refresh, at most one per 30 s
+    try the next server of the service                // the refresh runs at the next refresh(hosts)
+
+// Whenever convenient (before using third-party hosts, on a timer of the app's own, ...):
+refresh(hosts)
+```
+
+`refresh` with `Client` is one call, `hosts.refresh(&client, gateway_host, timeout).await`. With
+a transport of the SDK's own it is the same three steps:
+
+```text
+if let Some(refresh) = hosts.begin_refresh():         // None: fresh, running, or backing off
+    request  = refresh.request(gateway_host)          // GET /ohttp-gateway/v1/third-party-hosts
+    response = send through OHTTP like any request    // stop reading at 256 KiB, give up
+                                                      // well before 5 minutes
+    hosts.finish_refresh(refresh, Some(response))     // or fail_refresh(refresh, reason) when
+                                                      // the exchange failed: always one of them
+```
+
+What it does for the caller:
+
+- **Which hosts are allowed.** Before a list was fetched: the compiled list. While the list held
+  has `scope` `all`: exactly that list. While it is `dynamic` or a scope the crate does not
+  know: that list plus the compiled list. `host[:port]` is compared whole and
+  case-insensitively; there is no suffix matching and no other equivalence (`name:443` is not
+  `name`: the gateway lists a host on port 443 by its name alone).
+- **What to send.** `carried_authority` and `CarriedServer::authority` return the value that
+  was checked: lower case, and for a server URL its host with the port unless it is 443. Put
+  exactly this value in `:authority`. Upper and lower case name the same host (the value
+  returned is the lower-case one the gateway expects); nothing else is equivalent. As a host
+  value (`carried_authority`, `is_carried`) the crate knows a host only in the spelling the
+  gateway lists: `name:443`, a port with leading zeros and the like are refused here even
+  where a gateway would accept them. In a server URL an explicit `:443` is the default port
+  and is left out of the authority. A server URL
+  must be plain: it starts with `https://`, has no userinfo, whitespace or backslash, and
+  its host is written as it is sent (no percent escape, numeric IPv4 alias or non-ASCII
+  name), so that every URL parser reads the same host in it. A server on port 443 is known
+  by its name alone: a gateway that lists a host as `name:443` (a static alias configured
+  that way) carries it for `carried_authority("name:443")` only, not for a server URL.
+- **When to fetch.** At once when nothing is held; then when the list is older than its
+  `max_age_secs` (clamped to 30 s..24 h); or when asked (`report_unknown_authority`,
+  `refresh_before_refusing`), and then again after the backoff until a refresh succeeded. One
+  refresh at a time; the list held stays in use while it runs. A request for an allowed host
+  never waits for a refresh. A refresh that finds another one running sends nothing and
+  says so (`RefreshOutcome::Running`; `begin_refresh()` returns `None`). Whenever a refresh
+  is running (`is_refreshing()`), whoever began it and for whatever reason, a host that is
+  not allowed may be in the list it brings: report a temporary failure (or wait a moment and
+  ask again), not "the gateway does not carry this host".
+- **Failures.** Any answer that is not the version 1 document (or a `304` for the revision
+  held), a body over 256 KiB, or a failed exchange keeps what is held, the compiled list if
+  nothing was fetched yet, and starts a backoff (30 s, doubling to 5 min). `NoHostList` says
+  why, with a status or a fixed text only. A gateway that does not publish the list therefore
+  costs one small request per backoff period and changes nothing. An entry of the list that
+  is not well-formed, or whose host is no `host[:port]`, is left out; the rest of the list is
+  used.
+- **Cancellation.** A `HostListRefresh` that is neither finished nor failed is given up after
+  5 minutes and counts as a failure, and the next refresh may begin: an SDK transport must
+  give its exchange up before that. `ThirdPartyHosts::refresh` limits its exchange to four
+  minutes and gives up at once when its future is dropped. A refresh finished at another
+  holder than the one that began it, or 5 minutes or more after it began, changes nothing
+  (`Superseded`).
+
+Through a foreign-function boundary the holder maps to a handful of calls: carried-authority
+(not is-carried alone: the caller needs the value to send), filter-servers (return the kept
+URLs with their authorities, or their indices),
+report-unknown-authority, refresh-before-refusing and refresh (or begin / finish / fail for an
+SDK transport). The methods take `&self` and are safe to call from any thread. The `_at`
+variants take the current time as an `Instant`, for tests and for Rust callers that already
+hold one.
+
+The list says where the gateway forwards. It does not authenticate a host: which servers a
+wallet uses still comes from the service's own discovery and its checks. The hosts of a list
+identify the deployment: the `Debug` of `ThirdPartyHosts` shows counts only, but `HostList`,
+`HostListAnswer`, `CarriedHost`, `CarriedServer` and `CarriedServers` hold the names and are not
+log-safe. The `Debug` of a `HostListRefresh` shows the revision it revalidates and two counters.
+
+## 6. Errors
 
 `Error` is non-exhaustive. `Refused { status }`, `MediaType`, `TooLarge`, `KeyConfig`, `Seal`,
-`BhttpFormat` and `NotAResponse` are permanent for that request; `Truncated` (the answer ended
-before its final chunk) and `Http` are transport failures and may be retried with a fresh
-sealing; `Open` means a chunk did not authenticate; `Backoff { wait }` means the relay asked for
-a pause; `Setup` means a `Client` constructor refused its arguments or could not initialize its
-TLS backend.
+`BhttpFormat` and `NotAResponse` are permanent for that request; `NoHostList` means the
+gateway's answer to a host list request is no list (keep what is held, section 5);
+`Truncated` (the answer ended before its final chunk) and `Http` are transport failures and
+may be retried with a fresh sealing; `Open` means a chunk did not authenticate;
+`Backoff { wait }` means the relay asked for a pause; `Setup` means a `Client` constructor
+refused its arguments or could not initialize its TLS backend.
 
 What may be logged and what may not:
 
 - **Log-safe.** The `Display` and `Debug` of the errors the library produces (`Error`,
-  `ConfigError`), and the `Debug` of `OhttpConfigParams`, `OhttpConfig` and `OhttpNetworks`
+  `ConfigError`, `NoHostList`), the `Debug` of `ThirdPartyHosts` (counts only), and the
+  `Debug` of `OhttpConfigParams`, `OhttpConfig` and `OhttpNetworks`
   (which show only which fields are set), `KeyConfigSource` (the variant and the network only)
   and `RelayBackoff` (the number of relays only).
   The library itself never puts a URL, host name, address, port or key id of the configuration
@@ -299,7 +419,7 @@ What may be logged and what may not:
   backend's answer); key configurations, envelopes and `SignedKeys`; and trace ids, which link
   the relay's and the gateway's logs.
 
-## 6. Testing an integration
+## 7. Testing an integration
 
 The crate's own tests need no network and use example configurations (`*.example` names,
 RFC 2606) of their own. Those that run against the gateway's code (`tests/gateway.rs`,

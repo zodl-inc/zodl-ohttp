@@ -89,6 +89,7 @@ lightwalletd or a third-party backend:
 | `client_key_config` | `application/ohttp-keys` documents |
 | `client_signed_config` | signed envelopes |
 | `client_outer` | outer responses |
+| `client_third_party_hosts` | the gateway's third-party host list |
 
 `fuzz.yml` seeds the corpora (`examples/gen_corpus.rs`, real encodings), builds every target with
 debug assertions and runs each for 60 s on pull requests and pushes to `main`, and for 10 min on
