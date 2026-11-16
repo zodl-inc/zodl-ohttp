@@ -73,9 +73,10 @@ impl SuccessStatus {
 pub struct OuterPolicy {
     /// Which statuses are success.
     pub success: SuccessStatus,
-    /// How many bytes of a non-success answer's body are quoted in
-    /// [`OuterOutcome::Refused`]; `None` for all of it. (An outer `400` or `422` is retried
-    /// whatever its body says: see [`classify_outer_response`].)
+    /// How many bytes of a non-success answer's body are read for the quote in
+    /// [`OuterOutcome::Refused`]; `None` for all of it. The quote itself is at most
+    /// [`MAX_REFUSED_DETAIL_CHARS`] characters of printable ASCII, whatever the window. (An outer
+    /// `400` or `422` is retried whatever its body says: see [`classify_outer_response`].)
     pub body_window: Option<usize>,
     /// Whether a success answer must be labelled `message/ohttp-chunked-res`.
     pub require_response_media_type: bool,
@@ -90,21 +91,22 @@ impl OuterPolicy {
         body_window: None,
         require_response_media_type: false,
     };
-    /// The Android SDK (`OhttpTransport.roundTrip`): 200 only, the first 200 bytes of an
-    /// error body quoted.
+    /// The Android SDK (`OhttpTransport.roundTrip`): 200 only, a window of the first 200 bytes
+    /// of an error body (quoted as at most 120 characters).
     pub const ANDROID: OuterPolicy = OuterPolicy {
         success: SuccessStatus::Exactly200,
         body_window: Some(200),
         require_response_media_type: false,
     };
-    /// The Swift SDK (`OHTTPTransport.roundTrip`): 200 only, the first 200 bytes of an error
-    /// body quoted.
+    /// The Swift SDK (`OHTTPTransport.roundTrip`): 200 only, a window of the first 200 bytes of
+    /// an error body (quoted as at most 120 characters).
     pub const IOS: OuterPolicy = OuterPolicy {
         success: SuccessStatus::Exactly200,
         body_window: Some(200),
         require_response_media_type: false,
     };
-    /// Slipstream (`OhttpClient::round_trip`): 200 only, the whole error body quoted.
+    /// Slipstream (`OhttpClient::round_trip`): 200 only, the whole error body as the window
+    /// (quoted as at most 120 characters).
     pub const SLIPSTREAM: OuterPolicy = OuterPolicy {
         success: SuccessStatus::Exactly200,
         body_window: None,
@@ -126,6 +128,13 @@ pub struct OuterResponse<'a> {
     pub body: &'a [u8],
 }
 
+/// The most characters of a `Content-Type` [`OuterOutcome::WrongMediaType`] (and
+/// `Error::MediaType`) quotes.
+pub const MAX_MEDIA_TYPE_CHARS: usize = 64;
+
+/// The most characters of an outer error body [`OuterOutcome::Refused`] quotes.
+pub const MAX_REFUSED_DETAIL_CHARS: usize = 120;
+
 /// What an outer answer means.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum OuterOutcome {
@@ -139,12 +148,19 @@ pub enum OuterOutcome {
     Refused {
         /// The outer status.
         status: u16,
-        /// The body, up to the policy's window, invalid UTF-8 replaced.
+        /// The body, up to the policy's window, as at most [`MAX_REFUSED_DETAIL_CHARS`]
+        /// characters of printable ASCII: anything else (invalid UTF-8, any non-ASCII character,
+        /// newlines and other controls) replaced by `?`. Safe to log in format only (one short
+        /// line, which cannot inject log lines): the content is whatever the relay sent and may
+        /// itself name an address or an identifier, so a privacy-sensitive log records the
+        /// status and drops this.
         detail: String,
     },
     /// A success status, but not labelled `message/ohttp-chunked-res`.
     WrongMediaType {
-        /// The `Content-Type` received.
+        /// The `Content-Type` received, as at most [`MAX_MEDIA_TYPE_CHARS`] characters of
+        /// printable ASCII, anything else replaced by `?`: one short line, whose content is the
+        /// relay's choice.
         content_type: String,
     },
 }
@@ -173,7 +189,7 @@ pub fn classify_outer_response(
     if !policy.success.accepts(response.status) {
         return OuterOutcome::Refused {
             status: response.status,
-            detail: String::from_utf8_lossy(window).into_owned(),
+            detail: crate::sanitized(&String::from_utf8_lossy(window), MAX_REFUSED_DETAIL_CHARS),
         };
     }
     if policy.require_response_media_type {
@@ -181,7 +197,7 @@ pub fn classify_outer_response(
         let essence = content_type.split(';').next().unwrap_or_default().trim();
         if !essence.eq_ignore_ascii_case(RESPONSE_MEDIA_TYPE) {
             return OuterOutcome::WrongMediaType {
-                content_type: content_type.to_string(),
+                content_type: crate::sanitized(content_type, MAX_MEDIA_TYPE_CHARS),
             };
         }
     }
@@ -719,7 +735,68 @@ mod tests {
             else {
                 panic!("a 503 was not refused");
             };
-            assert_eq!(detail.len(), window);
+            assert_eq!(detail.len(), window.min(MAX_REFUSED_DETAIL_CHARS));
+        }
+        // A narrower window than the quote cap bounds it.
+        let narrow = OuterPolicy {
+            body_window: Some(10),
+            ..OuterPolicy::LIBRARY
+        };
+        let OuterOutcome::Refused { detail, .. } =
+            classify_outer_response(&narrow, &outer(503, None, &body), 0)
+        else {
+            panic!("a 503 was not refused");
+        };
+        assert_eq!(detail, "x".repeat(10));
+    }
+
+    /// The relay's `Content-Type` is quoted as one short line of printable ASCII.
+    #[test]
+    fn a_wrong_media_type_is_quoted_short_and_printable() {
+        let policy = OuterPolicy {
+            require_response_media_type: true,
+            ..OuterPolicy::LIBRARY
+        };
+        let long = format!("text/html\r\nX-Injected: 1; {}", "a".repeat(200));
+        let OuterOutcome::WrongMediaType { content_type } =
+            classify_outer_response(&policy, &outer(200, Some(&long), &[]), 0)
+        else {
+            panic!("a wrong label was accepted");
+        };
+        assert_eq!(content_type.chars().count(), MAX_MEDIA_TYPE_CHARS);
+        assert!(content_type.starts_with("text/html??X-Injected: 1; "));
+        assert!(content_type
+            .chars()
+            .all(|c| c.is_ascii_graphic() || c == ' '));
+    }
+
+    /// The relay's error body is quoted as one short line of printable ASCII.
+    #[test]
+    fn a_quoted_body_is_one_short_printable_line() {
+        let mut body = b"bad\r\nInjected: header\x00\x1b[31m".to_vec();
+        body.extend_from_slice("é€".as_bytes());
+        body.extend_from_slice(&[0xff, 0xfe]);
+        body.extend_from_slice(&[b'y'; 500]);
+        for policy in [
+            OuterPolicy::LIBRARY,
+            OuterPolicy::ANDROID,
+            OuterPolicy::IOS,
+            OuterPolicy::SLIPSTREAM,
+        ] {
+            let OuterOutcome::Refused { detail, .. } =
+                classify_outer_response(&policy, &outer(502, None, &body), 0)
+            else {
+                panic!("a 502 was not refused");
+            };
+            assert!(detail.chars().count() <= MAX_REFUSED_DETAIL_CHARS);
+            assert!(
+                detail.chars().all(|c| c.is_ascii_graphic() || c == ' '),
+                "{detail:?}"
+            );
+            assert!(
+                detail.starts_with("bad??Injected: header??[31m??"),
+                "{detail:?}"
+            );
         }
     }
 

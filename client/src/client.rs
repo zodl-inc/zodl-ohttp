@@ -29,8 +29,9 @@ use crate::chunked::{
 };
 use crate::{
     check_size, encode_request, open_signed_config, retry_after_delay, signed_config_url, Error,
-    KeyConfig, Limits, Network, OhttpNetworks, OuterHeaders, RelayBackoff, Request, Response,
-    SignedConfigUrlRule, SizeGuard, GATEWAY_MAX_ENCAPSULATED_REQUEST_BYTES,
+    HttpError, HttpErrorKind, KeyConfig, Limits, Network, OhttpNetworks, OuterHeaders,
+    RelayBackoff, Request, Response, SignedConfigUrlRule, SizeGuard,
+    GATEWAY_MAX_ENCAPSULATED_REQUEST_BYTES,
 };
 
 /// Where a gateway's key configuration is fetched, and how it is authenticated.
@@ -350,7 +351,10 @@ impl Client {
                 .unwrap_or_default();
             let essence = media_type.split(';').next().unwrap_or_default().trim();
             if !essence.eq_ignore_ascii_case(CONTENT_TYPE_CHUNKED_RES) {
-                return Err(Error::MediaType(media_type.to_string()));
+                return Err(Error::MediaType(crate::sanitized(
+                    media_type,
+                    crate::MAX_MEDIA_TYPE_CHARS,
+                )));
             }
             let guard = Limits::LIBRARY.response_guard();
             if let Some(declared) = resp.content_length() {
@@ -391,7 +395,12 @@ impl Client {
         for (name, value) in headers {
             get = get.header(name, value);
         }
-        let resp = get.timeout(timeout).send().await?.error_for_status()?;
+        let resp = get.timeout(timeout).send().await?;
+        // Never followed (the stack's policy is none); reported as what it is.
+        if resp.status().is_redirection() {
+            return Err(Error::Http(HttpError::new(HttpErrorKind::RedirectRefused)));
+        }
+        let resp = resp.error_for_status()?;
         // How long an unsigned document may be kept; a signed one is kept until its `not_after`.
         #[cfg(feature = "insecure-plain-key-config")]
         let max_age = crate::unsigned_cache_secs(
@@ -449,7 +458,7 @@ impl ResponseStream {
                     self.resp = None;
                     self.decoder.finish()
                 }
-                Err(e) => Err(Error::Http(e)),
+                Err(e) => Err(Error::from(e)),
             };
             match step {
                 Ok(events) => self.pending.extend(events),
@@ -974,10 +983,10 @@ mod tests {
         )
         .unwrap();
         let request = Request::new("GET", "backend.example", "/v1/info");
-        assert!(client
-            .send(&request, Duration::from_secs(10))
-            .await
-            .is_err());
+        let Err(Error::Http(error)) = client.send(&request, Duration::from_secs(10)).await else {
+            panic!("a redirect was followed or ignored");
+        };
+        assert_eq!(error.kind(), HttpErrorKind::RedirectRefused);
         assert_eq!(tls::count(&accepted), 1);
         assert_eq!(tls::count(&target_accepted), 0, "the redirect was followed");
     }
@@ -1009,5 +1018,98 @@ mod tests {
             client.send_stream(&request, Duration::MAX).await,
             Err(Error::Http(_))
         ));
+    }
+
+    /// Neither output of a transport error names the host, the address, the port or the path.
+    fn assert_shows_no_peer(error: &Error, port: u16) {
+        let shown = format!("{error} | {error:?}");
+        for part in [
+            "127.0.0.1".to_string(),
+            "localhost".to_string(),
+            port.to_string(),
+            "/ohttp-configs".to_string(),
+            "/relay".to_string(),
+            "https".to_string(),
+        ] {
+            assert!(!shown.contains(&part), "{shown} shows {part}");
+        }
+    }
+
+    async fn transport_error(base: &str) -> Error {
+        let (_, signer) = signed_envelope();
+        let client = Client::checked(
+            format!("{base}/relay"),
+            signed_at(format!("{base}/ohttp-configs/signed"), signer),
+            tls::builder(),
+        )
+        .unwrap();
+        let request = Request::new("GET", "backend.example", "/v1/info");
+        match client.send(&request, Duration::from_millis(1_500)).await {
+            Err(error) => error,
+            Ok(_) => panic!("{base} answered"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_refused_connection_is_a_kind_only() {
+        // Reserved for this test (bound, never listening): refused, and not taken meanwhile.
+        let reserved = tokio::net::TcpSocket::new_v4().unwrap();
+        reserved.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let port = reserved.local_addr().unwrap().port();
+        let error = transport_error(&format!("https://127.0.0.1:{port}")).await;
+        let Error::Http(http) = &error else {
+            panic!("{error}");
+        };
+        assert_eq!(http.kind(), HttpErrorKind::Connect);
+        assert_shows_no_peer(&error, port);
+    }
+
+    #[tokio::test]
+    async fn a_certificate_for_another_name_is_a_kind_only() {
+        // The test leaf is for `localhost`; asked for by address, it does not match.
+        let (port, _) = tls::serve(
+            true,
+            std::sync::Arc::new(|_: &str| Some(tls::response("200 OK", &[], b""))),
+        )
+        .await;
+        let error = transport_error(&format!("https://127.0.0.1:{port}")).await;
+        let Error::Http(http) = &error else {
+            panic!("{error}");
+        };
+        assert!(http.transport_error_not_log_safe().is_some());
+        assert_eq!(
+            http.kind(),
+            HttpErrorKind::Tls,
+            "{:?}",
+            http.transport_error_not_log_safe()
+        );
+        assert_shows_no_peer(&error, port);
+    }
+
+    #[tokio::test]
+    async fn a_timeout_is_a_kind_only() {
+        // Accepts and completes the handshake, then never answers.
+        let (port, _) = tls::serve(true, std::sync::Arc::new(|_: &str| None)).await;
+        let error = transport_error(&format!("https://localhost:{port}")).await;
+        let Error::Http(http) = &error else {
+            panic!("{error}");
+        };
+        assert_eq!(http.kind(), HttpErrorKind::Timeout);
+        assert_shows_no_peer(&error, port);
+    }
+
+    #[tokio::test]
+    async fn an_error_status_is_a_kind_only() {
+        let (port, _) = tls::serve(
+            true,
+            std::sync::Arc::new(|_: &str| Some(tls::response("404 Not Found", &[], b"/relay"))),
+        )
+        .await;
+        let error = transport_error(&format!("https://localhost:{port}")).await;
+        let Error::Http(http) = &error else {
+            panic!("{error}");
+        };
+        assert_eq!(http.kind(), HttpErrorKind::Status(404));
+        assert_shows_no_peer(&error, port);
     }
 }

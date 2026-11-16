@@ -738,6 +738,7 @@ dependencies = [
  "anyhow",
  "hex",
  "reqwest",
+ "url",
  "zodl-ohttp-client",
 ]
 

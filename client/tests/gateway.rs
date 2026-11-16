@@ -41,7 +41,7 @@ use ohttp_gateway::ohttp::{self as gateway, InnerResponse};
 use ohttp_gateway::ohttp_chunked::decapsulate_chunked_request;
 use ohttp_gateway::signing::SigningState;
 use zodl_ohttp_client::{
-    Client, Error, KeyConfig, KeyConfigSource, Network, OuterHeaders, Request,
+    Client, Error, HttpErrorKind, KeyConfig, KeyConfigSource, Network, OuterHeaders, Request,
 };
 
 const TIMEOUT: Duration = Duration::from_secs(10);
@@ -420,6 +420,59 @@ async fn the_relay_sees_the_presets_headers_and_nothing_more() {
         };
         assert_eq!(got, want, "{route}");
     }
+}
+
+/// A transport error shows its kind only: no URL, host, address, port or path.
+fn assert_shows_no_peer(error: &Error, base: &str) {
+    let shown = format!("{error} | {error:?}");
+    let authority = base.trim_start_matches("http://");
+    let (host, port) = authority.split_once(':').unwrap();
+    for part in [
+        base,
+        authority,
+        host,
+        port,
+        "/ohttp-configs",
+        "/relay",
+        "http:",
+    ] {
+        assert!(!shown.contains(part), "{shown} shows {part}");
+    }
+}
+
+#[tokio::test]
+async fn a_transport_error_shows_its_kind_only() {
+    // A port reserved for this test (bound, never listening), so a connection is refused and no
+    // other test can take the port meanwhile.
+    let reserved = tokio::net::TcpSocket::new_v4().unwrap();
+    reserved.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let base = format!("http://{}", reserved.local_addr().unwrap());
+    let Err(error @ Error::Http(_)) = plain_client(&base).send(&json_post(), TIMEOUT).await else {
+        panic!("a closed port answered");
+    };
+    let Error::Http(http) = &error else {
+        unreachable!()
+    };
+    assert_eq!(http.kind(), HttpErrorKind::Connect);
+    assert_shows_no_peer(&error, &base);
+
+    // An error status on the key-configuration fetch.
+    let (base, _gw) = spawn().await;
+    let missing = Client::insecure_for_local_testing(
+        format!("{base}/relay"),
+        KeyConfigSource::Plain {
+            url: format!("{base}/ohttp-configs/missing"),
+        },
+    )
+    .unwrap();
+    let Err(error @ Error::Http(_)) = missing.send(&json_post(), TIMEOUT).await else {
+        panic!("a 404 key configuration was used");
+    };
+    let Error::Http(http) = &error else {
+        unreachable!()
+    };
+    assert_eq!(http.kind(), HttpErrorKind::Status(404));
+    assert_shows_no_peer(&error, &base);
 }
 
 #[tokio::test]

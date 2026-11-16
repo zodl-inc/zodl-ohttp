@@ -44,6 +44,19 @@ each change.
   whatever form it was written in, an IPv6 address in its standard form, no `:443`, dot segments
   resolved and percent-encoding normalized. Requests go to that URL.
 
+- `Error::Http` holds an `HttpError` instead of a `reqwest::Error`. Its `Display` and `Debug` give
+  only an `HttpErrorKind` (`Connect`, `Tls`, `Timeout`, `Status(n)`, `RedirectRefused`, `Body`,
+  `Request`, `Other`): never a URL, host, address, port or the HTTP stack's own message, and it
+  has no `source()`, so error-chain printers do not reach the underlying error either. Match on
+  `HttpError::kind()`; `HttpError::transport_error_not_log_safe()` returns the underlying error
+  for local debugging (not log-safe). A redirect on the key-configuration fetch is now
+  `HttpErrorKind::RedirectRefused` (it was read as a body and failed as `Error::KeyConfig`).
+- `Error::KeyConfig` and `Error::MediaType` texts changed (they no longer quote peer text or key
+  ids, see "Changed"); code matching on the messages must be updated.
+- `OuterOutcome::Refused::detail` is at most `MAX_REFUSED_DETAIL_CHARS` (120) characters of
+  printable ASCII, anything else replaced by `?` (it was up to the policy's whole window, with
+  newlines and any text).
+
 ### Added
 
 - `Client::for_network(&OhttpNetworks, Network, SignedConfigUrlRule)`: a client posting to the
@@ -53,6 +66,7 @@ each change.
 - `Client::insecure_for_local_testing`: no checks, `http://` allowed, the unsigned source with
   the feature; for tests against a local gateway.
 - `Error::Setup`, naming what a `Client` constructor refused and the rule, never the value.
+- `HttpError`, `HttpErrorKind` and the constant `MAX_REFUSED_DETAIL_CHARS`.
 
 ### Changed
 
@@ -81,6 +95,14 @@ each change.
   ASCII case, as before): `https://h/relay`, `https://h:443/relay/` and `https://h/a/../relay`
   are one relay, and so are `https://192.0.2.1/relay`, `https://0xc0000201/relay` and
   `https://[::ffff:192.0.2.1]/relay`.
+- `Error::KeyConfig` from the signed envelope and the DoH answer no longer quotes the peer's text:
+  not the envelope's `network` or `key_id` (the expected network is named; no key id is, the
+  pinned one would tell a log reader which deployment the client is configured for), not an
+  unknown or duplicated field name (one of the envelope's own fields is still named), not a JSON
+  parser message (only its kind, line and column), not a character of a malformed TXT record.
+  Before, a relay or resolver could put up to 64 KiB of text, newlines included, into the error
+  and so into a wallet's logs. `Error::MediaType` holds at most 64 characters of the
+  `Content-Type`, non-printable characters replaced by `?`.
 - The crate-level example builds its client with `Client::for_network` (the signed source). It
   used `KeyConfigSource::Plain` on the relay host, which lets the relay substitute its own key.
 - `Client::send` and `Client::send_stream` no longer panic on a timeout too long to add to the

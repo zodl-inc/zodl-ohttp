@@ -100,6 +100,8 @@ mod config;
 mod dns;
 pub mod encapsulation;
 pub mod freshness;
+#[cfg(feature = "client")]
+mod http_error;
 mod message;
 mod outer;
 mod profile;
@@ -117,19 +119,23 @@ pub use chunked::{
 };
 #[cfg(feature = "client")]
 pub use client::{Client, KeyConfigSource, ResponseStream};
-pub use config::{ConfigError, ConfigField, OhttpConfig, OhttpConfigParams, OhttpNetworks};
+pub use config::{
+    canonical_relay_url, ConfigError, ConfigField, OhttpConfig, OhttpConfigParams, OhttpNetworks,
+};
 pub use dns::{doh_query_url, envelope_from_doh_json, DOH_RESOLVERS};
 /// The key type of [`open_signed_config`]'s signer, so callers need not pin `ed25519-dalek`.
 pub use ed25519_dalek::VerifyingKey;
 pub use encapsulation::{EntryLayout, KeyConfig, KeySelection, UnsupportedKem, KEY_BYTES};
+#[cfg(feature = "client")]
+pub use http_error::{HttpError, HttpErrorKind};
 pub use message::{decode_response, encode_request, Request, Response};
 pub use outer::{
     check_size, classify_outer_response, retry_after_delay, signed_config_url, unsigned_cache_secs,
     CachePolicy, Limits, OuterHeaders, OuterOutcome, OuterPolicy, OuterResponse, RelayBackoff,
     SignedConfigUrlRule, SizeGuard, SuccessStatus, GATEWAY_MAX_ENCAPSULATED_REQUEST_BYTES,
     GATEWAY_MAX_SEALED_RESPONSE_BYTES, GATEWAY_MAX_UPSTREAM_RESPONSE_BYTES, KEY_CONFIG_MEDIA_TYPE,
-    MAX_KEY_CONFIG_BYTES, MAX_RETRY_AFTER, RELAY_ACCEPT_LANGUAGE, RELAY_USER_AGENT,
-    SIGNED_CONFIG_MEDIA_TYPE, UNSIGNED_DEFAULT_CACHE_SECS,
+    MAX_KEY_CONFIG_BYTES, MAX_MEDIA_TYPE_CHARS, MAX_REFUSED_DETAIL_CHARS, MAX_RETRY_AFTER,
+    RELAY_ACCEPT_LANGUAGE, RELAY_USER_AGENT, SIGNED_CONFIG_MEDIA_TYPE, UNSIGNED_DEFAULT_CACHE_SECS,
 };
 pub use profile::ClientProfile;
 pub use signed::{
@@ -150,10 +156,12 @@ pub const RESPONSE_MEDIA_TYPE: &str = "message/ohttp-chunked-res";
 #[non_exhaustive]
 pub enum Error {
     /// The relay or the key-configuration URL could not be reached, the exchange broke off or
-    /// timed out, or the key-configuration URL answered an error status.
+    /// timed out, or the key-configuration URL answered an error status or a redirect. Shows
+    /// only the kind of failure ([`HttpError`]): never a URL, host, address, port or the HTTP
+    /// stack's own message.
     #[cfg(feature = "client")]
     #[error("HTTP: {0}")]
-    Http(#[from] reqwest::Error),
+    Http(HttpError),
     /// The relay or the gateway refused the sealed request (an HTTP error status on the outer
     /// response). The backend's own answers, errors included, are [`Response`]s.
     #[error("the relay or the gateway answered {status}")]
@@ -171,7 +179,9 @@ pub enum Error {
         /// The rule it breaks.
         rule: &'static str,
     },
-    /// The relay answered something other than a sealed response.
+    /// The relay answered something other than a sealed response. The `Content-Type` received,
+    /// as `Client` reports it: at most 64 characters, anything but printable ASCII replaced by
+    /// `?`.
     #[error("the relay answered {0:?}, not {RESPONSE_MEDIA_TYPE}")]
     MediaType(String),
     /// A key configuration or a sealed response was larger than `max` bytes.
@@ -208,4 +218,28 @@ pub enum Error {
     /// or a field too long to frame.
     #[error("binary HTTP: {0}")]
     BhttpFormat(String),
+}
+
+/// A transport error of `Client`, reduced to its kind ([`HttpError`]).
+#[cfg(feature = "client")]
+impl From<reqwest::Error> for Error {
+    fn from(error: reqwest::Error) -> Self {
+        Error::Http(HttpError::from_reqwest(error))
+    }
+}
+
+/// At most `max` characters of untrusted `text` (a peer's header or field), every character
+/// that is not printable ASCII replaced by `?`, so an error or a log line quoting it stays one
+/// short line.
+pub(crate) fn sanitized(text: &str, max: usize) -> String {
+    text.chars()
+        .take(max)
+        .map(|c| {
+            if c.is_ascii_graphic() || c == ' ' {
+                c
+            } else {
+                '?'
+            }
+        })
+        .collect()
 }

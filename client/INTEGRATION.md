@@ -255,7 +255,32 @@ Rules that matter for privacy and correctness:
 `BhttpFormat` and `NotAResponse` are permanent for that request; `Truncated` (the answer ended
 before its final chunk) and `Http` are transport failures and may be retried with a fresh
 sealing; `Open` means a chunk did not authenticate; `Backoff { wait }` means the relay asked for
-a pause.
+a pause; `Setup` means a `Client` constructor refused its arguments.
+
+What may be logged and what may not:
+
+- **Log-safe.** The `Display` and `Debug` of every `Error` and `ConfigError`, and of
+  `OhttpConfigParams`, `OhttpConfig` and `OhttpNetworks` (which show only which fields are set).
+  The library itself never puts a URL, host name, address, port or key id of the configuration
+  or of the transport into an error. `Http` holds an `HttpError` that shows only its
+  `HttpErrorKind` (`Connect`, `Tls`, `Timeout`, `Status(n)`, `RedirectRefused`, `Body`,
+  `Request`, `Other`) and has no `source()`. What a peer chose appears as numbers (an outer or
+  DoH status, a length, a KEM or framing identifier) and in the two quotes below.
+- **Format-safe, content the relay's.** Two quotes of relay-chosen text: the relay's
+  `Content-Type` in `Error::MediaType` and `OuterOutcome::WrongMediaType { content_type }` (at
+  most 64 characters, `MAX_MEDIA_TYPE_CHARS`) and the relay's error body in
+  `OuterOutcome::Refused { detail }` (at most 120, `MAX_REFUSED_DETAIL_CHARS`). Each is one
+  short line of printable ASCII (anything else `?`), so it cannot inject log lines; but its
+  content is whatever the relay sent, and a relay's error body may itself name things (the
+  client's own address, a request or node identifier). A privacy-sensitive log records the
+  status and drops the quote.
+- **Not log-safe.** `HttpError::transport_error_not_log_safe()` (the HTTP stack's own error,
+  with URLs, hosts and addresses); the `Debug` of a `KeyConfigSource` (derived: it shows the
+  envelope URL and the signing key); the values behind the `OhttpConfig` accessors (relay URL,
+  gateway host, keys DNS name, signing key: they identify the deployment); a `Request`, a
+  `Response`, `ResponseEvent`s and decoded Binary HTTP messages (the user's request and the
+  backend's answer); key configurations, envelopes and `SignedKeys`; and trace ids, which link
+  the relay's and the gateway's logs.
 
 ## 6. Testing an integration
 

@@ -343,6 +343,24 @@ impl OhttpNetworks {
     }
 }
 
+/// `value` in the canonical form [`OhttpConfig::relay_url`] keeps a relay URL in, under the
+/// rules of [`OhttpConfigParams::relay_url`] (except the gateway-host rule, which needs the
+/// gateway host): for a caller that posts to a relay URL it did not get from an [`OhttpConfig`].
+/// The error is [`ConfigError::Invalid`] for [`ConfigField::RelayUrl`], naming the rule only.
+pub fn canonical_relay_url(value: &str) -> Result<String, ConfigError> {
+    if value.is_empty() {
+        return Err(ConfigError::Empty {
+            field: ConfigField::RelayUrl,
+        });
+    }
+    parse_relay_url(value)
+        .map(|relay| relay.url)
+        .map_err(|rule| ConfigError::Invalid {
+            field: ConfigField::RelayUrl,
+            rule,
+        })
+}
+
 /// The rule broken by a relay URL on a gateway host.
 const RELAY_ON_GATEWAY_HOST: &str = "must not be on a gateway host";
 
@@ -600,6 +618,27 @@ pub(crate) mod tests {
             ),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn a_relay_url_is_canonicalized_on_its_own() {
+        assert_eq!(
+            canonical_relay_url("https://Relay.Example:443/a/../relay/").unwrap(),
+            "https://relay.example/relay"
+        );
+        assert_eq!(
+            canonical_relay_url(""),
+            Err(ConfigError::Empty {
+                field: ConfigField::RelayUrl
+            })
+        );
+        assert_eq!(
+            canonical_relay_url("http://relay.example/relay"),
+            Err(ConfigError::Invalid {
+                field: ConfigField::RelayUrl,
+                rule: "must be an https:// URL"
+            })
+        );
     }
 
     #[test]

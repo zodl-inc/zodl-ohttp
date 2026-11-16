@@ -68,8 +68,12 @@ pub fn envelope_from_doh_json(
 fn envelope_from_doh_json_for(body: &[u8], expected_name: &str) -> Result<Vec<u8>, Error> {
     let refused = |why: String| Error::KeyConfig(format!("DoH response: {why}"));
 
-    let response: DohResponse = serde_json::from_slice(body)
-        .map_err(|e| refused(format!("not a DoH JSON response: {e}")))?;
+    let response: DohResponse = serde_json::from_slice(body).map_err(|e| {
+        refused(format!(
+            "not a DoH JSON response: {}",
+            crate::signed::json_error(&e)
+        ))
+    })?;
 
     if response.status != 0 {
         return Err(refused(format!("Status {}, not 0", response.status)));
@@ -173,19 +177,18 @@ fn parse_txt_presentation(data: &str) -> Result<String, String> {
                     let d2 = chars.next().ok_or("incomplete \\DDD escape")?;
                     let d3 = chars.next().ok_or("incomplete \\DDD escape")?;
                     if !d2.is_ascii_digit() || !d3.is_ascii_digit() {
-                        return Err(format!("invalid \\DDD escape: \\{d1}{d2}{d3}"));
+                        return Err("invalid \\DDD escape".into());
                     }
-                    let decimal = format!("{d1}{d2}{d3}");
-                    let byte: u8 = decimal
+                    let byte: u8 = format!("{d1}{d2}{d3}")
                         .parse()
-                        .map_err(|_| format!("invalid decimal escape: \\{decimal}"))?;
+                        .map_err(|_| "invalid decimal escape (over 255)")?;
                     result.push(byte as char);
                 }
-                Some(other) => return Err(format!("invalid escape: \\{other}")),
+                Some(_) => return Err("invalid escape".into()),
                 None => return Err("trailing backslash".into()),
             },
             _ if in_string => result.push(c),
-            _ => return Err(format!("unexpected character outside quoted string: {c}")),
+            _ => return Err("unexpected character outside quoted string".into()),
         }
     }
 
@@ -569,6 +572,27 @@ mod tests {
             assert_eq!(keys.not_after, v.not_after);
             // The record of the other network is not this one.
             assert!(envelope_from_doh_json_for(json.as_bytes(), MAINNET_NAME).is_err());
+        }
+    }
+
+    #[test]
+    fn a_refusal_does_not_quote_the_resolver() {
+        for body in [
+            r#"{"Status":"RELAY-TEXT\n"}"#.to_string(),
+            r#"{"RELAY-TEXT"#.to_string(),
+            format!(
+                r#"{{"Status":0,"Answer":[{{"name":"{MAINNET_NAME}","type":16,"data":"\"a\\RELAY-TEXT\""}}]}}"#
+            ),
+            format!(
+                r#"{{"Status":0,"Answer":[{{"name":"{MAINNET_NAME}","type":16,"data":"\"a\" RELAY-TEXT"}}]}}"#
+            ),
+        ] {
+            let Err(Error::KeyConfig(msg)) =
+                envelope_from_doh_json_for(body.as_bytes(), MAINNET_NAME)
+            else {
+                panic!("{body} was accepted");
+            };
+            assert!(!msg.contains("RELAY") && !msg.contains('\n'), "{msg}");
         }
     }
 }

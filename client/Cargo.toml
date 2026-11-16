@@ -36,6 +36,8 @@ serde_json = "1"
 thiserror = "2"
 # `Client`: fetching key configurations and posting to the relay.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"], optional = true }
+# Telling a TLS failure apart in `HttpError` (the rustls reqwest uses; no provider of its own).
+rustls = { version = "0.23", default-features = false, optional = true }
 # URL parsing: the checks of `Client`'s URLs and of the relay URL.
 url = "2.5"
 
@@ -43,7 +45,7 @@ url = "2.5"
 default = ["client"]
 ## `Client`, over reqwest. Without it the crate is the encapsulation alone, for callers
 ## that do their own I/O.
-client = ["dep:reqwest"]
+client = ["dep:reqwest", "dep:rustls"]
 ## `KeyConfigSource::Plain`, an unsigned key configuration, for tests against a local gateway
 ## (`Client::insecure_for_local_testing` only). Never enable it in a wallet build.
 insecure-plain-key-config = ["client"]
@@ -58,9 +60,9 @@ required-features = ["client", "insecure-plain-key-config"]
 ohttp-gateway = { path = "../gateway" }
 axum = "0.8"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time", "test-util", "io-util"] }
-# A local TLS server for the `Client` tests, on the ring provider reqwest uses.
-rustls = { version = "0.23", default-features = false }
-# The test root and leaf, generated at test time (no key material is shipped).
+# A local TLS server for the `Client` tests, on the ring provider reqwest uses (rustls itself
+# is a dependency of the feature `client`), with a root and leaf generated at test time by
+# rcgen (no key material is shipped).
 rcgen = { version = "0.14", default-features = false, features = ["ring"] }
 tokio-rustls = { version = "0.26", default-features = false }
 # Driving the gateway's streaming encoder in the chunked round-trip tests (its frame stream
