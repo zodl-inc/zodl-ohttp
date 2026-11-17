@@ -2333,6 +2333,7 @@ async fn gateway_handler(
             "gateway",
             "third_party_hosts",
             start.elapsed().as_secs_f64(),
+            client_trace_id.is_some(),
         );
         log.served_gateway("host_list", status, resp.body.len());
         return responder.collected(resp);
@@ -2468,6 +2469,7 @@ async fn gateway_handler(
                 &backend,
                 &backend_rpc,
                 start.elapsed().as_secs_f64(),
+                client_trace_id.is_some(),
             );
             log.served_third_party(status, resp.body.len());
             return responder.collected(resp);
@@ -2526,6 +2528,7 @@ async fn gateway_handler(
             &backend,
             &backend_rpc,
             start.elapsed().as_secs_f64(),
+            client_trace_id.is_some(),
         );
         return responder.stream(status, headers, log.stream("backend_stream", "-", stream));
     }
@@ -2553,6 +2556,7 @@ async fn gateway_handler(
             &backend,
             &rpc,
             start.elapsed().as_secs_f64(),
+            client_trace_id.is_some(),
         );
     };
 
