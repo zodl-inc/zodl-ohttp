@@ -2,7 +2,7 @@
 
 [Keep a Changelog](https://keepachangelog.com).
 
-## 2.1.0 (unreleased)
+## 2.1.0
 
 No breaking change. `Error` (non-exhaustive) gains the variant `NoHostList`.
 
