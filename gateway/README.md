@@ -313,7 +313,8 @@ trace ids are never labels. `network` is `NETWORK`.
 | Metric | Labels | Meaning |
 |---|---|---|
 | `ohttp_requests_total` | `status, mode, network, hop, method, http_status, grpc_status, backend, route_class` | Requests by outcome. |
-| `ohttp_request_duration_seconds` | `network, hop, backend` | Request duration (histogram). |
+| `ohttp_request_duration_seconds` | `network, hop, backend, rpc` | Request duration (histogram). |
+| `ohttp_traced_request_duration_seconds` | `network, hop, backend, rpc` | The same histogram (same buckets), observed in addition for requests whose outer request carried a valid `X-Client-Trace-Id`, so it holds only synthetic checks, test tools and debug builds. Real-user latency is `ohttp_request_duration_seconds` minus this one, per bucket. |
 | `ohttp_requests_in_flight` | `network` | Requests in flight. |
 | `ohttp_relay_requests_total` | `network, relay, edge` | Authenticated `POST /gateway` by relay name and edge location (below). |
 | `ohttp_relay_request_id_total` | `network, state` | Relay correlation id `present`, `missing` or `invalid`. |

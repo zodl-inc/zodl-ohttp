@@ -28,6 +28,21 @@ const DURATION_BUCKETS: [f64; 16] = [
     0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.15, 0.25, 0.35, 0.5, 0.75, 1.0, 1.5, 2.5, 5.0, 10.0,
 ];
 
+// A block of its own: the main one below is at the macro recursion limit.
+lazy_static::lazy_static! {
+    /// The same observations as `ohttp_request_duration_seconds`, for requests that carried a
+    /// valid client trace id only (synthetic checks and test tools; release clients send none).
+    static ref OHTTP_TRACED_REQUEST_DURATION_SECONDS: HistogramVec = HistogramVec::new(
+        prometheus::HistogramOpts::new(
+            "ohttp_traced_request_duration_seconds",
+            "OHTTP request duration in seconds, requests with a client trace id only"
+        )
+        .buckets(DURATION_BUCKETS.to_vec()),
+        &["network", "hop", "backend", "rpc"]
+    )
+    .unwrap();
+}
+
 lazy_static::lazy_static! {
     pub static ref REGISTRY: Registry = Registry::new();
 
@@ -482,6 +497,9 @@ pub fn init_metrics() {
         .register(Box::new(OHTTP_REQUEST_DURATION_SECONDS.clone()))
         .ok();
     REGISTRY
+        .register(Box::new(OHTTP_TRACED_REQUEST_DURATION_SECONDS.clone()))
+        .ok();
+    REGISTRY
         .register(Box::new(OHTTP_REQUESTS_IN_FLIGHT.clone()))
         .ok();
     REGISTRY
@@ -762,10 +780,25 @@ pub fn record_request_detailed(
         .inc();
 }
 
-pub fn record_duration(network: &str, hop: &str, backend: &str, rpc: &str, duration_secs: f64) {
+/// Observes a request duration. `traced`: the outer request carried a valid client trace id; the
+/// duration then also goes into `ohttp_traced_request_duration_seconds`.
+pub fn record_duration(
+    network: &str,
+    hop: &str,
+    backend: &str,
+    rpc: &str,
+    duration_secs: f64,
+    traced: bool,
+) {
+    let labels = [network, hop, backend, rpc];
     OHTTP_REQUEST_DURATION_SECONDS
-        .with_label_values(&[network, hop, backend, rpc])
+        .with_label_values(&labels)
         .observe(duration_secs);
+    if traced {
+        OHTTP_TRACED_REQUEST_DURATION_SECONDS
+            .with_label_values(&labels)
+            .observe(duration_secs);
+    }
 }
 
 pub fn record_in_flight_inc(network: &str) {
@@ -2150,10 +2183,10 @@ mod tests {
     fn test_record_duration_with_rpc_label() {
         init_metrics();
         // Record durations with different RPC methods
-        record_duration("testnet", "ohttp", "lwd", "GetLatestBlock", 0.15);
-        record_duration("testnet", "ohttp", "lwd", "SendTransaction", 0.25);
-        record_duration("testnet", "ohttp", "lwd", "GetBlockRange", 0.10);
-        record_duration("testnet", "ohttp", "lwd", "other", 0.05);
+        record_duration("testnet", "ohttp", "lwd", "GetLatestBlock", 0.15, false);
+        record_duration("testnet", "ohttp", "lwd", "SendTransaction", 0.25, false);
+        record_duration("testnet", "ohttp", "lwd", "GetBlockRange", 0.10, false);
+        record_duration("testnet", "ohttp", "lwd", "other", 0.05, false);
 
         let families = REGISTRY.gather();
         let histogram = families
@@ -2204,7 +2237,14 @@ mod tests {
     fn duration_histograms_use_the_fine_buckets_and_keep_the_old_bounds() {
         init_metrics();
         // A network label of its own: the registry is shared with the other tests.
-        record_duration("buckets-test", "ohttp", "lwd", "SendTransaction", 0.4);
+        record_duration(
+            "buckets-test",
+            "ohttp",
+            "lwd",
+            "SendTransaction",
+            0.4,
+            false,
+        );
         OHTTP_UPSTREAM_REQUEST_DURATION_SECONDS
             .with_label_values(&["buckets-test", "lwd", "SendTransaction"])
             .observe(0.4);
@@ -2257,6 +2297,58 @@ mod tests {
                 .get_cumulative_count()
         };
         assert!(at(0.5) > at(0.35));
+    }
+
+    #[test]
+    fn traced_durations_go_into_both_histograms_untraced_only_into_the_main_one() {
+        init_metrics();
+        // Network labels of their own: the registry is shared with the other tests.
+        record_duration("traced", "ohttp", "lwd", "GetLatestBlock", 0.2, true);
+        record_duration("untraced", "ohttp", "lwd", "GetLatestBlock", 0.2, false);
+
+        let families = REGISTRY.gather();
+        let series = |name: &str, network: &str| {
+            families
+                .iter()
+                .find(|f| f.get_name() == name)
+                .unwrap_or_else(|| panic!("{name} not registered"))
+                .get_metric()
+                .iter()
+                .find(|m| {
+                    m.get_label()
+                        .iter()
+                        .any(|l| l.get_name() == "network" && l.get_value() == network)
+                })
+                .map(|m| {
+                    let labels: Vec<(String, String)> = m
+                        .get_label()
+                        .iter()
+                        .map(|l| (l.get_name().to_string(), l.get_value().to_string()))
+                        .collect();
+                    let buckets: Vec<(f64, u64)> = m
+                        .get_histogram()
+                        .get_bucket()
+                        .iter()
+                        .map(|b| (b.get_upper_bound(), b.get_cumulative_count()))
+                        .collect();
+                    (labels, buckets, m.get_histogram().get_sample_count())
+                })
+        };
+
+        let main = series("ohttp_request_duration_seconds", "traced").unwrap();
+        let traced = series("ohttp_traced_request_duration_seconds", "traced").unwrap();
+        assert_eq!(main, traced, "same labels, buckets and counts");
+        assert_eq!(traced.2, 1);
+        let bounds: Vec<f64> = traced.1.iter().map(|b| b.0).collect();
+        assert_eq!(bounds, DURATION_BUCKETS.to_vec());
+
+        assert_eq!(
+            series("ohttp_request_duration_seconds", "untraced")
+                .unwrap()
+                .2,
+            1
+        );
+        assert!(series("ohttp_traced_request_duration_seconds", "untraced").is_none());
     }
 
     #[test]

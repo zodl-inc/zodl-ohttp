@@ -62,6 +62,12 @@ keeps its own log in [client/CHANGELOG.md](client/CHANGELOG.md).
 
 ### Gateway
 
+- New histogram `ohttp_traced_request_duration_seconds` (labels `network, hop, backend, rpc`,
+  the buckets of `ohttp_request_duration_seconds`): every duration observed in
+  `ohttp_request_duration_seconds` for a request whose outer request carried a valid
+  `X-Client-Trace-Id` is observed here too. Release clients send no trace id, so it holds only
+  synthetic checks, test tools and debug builds; subtracting it per bucket from
+  `ohttp_request_duration_seconds` gives real-user latency. Existing metrics are unchanged.
 - New, off by default: **dynamic third-party hosts** (`DYNAMIC_HOST_SOURCES`, a JSON array of
   sources). A source is the URL of a JSON document plus, per list in it, a JSON pointer to an
   array of URLs and the routes those hosts get. The gateway reads each source every
