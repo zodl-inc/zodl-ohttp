@@ -211,6 +211,19 @@ fn main() {
         ],
     );
 
+    write(
+        dir,
+        "gateway_dynamic_hosts",
+        &[
+            br#"{"hosts":["https://vote.example.org","https://query.example.org:8443/"],"servers":[{"url":"https://a.example.com","label":"a"}]}"#.to_vec(),
+            br#"{"hosts":["http://plain.example.org","https://127.0.0.1","https://user@b.example.org","https://localhost"],"servers":[{"label":"no url"},7]}"#.to_vec(),
+            br#"{"hosts":{"url":"https://c.example.org"}}"#.to_vec(),
+            b"https://vote.example.org:8443".to_vec(),
+            b"https://198.51.101.34/".to_vec(),
+            b"https://[::1]/".to_vec(),
+        ],
+    );
+
     let responses = responses();
     let mut wires: Vec<Vec<u8>> = responses
         .iter()

@@ -18,10 +18,12 @@
 pub mod block_cache;
 pub mod cache;
 pub mod config;
+pub mod dynamic_hosts;
 pub mod enforcement;
 pub mod flexa;
 pub mod freshness;
 pub mod health;
+pub mod host_list;
 pub mod hpke;
 pub mod lwd;
 pub mod lwd_endpoints;

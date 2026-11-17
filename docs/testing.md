@@ -83,6 +83,7 @@ lightwalletd or a third-party backend:
 | `gateway_inner_request` | Binary HTTP inner requests |
 | `gateway_grpc_frames` | gRPC frames from upstream |
 | `gateway_outer_headers` | outer request headers |
+| `gateway_dynamic_hosts` | dynamic host source documents |
 | `client_chunked_response` | chunked sealed responses |
 | `client_bhttp_response` | Binary HTTP responses |
 | `client_key_config` | `application/ohttp-keys` documents |

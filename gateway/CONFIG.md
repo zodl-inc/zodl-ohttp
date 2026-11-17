@@ -53,6 +53,151 @@ otherwise. A malformed value is a startup error unless a row says it falls back 
 | `THIRD_PARTY_RATE_LIMITS` | unset | Per-alias cap on upstream calls (cache hits do not count), `alias=REQUESTS/WINDOWs,...` (e.g. `prices.example=120/60s`). Over the cap the inner answer is 429 with `retry-after`. Fixed window, per process. |
 | `CACHE_KEY_BACKEND` | `LWD_ADDR` | Backend name written into cache keys. For an instance that fills the cache from a different lightwalletd address than the serving gateways use. |
 
+### Dynamic third-party hosts
+
+A service whose operators publish their server list in a JSON document can add a server at any
+time. With a static `BACKENDS` map the gateway refuses the new host until it is redeployed. A
+*dynamic host source* reads such a document periodically and serves the hosts it lists, like a
+`BACKENDS` alias whose target is the host itself: a listed `https://vote.example.org` makes the
+inner `:authority` `vote.example.org` go to `https://vote.example.org<path>`, on the routes of
+its list only. Off unless `DYNAMIC_HOST_SOURCES` is set.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `DYNAMIC_HOST_SOURCES` | unset | A JSON array of at most 8 sources (fields below). Unset or empty: no dynamic host. A malformed value, an unknown field or a value out of range is a startup error. |
+| `DYNAMIC_HOSTS_MAX_DOCUMENT_BYTES` | `262144` | Largest source document read (1024..=8388608). A larger one is refused while it is read (`result="too_large"`). |
+| `DYNAMIC_HOSTS_FETCH_TIMEOUT_SECS` | `10` | Network time of one refresh of one source in total: fetching the document and, when configured, its signature, each with connect, head and body (1..=60). Checking and applying the document is not part of it. |
+| `DYNAMIC_HOSTS_DENY_CIDRS` | unset | Address blocks no dynamic host is ever connected to, besides the non-public ones: comma-separated `address/prefix` (IPv4 or IPv6; an IPv4 block also covers its IPv4-mapped and NAT64 forms). For the operator's own public ranges and anything else that trusts the gateway's addresses. An IPv4 block written in IPv4-mapped IPv6 form (prefix 96 or longer) is that IPv4 block; any other IPv6 block covers IPv6 addresses only. Read once, when the process starts. A malformed entry is a startup error. |
+| `THIRD_PARTY_HOSTS_PUBLISH` | `off` | The host list for wallets (below): `off`, `dynamic` (the hosts of the sources) or `all` (the `BACKENDS` aliases too). Any other value is a startup error. |
+| `THIRD_PARTY_HOSTS_MAX_AGE_SECS` | `300` | How long a wallet may use the host list before it asks again (30..=86400): `max_age_secs` in the document and `cache-control: max-age`. |
+
+Fields of a source:
+
+| Field | Default | Meaning |
+|---|---|---|
+| `name` | required | 1 to 32 characters of `a-z`, `0-9`, `-`, `_`; unique. The `source` metric label; the hosts' `backend` label is `dynamic:<name>`. |
+| `url` | required | The document, `https://` only. Fetched with `GET`; only a `200` counts, a redirect is not followed. This URL (and `signature_url`) is the operator's choice and is fetched with the ordinary client: it may be an internal mirror. The public-address rule below is for the hosts the document lists. |
+| `refresh_secs` | `60` | Refresh interval (30..=86400), with ±10 % jitter. After a failed refresh the next attempt comes after `min(refresh_secs, 60)` s, with the same jitter. |
+| `lists` | required | 1 to 8 lists: `pointer` (RFC 6901 JSON pointer to an array), `url_field` (the field of each element that holds the URL; omitted: the elements are the URL strings), `routes` (what the hosts of this list may be asked, `METHOD /path,METHOD /prefix/*` as in `BACKENDS_POLICY`; required), `read_routes` (of those, the ones without a side effect, in the same syntax; default none, so every request is a WRITE for the replay check). A host in several lists may be asked what any of them allows; a request is a READ only when every list that allows it also has it in `read_routes`, so a `read_routes` entry never reaches beyond its own list's `routes`. `REPLAY_READ_ROUTES` and `REPLAY_ONE_SIDED_WRITE_ROUTES` are not consulted for a dynamic host. |
+| `host_suffixes` | none | When set, a listed host must equal one of these names or be a subdomain of one. |
+| `allow_ports` | none | Ports accepted besides 443. A host on another port is addressed as `host:port`. |
+| `max_hosts` | `64` | Hosts per document (1..=256). A document that lists more is refused whole (`result="invalid"`). |
+| `max_new_hosts_per_refresh` | `8` (at most `max_hosts`) | Hosts not served yet that one refresh admits, in document order; the rest wait for the next refreshes (`result="partial"`, `ohttp_dynamic_hosts_held`). The first document a process accepts is bounded by `max_hosts` only. |
+| `rate_limit` | none | Cap on upstream calls per host, `REQUESTS/WINDOWs` as in `THIRD_PARTY_RATE_LIMITS`; over it the inner answer is 429 with `retry-after`. Per process. The window and the in-flight count belong to the host for as long as the source lists it, whatever happens to its routes; a host that leaves the list and returns starts anew. |
+| `signature_url`, `signature_keys` | none | Together: the document is accepted only with a detached Ed25519 signature over its exact bytes, fetched from `signature_url` (the base64 text of the 64 bytes, or the 64 raw bytes), that verifies under one of `signature_keys` (base64 public keys). Else `result="signature"`. The signature proves who wrote the document, not that it is the newest one: an older signed document is accepted again. |
+
+```
+DYNAMIC_HOST_SOURCES=[{"name":"servers","url":"https://config.example.org/dynamic.json",
+  "lists":[{"pointer":"/api_servers","url_field":"url","routes":"GET /*,POST /*","read_routes":"GET /*"},
+           {"pointer":"/query_endpoints","url_field":"url","routes":"GET /root,POST /v1/query"}],
+  "rate_limit":"600/60s"}]
+```
+
+Rules:
+
+- **Static configuration wins.** A listed host that is a `BACKENDS` alias, a `GATEWAY_HOSTS`
+  name, the host of a `BACKENDS` target or of `LWD_ADDR` is never served from a source
+  (`ohttp_dynamic_hosts_shadowed`): what the static configuration forwards to stays reachable
+  only under its alias, with that alias' policy, cache and limits. Of two sources that list
+  one host, the first in the array serves it.
+- A listed URL must be `https://host[:port]` and nothing more: no userinfo, no path (a single
+  `/` is accepted), query or fragment. The host is a DNS name of at least two labels whose last
+  label is alphabetic (or `xn--`) and not a special-use name (`localhost`, `local`, `internal`,
+  `arpa`, `test`, `invalid`, `onion`, `lan`, `home`, `corp`), or a public dotted-quad IPv4
+  address; IPv6 literals are not accepted. An entry that fails is skipped
+  (`ohttp_dynamic_hosts_rejected`) and the others are served: a host whose entry became
+  invalid is no longer served, like a host that was removed. A document whose lists hold more
+  than four times `max_hosts` entries in total, valid or not, is refused whole (`invalid`).
+- **Only public addresses are connected to.** Requests to dynamic hosts use their own HTTPS
+  client, whose resolver drops every address that is not globally routable (loopback, private,
+  shared, link-local including the instance metadata address, unique local, multicast,
+  documentation, reserved, and the IPv4-mapped, NAT64, 6to4 forms of those) and every address
+  in `DYNAMIC_HOSTS_DENY_CIDRS` before a connection is made. A host name without such an
+  address fails to connect (inner 502), whatever it resolved to when it was listed. A host
+  listed as an IPv4 literal is checked when it is listed and again for every request. TLS
+  certificates are verified as for `BACKENDS`.
+- A dynamic host gets only the routes of its list: `BACKENDS_POLICY_DEFAULT=allow` does not
+  apply. It never receives `BACKEND_HEADERS` values or the `FLEXA_ALIAS` handling, and
+  `THIRD_PARTY_CACHE_ROUTES` and `THIRD_PARTY_RATE_LIMITS` do not apply to it. The gateway's
+  `X-Request-Id` is not sent to it. The global and per-backend in-flight limits, response size
+  limit and timeouts apply as to any third party; without the source's `rate_limit` there is
+  no cap on the call rate, only on calls in flight.
+- **Last-known-good.** A failed fetch, a status other than 200, an oversized or unparsable
+  document, a missing list, a document without a valid host, more hosts than `max_hosts` or a
+  signature that does not verify change nothing: the hosts of the last accepted document stay
+  served, and the refresh is counted by `result`. A source cannot empty its list. (Single
+  invalid entries of an otherwise valid document are skipped, see above.)
+- A refresh replaces the served set in one step. A request reads the served set once, before
+  its replay check, and uses that entry for its replay class, policy, limits, labels and the
+  forward; requests in flight to a host that was removed complete.
+- Before it serves, a starting gateway attempts one refresh per source, all at once. The
+  network waits of a refresh end after `DYNAMIC_HOSTS_FETCH_TIMEOUT_SECS`; checking and
+  applying a document (of at most `DYNAMIC_HOSTS_MAX_DOCUMENT_BYTES`) comes on top. Leave room
+  for both in the startup probe's budget; a source that does not answer never stops the start, its hosts are missing until
+  it does. Nothing is kept across restarts, so hosts that must be
+  reachable while a source is down belong in `BACKENDS`. The same holds when a source's
+  document stops listing any valid host: replicas that accepted hosts from it before keep
+  them (`result="empty"`), a replica started since then has none, until the source lists
+  hosts again or the older replicas restart.
+- Every process refreshes on its own. While the source answers, replicas differ for about one
+  refresh interval at most (longer while hosts are held by `max_new_hosts_per_refresh`); while
+  it does not, each keeps what it last accepted, and a replica started meanwhile has none, for
+  as long as the outage lasts. A request for a host a replica does not serve gets the inner
+  403 `unknown authority`. A replica without the feature refuses every
+  dynamic host, so when moving hosts from `BACKENDS` to a source, remove the static entries
+  only after every replica runs with the source.
+- In `proxy` mode (`GATEWAY_MODE=proxy`, no OHTTP) a dynamic host is selected by the request's
+  `Host`, exactly like a `BACKENDS` alias, under the same rules as above.
+
+Published server lists are usually not signed: where such a document carries signatures, they
+tend to cover other entries of it, not the server lists and not the document as a whole. So without `signature_url`
+the list's only authenticity is TLS to `url`. What a wrong or compromised document can then add
+is bounded by the rules above: at most `max_hosts` public HTTPS hosts, at most
+`max_new_hosts_per_refresh` more per refresh, reachable on the configured routes only, without
+any credential. Public is not the same as harmless: a listed host can be any public service,
+including one that trusts the gateway's egress addresses, or the operator's own public
+(IPv4 or IPv6) addresses: list those in `DYNAMIC_HOSTS_DENY_CIDRS`. Where the publisher's
+hosts share domains, set `host_suffixes`; a source with neither `host_suffixes` nor a signature is logged
+at startup. Alert on `ohttp_dynamic_hosts_held > 0` and on refresh results other than `ok` and
+`unchanged`. The growth cap does not bound the first document a process accepts (a restart
+loads up to `max_hosts` at once; logged when it exceeds `max_new_hosts_per_refresh`), so also
+watch `ohttp_dynamic_hosts` itself.
+
+#### The host list for wallets
+
+Wallets refuse to send a third-party request through the gateway unless they know the gateway
+carries its host. With `THIRD_PARTY_HOSTS_PUBLISH` the gateway tells them: the inner request
+`GET /ohttp-gateway/v1/third-party-hosts` with a `GATEWAY_HOSTS` name as `:authority` (through
+OHTTP only; the path does not exist on the public listener) is answered by the gateway itself:
+
+```json
+{"version":1,"revision":"5b0c1d9e7a3f2c44","scope":"all","max_age_secs":300,
+ "hosts":[{"host":"vote.example.org","routes":["GET /*","POST /*"]}]}
+```
+
+`host` is what a wallet puts in `:authority`; nothing else about a backend is published (no
+alias target, no injected header, no source). `routes` are the operations forwarded, in
+`BACKENDS_POLICY` syntax. Under `all`, a `BACKENDS` alias is listed with its `BACKENDS_POLICY`
+rules; one without rules only under `BACKENDS_POLICY_DEFAULT=allow`, as `* /*`. `hosts` is
+sorted. `scope` repeats the mode: `all` = every third-party host the gateway carries, `dynamic`
+= only the hosts of the sources (for a wallet that replaces a compiled list, publish `all`).
+`revision` is derived from `version`, `scope`, `max_age_secs` and `hosts`, so it changes
+exactly when the document does and is the same on replicas with the same configuration and
+the same hosts. The answer carries `cache-control: max-age` and
+`etag: "<revision>"`; a request whose `if-none-match` names the current revision gets a 304
+without a body. The request passes the same checks as any inner request (relay
+authentication, freshness, replay) and counts as a READ; the gateway host's `BACKENDS_POLICY`
+entry does not apply to it. A process that has no complete list answers an inner 503 instead
+of a shorter list: until the document of every source has been read once since the start
+(its hosts would be missing although other replicas serve them; a document without any valid
+host counts as read, a source that cannot be fetched, parsed or verified does not, so the 503
+lasts as long as such a failure; `ohttp_dynamic_hosts_last_success_timestamp_seconds` has no
+value for that source), or if the document would exceed 256 KiB (logged
+as an error once each time it becomes too large and counted in `ohttp_requests_total{status="unavailable",
+backend="gateway"}`; wallets refuse a larger one). With `off` the path is an ordinary lightwalletd
+path. What a wallet
+does with the list: [README.md](README.md), "Third-party host list: wallet integration".
+
 ## Limits and timeouts
 
 | Variable | Default | Meaning |

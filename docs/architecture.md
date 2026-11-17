@@ -49,6 +49,11 @@ request's HPKE context, the relay returns it unchanged, and only the wallet can 
 The inner request's `:authority` selects the upstream: a `GATEWAY_HOSTS` name goes to
 lightwalletd, an exact `BACKENDS` alias to that alias's base URL, anything else is refused with
 an inner 403. Every alias has an explicit allowlist of methods and paths (`BACKENDS_POLICY`).
+Hosts that a service publishes in a server list can be served without a static entry
+(`DYNAMIC_HOST_SOURCES`): the gateway reads the list periodically, serves each listed host as
+itself on configured routes only, connects to public addresses only, and keeps the last accepted
+list when the source fails. The gateway can publish the set of third-party hosts it carries to
+wallets (`THIRD_PARTY_HOSTS_PUBLISH`), so that they need no compiled copy of it.
 Only an allowlist of request and response headers crosses the gateway; credentials an upstream
 needs are injected by the gateway (`BACKEND_HEADERS`) and never come from the client.
 
