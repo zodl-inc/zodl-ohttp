@@ -2,6 +2,57 @@
 
 [Keep a Changelog](https://keepachangelog.com).
 
+## 2.1.0
+
+No breaking change. `Error` (non-exhaustive) gains the variant `NoHostList`.
+
+### Added
+
+- The third-party host list of a gateway (`gateway/README.md`, "Third-party host list: wallet
+  integration"), so that every wallet uses one implementation of it instead of a compiled copy
+  of the gateway's hosts. No new dependency; nothing starts a task or a timer.
+  - `third_party_hosts_request(gateway_host, revision)` builds the inner request
+    (`GET /ohttp-gateway/v1/third-party-hosts`, `if-none-match` for a held revision) and
+    `read_third_party_hosts(&Response)` reads the answer: `HostListAnswer::List(HostList)`
+    (`revision`, `scope`, `max_age_secs`, `hosts` of `CarriedHost { host, routes }`),
+    `HostListAnswer::NotModified`, or `NoHostList` (`Status(n)`, `TooLarge`, `Malformed`,
+    `Version`, `UnexpectedNotModified`). Unknown fields are ignored, any `version` other than 1
+    is no list, a body over 256 KiB (`MAX_THIRD_PARTY_HOSTS_BYTES`) is refused, an entry of
+    `hosts` that is not well-formed or whose `host` is no `host[:port]` is left out.
+  - `ThirdPartyHosts::new(bootstrap)` holds the compiled list and the list last fetched.
+    `is_carried(host)` / `carried_authority(host)` compare `host[:port]` whole and
+    case-insensitively (no suffix matching, no other equivalence: `name:443` is not `name`):
+    the bootstrap list before a fetch, exactly the list while its scope is `all`, the list plus
+    the bootstrap list while it is `dynamic` or unknown. `filter_servers(urls)` keeps the
+    `https` server URLs the gateway carries, each with the `:authority` to send
+    (`CarriedServer { url, authority }`), and says whether any is left (`CarriedServers::any`),
+    so a caller drops servers the gateway does not carry instead of failing; nothing suggests a
+    direct connection. A server URL must be plain: `https://`, no userinfo, whitespace or
+    backslash, the host written as it is sent.
+  - Refreshing, sans-IO: `begin_refresh()` returns a `HostListRefresh` when one is due (no list
+    yet, the list older than `max_age_secs` clamped to 30 s..24 h, or asked for) and none is
+    running (`is_refreshing()`); `finish_refresh(refresh, Some(&response) | None)` or
+    `fail_refresh(refresh, reason)` ends it (`RefreshOutcome`). A failure keeps what is held
+    and starts a backoff (30 s, doubling to 5 min); a refresh that was asked for is tried
+    again after it. `report_unknown_authority(host)` (after `is_unknown_authority(&response)`,
+    an inner `403 unknown authority`, for a listed host) asks for a refresh at most once per
+    30 s; `refresh_before_refusing()` says whether one is worth it before a host is refused
+    (no list yet, or one older than 5 s). Every one of these has an `_at(.., now)` form. A
+    refresh is finished only at the holder that began it and within 5 minutes of its
+    beginning; otherwise it changes nothing (`RefreshOutcome::Superseded`).
+  - With the feature `client`: `Client::third_party_hosts(gateway_host, revision, timeout)` and
+    `ThirdPartyHosts::refresh(&client, gateway_host, timeout)`; both stop reading the answer at
+    256 KiB. `refresh` limits its exchange to four minutes, gives it up when its future is
+    dropped, and returns `RefreshOutcome::Running` when another refresh is in flight (a host
+    refused at that moment may be in the list that refresh brings).
+  - The new public structs and `HostListAnswer` are `#[non_exhaustive]`.
+- `Error::NoHostList(NoHostList)`: the gateway's answer to a host list request is no list.
+  Like every error of the library it shows a status or a fixed text only.
+
+### Documentation
+
+- `INTEGRATION.md`: section 5, "The gateway's third-party hosts".
+
 ## 2.0.2
 
 No API or wire-format change.

@@ -275,6 +275,24 @@ fn main() {
 
     write(
         dir,
+        "client_third_party_hosts",
+        &[
+            cat(
+                &[2],
+                br#"{"version":1,"revision":"5b0c1d9e7a3f2c44","scope":"all","max_age_secs":300,"hosts":[{"host":"api.example.org","routes":["GET /*","POST /*"]},{"host":"query.example.org:8443","routes":["GET /root"]}]}"#,
+            ),
+            cat(
+                &[3],
+                br#"{"version":1,"revision":"r2","scope":"dynamic","max_age_secs":30,"future":{"x":1},"hosts":[{"host":"Compiled.Example.org","routes":[]},{"host":"https://not-a-host/","routes":[]}]}"#,
+            ),
+            cat(&[4], br#"{"version":2,"entirely":"different"}"#),
+            cat(&[0], b""),
+            cat(&[1], b"host list not ready"),
+        ],
+    );
+
+    write(
+        dir,
         "client_outer",
         &[
             cat(&[1, 0xad], b"30"),

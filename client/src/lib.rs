@@ -31,6 +31,10 @@
 //! - `Client` (feature `client`): one relay and one gateway, the key configuration
 //!   fetched on first use and again after a key rotation, and one call per request.
 //!
+//! Beside them, with no I/O of its own: [`ThirdPartyHosts`], the third-party hosts a gateway
+//! carries as the gateway publishes them (which hosts may be sent through it, which servers
+//! of a service to use), fetched through either layer.
+//!
 //! Underneath both is a sans-IO core for clients that do their own I/O (the Android and iOS
 //! SDKs over Tor-capable transports, Slipstream over hyper): [`KeyConfig::select_with`],
 //! [`verify_signed_config`], [`encode_bhttp_request`], [`encapsulate_chunked_request`],
@@ -106,6 +110,7 @@ mod message;
 mod outer;
 mod profile;
 mod signed;
+mod third_party_hosts;
 mod trace;
 
 pub use bhttp_codec::{
@@ -142,6 +147,14 @@ pub use signed::{
     open_signed_config, verify_signed_config, verify_signed_config_with, Base64Decoding,
     DuplicateKeys, Network, NetworkRule, SignatureCheck, SignedConfigPolicy, SignedKeys,
     UnknownFields, CLOCK_SKEW_SECS,
+};
+pub use third_party_hosts::{
+    is_unknown_authority, read_third_party_hosts, third_party_hosts_request, CarriedHost,
+    CarriedServer, CarriedServers, HostList, HostListAnswer, HostListRefresh, HostListScope,
+    NoHostList, RefreshOutcome, ThirdPartyHosts, FIRST_REFRESH_BACKOFF, MAX_HOST_LIST_AGE,
+    MAX_REFRESH_BACKOFF, MAX_THIRD_PARTY_HOSTS_BYTES, MIN_HOST_LIST_AGE, REFRESH_ABANDONED_AFTER,
+    REFUSAL_REFRESH_MIN_AGE, THIRD_PARTY_HOSTS_PATH, THIRD_PARTY_HOSTS_VERSION,
+    UNKNOWN_AUTHORITY_REFRESH_INTERVAL,
 };
 pub use trace::{ClientTrace, PrefixSanitization, TraceIdFormat, TracePolicy};
 
@@ -218,6 +231,10 @@ pub enum Error {
     /// or a field too long to frame.
     #[error("binary HTTP: {0}")]
     BhttpFormat(String),
+    /// The gateway's answer to a host list request is no list ([`NoHostList`]): keep the list
+    /// held. Shows a status or a fixed text only.
+    #[error("no third-party host list: {0}")]
+    NoHostList(NoHostList),
 }
 
 /// A transport error of `Client`, reduced to its kind ([`HttpError`]).

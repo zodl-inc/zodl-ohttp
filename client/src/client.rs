@@ -29,9 +29,9 @@ use crate::chunked::{
 };
 use crate::{
     check_size, encode_request, open_signed_config, retry_after_delay, signed_config_url, Error,
-    HttpError, HttpErrorKind, KeyConfig, Limits, Network, OhttpNetworks, OuterHeaders,
-    RelayBackoff, Request, Response, SignedConfigUrlRule, SizeGuard,
-    GATEWAY_MAX_ENCAPSULATED_REQUEST_BYTES,
+    HostListAnswer, HttpError, HttpErrorKind, KeyConfig, Limits, Network, NoHostList,
+    OhttpNetworks, OuterHeaders, RelayBackoff, Request, Response, SignedConfigUrlRule, SizeGuard,
+    GATEWAY_MAX_ENCAPSULATED_REQUEST_BYTES, MAX_THIRD_PARTY_HOSTS_BYTES,
 };
 
 /// Where a gateway's key configuration is fetched, and how it is authenticated.
@@ -269,6 +269,67 @@ impl Client {
         let mut events = Vec::new();
         while let Some(event) = stream.next().await {
             events.push(event?);
+        }
+        collect_response(events)
+    }
+
+    /// Fetches the list of third-party hosts the gateway `gateway_host` carries (the
+    /// gateway's own host name, as for lightwalletd calls), through the relay like any other
+    /// request, within `timeout`. `revision`: the revision of the list held, sent as
+    /// `if-none-match`; the answer is then [`HostListAnswer::NotModified`] while that list is
+    /// still the gateway's.
+    ///
+    /// [`Error::NoHostList`] when the gateway's answer is no list (it does not publish one, has
+    /// no complete list at the moment, or sent a document this crate does not read or one
+    /// over 256 KiB, which is not read to its end): keep what is held. Any other error is
+    /// that of [`send`](Self::send).
+    /// [`ThirdPartyHosts`](crate::ThirdPartyHosts) holds the list and decides when to fetch
+    /// it again.
+    pub async fn third_party_hosts(
+        &self,
+        gateway_host: &str,
+        revision: Option<&str>,
+        timeout: Duration,
+    ) -> Result<HostListAnswer, Error> {
+        let request = crate::third_party_hosts_request(gateway_host, revision);
+        let sent_revision = request
+            .headers
+            .iter()
+            .any(|(name, _)| name == "if-none-match");
+        let response = match self.host_list_exchange(&request, timeout).await {
+            Err(Error::TooLarge { .. }) => return Err(Error::NoHostList(NoHostList::TooLarge)),
+            other => other?,
+        };
+        match crate::read_third_party_hosts(&response) {
+            Ok(HostListAnswer::NotModified) if !sent_revision => {
+                Err(Error::NoHostList(NoHostList::UnexpectedNotModified))
+            }
+            Ok(answer) => Ok(answer),
+            Err(reason) => Err(Error::NoHostList(reason)),
+        }
+    }
+
+    /// [`send`](Self::send) for a host list request: the answer's body is read up to
+    /// [`MAX_THIRD_PARTY_HOSTS_BYTES`] and no further ([`Error::TooLarge`] beyond it).
+    pub(crate) async fn host_list_exchange(
+        &self,
+        request: &Request,
+        timeout: Duration,
+    ) -> Result<Response, Error> {
+        let mut stream = self.send_stream(request, timeout).await?;
+        let mut events = Vec::new();
+        let mut body_bytes = 0usize;
+        while let Some(event) = stream.next().await {
+            let event = event?;
+            if let ResponseEvent::Data(data) = &event {
+                body_bytes = body_bytes.saturating_add(data.len());
+                if body_bytes > MAX_THIRD_PARTY_HOSTS_BYTES {
+                    return Err(Error::TooLarge {
+                        max: MAX_THIRD_PARTY_HOSTS_BYTES,
+                    });
+                }
+            }
+            events.push(event);
         }
         collect_response(events)
     }
