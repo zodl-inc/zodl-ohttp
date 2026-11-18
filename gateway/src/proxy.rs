@@ -110,6 +110,9 @@ pub fn dynamic_host(config: &Config, authority_lower: &str) -> Option<Arc<Dynami
 #[derive(Clone, Default)]
 pub struct RouteContext {
     dynamic: Option<Arc<DynamicHost>>,
+    /// The `THIRD_PARTY_QUERY_RULES` verdict taken once for this request
+    /// ([`RouteContext::with_query_verdict`]); `None`: evaluated where needed.
+    query_admitted: Option<bool>,
 }
 
 impl RouteContext {
@@ -118,7 +121,22 @@ impl RouteContext {
     pub fn resolve(config: &Config, inner_request: &InnerRequest) -> Self {
         Self {
             dynamic: dynamic_host(config, &inner_request.authority.to_ascii_lowercase()),
+            query_admitted: None,
         }
+    }
+
+    /// Take the `THIRD_PARTY_QUERY_RULES` verdict for `inner_request` now, with the source lists
+    /// of this moment, so that every later check of the request (the handler's precheck, the
+    /// collected and the streamed forward) uses the same one: a list replaced meanwhile can
+    /// neither admit a request the precheck refused (an upstream call past the cap) nor refuse
+    /// one it admitted (a spent cap call for an inner 403).
+    pub fn with_query_verdict(mut self, config: &Config, inner_request: &InnerRequest) -> Self {
+        self.query_admitted = Some(config.third_party_query_rules.admits(
+            &inner_request.authority,
+            &inner_request.method,
+            &inner_request.path,
+        ));
+        self
     }
 
     /// The dynamic host the request is for, if any.
@@ -192,6 +210,7 @@ impl RouteContext {
 pub fn backend_label(config: &Config, authority: &str) -> String {
     RouteContext {
         dynamic: dynamic_host(config, &authority.to_ascii_lowercase()),
+        query_admitted: None,
     }
     .backend_label(config, authority)
 }
@@ -371,6 +390,12 @@ fn path_trick(path: &str) -> Option<&'static str> {
     None
 }
 
+/// The request-side path rejections ([`path_trick`], [`validate_path`]) for a
+/// `THIRD_PARTY_QUERY_RULES` rule path, checked at startup.
+pub(crate) fn rule_path_rejection(path: &str) -> Option<&'static str> {
+    path_trick(path).or_else(|| validate_path(path))
+}
+
 /// Whether a dynamic host's routes refuse `method path`: `None` if allowed, `Some(reason)` if
 /// not. Only the routes of the host's list count; `BACKENDS_POLICY_DEFAULT` never applies.
 fn check_dynamic_policy(host: &DynamicHost, method: &str, path: &str) -> Option<&'static str> {
@@ -389,6 +414,7 @@ fn check_dynamic_policy(host: &DynamicHost, method: &str, path: &str) -> Option<
 fn route_denial(
     config: &Config,
     dynamic: Option<&DynamicHost>,
+    query_admitted: Option<bool>,
     inner_request: &InnerRequest,
 ) -> Option<&'static str> {
     if let Some(host) = dynamic {
@@ -400,15 +426,17 @@ fn route_denial(
     {
         return None;
     }
-    check_operation_policy(
+    check_operation_policy_with(
         config,
         &inner_request.authority,
         &inner_request.method,
         &inner_request.path,
+        query_admitted,
     )
 }
 
-/// Check if a request matches the per-alias operation policy.
+/// Check if a request matches the per-alias operation policy and, for a route with a
+/// `THIRD_PARTY_QUERY_RULES` entry, its query rule.
 /// Returns None if allowed, Some(reason) if denied.
 ///
 /// A policy may allow every method on `/*` for a host whose protocol is public and for which the
@@ -419,6 +447,18 @@ fn check_operation_policy(
     method: &str,
     path: &str,
 ) -> Option<&'static str> {
+    check_operation_policy_with(config, authority, method, path, None)
+}
+
+/// [`check_operation_policy`] with the request's query verdict when it was taken already
+/// (`query_admitted`), else evaluated now.
+fn check_operation_policy_with(
+    config: &Config,
+    authority: &str,
+    method: &str,
+    path: &str,
+    query_admitted: Option<bool>,
+) -> Option<&'static str> {
     if let Some(reason) = path_trick(path) {
         return Some(reason);
     }
@@ -427,15 +467,25 @@ fn check_operation_policy(
 
     // If policy exists for this alias, check it
     if let Some(policies) = config.backends_policy.get(&authority_lower) {
-        if matching_rule(policies, method, path).is_some() {
-            return None; // Allowed
+        if matching_rule(policies, method, path).is_none() {
+            return Some("operation not in alias policy");
         }
-        return Some("operation not in alias policy");
+    } else if config.backends.contains_key(&authority_lower)
+        && !config.backends_policy_default_allow
+    {
+        // No policy for this alias: check default
+        return Some("alias has no operation policy");
     }
 
-    // No policy for this alias: check default
-    if config.backends.contains_key(&authority_lower) && !config.backends_policy_default_allow {
-        return Some("alias has no operation policy");
+    // An allowed operation whose exact route has a THIRD_PARTY_QUERY_RULES entry must carry
+    // one of the query shapes listed there.
+    let admitted = query_admitted.unwrap_or_else(|| {
+        config
+            .third_party_query_rules
+            .admits(&authority_lower, method, path)
+    });
+    if !admitted {
+        return Some("query not allowed");
     }
 
     None
@@ -464,11 +514,12 @@ pub fn policy_denies_in(
     config
         .backends
         .contains_key(&inner_request.authority.to_ascii_lowercase())
-        && check_operation_policy(
+        && check_operation_policy_with(
             config,
             &inner_request.authority,
             &inner_request.method,
             &inner_request.path,
+            route.query_admitted,
         )
         .is_some()
 }
@@ -1232,7 +1283,12 @@ async fn forward_to_backend_internal(
     // Check operation policy for mapped backends
     let authority_lower = inner_request.authority.to_ascii_lowercase();
     {
-        if let Some(reason) = route_denial(config, dynamic.as_deref(), inner_request) {
+        if let Some(reason) = route_denial(
+            config,
+            dynamic.as_deref(),
+            route.query_admitted,
+            inner_request,
+        ) {
             warn!(
                 policy = "deny",
                 request_id = ?request_id,
@@ -1831,7 +1887,12 @@ pub async fn forward_to_backend_stream_in(
     // Check operation policy for mapped backends
     let authority_lower = inner_request.authority.to_ascii_lowercase();
     {
-        if let Some(reason) = route_denial(config, dynamic.as_deref(), inner_request) {
+        if let Some(reason) = route_denial(
+            config,
+            dynamic.as_deref(),
+            route.query_admitted,
+            inner_request,
+        ) {
             warn!(
                 policy = "deny",
                 request_id = ?request_id,
@@ -2541,6 +2602,7 @@ mod tests {
             near_alias: None,
             dynamic_hosts: Default::default(),
             host_list: Default::default(),
+            third_party_query_rules: Default::default(),
             relay_secret_on_key_config: crate::config::RelaySecretOnKeyConfig::Off,
         }
     }
@@ -2981,6 +3043,7 @@ mod policy_enforcement_tests {
             near_alias: None,
             dynamic_hosts: Default::default(),
             host_list: Default::default(),
+            third_party_query_rules: Default::default(),
             relay_secret_on_key_config: crate::config::RelaySecretOnKeyConfig::Off,
         }
     }
@@ -3215,6 +3278,7 @@ mod policy_tests {
             near_alias: None,
             dynamic_hosts: Default::default(),
             host_list: Default::default(),
+            third_party_query_rules: Default::default(),
             relay_secret_on_key_config: crate::config::RelaySecretOnKeyConfig::Off,
         }
     }
@@ -3352,6 +3416,7 @@ mod method_wildcard_tests {
             near_alias: None,
             dynamic_hosts: Default::default(),
             host_list: Default::default(),
+            third_party_query_rules: Default::default(),
             relay_secret_on_key_config: crate::config::RelaySecretOnKeyConfig::Off,
         };
 
@@ -3428,6 +3493,7 @@ mod path_semantics_tests {
             near_alias: None,
             dynamic_hosts: Default::default(),
             host_list: Default::default(),
+            third_party_query_rules: Default::default(),
             relay_secret_on_key_config: crate::config::RelaySecretOnKeyConfig::Off,
         };
 
@@ -3508,6 +3574,7 @@ mod path_semantics_tests {
             near_alias: None,
             dynamic_hosts: Default::default(),
             host_list: Default::default(),
+            third_party_query_rules: Default::default(),
             relay_secret_on_key_config: crate::config::RelaySecretOnKeyConfig::Off,
         };
 
@@ -3596,6 +3663,7 @@ mod path_semantics_tests {
             near_alias: None,
             dynamic_hosts: Default::default(),
             host_list: Default::default(),
+            third_party_query_rules: Default::default(),
             relay_secret_on_key_config: crate::config::RelaySecretOnKeyConfig::Off,
         };
 
@@ -3813,6 +3881,7 @@ mod stream_tests {
             near_alias: None,
             dynamic_hosts: Default::default(),
             host_list: Default::default(),
+            third_party_query_rules: Default::default(),
             relay_secret_on_key_config: crate::config::RelaySecretOnKeyConfig::Off,
         };
 
@@ -4039,6 +4108,7 @@ mod stream_tests {
             near_alias: None,
             dynamic_hosts: Default::default(),
             host_list: Default::default(),
+            third_party_query_rules: Default::default(),
             relay_secret_on_key_config: crate::config::RelaySecretOnKeyConfig::Off,
         };
 
@@ -4292,6 +4362,310 @@ mod stream_tests {
             let (status, _) = collect_body(&state, &flexa_request(method, path, &[])).await;
             assert_eq!(status, 200, "{method} {path}");
         }
+    }
+
+    /// A backend that records the path and query of every request it gets and answers `ok`.
+    async fn make_recording_server() -> (String, Arc<parking_lot::Mutex<Vec<String>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let recorded = seen.clone();
+        tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let recorded = recorded.clone();
+                let service = service_fn(move |req: Request<hyper::body::Incoming>| {
+                    let recorded = recorded.clone();
+                    async move {
+                        recorded.lock().push(
+                            req.uri()
+                                .path_and_query()
+                                .map(|pq| pq.as_str().to_string())
+                                .unwrap_or_default(),
+                        );
+                        Ok::<_, Infallible>(Response::new(http_body_util::Full::new(
+                            Bytes::from_static(b"ok"),
+                        )))
+                    }
+                });
+                tokio::spawn(async move {
+                    let _ = hyper_util::server::conn::auto::Builder::new(
+                        hyper_util::rt::TokioExecutor::new(),
+                    )
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await;
+                });
+            }
+        });
+        (format!("http://127.0.0.1:{}", addr.port()), seen)
+    }
+
+    #[tokio::test]
+    async fn test_query_rules_refuse_before_the_upstream() {
+        let (url, seen) = make_recording_server().await;
+        let state = make_test_state(&url, 1024 * 1024);
+        let mut config = state.config.clone();
+        config.backends_policy = [(
+            "test.example.com".to_string(),
+            vec![
+                ("GET".to_string(), "/v1/quotes".to_string()),
+                ("GET".to_string(), "/v1/other".to_string()),
+            ],
+        )]
+        .into();
+        config.backends_policy_default_allow = false;
+        config.third_party_query_rules = crate::query_rules::QueryRules::parse(
+            "test.example.com=GET /v1/quotes?symbol=ZEC&convert={upper:3-5}",
+        )
+        .unwrap();
+        config
+            .third_party_query_rules
+            .validate(&config.backends, &config.backends_policy)
+            .unwrap();
+        let state = Arc::try_unwrap(state).ok().unwrap();
+        let state = Arc::new(AppState { config, ..state });
+        let request = |path: &str| InnerRequest {
+            method: "GET".to_string(),
+            path: path.to_string(),
+            authority: "test.example.com".to_string(),
+            headers: vec![],
+            body: vec![],
+        };
+
+        for path in [
+            "/v1/quotes",
+            "/v1/quotes?symbol=ZEC",
+            "/v1/quotes?symbol=ZEC&convert=usd",
+            "/v1/quotes?symbol=ZEC&convert=USD&limit=5000",
+            "/v1/quotes?symbol=ZEC&convert=USD&convert=EUR",
+            "/v1/quotes?symbol=BTC&convert=USD",
+            "/v1/quotes?convert=USD&symbol=ZEC",
+        ] {
+            assert!(policy_denies(&state.config, &request(path)), "{path}");
+            // Streamed path.
+            let (status, body) = collect_body(&state, &request(path)).await;
+            assert_eq!((status, body.as_str()), (403, "policy denied"), "{path}");
+            // Collected path (the one the third-party cache and upstream cap call).
+            let resp = forward_to_backend(&state, &request(path)).await.unwrap();
+            assert_eq!(
+                (resp.status, resp.body.as_slice()),
+                (403, &b"policy denied"[..]),
+                "{path}"
+            );
+        }
+        assert!(seen.lock().is_empty(), "{:?}", seen.lock());
+
+        // Allowed shapes, and a route without a query rule, reach the upstream unchanged.
+        let allowed = [
+            "/v1/quotes?symbol=ZEC&convert=USD",
+            "/v1/quotes?symbol=ZEC&convert=EURO",
+            "/v1/other?anything=1",
+        ];
+        for path in allowed {
+            assert!(!policy_denies(&state.config, &request(path)), "{path}");
+            let (status, body) = collect_body(&state, &request(path)).await;
+            assert_eq!((status, body.as_str()), (200, "ok"), "{path}");
+            let resp = forward_to_backend(&state, &request(path)).await.unwrap();
+            assert_eq!(resp.status, 200, "{path}");
+        }
+        let expected: Vec<String> = allowed
+            .iter()
+            .flat_map(|p| [p.to_string(), p.to_string()])
+            .collect();
+        assert_eq!(*seen.lock(), expected);
+    }
+
+    /// THIRD_PARTY_QUERY_VALUE_SOURCES end to end against one mock upstream that serves the
+    /// list and the quotes route: the list is fetched through the forwarder (with the alias's
+    /// credential), a value in it passes, one not in it is refused before anything goes
+    /// upstream (so before the third-party cache and cap, see `policy_denies`), a changed list
+    /// is picked up by the next refresh, and a failed refresh keeps the last accepted list.
+    #[tokio::test]
+    async fn test_query_value_source_lists_admit_values_from_the_upstream() {
+        crate::health::init_metrics();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        // The list document (status, body), and every request: path and query, API key.
+        let list = Arc::new(parking_lot::Mutex::new((
+            200u16,
+            r#"{"data":[{"symbol":"USD"},{"symbol":"EUR"}]}"#.to_string(),
+        )));
+        let seen = Arc::new(parking_lot::Mutex::new(Vec::<String>::new()));
+        let (served, recorded) = (list.clone(), seen.clone());
+        tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (served, recorded) = (served.clone(), recorded.clone());
+                let service = service_fn(move |req: Request<hyper::body::Incoming>| {
+                    let path = req
+                        .uri()
+                        .path_and_query()
+                        .map(|pq| pq.as_str().to_string())
+                        .unwrap_or_default();
+                    let key = req
+                        .headers()
+                        .get("x-api-key")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("-")
+                        .to_string();
+                    recorded.lock().push(format!("{path} {key}"));
+                    let (status, body) = if path == "/v1/fiat/map" {
+                        served.lock().clone()
+                    } else {
+                        (200, "ok".to_string())
+                    };
+                    async move {
+                        Ok::<_, Infallible>(
+                            Response::builder()
+                                .status(status)
+                                .body(http_body_util::Full::new(Bytes::from(body)))
+                                .unwrap(),
+                        )
+                    }
+                });
+                tokio::spawn(async move {
+                    let _ = hyper_util::server::conn::auto::Builder::new(
+                        hyper_util::rt::TokioExecutor::new(),
+                    )
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await;
+                });
+            }
+        });
+
+        let state = make_test_state(&url, 4 * 1024 * 1024);
+        let mut config = state.config.clone();
+        config.backend_headers = [(
+            "test.example.com".to_string(),
+            vec![("X-API-KEY".to_string(), "k1".to_string())],
+        )]
+        .into();
+        config.backends_policy = [(
+            "test.example.com".to_string(),
+            vec![
+                ("GET".to_string(), "/v1/quotes".to_string()),
+                ("GET".to_string(), "/v1/fiat/map".to_string()),
+            ],
+        )]
+        .into();
+        config.backends_policy_default_allow = false;
+        let sources = crate::query_value_sources::QueryValueSources::parse(
+            "fiat=test.example.com GET /v1/fiat/map#/data/*/symbol@300",
+        )
+        .unwrap();
+        config.third_party_query_rules = crate::query_rules::QueryRules::parse_with_sources(
+            "test.example.com=GET /v1/quotes?symbol=ZEC&convert={from:fiat}",
+            sources.clone(),
+        )
+        .unwrap();
+        config
+            .third_party_query_rules
+            .validate(&config.backends, &config.backends_policy)
+            .unwrap();
+        let state = Arc::try_unwrap(state).ok().unwrap();
+        let state = Arc::new(AppState { config, ..state });
+        let quotes = |convert: &str| InnerRequest {
+            method: "GET".to_string(),
+            path: format!("/v1/quotes?symbol=ZEC&convert={convert}"),
+            authority: "test.example.com".to_string(),
+            headers: vec![],
+            body: vec![],
+        };
+        let status = |convert: &str| {
+            let state = state.clone();
+            let request = quotes(convert);
+            async move { collect_body(&state, &request).await }
+        };
+
+        // No fallback, no fetch yet: nothing is admitted (fail closed), nothing goes upstream.
+        assert!(policy_denies(&state.config, &quotes("USD")));
+        assert_eq!(status("USD").await, (403, "policy denied".to_string()));
+        assert!(seen.lock().is_empty());
+
+        // The first refresh: the list is a GET of the alias with its credential.
+        use crate::query_value_sources::Outcome;
+        assert_eq!(sources.refresh(&state, "fiat").await, Outcome::Ok);
+        assert_eq!(*seen.lock(), vec!["/v1/fiat/map k1".to_string()]);
+        assert_eq!(status("USD").await, (200, "ok".to_string()));
+        assert_eq!(status("EUR").await, (200, "ok".to_string()));
+        for refused in ["JPY", "usd", "USD%20", "US"] {
+            assert!(policy_denies(&state.config, &quotes(refused)), "{refused}");
+            assert_eq!(
+                status(refused).await,
+                (403, "policy denied".to_string()),
+                "{refused}"
+            );
+        }
+        assert_eq!(seen.lock().len(), 3, "{:?}", seen.lock());
+
+        // The verdict is taken once per request (the handler does it before its precheck):
+        // a list replaced before the forward does not change it either way.
+        let decided = |convert: &str| {
+            RouteContext::resolve(&state.config, &quotes(convert))
+                .with_query_verdict(&state.config, &quotes(convert))
+        };
+        let (usd_admitted, jpy_refused) = (decided("USD"), decided("JPY"));
+
+        // A changed list is picked up by the next refresh.
+        list.lock().1 = r#"{"data":[{"symbol":"JPY"},{"symbol":"EUR"}]}"#.to_string();
+        assert_eq!(sources.refresh(&state, "fiat").await, Outcome::Ok);
+        assert!(!policy_denies_in(
+            &state.config,
+            &quotes("USD"),
+            &usd_admitted
+        ));
+        assert!(policy_denies_in(
+            &state.config,
+            &quotes("JPY"),
+            &jpy_refused
+        ));
+        let before = seen.lock().len();
+        for (convert, route, expected) in [
+            ("USD", &usd_admitted, (200, "ok")),
+            ("JPY", &jpy_refused, (403, "policy denied")),
+        ] {
+            let (status, _, mut stream) = forward_to_backend_stream_in(
+                &state,
+                &quotes(convert),
+                uuid::Uuid::new_v4(),
+                None,
+                route,
+            )
+            .await
+            .unwrap();
+            let mut body = Vec::new();
+            while let Some(Ok(frame)) = stream.next().await {
+                if let UpFrame::Data(data) = frame {
+                    body.extend_from_slice(&data);
+                }
+            }
+            assert_eq!(
+                (status, String::from_utf8(body).unwrap().as_str()),
+                expected,
+                "{convert}"
+            );
+            let resp = forward_to_backend_in(&state, &quotes(convert), route)
+                .await
+                .unwrap();
+            assert_eq!(resp.status, expected.0, "{convert}");
+        }
+        // Only the decided USD went upstream (twice: streamed and collected).
+        assert_eq!(seen.lock().len(), before + 2);
+        assert_eq!(status("JPY").await, (200, "ok".to_string()));
+        assert_eq!(status("USD").await, (403, "policy denied".to_string()));
+
+        // Failed refreshes keep it: an error status, a document without the pointer.
+        *list.lock() = (500, "{}".to_string());
+        assert_eq!(sources.refresh(&state, "fiat").await, Outcome::Status);
+        *list.lock() = (200, r#"{"status":"ok"}"#.to_string());
+        assert_eq!(sources.refresh(&state, "fiat").await, Outcome::Pointer);
+        *list.lock() = (
+            200,
+            "x".repeat(crate::query_value_sources::MAX_BODY_BYTES + 1),
+        );
+        assert_eq!(sources.refresh(&state, "fiat").await, Outcome::Oversize);
+        assert_eq!(status("JPY").await, (200, "ok".to_string()));
+        assert_eq!(status("USD").await, (403, "policy denied".to_string()));
     }
 
     #[tokio::test]

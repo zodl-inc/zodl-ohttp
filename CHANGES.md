@@ -62,6 +62,46 @@ keeps its own log in [client/CHANGELOG.md](client/CHANGELOG.md).
 
 ### Gateway
 
+- New, off by default: **`THIRD_PARTY_QUERY_RULES`**, per-route query string allowlists for
+  `BACKENDS` aliases (`alias=METHOD /path?name=VALUE&name2=VALUE2,METHOD /path?;alias2=...`;
+  VALUE a literal, `{in:A|B|C}` (alternatives of `[A-Za-z0-9._~-]`), `{upper:MIN-MAX}` (MAX at most
+  32) or `{from:name}` of a source of the same alias). `BACKENDS_POLICY`
+  admits a method and path with any query string, so a client could use an alias whose
+  credential the gateway injects as a general proxy of that API, and every new query string was
+  a new third-party cache key spending upstream quota. A request to a route with a rule must
+  carry exactly the rule's parameters in the rule's order, with matching values (byte for byte
+  on the raw query, never rewritten, so the checked string is the cache key and the upstream
+  request); otherwise it gets the inner 403 `policy denied` of a `BACKENDS_POLICY` denial (same
+  metric, log reason `query not allowed`), before the third-party cache and the upstream cap.
+  This bounds the distinct cache keys of a route by its admitted values (`/path?` and `/path`
+  are two keys); answers that are not a 200 are still not cached, and `THIRD_PARTY_RATE_LIMITS`
+  still bounds the upstream calls they cost. `{in:...}` or `{from:...}` is recommended for
+  credentialed upstreams. Unset: no change. Startup errors: malformed rules, prefix paths or
+  paths the request side refuses, aliases outside `BACKENDS`, routes `BACKENDS_POLICY` does not
+  allow, and `BACKENDS_POLICY` entries that admit a rule's path through a `*` method, a `/*`
+  prefix or another method without a rule, or that contain `?`. A `THIRD_PARTY_QUERY_RULES`
+  value that is not UTF-8 is a startup error.
+- New, off by default: **`THIRD_PARTY_QUERY_VALUE_SOURCES`**, allowed-value lists read from
+  the upstream itself for the `{from:name}` pattern of `THIRD_PARTY_QUERY_RULES`
+  (`name=alias GET /path#/json/pointer@REFRESH_SECS[@fallback=A|B|C];...`). Each process fetches
+  each source in the background 0 to 5 s after startup, then every `REFRESH_SECS` (300..=604800),
+  after a failure again in 60 s doubling up to `REFRESH_SECS`, every wait +-10 % (lists of
+  different processes can differ for up to `REFRESH_SECS`); a `GET` through the forwarder with
+  the alias's `BACKEND_HEADERS` (its permits, upstream metrics and logs), 10 s deadline, at most
+  256 KiB read, outside the third-party cache and `THIRD_PARTY_RATE_LIMITS`. A JSON pointer (`*` iterates an array, at most two) selects
+  string values (1 to 64 characters of `[A-Za-z0-9._~-]`; others are skipped and counted; more
+  than 2048 rejects the document, the walk stopping there). A failed refresh of any kind, including one with fewer valid values than half the list admitted
+  now (`too_few`), keeps the last accepted list. A list smaller than half the admitted one is therefore never
+  accepted by refreshes: it is held until a restart (with a smaller or no fallback) or a
+  configuration change; alert on `result="too_few"` and on a stale last success (0 = never).
+  Before the first accepted list the `fallback` list is admitted (the first accepted list
+  replaces it), without one `{from:name}` admits nothing. The query verdict of a request is
+  taken once, so the handler's precheck and both forwards agree even if a list is replaced
+  meanwhile. New metrics `ohttp_query_value_source_refresh_total{network,source,result}`,
+  `ohttp_query_value_source_values{network,source}`,
+  `ohttp_query_value_source_last_success_timestamp_seconds{network,source}` (0 until the first
+  success) and `ohttp_query_value_source_skipped_total{network,source}`; one log line per
+  accepted change (counts only), failures logged with status and error (never the body).
 - New histogram `ohttp_traced_request_duration_seconds` (labels `network, hop, backend, rpc`,
   the buckets of `ohttp_request_duration_seconds`): every duration observed in
   `ohttp_request_duration_seconds` for a request whose outer request carried a valid

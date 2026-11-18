@@ -66,6 +66,8 @@ mod origin;
 mod padding;
 mod prefetch;
 mod proxy;
+mod query_rules;
+mod query_value_sources;
 mod replication;
 mod request_id;
 mod rpc_cache;
@@ -293,6 +295,12 @@ async fn main() -> anyhow::Result<()> {
             backends_with_policy = config.backends_policy.len(),
             "Per-alias operation policies configured"
         );
+        if !config.third_party_query_rules.is_empty() {
+            info!(
+                query_rules = config.third_party_query_rules.len(),
+                "Per-route query allowlists configured (THIRD_PARTY_QUERY_RULES)"
+            );
+        }
     } else if !config.backends.is_empty() && !config.backends_policy_default_allow {
         warn!(
             "BACKENDS configured without BACKENDS_POLICY; all requests to aliases will be denied. \
@@ -845,6 +853,18 @@ async fn main() -> anyhow::Result<()> {
         third_party,
         request_semaphore: Arc::new(Semaphore::new(max_inflight_requests)),
     });
+
+    // THIRD_PARTY_QUERY_VALUE_SOURCES: each list is fetched in the background (first after a
+    // random 0..5 s);
+    // until a fetch is accepted, `{from:name}` admits the source's fallback, or nothing.
+    let value_sources = app_state.config.third_party_query_rules.sources().clone();
+    if !value_sources.is_empty() {
+        info!(
+            sources = value_sources.len(),
+            "Query value sources configured (THIRD_PARTY_QUERY_VALUE_SOURCES)"
+        );
+        value_sources.spawn_refresh_tasks(app_state.clone());
+    }
 
     // Pinned tier backfill: PINNED_BACKFILL_WORKERS per process (0/unset = write-through only).
     let backfill_workers: usize = std::env::var("PINNED_BACKFILL_WORKERS")
@@ -2008,7 +2028,10 @@ async fn gateway_handler(
 
     // The dynamic-host view of this request, read once: the replay class, policy, labels, logged
     // route and the forward all use it, whatever a refresh does to the served set meanwhile.
-    let route = proxy::RouteContext::resolve(&state.config, &inner_request);
+    // The THIRD_PARTY_QUERY_RULES verdict is taken here once too, for the precheck and both
+    // forwards.
+    let route = proxy::RouteContext::resolve(&state.config, &inner_request)
+        .with_query_verdict(&state.config, &inner_request);
 
     // Third-party paths are logged as their policy pattern at every level, debug included.
     let log = RequestLog {
@@ -2426,7 +2449,8 @@ async fn gateway_handler(
     // Third-party backends: an answer from THIRD_PARTY_CACHE_ROUTES, or the per-backend cap's
     // inner 429 (THIRD_PARTY_RATE_LIMITS), before the usual streamed forward. The gateway cannot
     // see clients, so a backend's quota is protected per backend. A request the backend's policy
-    // refuses skips both: it gets the inner 403 below and uses up no quota.
+    // refuses (BACKENDS_POLICY, or a THIRD_PARTY_QUERY_RULES query shape) skips both: it gets the
+    // inner 403 below and uses up no quota.
     // A dynamic host has neither: THIRD_PARTY_CACHE_ROUTES and THIRD_PARTY_RATE_LIMITS belong to
     // BACKENDS aliases; its cap is its source's `rate_limit`, counted in the forwarder.
     let is_dynamic_host = route.dynamic().is_some();
@@ -2949,6 +2973,7 @@ mod handler_tests {
             near_alias: None,
             dynamic_hosts: Default::default(),
             host_list: Default::default(),
+            third_party_query_rules: Default::default(),
             relay_secret_on_key_config: config::RelaySecretOnKeyConfig::Off,
         }
     }
@@ -3442,6 +3467,251 @@ mod handler_tests {
 
         assert_eq!(tp_hits.load(Ordering::SeqCst), 0, "nothing forwarded");
         assert_eq!(lwd_hits.load(Ordering::SeqCst), 0, "nothing forwarded");
+    }
+
+    /// A recording third-party backend: the path and query of every request it gets; it
+    /// answers `/v1/fiat/map` with a list document (`USD`, `EUR`) and anything else `200 ok`.
+    async fn quotes_backend() -> (String, Arc<parking_lot::Mutex<Vec<String>>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend = format!("http://{}", listener.local_addr().unwrap());
+        let seen = Arc::new(parking_lot::Mutex::new(Vec::<String>::new()));
+        let recorded = seen.clone();
+        tokio::spawn(async move {
+            while let Ok((sock, _)) = listener.accept().await {
+                let recorded = recorded.clone();
+                tokio::spawn(async move {
+                    let service = hyper::service::service_fn(
+                        move |req: hyper::Request<hyper::body::Incoming>| {
+                            let path = req
+                                .uri()
+                                .path_and_query()
+                                .map(|pq| pq.as_str().to_string())
+                                .unwrap_or_default();
+                            let body: &'static [u8] = if path == "/v1/fiat/map" {
+                                br#"{"data":[{"symbol":"USD"},{"symbol":"EUR"}]}"#
+                            } else {
+                                b"ok"
+                            };
+                            recorded.lock().push(path);
+                            async move {
+                                Ok::<_, std::convert::Infallible>(hyper::Response::new(
+                                    http_body_util::Full::new(bytes::Bytes::from_static(body)),
+                                ))
+                            }
+                        },
+                    );
+                    let _ = hyper_util::server::conn::auto::Builder::new(
+                        hyper_util::rt::TokioExecutor::new(),
+                    )
+                    .serve_connection(hyper_util::rt::TokioIo::new(sock), service)
+                    .await;
+                });
+            }
+        });
+        (backend, seen)
+    }
+
+    /// A handler state whose alias `quotes.example` (to `backend`) allows `GET` on `paths`,
+    /// with `rules`, `THIRD_PARTY_CACHE_ROUTES` on `GET /v1/quotes` and a cap of one upstream
+    /// call per hour.
+    async fn quotes_state(
+        network: &str,
+        backend: &str,
+        paths: &[&str],
+        rules: query_rules::QueryRules,
+    ) -> Arc<AppState> {
+        let (lwd, _) = upstream(false).await;
+        let mut config = config(network, "redis://127.0.0.1:6379/3", &lwd, backend);
+        // An alias no other handler test uses: the variables set below are process-wide.
+        config
+            .backends
+            .insert("quotes.example".to_string(), backend.to_string());
+        config.backends_policy_default_allow = false;
+        config.backends_policy.insert(
+            "quotes.example".to_string(),
+            paths
+                .iter()
+                .map(|p| ("GET".to_string(), p.to_string()))
+                .collect(),
+        );
+        config.third_party_query_rules = rules;
+        config
+            .third_party_query_rules
+            .validate(&config.backends, &config.backends_policy)
+            .unwrap();
+        let origin = origin::OriginSettings::default();
+        let cache = base_cache(&config, &origin, None).await;
+        // ThirdParty::from_env (in app_state) reads both variables; nothing awaits here.
+        let _env = config::test_env_lock();
+        std::env::set_var(
+            "THIRD_PARTY_CACHE_ROUTES",
+            "quotes.example=GET /v1/quotes@300",
+        );
+        std::env::set_var("THIRD_PARTY_RATE_LIMITS", "quotes.example=1/3600s");
+        let state = app_state(config, origin, cache);
+        std::env::remove_var("THIRD_PARTY_CACHE_ROUTES");
+        std::env::remove_var("THIRD_PARTY_RATE_LIMITS");
+        state
+    }
+
+    /// `ohttp_third_party_cache_total` (hits + misses) and `ohttp_third_party_limited_total` of
+    /// `quotes.example` on `network`.
+    fn quotes_counters(network: &str) -> (f64, f64, f64) {
+        let lookups = |result: &str| {
+            counter(
+                "ohttp_third_party_cache_total",
+                &[
+                    ("network", network),
+                    ("authority", "quotes.example"),
+                    ("result", result),
+                ],
+            )
+        };
+        let limited = counter(
+            "ohttp_third_party_limited_total",
+            &[("network", network), ("authority", "quotes.example")],
+        );
+        (lookups("hit"), lookups("miss"), limited)
+    }
+
+    /// `{from:}` through the OHTTP handler with the cache and a cap of one call: before the first
+    /// fetch (no fallback) nothing is admitted; the list fetch itself neither uses the cache nor
+    /// spends the cap; a value not in the list is refused before both; a value in it reaches the
+    /// upstream and spends the cap.
+    #[tokio::test]
+    async fn a_value_source_list_is_checked_before_the_cache_and_the_cap() {
+        if !store_up("redis://127.0.0.1:6379", "the test Redis").await {
+            return;
+        }
+        health::init_metrics();
+        let (backend, seen) = quotes_backend().await;
+        let network = format!("testnet-handler-qsources-{}", Uuid::new_v4().simple());
+        let sources = query_value_sources::QueryValueSources::parse(
+            "fiat=quotes.example GET /v1/fiat/map#/data/*/symbol@300",
+        )
+        .unwrap();
+        let rules = query_rules::QueryRules::parse_with_sources(
+            "quotes.example=GET /v1/quotes?convert={from:fiat}",
+            sources.clone(),
+        )
+        .unwrap();
+        let state = quotes_state(&network, &backend, &["/v1/quotes", "/v1/fiat/map"], rules).await;
+        let get = |path: &str| bhttp("GET", "quotes.example", path, "application/json", b"");
+        let denied =
+            |(status, _, body): (u64, String, Vec<u8>)| status == 403 && body == b"policy denied";
+
+        // Fail closed until the first accepted fetch.
+        assert!(denied(post(&state, get("/v1/quotes?convert=USD")).await));
+        assert!(seen.lock().is_empty());
+
+        assert_eq!(
+            sources.refresh(&state, "fiat").await,
+            query_value_sources::Outcome::Ok
+        );
+        assert_eq!(*seen.lock(), vec!["/v1/fiat/map".to_string()]);
+        assert_eq!(quotes_counters(&network), (0.0, 0.0, 0.0));
+
+        for refused in ["JPY", "usd", "USD&x=1"] {
+            let path = format!("/v1/quotes?convert={refused}");
+            assert!(denied(post(&state, get(&path)).await), "{path}");
+        }
+        assert_eq!(quotes_counters(&network), (0.0, 0.0, 0.0));
+        assert_eq!(seen.lock().len(), 1);
+
+        // In the list: upstream once (a miss, the cap's one call), then the cache.
+        let (status, _, body) = post(&state, get("/v1/quotes?convert=USD")).await;
+        assert_eq!((status, body.as_slice()), (200, &b"ok"[..]));
+        let (status, _, _) = post(&state, get("/v1/quotes?convert=USD")).await;
+        assert_eq!(status, 200);
+        assert_eq!(quotes_counters(&network), (1.0, 1.0, 0.0));
+        // The other listed value is its own key; the cap is spent.
+        let (status, _, _) = post(&state, get("/v1/quotes?convert=EUR")).await;
+        assert_eq!(status, 429);
+        assert_eq!(
+            *seen.lock(),
+            vec![
+                "/v1/fiat/map".to_string(),
+                "/v1/quotes?convert=USD".to_string()
+            ]
+        );
+    }
+
+    /// THIRD_PARTY_QUERY_RULES through the OHTTP handler, with a cached route and an upstream cap
+    /// of one call: a refused query gets the inner 403 without reading or filling the cache and
+    /// without spending the cap, so the allowed query after it still gets the upstream's 200 (a
+    /// spent cap would answer 429), and the one after that is a cache hit.
+    #[tokio::test]
+    async fn a_refused_query_costs_no_cache_lookup_and_no_upstream_call() {
+        if !store_up("redis://127.0.0.1:6379", "the test Redis").await {
+            return;
+        }
+        health::init_metrics();
+        let (backend, seen) = quotes_backend().await;
+        // A network of its own: fresh cache keys and metric series on every run.
+        let network = format!("testnet-handler-qrules-{}", Uuid::new_v4().simple());
+        let rules =
+            query_rules::QueryRules::parse("quotes.example=GET /v1/quotes?symbol={in:ZEC|BTC}")
+                .unwrap();
+        let state = quotes_state(&network, &backend, &["/v1/quotes"], rules).await;
+        assert_eq!(state.third_party.summary(), (1, 1));
+        let get = |path: &str| bhttp("GET", "quotes.example", path, "application/json", b"");
+        let cache_lookups = |result: &str| {
+            counter(
+                "ohttp_third_party_cache_total",
+                &[
+                    ("network", &network),
+                    ("authority", "quotes.example"),
+                    ("result", result),
+                ],
+            )
+        };
+        let limited = || {
+            counter(
+                "ohttp_third_party_limited_total",
+                &[("network", &network), ("authority", "quotes.example")],
+            )
+        };
+
+        for path in [
+            "/v1/quotes?symbol=ETH",
+            "/v1/quotes?symbol=ZEC&x=1",
+            "/v1/quotes?symbol=zec",
+            "/v1/quotes",
+            "/v1/quotes?symbol=ETH",
+        ] {
+            let (status, _, body) = post(&state, get(path)).await;
+            assert_eq!(
+                (status, body.as_slice()),
+                (403, &b"policy denied"[..]),
+                "{path}"
+            );
+        }
+        assert_eq!(
+            cache_lookups("hit") + cache_lookups("miss"),
+            0.0,
+            "no cache lookup"
+        );
+        assert_eq!(limited(), 0.0);
+        assert!(seen.lock().is_empty(), "{:?}", seen.lock());
+
+        // The cap's one call is still there: the allowed query goes upstream (a miss), then is
+        // served from the cache.
+        let (status, _, body) = post(&state, get("/v1/quotes?symbol=ZEC")).await;
+        assert_eq!((status, body.as_slice()), (200, &b"ok"[..]));
+        assert_eq!((cache_lookups("hit"), cache_lookups("miss")), (0.0, 1.0));
+        let (status, _, body) = post(&state, get("/v1/quotes?symbol=ZEC")).await;
+        assert_eq!((status, body.as_slice()), (200, &b"ok"[..]));
+        assert_eq!((cache_lookups("hit"), cache_lookups("miss")), (1.0, 1.0));
+        assert_eq!(*seen.lock(), vec!["/v1/quotes?symbol=ZEC".to_string()]);
+
+        // Refused queries stay refused, with the cap now spent and an entry in the cache.
+        let (status, _, body) = post(&state, get("/v1/quotes?symbol=ETH")).await;
+        assert_eq!((status, body.as_slice()), (403, &b"policy denied"[..]));
+        // The other admitted value is its own cache key; the spent cap answers it.
+        let (status, _, _) = post(&state, get("/v1/quotes?symbol=BTC")).await;
+        assert_eq!(status, 429);
+        assert_eq!(limited(), 1.0);
+        assert_eq!(seen.lock().len(), 1);
     }
 
     /// `async-reads`, `REPLAY_PEER_FAIL_CLOSED_WRITES=0` (an unreachable hub tolerated).
