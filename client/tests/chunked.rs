@@ -80,6 +80,7 @@ fn gateway_config(key_id: u8, private_key_hex: &str) -> Config {
         near_alias: None,
         dynamic_hosts: Default::default(),
         host_list: Default::default(),
+        third_party_query_rules: Default::default(),
         relay_secret_on_key_config: ohttp_gateway::config::RelaySecretOnKeyConfig::Off,
         lwd_permit_wait_ms: 2000,
         lwd_permit_max_waiters: 0,

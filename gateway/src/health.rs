@@ -477,6 +477,30 @@ lazy_static::lazy_static! {
     .unwrap();
 }
 
+// A third block: THIRD_PARTY_QUERY_VALUE_SOURCES.
+lazy_static::lazy_static! {
+    static ref OHTTP_QUERY_VALUE_SOURCE_REFRESH_TOTAL: IntCounterVec = IntCounterVec::new(
+        Opts::new("ohttp_query_value_source_refresh_total", "Refreshes of a query value source (THIRD_PARTY_QUERY_VALUE_SOURCES) by result: ok, transport, status, oversize, json, pointer, empty, too_many, too_few; after any but ok the current list stays"),
+        &["network", "source", "result"]
+    )
+    .unwrap();
+    static ref OHTTP_QUERY_VALUE_SOURCE_VALUES: IntGaugeVec = IntGaugeVec::new(
+        Opts::new("ohttp_query_value_source_values", "Values in the current list of a query value source (the fallback before the first accepted refresh; 0 = {from:} admits nothing)"),
+        &["network", "source"]
+    )
+    .unwrap();
+    static ref OHTTP_QUERY_VALUE_SOURCE_LAST_SUCCESS: IntGaugeVec = IntGaugeVec::new(
+        Opts::new("ohttp_query_value_source_last_success_timestamp_seconds", "Unix time of the last accepted refresh of a query value source; 0 until the first accepted fetch"),
+        &["network", "source"]
+    )
+    .unwrap();
+    static ref OHTTP_QUERY_VALUE_SOURCE_SKIPPED_TOTAL: IntCounterVec = IntCounterVec::new(
+        Opts::new("ohttp_query_value_source_skipped_total", "Items a query value source's pointer selected that were skipped (missing, not a string, or not a valid value)"),
+        &["network", "source"]
+    )
+    .unwrap();
+}
+
 pub fn init_metrics() {
     for gauge in [
         &*OHTTP_DYNAMIC_HOSTS,
@@ -489,6 +513,18 @@ pub fn init_metrics() {
     }
     REGISTRY
         .register(Box::new(OHTTP_DYNAMIC_HOSTS_REFRESH_TOTAL.clone()))
+        .ok();
+    REGISTRY
+        .register(Box::new(OHTTP_QUERY_VALUE_SOURCE_REFRESH_TOTAL.clone()))
+        .ok();
+    REGISTRY
+        .register(Box::new(OHTTP_QUERY_VALUE_SOURCE_VALUES.clone()))
+        .ok();
+    REGISTRY
+        .register(Box::new(OHTTP_QUERY_VALUE_SOURCE_LAST_SUCCESS.clone()))
+        .ok();
+    REGISTRY
+        .register(Box::new(OHTTP_QUERY_VALUE_SOURCE_SKIPPED_TOTAL.clone()))
         .ok();
     REGISTRY
         .register(Box::new(OHTTP_REQUESTS_TOTAL.clone()))
@@ -1891,6 +1927,47 @@ pub fn dynamic_hosts_gauges(network: &str, source: &str) -> (i64, i64, i64, i64)
             .with_label_values(&[network, source])
             .get(),
     )
+}
+
+/// One refresh of query value source `source` ended with `result`.
+pub fn record_query_value_source_refresh(network: &str, source: &str, result: &str) {
+    OHTTP_QUERY_VALUE_SOURCE_REFRESH_TOTAL
+        .with_label_values(&[network, source, result])
+        .inc();
+}
+
+/// The current list of query value source `source` has `values` values.
+pub fn set_query_value_source_values(network: &str, source: &str, values: usize) {
+    OHTTP_QUERY_VALUE_SOURCE_VALUES
+        .with_label_values(&[network, source])
+        .set(values as i64);
+}
+
+/// A query value source's task starts: its current list size, and no success yet (0), so a
+/// source that never succeeds is visible.
+pub fn init_query_value_source(network: &str, source: &str, values: usize) {
+    set_query_value_source_values(network, source, values);
+    OHTTP_QUERY_VALUE_SOURCE_LAST_SUCCESS
+        .with_label_values(&[network, source])
+        .set(0);
+}
+
+/// A refresh of query value source `source` was accepted now.
+pub fn record_query_value_source_success(network: &str, source: &str) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    OHTTP_QUERY_VALUE_SOURCE_LAST_SUCCESS
+        .with_label_values(&[network, source])
+        .set(now);
+}
+
+/// `skipped` selected items of query value source `source` were not valid values.
+pub fn add_query_value_source_skipped(network: &str, source: &str, skipped: u64) {
+    OHTTP_QUERY_VALUE_SOURCE_SKIPPED_TOTAL
+        .with_label_values(&[network, source])
+        .inc_by(skipped);
 }
 
 pub fn record_third_party_limited(network: &str, authority: &str) {

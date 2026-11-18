@@ -345,6 +345,10 @@ trace ids are never labels. `network` is `NETWORK`.
 | `ohttp_lwd_permit_wait_seconds` | `network, class` | Permit wait time (histogram). |
 | `ohttp_third_party_cache_total` | `network, authority, result` | Third-party cache `hit` / `miss`. |
 | `ohttp_third_party_limited_total` | `network, authority` | Third-party calls refused by `THIRD_PARTY_RATE_LIMITS`, or by the `rate_limit` of a dynamic host source (then `authority` is `dynamic:<source>`). |
+| `ohttp_query_value_source_refresh_total` | `network, source, result` | Refreshes of a `THIRD_PARTY_QUERY_VALUE_SOURCES` source: `ok`, `transport`, `status`, `oversize`, `json`, `pointer`, `empty`, `too_many`, `too_few`. After any result but `ok` the current list stays. |
+| `ohttp_query_value_source_values` | `network, source` | Values in the current list of a source (its fallback before the first accepted refresh; 0 = `{from:}` admits nothing). |
+| `ohttp_query_value_source_last_success_timestamp_seconds` | `network, source` | Unix time of the last accepted refresh of a source; 0 until the first one. |
+| `ohttp_query_value_source_skipped_total` | `network, source` | Items a source's pointer selected that were not valid values (missing, not a string, outside `[A-Za-z0-9._~-]` or longer than 64). |
 | `ohttp_dynamic_hosts` | `network, source` | Third-party hosts served from a dynamic host source (`DYNAMIC_HOST_SOURCES`). |
 | `ohttp_dynamic_hosts_refresh_total` | `network, source, result` | Refreshes of a source: `ok`, `unchanged`, `partial` (new hosts held by `max_new_hosts_per_refresh`), `fetch_error`, `too_large`, `parse_error`, `invalid`, `empty`, `signature`. After any result but the first three the last accepted hosts stay served. |
 | `ohttp_dynamic_hosts_last_success_timestamp_seconds` | `network, source` | Unix time of the last refresh whose document was accepted. |
