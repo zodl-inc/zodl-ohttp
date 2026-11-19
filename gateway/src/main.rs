@@ -1818,8 +1818,13 @@ async fn gateway_handler(
     let mut local_unavailable = false;
     // What the local check saw; every later admission step needs it (`cache::LocalCheck`).
     let mut local_check: Option<cache::LocalCheck> = None;
+    // The local check's duration: a stage of a WRITE (`ohttp_write_stage_duration_seconds`),
+    // recorded once the inner request is classified.
+    let local_started = Instant::now();
+    let mut local_elapsed = Duration::ZERO;
     if let Some(ref cache) = state.cache {
         let checked = cache.check_replay_detailed(&body_hash).await;
+        local_elapsed = local_started.elapsed();
         let verdict = checked
             .as_ref()
             .map(|c| c.verdict())
@@ -2074,6 +2079,19 @@ async fn gateway_handler(
             &inner_request,
         )
     };
+
+    if route_class == origin::RouteClass::Write && local_check.is_some() {
+        health::observe_write_stage(
+            &network,
+            "local",
+            if local_unavailable {
+                "unavailable"
+            } else {
+                "new"
+            },
+            local_elapsed,
+        );
+    }
 
     // The light client server's own operation policy (BACKENDS_POLICY entry of a GATEWAY_HOSTS
     // authority): inner 403 before the cache and before anything is forwarded.
@@ -2458,7 +2476,23 @@ async fn gateway_handler(
         && !is_dynamic_host
         && !proxy::policy_denies_in(&state.config, &inner_request, &route)
     {
-        let fetch = || proxy::forward_to_backend_in(&state, &inner_request, &route);
+        // The upstream call itself, when the cache and the cap let one through: the WRITE stage.
+        let fetch = || async {
+            let started = Instant::now();
+            let fetched = proxy::forward_to_backend_in(&state, &inner_request, &route).await;
+            if route_class == origin::RouteClass::Write {
+                health::observe_write_stage(
+                    &network,
+                    "upstream_third_party",
+                    match &fetched {
+                        Ok(resp) if resp.status < 500 => "ok",
+                        _ => "error",
+                    },
+                    started.elapsed(),
+                );
+            }
+            fetched
+        };
         if let Some(resp) = state
             .third_party
             .answer(
@@ -2502,15 +2536,27 @@ async fn gateway_handler(
 
     // Third-party backends, and authorities proxy.rs rejects (403/400): now streamed like lightwalletd.
     if !cache_allowed {
-        let (status, headers, stream) = match proxy::forward_to_backend_stream_in(
+        let started = Instant::now();
+        let forwarded = proxy::forward_to_backend_stream_in(
             &state,
             &inner_request,
             request_id,
             client_trace_id.clone(),
             &route,
         )
-        .await
-        {
+        .await;
+        if route_class == origin::RouteClass::Write {
+            health::observe_write_stage(
+                &network,
+                "upstream_third_party",
+                match &forwarded {
+                    Ok((status, _, _)) if *status < 500 => "ok",
+                    _ => "error",
+                },
+                started.elapsed(),
+            );
+        }
+        let (status, headers, stream) = match forwarded {
             Ok(r) => r,
             Err(e) => {
                 warn!(
@@ -2748,7 +2794,8 @@ async fn gateway_handler(
     let upstream = if rpc == "SendTransaction" {
         use singleflight::RpcSource;
         health::record_upstream_call(&network, &rpc);
-        state
+        let started = Instant::now();
+        let sent = state
             .sources
             .call_with_headers(
                 inner_request.path.clone(),
@@ -2756,7 +2803,16 @@ async fn gateway_handler(
                 Some(request_id),
                 client_headers,
             )
-            .await
+            .await;
+        if route_class == origin::RouteClass::Write {
+            health::observe_write_stage(
+                &network,
+                "upstream_lwd",
+                if sent.is_ok() { "ok" } else { "error" },
+                started.elapsed(),
+            );
+        }
+        sent
     } else {
         state
             .flights

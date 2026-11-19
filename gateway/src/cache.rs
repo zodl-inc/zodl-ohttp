@@ -923,6 +923,28 @@ impl LeasePool {
         }
     }
 
+    /// A connection no request holds right now (neither leased nor running shared work) that
+    /// `eligible` accepts, taken at once or not at all, round robin, and leased in either mode:
+    /// no shared work can be put on it before or behind the caller's command until it ends. A
+    /// leased command that gets no answer counts toward replacing the whole pool (two within
+    /// `WAIT_TIMEOUTS_WINDOW`), as in exclusive mode: it had its connection to itself.
+    fn take_idle(self: &Arc<Self>, eligible: impl Fn(usize) -> bool) -> Option<WaitSlot> {
+        if self.n == 0 {
+            return None;
+        }
+        let start = self.next.fetch_add(1, Ordering::Relaxed) as usize;
+        let mut st = self.state.lock();
+        let i = (0..self.n)
+            .map(|k| (start + k) % self.n)
+            .find(|i| st[*i] == (false, 0) && eligible(*i))?;
+        st[i].0 = true;
+        Some(WaitSlot {
+            pool: self.clone(),
+            index: i,
+            leased: true,
+        })
+    }
+
     /// One connection no request holds, leased to a housekeeping check (a busy one is never
     /// taken, and the checked one goes to no request until the check is answered). Staggered:
     /// one per call, in turn, leased only while another connection of the pool stays idle too,
@@ -1775,183 +1797,41 @@ impl ReplayPeers {
         key: &str,
         confirm: impl Fn(usize) -> bool,
     ) -> Result<(), ConfirmFailure> {
-        let Some(WriteWaitConfig {
-            replicas,
-            timeout_ms,
-        }) = self.wait
-        else {
+        if self.wait.is_none() {
             return Ok(());
-        };
-        // One attempt: its round trip and the server-side WAIT. The whole confirmation (both
-        // attempts, and the wait for a WAIT connection when none is open) ends at one deadline.
-        let budget = self.timeout + Duration::from_millis(timeout_ms);
-        let deadline = tokio::time::Instant::now()
-            + PEER_WAIT_CONNECT_TIMEOUT
-            + budget * PEER_WAIT_ATTEMPTS as u32;
-        let futures = self.peers.iter().filter(|p| confirm(p.index)).map(|p| async move {
-            let verdict = async {
-                let mut last = String::new();
-                let mut short = false;
-                let mut attempt = 0;
-                while attempt < PEER_WAIT_ATTEMPTS {
-                    // An attempt starts only while its whole budget still fits.
-                    let Some(attempt_deadline) = deadline.checked_sub(budget) else {
-                        break;
-                    };
-                    if tokio::time::Instant::now() > attempt_deadline {
-                        break;
-                    }
-                    if attempt > 0 {
-                        if crate::health::warn_due(&self.network, "peer_wait_retry") {
-                            warn!(network = %self.network, peer = p.index, error = %last, "Replay peer WAIT failed, retrying once");
-                        }
-                        crate::health::record_replay_peer(&self.network, p.index, "wait_retry");
-                    }
-                    // A WAIT connection of the pool (`LeasePool`): only an open one, waiting for
-                    // one to be released or opened (closed ones reopen in the background). In
-                    // exclusive mode the wait for a free connection is bounded like one attempt
-                    // (and leaves the attempt its whole budget before the deadline). Every open
-                    // one taken until then: the WAITs ahead all ran into their timeout (the
-                    // saturated path); none open: no attempt.
-                    p.wait.reopen_closed(&self.network, p.index, &p.url);
-                    let lease_deadline =
-                        attempt_deadline.min(tokio::time::Instant::now() + budget);
-                    let held = match p
-                        .wait
-                        .pool
-                        .acquire(lease_deadline, |i| p.wait.connected(i) && p.primary_usable())
-                        .await
-                    {
-                        Acquired::Slot(h) => h,
-                        Acquired::Busy => {
-                            return self.peer_wait_saturated(p, key, timeout_ms, deadline).await
-                        }
-                        Acquired::NoneOpen => {
-                            last = "no WAIT connection open in time (reopening in the background)"
-                                .to_string();
-                            short = false;
-                            break;
-                        }
-                    };
-                    let slot_index = held.index();
-                    let slot = p.wait.slots[slot_index].clone();
-                    // Closed since it was picked: take another one.
-                    let Some(conn) = slot.conn.load_full() else {
-                        drop(held);
-                        continue;
-                    };
-                    // Checked again right before the command goes out: never after the cutoff.
-                    if tokio::time::Instant::now() > attempt_deadline {
-                        drop(held);
-                        break;
-                    }
-                    attempt += 1;
-                    let mut c = (*conn).clone();
-                    let owned_key = key.to_string();
-                    let command = async move {
-                        redis::pipe()
-                            .cmd("SET")
-                            .arg(&owned_key)
-                            .arg("1")
-                            .arg("XX")
-                            .arg("EX")
-                            .arg(REPLAY_TTL_SECS)
-                            .cmd("WAIT")
-                            .arg(replicas)
-                            .arg(timeout_ms)
-                            .query_async::<_, (Option<String>, i64)>(&mut c)
-                            .await
-                    };
-                    let retire = {
-                        let (network, index, url, slot, used) = (
-                            self.network.clone(),
-                            p.index,
-                            p.url.clone(),
-                            slot.clone(),
-                            conn.clone(),
-                        );
-                        move || {
-                            drop_wait_conn(&network, index, &url, &slot, &used);
-                        }
-                    };
-                    // The pool's mode and the connection's timeout are recorded by the task
-                    // that owns the command, also if this request goes away meanwhile.
-                    // An error is handled there too (`PeerLinks::command_failed`): this
-                    // connection is dropped, and on a signal about the node the peer's other
-                    // connections as well, if this one was still installed.
-                    let failed = {
-                        let (links, network, slot, conn) =
-                            (p.links(), self.network.clone(), slot.clone(), conn.clone());
-                        move |e: &redis::RedisError| {
-                            links.command_failed(&network, FailedOn::Extra(&slot, &conn), e)
-                        }
-                    };
-                    let hooks = wait_hooks(
-                        p.wait.pool.clone(),
-                        move |r: &redis::RedisResult<(Option<String>, i64)>| {
-                            if let Err(e) = r {
-                                failed(e);
-                            }
-                            matches!(r, Ok((Some(_), acked)) if *acked >= replicas as i64)
-                        },
-                        p.wait.on_timeout(
-                            &self.network,
-                            p.index,
-                            &p.url,
-                            slot_index,
-                            &conn,
-                            held.leased(),
-                        ),
-                        retire,
-                    );
-                    let result = run_on_slot_with(
-                        held,
-                        (tokio::time::Instant::now() + budget).min(deadline),
-                        budget + WAIT_DRAIN_EXTRA,
-                        command,
-                        hooks,
-                    )
-                    .await;
-                    short = matches!(result, Ok(Ok((Some(_), _))));
-                    last = match result {
-                        Ok(Ok((Some(_), acked))) if acked >= replicas as i64 => return Ok(()),
-                        Ok(Ok((Some(_), acked))) => format!(
-                            "acknowledged by {acked} of {replicas} replica(s) within {timeout_ms}ms"
-                        ),
-                        Ok(Ok((None, _))) => {
-                            return Err((false, "nonce no longer at the peer".to_string()))
-                        }
-                        // A broken or stuck connection: replaced in the background, and the
-                        // retry takes another one. Only a signal about the node (it is no
-                        // longer the primary) also replaces the peer's main connection; an
-                        // I/O error on this connection says nothing about that one.
-                        // Handled by the command's task (`PeerLinks::command_failed` above).
-                        Ok(Err(e)) => store_error(&e),
-                        // No answer although a WAIT ends after its timeout: this connection is
-                        // stuck and replaced, and a second one of this peer stuck within a few
-                        // seconds means the path is and all of them are (the command's task,
-                        // `PeerWaitPool::on_timeout`).
-                        Err(_) => format!("timed out after {}ms", budget.as_millis()),
-                    };
-                }
-                if last.is_empty() {
-                    last = "no time left for an attempt".to_string();
-                }
-                Err((short, last))
-            }
-            .await;
-            crate::health::record_replay_peer(
-                &self.network,
-                p.index,
-                if verdict.is_ok() { "acknowledged" } else { "unacknowledged" },
-            );
-            verdict.map_err(|(short, e)| (short, format!("peer {}: {e}", p.index)))
-        });
-        let failures: Vec<(bool, String)> = futures_util::future::join_all(futures)
-            .await
-            .into_iter()
-            .filter_map(Result::err)
-            .collect();
+        }
+        let futures = self
+            .peers
+            .iter()
+            .filter(|p| confirm(p.index))
+            .map(|p| self.confirm_recorded(p, key, PeerAttempt::default()));
+        Self::confirm_failures(futures_util::future::join_all(futures).await)
+    }
+
+    /// `confirm_peer`, counted in `ohttp_replay_peer_total` (`acknowledged` / `unacknowledged`),
+    /// the failure prefixed with the peer.
+    async fn confirm_recorded(
+        &self,
+        p: &ReplayPeer,
+        key: &str,
+        from: PeerAttempt,
+    ) -> Result<(), (bool, String)> {
+        let verdict = self.confirm_peer(p, key, from).await;
+        crate::health::record_replay_peer(
+            &self.network,
+            p.index,
+            if verdict.is_ok() {
+                "acknowledged"
+            } else {
+                "unacknowledged"
+            },
+        );
+        verdict.map_err(|(short, e)| (short, format!("peer {}: {e}", p.index)))
+    }
+
+    /// The verdict of a confirmation from the verdicts of its peers.
+    fn confirm_failures(verdicts: Vec<Result<(), (bool, String)>>) -> Result<(), ConfirmFailure> {
+        let failures: Vec<(bool, String)> = verdicts.into_iter().filter_map(Result::err).collect();
         if failures.is_empty() {
             Ok(())
         } else {
@@ -1967,6 +1847,182 @@ impl ReplayPeers {
                 ),
             })
         }
+    }
+
+    /// The replica acknowledgement of the nonce `key` at peer `p`: up to `PEER_WAIT_ATTEMPTS`
+    /// attempts (`SET XX` + `WAIT` on one of its `WAIT` connections), counting the ones `from`
+    /// already used (`write_nonce_acked`: its pipelined `WAIT` is the first). Each attempt is
+    /// bounded by REPLAY_PEER_TIMEOUT_MS + REPLAY_PEER_WAIT_MS, and the whole confirmation (the
+    /// attempts left, and the wait for a `WAIT` connection when none is open) ends at one
+    /// deadline. `Err((short, why))`: `short` when the peer still held the nonce and only its
+    /// replicas did not acknowledge in time.
+    async fn confirm_peer(
+        &self,
+        p: &ReplayPeer,
+        key: &str,
+        from: PeerAttempt,
+    ) -> Result<(), (bool, String)> {
+        let Some(WriteWaitConfig {
+            replicas,
+            timeout_ms,
+        }) = self.wait
+        else {
+            return Ok(());
+        };
+        let budget = self.timeout + Duration::from_millis(timeout_ms);
+        let left = PEER_WAIT_ATTEMPTS.saturating_sub(from.attempts) as u32;
+        let deadline = tokio::time::Instant::now() + PEER_WAIT_CONNECT_TIMEOUT + budget * left;
+        let PeerAttempt {
+            attempts: mut attempt,
+            mut last,
+            mut short,
+        } = from;
+        while attempt < PEER_WAIT_ATTEMPTS {
+            // An attempt starts only while its whole budget still fits.
+            let Some(attempt_deadline) = deadline.checked_sub(budget) else {
+                break;
+            };
+            if tokio::time::Instant::now() > attempt_deadline {
+                break;
+            }
+            if attempt > 0 {
+                if crate::health::warn_due(&self.network, "peer_wait_retry") {
+                    warn!(network = %self.network, peer = p.index, error = %last, "Replay peer WAIT failed, retrying once");
+                }
+                crate::health::record_replay_peer(&self.network, p.index, "wait_retry");
+            }
+            // A WAIT connection of the pool (`LeasePool`): only an open one, waiting for
+            // one to be released or opened (closed ones reopen in the background). In
+            // exclusive mode the wait for a free connection is bounded like one attempt
+            // (and leaves the attempt its whole budget before the deadline). Every open
+            // one taken until then: the WAITs ahead all ran into their timeout (the
+            // saturated path); none open: no attempt.
+            p.wait.reopen_closed(&self.network, p.index, &p.url);
+            let lease_deadline = attempt_deadline.min(tokio::time::Instant::now() + budget);
+            let held = match p
+                .wait
+                .pool
+                .acquire(lease_deadline, |i| {
+                    p.wait.connected(i) && p.primary_usable()
+                })
+                .await
+            {
+                Acquired::Slot(h) => h,
+                Acquired::Busy => {
+                    return self.peer_wait_saturated(p, key, timeout_ms, deadline).await
+                }
+                Acquired::NoneOpen => {
+                    last =
+                        "no WAIT connection open in time (reopening in the background)".to_string();
+                    short = false;
+                    break;
+                }
+            };
+            let slot_index = held.index();
+            let slot = p.wait.slots[slot_index].clone();
+            // Closed since it was picked: take another one.
+            let Some(conn) = slot.conn.load_full() else {
+                drop(held);
+                continue;
+            };
+            // Checked again right before the command goes out: never after the cutoff.
+            if tokio::time::Instant::now() > attempt_deadline {
+                drop(held);
+                break;
+            }
+            attempt += 1;
+            let mut c = (*conn).clone();
+            let owned_key = key.to_string();
+            let command = async move {
+                redis::pipe()
+                    .cmd("SET")
+                    .arg(&owned_key)
+                    .arg("1")
+                    .arg("XX")
+                    .arg("EX")
+                    .arg(REPLAY_TTL_SECS)
+                    .cmd("WAIT")
+                    .arg(replicas)
+                    .arg(timeout_ms)
+                    .query_async::<_, (Option<String>, i64)>(&mut c)
+                    .await
+            };
+            let retire = {
+                let (network, index, url, slot, used) = (
+                    self.network.clone(),
+                    p.index,
+                    p.url.clone(),
+                    slot.clone(),
+                    conn.clone(),
+                );
+                move || {
+                    drop_wait_conn(&network, index, &url, &slot, &used);
+                }
+            };
+            // The pool's mode and the connection's timeout are recorded by the task
+            // that owns the command, also if this request goes away meanwhile.
+            // An error is handled there too (`PeerLinks::command_failed`): this
+            // connection is dropped, and on a signal about the node the peer's other
+            // connections as well, if this one was still installed.
+            let failed = {
+                let (links, network, slot, conn) =
+                    (p.links(), self.network.clone(), slot.clone(), conn.clone());
+                move |e: &redis::RedisError| {
+                    links.command_failed(&network, FailedOn::Extra(&slot, &conn), e)
+                }
+            };
+            let hooks = wait_hooks(
+                p.wait.pool.clone(),
+                move |r: &redis::RedisResult<(Option<String>, i64)>| {
+                    if let Err(e) = r {
+                        failed(e);
+                    }
+                    matches!(r, Ok((Some(_), acked)) if *acked >= replicas as i64)
+                },
+                p.wait.on_timeout(
+                    &self.network,
+                    p.index,
+                    &p.url,
+                    slot_index,
+                    &conn,
+                    held.leased(),
+                ),
+                retire,
+            );
+            let result = run_on_slot_with(
+                held,
+                (tokio::time::Instant::now() + budget).min(deadline),
+                budget + WAIT_DRAIN_EXTRA,
+                command,
+                hooks,
+            )
+            .await;
+            short = matches!(result, Ok(Ok((Some(_), _))));
+            last = match result {
+                Ok(Ok((Some(_), acked))) if acked >= replicas as i64 => return Ok(()),
+                Ok(Ok((Some(_), acked))) => format!(
+                    "acknowledged by {acked} of {replicas} replica(s) within {timeout_ms}ms"
+                ),
+                Ok(Ok((None, _))) => {
+                    return Err((false, "nonce no longer at the peer".to_string()))
+                }
+                // A broken or stuck connection: replaced in the background, and the
+                // retry takes another one. Only a signal about the node (it is no
+                // longer the primary) also replaces the peer's main connection; an
+                // I/O error on this connection says nothing about that one.
+                // Handled by the command's task (`PeerLinks::command_failed` above).
+                Ok(Err(e)) => store_error(&e),
+                // No answer although a WAIT ends after its timeout: this connection is
+                // stuck and replaced, and a second one of this peer stuck within a few
+                // seconds means the path is and all of them are (the command's task,
+                // `PeerWaitPool::on_timeout`).
+                Err(_) => format!("timed out after {}ms", budget.as_millis()),
+            };
+        }
+        if last.is_empty() {
+            last = "no time left for an attempt".to_string();
+        }
+        Err((short, last))
     }
 
     /// Write-back to every peer: `SET key 1 EX ttl` per entry on the `WAIT` connection, then
@@ -2056,6 +2112,55 @@ impl WriteBackSink for PeerWriteBack {
     fn reconnect(&self) {
         self.0.reset_write_back_conns();
     }
+}
+
+/// The attempts of a peer's replica acknowledgement already made (`ReplayPeers::confirm_peer`).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct PeerAttempt {
+    attempts: usize,
+    /// The last attempt's failure.
+    last: String,
+    /// The last attempt found the nonce held, only its replicas did not acknowledge in time.
+    short: bool,
+}
+
+/// What `ReplayPeers::write_nonce_acked` left to confirm at one peer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PeerAck {
+    /// No acknowledgement asked for: the peer did not take the nonce as new, or no replica
+    /// acknowledgement is configured (REPLAY_PEER_WAIT_REPLICAS=0).
+    NotAsked,
+    /// Taken as new, and its `WAIT`, in the same round trip, acknowledged it.
+    Acked,
+    /// Taken as new; the acknowledgement is still to come (`confirm_pending`).
+    Pending(PeerAttemptState),
+}
+
+/// The attempts of a `PeerAck::Pending` acknowledgement made so far (none when the nonce was
+/// written without its `WAIT`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerAttemptState(PeerAttempt);
+
+impl PeerAck {
+    fn pending(attempt: PeerAttempt) -> Self {
+        PeerAck::Pending(PeerAttemptState(attempt))
+    }
+
+    /// After a `SET NX` without its `WAIT`: the whole acknowledgement still to come if the
+    /// peer took the nonce.
+    fn after_set_nx(outcome: PeerOutcome) -> Self {
+        if outcome == PeerOutcome::Fresh {
+            PeerAck::pending(PeerAttempt::default())
+        } else {
+            PeerAck::NotAsked
+        }
+    }
+}
+
+/// An error of a command that says nothing about what the store did with it: the connection
+/// broke or the answer never came (as opposed to an error the store answered).
+fn transport_error(e: &redis::RedisError) -> bool {
+    e.is_io_error() || e.is_connection_dropped() || e.is_connection_refusal() || e.is_timeout()
 }
 
 /// Why `confirm_replicated_kind` failed.
@@ -2201,12 +2306,37 @@ impl ReplayPeers {
         value: &str,
         outcomes: &mut [PeerOutcome],
     ) {
+        self.retry_timed_out_except(key, ttl_secs, value, outcomes, &[], true)
+            .await
+    }
+
+    /// `retry_timed_out` for the peers whose outcome is `Timeout` and that `stuck` names (their
+    /// pipelined `SET NX` and `WAIT` did not answer on that `WAIT` connection), or every one with
+    /// `all`. Never on the connection `stuck[i]` of peer `i`, which still owes that answer,
+    /// unless it is the peer's only one.
+    async fn retry_timed_out_except(
+        &self,
+        key: &str,
+        ttl_secs: u64,
+        value: &str,
+        outcomes: &mut [PeerOutcome],
+        stuck: &[Option<usize>],
+        all: bool,
+    ) {
         let retries = self
             .peers
             .iter()
             .enumerate()
-            .filter(|(i, _)| outcomes.get(*i) == Some(&PeerOutcome::Timeout))
+            .filter(|(i, _)| {
+                outcomes.get(*i) == Some(&PeerOutcome::Timeout)
+                    && (all || stuck.get(*i).copied().flatten().is_some())
+            })
             .map(|(i, p)| async move {
+                let stuck = stuck
+                    .get(i)
+                    .copied()
+                    .flatten()
+                    .filter(|_| p.wait.slots.len() > 1);
                 crate::health::record_replay_peer(&self.network, p.index, "timeout_retry");
                 let deadline = tokio::time::Instant::now() + self.timeout;
                 // A WAIT connection of the peer, or its own retry connection without a WAIT
@@ -2219,7 +2349,9 @@ impl ReplayPeers {
                 pool.reopen_closed(&self.network, p.index, &p.url);
                 let outcome = match pool
                     .pool
-                    .acquire(deadline, |j| pool.connected(j) && p.primary_usable())
+                    .acquire(deadline, |j| {
+                        pool.connected(j) && p.primary_usable() && Some(j) != stuck
+                    })
                     .await
                 {
                     Acquired::Busy | Acquired::NoneOpen => PeerOutcome::Timeout,
@@ -2343,42 +2475,374 @@ impl ReplayPeers {
 
     async fn write_nonce_value(&self, key: &str, ttl_secs: u64, value: &str) -> Vec<PeerOutcome> {
         let futures = self.peers.iter().map(|p| async move {
-            let outcome = match p.conn.load_full() {
-                None => PeerOutcome::Disconnected,
-                Some(used) => {
-                    let mut conn = (*used).clone();
-                    match timeout(self.timeout, async {
-                        redis::cmd("SET")
-                            .arg(key)
-                            .arg(value)
-                            .arg("NX")
-                            .arg("EX")
-                            .arg(ttl_secs)
-                            .query_async::<_, Option<String>>(&mut conn)
-                            .await
-                    })
-                    .await
-                    {
-                        Ok(Ok(Some(_))) => PeerOutcome::Fresh,
-                        Ok(Ok(None)) => PeerOutcome::Replay,
-                        Ok(Err(e)) => {
-                            if crate::health::warn_due(&self.network, "peer_write") {
-                                warn!(network = %self.network, peer = p.index, error = %store_error(&e), "Replay peer write failed");
-                            }
-                            p.on_error(&self.network, &used, &e);
-                            PeerOutcome::Error
-                        }
-                        Err(_) => PeerOutcome::Timeout,
-                    }
-                }
-            };
-            crate::health::record_replay_peer(&self.network, p.index, outcome.as_str());
-            if !matches!(outcome, PeerOutcome::Fresh | PeerOutcome::Replay) {
-                self.disruptions.fetch_add(1, Ordering::Relaxed);
-            }
+            let outcome = self.set_nx_main(p, key, ttl_secs, value).await;
+            self.record_outcome(p, outcome);
             outcome
         });
         futures_util::future::join_all(futures).await
+    }
+
+    /// Count one peer's nonce outcome (`ohttp_replay_peer_total`; a disruption unless it gave a
+    /// verdict).
+    fn record_outcome(&self, p: &ReplayPeer, outcome: PeerOutcome) {
+        crate::health::record_replay_peer(&self.network, p.index, outcome.as_str());
+        if !matches!(outcome, PeerOutcome::Fresh | PeerOutcome::Replay) {
+            self.disruptions.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// `SET key value NX EX ttl` on the main connection of `p`, within REPLAY_PEER_TIMEOUT_MS.
+    async fn set_nx_main(
+        &self,
+        p: &ReplayPeer,
+        key: &str,
+        ttl_secs: u64,
+        value: &str,
+    ) -> PeerOutcome {
+        let Some(used) = p.conn.load_full() else {
+            return PeerOutcome::Disconnected;
+        };
+        let mut conn = (*used).clone();
+        match timeout(self.timeout, async {
+            redis::cmd("SET")
+                .arg(key)
+                .arg(value)
+                .arg("NX")
+                .arg("EX")
+                .arg(ttl_secs)
+                .query_async::<_, Option<String>>(&mut conn)
+                .await
+        })
+        .await
+        {
+            Ok(Ok(Some(_))) => PeerOutcome::Fresh,
+            Ok(Ok(None)) => PeerOutcome::Replay,
+            Ok(Err(e)) => {
+                if crate::health::warn_due(&self.network, "peer_write") {
+                    warn!(network = %self.network, peer = p.index, error = %store_error(&e), "Replay peer write failed");
+                }
+                p.on_error(&self.network, &used, &e);
+                PeerOutcome::Error
+            }
+            Err(_) => PeerOutcome::Timeout,
+        }
+    }
+
+    /// The hub check of a WRITE nonce (`async-reads`): `SET key value NX EX ttl` at every peer
+    /// and, with a replica acknowledgement (REPLAY_PEER_WAIT_REPLICAS), its `WAIT` in the same
+    /// round trip: both go out as one pipeline on one of the peer's `WAIT` connections. A `WAIT`
+    /// covers every write its connection made before it, so a `WAIT` that acknowledges after
+    /// that `SET NX` stored the nonce acknowledges exactly what `SET NX` and then `SET XX` +
+    /// `WAIT` acknowledged, in one round trip instead of two. The outcomes are those of
+    /// `write_nonce` (or, with `retrying`, `write_nonce_retrying`); the acknowledgement of the
+    /// peers that took the nonce is finished by `confirm_pending`, with the rules of
+    /// `confirm_replicated_kind` (whose first attempt the pipelined `WAIT` is).
+    ///
+    /// Where the pipeline cannot run, the peer is asked as before, `SET NX` on its main
+    /// connection with the acknowledgement left to `confirm_pending`: no `WAIT` connection free
+    /// right now (exclusive mode, every one leased: the saturated path stays as it was) or none
+    /// open. Its answers:
+    ///
+    /// - `SET NX` stored the nonce: `Fresh`; acknowledged, or the acknowledgement pending after
+    ///   one attempt (fewer replicas than required: `short`).
+    /// - nil: `Replay`.
+    /// - the connection broke: `Error` (no verdict, as a broken `SET NX` before).
+    /// - an error the store answered (it may belong to `SET NX` or to `WAIT`): the nonce is
+    ///   asked for once more on the main connection, `SET key value NX GET` (nil or this
+    ///   request's value = taken by this request, the acknowledgement pending after one failed
+    ///   attempt; another value = `Replay`; anything else = `Error`). Needs Redis >= 7.0 like
+    ///   the retry of `write_nonce_retrying`.
+    /// - no answer within REPLAY_PEER_TIMEOUT_MS + REPLAY_PEER_WAIT_MS: `Timeout` (whether
+    ///   `SET NX` landed is unknown). With `retrying` asked once more as in
+    ///   `write_nonce_retrying`, on another connection than the one that did not answer.
+    pub async fn write_nonce_acked(
+        &self,
+        key: &str,
+        ttl_secs: u64,
+        retrying: bool,
+    ) -> (Vec<PeerOutcome>, Vec<PeerAck>) {
+        let value = format!("{:016x}", rand::random::<u64>());
+        let Some(wait) = self.wait else {
+            let outcomes = if retrying {
+                self.write_nonce_retrying(key, ttl_secs).await
+            } else {
+                self.write_nonce(key, ttl_secs).await
+            };
+            let acks = vec![PeerAck::NotAsked; outcomes.len()];
+            return (outcomes, acks);
+        };
+        let value = value.as_str();
+        let futures = self.peers.iter().map(|p| async move {
+            let (outcome, ack, unclear) = self.set_nx_and_wait(p, key, ttl_secs, value, wait).await;
+            // An unclear pipeline is counted once its retry below has decided it.
+            if unclear.is_none() {
+                self.record_outcome(p, outcome);
+            }
+            (outcome, ack, unclear)
+        });
+        let answers = futures_util::future::join_all(futures).await;
+        let mut outcomes: Vec<PeerOutcome> = answers.iter().map(|a| a.0).collect();
+        let mut acks: Vec<PeerAck> = answers.iter().map(|a| a.1.clone()).collect();
+        // A pipeline without a clear answer (none in time, or its connection broke) is asked
+        // again at once, on another connection, whatever the policy: whether its `SET NX` landed
+        // is unknown, where before a `SET NX` that answered was followed by a second `WAIT`
+        // attempt elsewhere. A `SET NX` on the main connection that timed out is asked again only
+        // with `retrying`, as before.
+        let unclear: Vec<Option<usize>> = answers.iter().map(|a| a.2).collect();
+        if unclear.iter().any(Option::is_some)
+            || (retrying && outcomes.contains(&PeerOutcome::Timeout))
+        {
+            let before = outcomes.clone();
+            for (o, u) in outcomes.iter_mut().zip(&unclear) {
+                if u.is_some() {
+                    *o = PeerOutcome::Timeout;
+                }
+            }
+            self.retry_timed_out_except(key, ttl_secs, value, &mut outcomes, &unclear, retrying)
+                .await;
+            for (i, ack) in acks.iter_mut().enumerate() {
+                // Counted now (the retry counted its outcome): a disruption only if the retry
+                // gave no verdict either, so a WAIT that was merely slow neither counts as a
+                // lost peer nor opens the hub window.
+                if unclear[i].is_some()
+                    && !matches!(outcomes[i], PeerOutcome::Fresh | PeerOutcome::Replay)
+                {
+                    self.disruptions.fetch_add(1, Ordering::Relaxed);
+                }
+                if before[i] != PeerOutcome::Timeout && unclear[i].is_none() {
+                    continue;
+                }
+                *ack = match (outcomes[i], unclear[i]) {
+                    // The pipeline without an answer carried the first WAIT: one attempt of the
+                    // acknowledgement is left, as after a first SET XX + WAIT that failed.
+                    (PeerOutcome::Fresh, Some(_)) => PeerAck::pending(PeerAttempt {
+                        attempts: 1,
+                        last: "SET NX and WAIT got no clear answer".to_string(),
+                        short: false,
+                    }),
+                    (outcome, _) => PeerAck::after_set_nx(outcome),
+                };
+            }
+        }
+        (outcomes, acks)
+    }
+
+    /// One peer of `write_nonce_acked`: the outcome, what is left of its acknowledgement, and
+    /// the `WAIT` connection that did not answer (on a `Timeout` of the pipeline).
+    async fn set_nx_and_wait(
+        &self,
+        p: &ReplayPeer,
+        key: &str,
+        ttl_secs: u64,
+        value: &str,
+        wait: WriteWaitConfig,
+    ) -> (PeerOutcome, PeerAck, Option<usize>) {
+        let WriteWaitConfig {
+            replicas,
+            timeout_ms,
+        } = wait;
+        if !p.primary_usable() {
+            return (PeerOutcome::Disconnected, PeerAck::NotAsked, None);
+        }
+        // A WAIT connection that no request uses right now, never waited for, and only in a
+        // pool of at least two (with one, a retry would have to queue behind an unanswered
+        // pipeline): a pipelined SET NX never queues behind another request's WAIT, which may
+        // be slow while the replicas lag. Otherwise SET NX on the main connection, as before.
+        p.wait.reopen_closed(&self.network, p.index, &p.url);
+        let held = if p.wait.slots.len() >= 2 {
+            p.wait
+                .pool
+                .take_idle(|i| p.wait.connected(i) && p.primary_usable())
+        } else {
+            None
+        };
+        let Some((held, slot, conn)) = held.and_then(|h| {
+            let slot = p.wait.slots[h.index()].clone();
+            let conn = slot.conn.load_full()?;
+            Some((h, slot, conn))
+        }) else {
+            crate::health::record_hub_check_path(&self.network, "main");
+            let outcome = self.set_nx_main(p, key, ttl_secs, value).await;
+            return (outcome, PeerAck::after_set_nx(outcome), None);
+        };
+        crate::health::record_hub_check_path(&self.network, "pipelined");
+        let slot_index = held.index();
+        let budget = self.timeout + Duration::from_millis(timeout_ms);
+        // The verdict and the acknowledgement come from the node this connection reaches, the
+        // peer's primary as long as its main connection is (`primary_usable`: every signal that
+        // a node is not the primary drops all of the peer's connections).
+        let mut c = (*conn).clone();
+        let (owned_key, owned_value) = (key.to_string(), value.to_string());
+        let command = async move {
+            redis::pipe()
+                .cmd("SET")
+                .arg(&owned_key)
+                .arg(&owned_value)
+                .arg("NX")
+                .arg("EX")
+                .arg(ttl_secs)
+                .cmd("WAIT")
+                .arg(replicas)
+                .arg(timeout_ms)
+                .query_async::<_, (Option<String>, i64)>(&mut c)
+                .await
+        };
+        // The connection is handled like that of a `confirm_peer` attempt (the command's task:
+        // `run_on_slot_with`): an error drops it (a signal about the node the peer's others as
+        // well), no answer replaces it, and the `WAIT` is a sample of the pool's mode.
+        let retire = {
+            let (network, index, url, slot, used) = (
+                self.network.clone(),
+                p.index,
+                p.url.clone(),
+                slot.clone(),
+                conn.clone(),
+            );
+            move || {
+                drop_wait_conn(&network, index, &url, &slot, &used);
+            }
+        };
+        let failed = {
+            let (links, network, slot, conn) =
+                (p.links(), self.network.clone(), slot.clone(), conn.clone());
+            move |e: &redis::RedisError| {
+                links.command_failed(&network, FailedOn::Extra(&slot, &conn), e)
+            }
+        };
+        let hooks = wait_hooks(
+            p.wait.pool.clone(),
+            move |r: &redis::RedisResult<(Option<String>, i64)>| {
+                if let Err(e) = r {
+                    failed(e);
+                }
+                // A replay's `WAIT` (nothing written) is a round-trip sample too.
+                matches!(r, Ok((_, acked)) if *acked >= replicas as i64)
+            },
+            p.wait.on_timeout(
+                &self.network,
+                p.index,
+                &p.url,
+                slot_index,
+                &conn,
+                held.leased(),
+            ),
+            retire,
+        );
+        let result = run_on_slot_with(
+            held,
+            tokio::time::Instant::now() + budget,
+            budget + WAIT_DRAIN_EXTRA,
+            command,
+            hooks,
+        )
+        .await;
+        match result {
+            Ok(Ok((Some(_), acked))) if acked >= replicas as i64 => {
+                (PeerOutcome::Fresh, PeerAck::Acked, None)
+            }
+            Ok(Ok((Some(_), acked))) => (
+                PeerOutcome::Fresh,
+                PeerAck::pending(PeerAttempt {
+                    attempts: 1,
+                    last: format!(
+                        "acknowledged by {acked} of {replicas} replica(s) within {timeout_ms}ms"
+                    ),
+                    short: true,
+                }),
+                None,
+            ),
+            Ok(Ok((None, _))) => (PeerOutcome::Replay, PeerAck::NotAsked, None),
+            // The connection broke (the command's task replaced it): unclear like no answer.
+            Ok(Err(e)) if transport_error(&e) => {
+                if crate::health::warn_due(&self.network, "peer_write") {
+                    warn!(network = %self.network, peer = p.index, error = %store_error(&e), "Replay peer WAIT connection failed, asking for the nonce again");
+                }
+                (PeerOutcome::Error, PeerAck::NotAsked, Some(slot_index))
+            }
+            Ok(Err(e)) => self.set_nx_get_main(p, key, ttl_secs, value, &e).await,
+            Err(_) => (PeerOutcome::Timeout, PeerAck::NotAsked, Some(slot_index)),
+        }
+    }
+
+    /// The pipeline of `set_nx_and_wait` got an error the store answered (`e`), which may be
+    /// that of `SET NX` or that of `WAIT`: whether this request holds the nonce, asked once on
+    /// the main connection (`SET key value NX GET`, within REPLAY_PEER_TIMEOUT_MS).
+    async fn set_nx_get_main(
+        &self,
+        p: &ReplayPeer,
+        key: &str,
+        ttl_secs: u64,
+        value: &str,
+        e: &redis::RedisError,
+    ) -> (PeerOutcome, PeerAck, Option<usize>) {
+        if crate::health::warn_due(&self.network, "peer_write") {
+            warn!(network = %self.network, peer = p.index, error = %store_error(e), "Replay peer write failed, asking for the nonce again");
+        }
+        let Some(used) = p.conn.load_full() else {
+            return (PeerOutcome::Error, PeerAck::NotAsked, None);
+        };
+        let mut conn = (*used).clone();
+        let answer = timeout(
+            self.timeout,
+            redis::cmd("SET")
+                .arg(key)
+                .arg(value)
+                .arg("NX")
+                .arg("GET")
+                .arg("EX")
+                .arg(ttl_secs)
+                .query_async::<_, Option<String>>(&mut conn),
+        )
+        .await;
+        let taken = || {
+            PeerAck::pending(PeerAttempt {
+                attempts: 1,
+                last: store_error(e),
+                short: false,
+            })
+        };
+        match answer {
+            Ok(Ok(None)) => (PeerOutcome::Fresh, taken(), None),
+            Ok(Ok(Some(v))) if v == value => (PeerOutcome::Fresh, taken(), None),
+            Ok(Ok(Some(_))) => (PeerOutcome::Replay, PeerAck::NotAsked, None),
+            Ok(Err(e)) => {
+                p.on_error(&self.network, &used, &e);
+                (PeerOutcome::Error, PeerAck::NotAsked, None)
+            }
+            Err(_) => (PeerOutcome::Error, PeerAck::NotAsked, None),
+        }
+    }
+
+    /// The acknowledgement `write_nonce_acked` left (`acks`, by peer position) at the peers
+    /// `confirm(index)` selects: done for `PeerAck::Acked`, else `confirm_peer` from the
+    /// attempts made. The verdict and its counting are those of `confirm_replicated_kind`.
+    pub async fn confirm_pending(
+        &self,
+        key: &str,
+        acks: &[PeerAck],
+        confirm: impl Fn(usize) -> bool,
+    ) -> Result<(), ConfirmFailure> {
+        if self.wait.is_none() {
+            return Ok(());
+        }
+        let futures = self
+            .peers
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| confirm(p.index))
+            .map(|(i, p)| async move {
+                match acks.get(i) {
+                    Some(PeerAck::Acked) => {
+                        crate::health::record_replay_peer(&self.network, p.index, "acknowledged");
+                        Ok(())
+                    }
+                    Some(PeerAck::Pending(PeerAttemptState(from))) => {
+                        self.confirm_recorded(p, key, from.clone()).await
+                    }
+                    _ => self.confirm_recorded(p, key, PeerAttempt::default()).await,
+                }
+            });
+        Self::confirm_failures(futures_util::future::join_all(futures).await)
     }
 
     /// PING every peer for the `ohttp_replay_peer_connected` gauge (housekeeping). A connection
@@ -3447,6 +3911,16 @@ impl ResponseCache {
         crate::health::observe_replay_write_wait(
             &self.network,
             matches!(local, LocalWait::Acked),
+            started.elapsed(),
+        );
+        crate::health::observe_write_stage(
+            &self.network,
+            "replica_wait",
+            if matches!(local, LocalWait::Acked) {
+                "acknowledged"
+            } else {
+                "failed"
+            },
             started.elapsed(),
         );
         if let Some(fb) = &self.write_fallback {
@@ -5296,13 +5770,13 @@ impl ResponseCache {
                 // REPLAY_ONE_SIDED_WRITE_ROUTES at all: `WritePolicy`).
                 let early_standby = self.hub_fallback.as_ref().and(self.confirming_standby());
                 let hub = async {
+                    let started = std::time::Instant::now();
                     // A WRITE that both stores must take: a SET NX that timed out is asked once
-                    // more instead of failing the WRITE closed at once.
-                    let outcomes = if policy.one_sided {
-                        peers.write_nonce(&key, REPLAY_TTL_SECS).await
-                    } else {
-                        peers.write_nonce_retrying(&key, REPLAY_TTL_SECS).await
-                    };
+                    // more instead of failing the WRITE closed at once. With the hub's replica
+                    // wait the SET NX and its WAIT go out in one round trip (`write_nonce_acked`).
+                    let (outcomes, acks) = peers
+                        .write_nonce_acked(&key, REPLAY_TTL_SECS, !policy.one_sided)
+                        .await;
                     let disruptions = peers.disruptions();
                     // The replica wait of the peers that stored the nonce, in exactly the cases
                     // the verdict below lets through: every peer took it, or a peer did not
@@ -5317,20 +5791,51 @@ impl ResponseCache {
                                 && !peers.fail_closed_writes()
                                 && policy.one_sided))
                     {
-                        Some(peers.confirm_replicated_kind(&key, fresh).await)
+                        Some(peers.confirm_pending(&key, &acks, fresh).await)
                     } else {
                         None
                     };
+                    let result = match (verdict, &confirmed) {
+                        (PeerVerdict::Replay, _) => "replay",
+                        (PeerVerdict::Unavailable, _) => "unavailable",
+                        (PeerVerdict::Fresh, Some(Ok(()))) if peers.wait().is_some() => {
+                            "acknowledged"
+                        }
+                        (PeerVerdict::Fresh, Some(Err(f))) if f.only_short => "short",
+                        (PeerVerdict::Fresh, Some(Err(_))) => "failed",
+                        (PeerVerdict::Fresh, _) => "fresh",
+                    };
+                    crate::health::observe_write_stage(
+                        &self.network,
+                        "hub",
+                        result,
+                        started.elapsed(),
+                    );
                     (outcomes, disruptions, confirmed)
                 };
                 let standby = async {
-                    match early_standby {
+                    let started = std::time::Instant::now();
+                    let outcomes = match early_standby {
                         Some(s) if policy.one_sided => {
                             Some(s.write_nonce(&key, REPLAY_TTL_SECS).await)
                         }
                         Some(s) => Some(s.write_nonce_retrying(&key, REPLAY_TTL_SECS).await),
                         None => None,
+                    };
+                    if let Some(o) = &outcomes {
+                        let result = match combine_peer_outcomes(o) {
+                            PeerVerdict::Fresh => "fresh",
+                            PeerVerdict::Replay => "replay",
+                            PeerVerdict::Unavailable => "unavailable",
+                        };
+                        crate::health::observe_write_stage(
+                            &self.network,
+                            "standby",
+                            result,
+                            started.elapsed(),
+                        );
                     }
+                    outcomes
                 };
                 let ((outcomes, disruptions, confirmed), at_standby_outcomes) =
                     tokio::join!(hub, standby);
@@ -9560,6 +10065,231 @@ mod tests {
             .query_async(&mut peer_store)
             .await
             .unwrap();
+    }
+
+    /// The hub check of a WRITE takes the nonce and its replica acknowledgement in one round
+    /// trip (`write_nonce_acked`), with the verdicts of `SET NX` followed by `SET XX` + `WAIT`:
+    /// taken and acknowledged; held (a replay, nothing to acknowledge); taken but short (the CI
+    /// Redis has no replica: the second attempt runs, and the failure is `only_short`); every
+    /// `WAIT` connection taken (the nonce on the main connection, both attempts still to come);
+    /// a peer not connected.
+    #[tokio::test]
+    async fn test_hub_nonce_and_its_wait_in_one_round_trip() {
+        let Some(_) = local_redis().await else {
+            return;
+        };
+        let net = "testnet-hub-one-round-trip";
+        let url = "redis://127.0.0.1:6379/9".to_string();
+        let mut store = ConnectionManager::new(redis::Client::open(url.as_str()).unwrap())
+            .await
+            .unwrap();
+        let hub = |replicas: u32, conns: usize| {
+            let url = url.clone();
+            async move {
+                let peers = ReplayPeers::connect(
+                    &[url],
+                    net.to_string(),
+                    LOCAL_TEST_OP_TIMEOUT.as_millis() as u64,
+                    false,
+                )
+                .await
+                .with_mode(ReplayPeerMode::AsyncReads, true)
+                .with_wait_conns(
+                    Some(WriteWaitConfig {
+                        replicas,
+                        timeout_ms: 50,
+                    }),
+                    conns,
+                );
+                for _ in 0..80 {
+                    if peers.peers[0]
+                        .wait
+                        .slots
+                        .iter()
+                        .all(|s| s.conn.load().is_some())
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+                assert!(peers.peers[0].wait.any_connected(), "WAIT connections open");
+                peers
+            }
+        };
+        let key = |s: &str| {
+            format!(
+                "replay:{net}:{}",
+                hex::encode(sha2::Sha256::digest(unique(s)))
+            )
+        };
+        let all = |_: usize| true;
+
+        // No replica needed (WAIT 0): taken and acknowledged at once, then a replay.
+        let peers = hub(0, 2).await;
+        let k = key("taken and acknowledged");
+        let (outcomes, acks) = peers.write_nonce_acked(&k, REPLAY_TTL_SECS, false).await;
+        assert_eq!(outcomes, vec![PeerOutcome::Fresh]);
+        assert_eq!(acks, vec![PeerAck::Acked]);
+        assert!(peers.confirm_pending(&k, &acks, all).await.is_ok());
+        let ttl: i64 = redis::cmd("TTL")
+            .arg(&k)
+            .query_async(&mut store)
+            .await
+            .unwrap();
+        assert!(
+            ttl > 0 && ttl <= REPLAY_TTL_SECS as i64,
+            "the nonce has its TTL"
+        );
+        let (outcomes, acks) = peers.write_nonce_acked(&k, REPLAY_TTL_SECS, true).await;
+        assert_eq!(outcomes, vec![PeerOutcome::Replay]);
+        assert_eq!(acks, vec![PeerAck::NotAsked]);
+
+        // One replica required, none there: taken, short after the pipelined WAIT; the second
+        // attempt (SET XX + WAIT) is the only one left and is short as well.
+        let peers = hub(1, 2).await;
+        let k = key("taken, short");
+        let started = std::time::Instant::now();
+        let (outcomes, acks) = peers.write_nonce_acked(&k, REPLAY_TTL_SECS, true).await;
+        assert_eq!(outcomes, vec![PeerOutcome::Fresh]);
+        match &acks[0] {
+            PeerAck::Pending(PeerAttemptState(a)) => {
+                assert_eq!(a.attempts, 1);
+                assert!(a.short, "{a:?}");
+            }
+            other => panic!("pending expected: {other:?}"),
+        }
+        let f = peers.confirm_pending(&k, &acks, all).await.unwrap_err();
+        assert!(f.only_short, "{}", f.message);
+        assert!(f.message.contains("not acknowledged"), "{}", f.message);
+        // Two server-side WAITs in all, as before (one pipelined, one retry).
+        assert!(
+            started.elapsed() >= Duration::from_millis(100),
+            "{:?}",
+            started.elapsed()
+        );
+
+        // Every WAIT connection taken (exclusive mode, the only one leased): SET NX on the main
+        // connection, both attempts of the acknowledgement still to come.
+        let peers = hub(1, 1).await;
+        let pool = peers.peers[0].wait.pool.clone();
+        pool.observe(WaitOutcome::Slow, Duration::ZERO);
+        let lease = pool
+            .acquire(tokio::time::Instant::now() + Duration::from_secs(1), |_| {
+                true
+            })
+            .await
+            .slot()
+            .expect("the one connection leased");
+        let k = key("saturated");
+        let (outcomes, acks) = peers.write_nonce_acked(&k, REPLAY_TTL_SECS, true).await;
+        assert_eq!(outcomes, vec![PeerOutcome::Fresh]);
+        assert_eq!(acks, vec![PeerAck::pending(PeerAttempt::default())]);
+        drop(lease);
+
+        // A peer that is not connected gives no verdict and gets no WAIT.
+        let down = ReplayPeers::connect(
+            &["redis://127.0.0.1:1".to_string()],
+            net.to_string(),
+            100,
+            false,
+        )
+        .await
+        .with_mode(ReplayPeerMode::AsyncReads, true)
+        .with_wait(Some(WriteWaitConfig {
+            replicas: 1,
+            timeout_ms: 50,
+        }));
+        let (outcomes, acks) = down
+            .write_nonce_acked(&key("down"), REPLAY_TTL_SECS, true)
+            .await;
+        assert_eq!(outcomes, vec![PeerOutcome::Disconnected]);
+        assert_eq!(acks, vec![PeerAck::NotAsked]);
+
+        let _: () = redis::cmd("DEL")
+            .arg(&k)
+            .query_async(&mut store)
+            .await
+            .unwrap();
+    }
+
+    /// With a real primary and replica (tests/failover/docker-compose.yml): a nonce whose
+    /// pipelined WAIT acknowledged it is on the replica, i.e. the WAIT covered that SET NX.
+    #[tokio::test]
+    async fn test_hub_pipeline_nonce_is_on_the_replica_once_acknowledged() {
+        if std::env::var("OHTTP_FAILOVER_REDIS").is_err() {
+            eprintln!(
+                "skipped: set OHTTP_FAILOVER_REDIS=1 with tests/failover/docker-compose.yml up"
+            );
+            return;
+        }
+        let net = "testnet-hub-pipeline-replica";
+        let peers = ReplayPeers::connect(
+            &["redis://127.0.0.1:6391/5".to_string()],
+            net.to_string(),
+            LOCAL_TEST_OP_TIMEOUT.as_millis() as u64,
+            false,
+        )
+        .await
+        .with_mode(ReplayPeerMode::AsyncReads, true)
+        .with_wait_conns(
+            Some(WriteWaitConfig {
+                replicas: 1,
+                timeout_ms: 2000,
+            }),
+            2,
+        );
+        for _ in 0..80 {
+            if peers.peers[0]
+                .wait
+                .slots
+                .iter()
+                .all(|s| s.conn.load().is_some())
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let mut replica =
+            ConnectionManager::new(redis::Client::open("redis://127.0.0.1:6392/5").unwrap())
+                .await
+                .unwrap();
+        for n in 0..20 {
+            let k = format!(
+                "replay:{net}:{}",
+                hex::encode(sha2::Sha256::digest(unique(&format!("replica {n}"))))
+            );
+            let (outcomes, acks) = peers.write_nonce_acked(&k, REPLAY_TTL_SECS, true).await;
+            assert_eq!(outcomes, vec![PeerOutcome::Fresh]);
+            assert_eq!(acks, vec![PeerAck::Acked], "acknowledged in the pipeline");
+            let on_replica: Option<String> = redis::cmd("GET")
+                .arg(&k)
+                .query_async(&mut replica)
+                .await
+                .unwrap();
+            assert!(on_replica.is_some(), "acknowledged means replicated: {k}");
+        }
+    }
+
+    /// `take_idle` leases the connection in shared mode too: no shared WAIT can be put on it
+    /// while the pipeline runs, and it never takes a connection that has shared work.
+    #[tokio::test]
+    async fn take_idle_leases_and_skips_busy_connections() {
+        let pool = LeasePool::new(1, 100);
+        let shared = pool
+            .acquire(tokio::time::Instant::now(), |_| true)
+            .await
+            .slot()
+            .expect("shared");
+        assert!(pool.take_idle(|_| true).is_none(), "shared work on it");
+        drop(shared);
+        let idle = pool.take_idle(|_| true).expect("idle now");
+        assert!(idle.leased());
+        assert!(matches!(
+            pool.acquire(tokio::time::Instant::now(), |_| true).await,
+            Acquired::Busy
+        ));
+        drop(idle);
+        assert!(pool.take_idle(|_| false).is_none(), "not eligible");
     }
 
     #[test]

@@ -62,6 +62,47 @@ keeps its own log in [client/CHANGELOG.md](client/CHANGELOG.md).
 
 ### Gateway
 
+- The hub check of a WRITE at an `async-reads` origin (its peer store, with
+  `REPLAY_PEER_WAIT_REPLICAS` >= 1) takes one round trip instead of two: the nonce's `SET NX`
+  and the peer's `WAIT` go out as one pipeline on one of the peer's `WAIT` connections. A `WAIT`
+  covers every earlier write of its connection, so the nonce it acknowledges is the one that
+  `SET NX` stored, exactly as `SET NX` followed by `SET XX` + `WAIT` before. Verdicts, metrics
+  and every fallback path are unchanged: taken and acknowledged runs; held is a replay; taken
+  but short (fewer replicas) gets the one remaining attempt (`SET XX` + `WAIT`), then the
+  short-acknowledgement path (`hub_short_ack`). An error the store answers, which may be that of
+  `SET NX` or of `WAIT`, is resolved with one `SET key value NX GET` on the main connection
+  (this request's value or nil = taken by this request, with one attempt of the acknowledgement
+  left; another value = replay; like the existing `SET NX` retry this needs Redis >= 7.0 at the
+  hub, an older store gives no verdict). A pipeline without a clear answer (none within
+  `REPLAY_PEER_TIMEOUT_MS` + `REPLAY_PEER_WAIT_MS`, or its connection broke), whose `SET NX` may
+  have landed, is asked again at once with `SET ... NX GET` on another `WAIT` connection, for
+  every route (before, only a both-stores WRITE retried a `SET NX` timeout); it is counted once
+  decided (`ohttp_replay_peer_total`: `timeout_retry` and the retry's outcome) and is a
+  disruption of the hub (which opens the hub window) only if that retry gives no verdict either.
+  A hub that does not answer at all is therefore declared unavailable after that sum plus one
+  `REPLAY_PEER_TIMEOUT_MS` instead of one `REPLAY_PEER_TIMEOUT_MS`. The pipeline only uses a
+  `WAIT` connection no other request uses at that moment, in a pool of at least two
+  (`REPLAY_WAIT_CONNS` >= 2), so a pipelined `SET NX` never queues behind another request's
+  `WAIT`; otherwise, and when no connection is idle at once (more WRITEs in flight than
+  `REPLAY_WAIT_CONNS`), the hub is asked as before (`SET NX` on its main connection, then the
+  acknowledgement), so the saturated path (`ohttp_replay_wait_saturated_total`) is unchanged;
+  `ohttp_replay_hub_check_total{path="pipelined"|"main"}` counts which one ran. The pipeline
+  holds its connection alone, also in shared mode, so two pipelines without an answer on
+  different connections within 5 s replace the whole `WAIT` pool, as in exclusive mode. The verdict and the acknowledgement now
+  come from the same connection: the old `SET XX` on the `WAIT` connection also noticed a nonce
+  missing on the node the `WAIT` connection reached, which matters only while two primaries are
+  reachable under one address. The concurrent check at the standby stores is unchanged.
+- New histogram **`ohttp_write_stage_duration_seconds{network, stage, result}`**: the time of
+  each stage of a WRITE, for latency budgets per stage. `stage`: `local` (the local `SET NX`;
+  `new`, `unavailable`), `hub` (a read origin's hub `SET NX` and replica wait: `acknowledged`,
+  `short`, `failed`, `fresh` without a wait, `replay`, `unavailable`), `standby` (its concurrent
+  standby `SET NX`: `fresh`, `replay`, `unavailable`), `replica_wait` (the local replica wait:
+  `acknowledged`, `failed`), `upstream_lwd` (the light client server call of a WRITE, e.g.
+  `SendTransaction`, which had no upstream histogram: `ok`, `error`), `upstream_third_party`
+  (the upstream call of a third-party WRITE until its response head, cache hits and the cap's
+  429 excluded: `ok`, `error` for a transport error or a 5xx). Buckets from 0.5 ms to 10 s, every
+  25 to 50 ms between 25 and 300 ms, then 400 ms. No request identifiers; at most a few dozen
+  series per network.
 - New, off by default: **`THIRD_PARTY_QUERY_RULES`**, per-route query string allowlists for
   `BACKENDS` aliases (`alias=METHOD /path?name=VALUE&name2=VALUE2,METHOD /path?;alias2=...`;
   VALUE a literal, `{in:A|B|C}` (alternatives of `[A-Za-z0-9._~-]`), `{upper:MIN-MAX}` (MAX at most
