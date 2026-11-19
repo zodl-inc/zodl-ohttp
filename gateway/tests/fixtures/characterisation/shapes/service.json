@@ -1,0 +1,501 @@
+{
+  "description": "A first-party service: exact and prefix routes, reads by route.",
+  "networks": [
+    "mainnet",
+    "testnet"
+  ],
+  "shapes": [
+    {
+      "authority": "service.example",
+      "expect": {
+        "mainnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "read",
+            "stage": "third_party_path",
+            "third_party_answer": {
+              "cache_ttl_secs": null,
+              "cap": null
+            }
+          },
+          "raw": {
+            "backend_label": "service.example",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "/v1/info",
+            "one_sided_write": false,
+            "policy_denied": false,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": null,
+            "route_replay_class": "read",
+            "rpc_label": "GET /v1/info",
+            "target": {
+              "label": "service.example",
+              "upstream": "https://service.example/v1/info"
+            },
+            "upstream_headers": {
+              "injected": []
+            }
+          }
+        },
+        "testnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "read",
+            "stage": "third_party_path",
+            "third_party_answer": {
+              "cache_ttl_secs": null,
+              "cap": null
+            }
+          },
+          "raw": {
+            "backend_label": "service.example",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "/v1/info",
+            "one_sided_write": false,
+            "policy_denied": false,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": null,
+            "route_replay_class": "read",
+            "rpc_label": "GET /v1/info",
+            "target": {
+              "label": "service.example",
+              "upstream": "https://service.example/v1/info"
+            },
+            "upstream_headers": {
+              "injected": []
+            }
+          }
+        }
+      },
+      "method": "GET",
+      "name": "info",
+      "path": "/v1/info"
+    },
+    {
+      "authority": "service.example",
+      "expect": {
+        "mainnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "write",
+            "stage": "third_party_path",
+            "third_party_answer": {
+              "cache_ttl_secs": null,
+              "cap": null
+            }
+          },
+          "raw": {
+            "backend_label": "service.example",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "/v1/slots",
+            "one_sided_write": false,
+            "policy_denied": false,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": null,
+            "route_replay_class": "write",
+            "rpc_label": "POST /v1/slots",
+            "target": {
+              "label": "service.example",
+              "upstream": "https://service.example/v1/slots"
+            },
+            "upstream_headers": {
+              "injected": []
+            }
+          }
+        },
+        "testnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "write",
+            "stage": "third_party_path",
+            "third_party_answer": {
+              "cache_ttl_secs": null,
+              "cap": null
+            }
+          },
+          "raw": {
+            "backend_label": "service.example",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "/v1/slots",
+            "one_sided_write": false,
+            "policy_denied": false,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": null,
+            "route_replay_class": "write",
+            "rpc_label": "POST /v1/slots",
+            "target": {
+              "label": "service.example",
+              "upstream": "https://service.example/v1/slots"
+            },
+            "upstream_headers": {
+              "injected": []
+            }
+          }
+        }
+      },
+      "method": "POST",
+      "name": "create slot",
+      "path": "/v1/slots"
+    },
+    {
+      "authority": "service.example",
+      "expect": {
+        "mainnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "read",
+            "stage": "third_party_path",
+            "third_party_answer": {
+              "cache_ttl_secs": null,
+              "cap": null
+            }
+          },
+          "raw": {
+            "backend_label": "service.example",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "/v1/slots/*",
+            "one_sided_write": false,
+            "policy_denied": false,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": null,
+            "route_replay_class": "read",
+            "rpc_label": "GET /v1/slots/*",
+            "target": {
+              "label": "service.example",
+              "upstream": "https://service.example/v1/slots/slot-1"
+            },
+            "upstream_headers": {
+              "injected": []
+            }
+          }
+        },
+        "testnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "read",
+            "stage": "third_party_path",
+            "third_party_answer": {
+              "cache_ttl_secs": null,
+              "cap": null
+            }
+          },
+          "raw": {
+            "backend_label": "service.example",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "/v1/slots/*",
+            "one_sided_write": false,
+            "policy_denied": false,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": null,
+            "route_replay_class": "read",
+            "rpc_label": "GET /v1/slots/*",
+            "target": {
+              "label": "service.example",
+              "upstream": "https://service.example/v1/slots/slot-1"
+            },
+            "upstream_headers": {
+              "injected": []
+            }
+          }
+        }
+      },
+      "method": "GET",
+      "name": "read slot",
+      "path": "/v1/slots/slot-1"
+    },
+    {
+      "authority": "service.example",
+      "expect": {
+        "mainnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "write",
+            "stage": "third_party_path",
+            "third_party_answer": {
+              "cache_ttl_secs": null,
+              "cap": null
+            }
+          },
+          "raw": {
+            "backend_label": "service.example",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "/v1/slots/*",
+            "one_sided_write": false,
+            "policy_denied": false,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": null,
+            "route_replay_class": "write",
+            "rpc_label": "POST /v1/slots/*",
+            "target": {
+              "label": "service.example",
+              "upstream": "https://service.example/v1/slots/slot-1/claim"
+            },
+            "upstream_headers": {
+              "injected": []
+            }
+          }
+        },
+        "testnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "write",
+            "stage": "third_party_path",
+            "third_party_answer": {
+              "cache_ttl_secs": null,
+              "cap": null
+            }
+          },
+          "raw": {
+            "backend_label": "service.example",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "/v1/slots/*",
+            "one_sided_write": false,
+            "policy_denied": false,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": null,
+            "route_replay_class": "write",
+            "rpc_label": "POST /v1/slots/*",
+            "target": {
+              "label": "service.example",
+              "upstream": "https://service.example/v1/slots/slot-1/claim"
+            },
+            "upstream_headers": {
+              "injected": []
+            }
+          }
+        }
+      },
+      "method": "POST",
+      "name": "slot action",
+      "path": "/v1/slots/slot-1/claim"
+    },
+    {
+      "authority": "service.example",
+      "expect": {
+        "mainnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "write",
+            "stage": "third_party_path",
+            "third_party_answer": null
+          },
+          "raw": {
+            "backend_label": "service.example",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "(not in policy)",
+            "one_sided_write": false,
+            "policy_denied": true,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": null,
+            "route_replay_class": "write",
+            "rpc_label": "other",
+            "target": {
+              "label": "service.example",
+              "upstream": "https://service.example/v1/slots/slot-1"
+            },
+            "upstream_headers": {
+              "injected": []
+            }
+          }
+        },
+        "testnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "write",
+            "stage": "third_party_path",
+            "third_party_answer": null
+          },
+          "raw": {
+            "backend_label": "service.example",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "(not in policy)",
+            "one_sided_write": false,
+            "policy_denied": true,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": null,
+            "route_replay_class": "write",
+            "rpc_label": "other",
+            "target": {
+              "label": "service.example",
+              "upstream": "https://service.example/v1/slots/slot-1"
+            },
+            "upstream_headers": {
+              "injected": []
+            }
+          }
+        }
+      },
+      "method": "DELETE",
+      "name": "delete slot",
+      "path": "/v1/slots/slot-1"
+    },
+    {
+      "authority": "service.example",
+      "expect": {
+        "mainnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "read",
+            "stage": "third_party_path",
+            "third_party_answer": {
+              "cache_ttl_secs": null,
+              "cap": null
+            }
+          },
+          "raw": {
+            "backend_label": "service.example",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "/v1/slots/*",
+            "one_sided_write": false,
+            "policy_denied": false,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": null,
+            "route_replay_class": "read",
+            "rpc_label": "GET /v1/slots/*",
+            "target": {
+              "label": "service.example",
+              "upstream": "https://service.example/v1/slots"
+            },
+            "upstream_headers": {
+              "injected": []
+            }
+          }
+        },
+        "testnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "read",
+            "stage": "third_party_path",
+            "third_party_answer": {
+              "cache_ttl_secs": null,
+              "cap": null
+            }
+          },
+          "raw": {
+            "backend_label": "service.example",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "/v1/slots/*",
+            "one_sided_write": false,
+            "policy_denied": false,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": null,
+            "route_replay_class": "read",
+            "rpc_label": "GET /v1/slots/*",
+            "target": {
+              "label": "service.example",
+              "upstream": "https://service.example/v1/slots"
+            },
+            "upstream_headers": {
+              "injected": []
+            }
+          }
+        }
+      },
+      "method": "GET",
+      "name": "slot list GET",
+      "path": "/v1/slots"
+    },
+    {
+      "authority": "service.example",
+      "expect": {
+        "mainnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "write",
+            "stage": "third_party_path",
+            "third_party_answer": null
+          },
+          "raw": {
+            "backend_label": "service.example",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "(not in policy)",
+            "one_sided_write": false,
+            "policy_denied": true,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": null,
+            "route_replay_class": "write",
+            "rpc_label": "other",
+            "target": {
+              "label": "service.example",
+              "upstream": "https://service.example/v1/other"
+            },
+            "upstream_headers": {
+              "injected": []
+            }
+          }
+        },
+        "testnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "write",
+            "stage": "third_party_path",
+            "third_party_answer": null
+          },
+          "raw": {
+            "backend_label": "service.example",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "(not in policy)",
+            "one_sided_write": false,
+            "policy_denied": true,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": null,
+            "route_replay_class": "write",
+            "rpc_label": "other",
+            "target": {
+              "label": "service.example",
+              "upstream": "https://service.example/v1/other"
+            },
+            "upstream_headers": {
+              "injected": []
+            }
+          }
+        }
+      },
+      "method": "GET",
+      "name": "other",
+      "path": "/v1/other"
+    }
+  ]
+}

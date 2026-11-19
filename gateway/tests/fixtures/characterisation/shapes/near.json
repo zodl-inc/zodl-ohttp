@@ -1,0 +1,1075 @@
+{
+  "description": "Swap intents: bearer credential, only the token list cacheable, deposit routes are writes.",
+  "networks": [
+    "mainnet",
+    "testnet"
+  ],
+  "shapes": [
+    {
+      "authority": "near.example",
+      "expect": {
+        "mainnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "read",
+            "stage": "third_party_path",
+            "third_party_answer": {
+              "cache_ttl_secs": 300,
+              "cap": {
+                "requests": 120,
+                "window_secs": 60
+              }
+            }
+          },
+          "raw": {
+            "backend_label": "near.example",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "/v0/tokens",
+            "one_sided_write": false,
+            "policy_denied": false,
+            "query_admitted": true,
+            "route_cache_ttl_secs": 300,
+            "route_cap": {
+              "requests": 120,
+              "window_secs": 60
+            },
+            "route_replay_class": "read",
+            "rpc_label": "GET /v0/tokens",
+            "target": {
+              "label": "near.example",
+              "upstream": "https://near-api.example/v0/tokens"
+            },
+            "upstream_headers": {
+              "injected": [
+                [
+                  "Authorization",
+                  "Bearer fake-near-jwt"
+                ]
+              ]
+            }
+          }
+        },
+        "testnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "read",
+            "stage": "third_party_path",
+            "third_party_answer": {
+              "cache_ttl_secs": 300,
+              "cap": {
+                "requests": 120,
+                "window_secs": 60
+              }
+            }
+          },
+          "raw": {
+            "backend_label": "near.example",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "/v0/tokens",
+            "one_sided_write": false,
+            "policy_denied": false,
+            "query_admitted": true,
+            "route_cache_ttl_secs": 300,
+            "route_cap": {
+              "requests": 120,
+              "window_secs": 60
+            },
+            "route_replay_class": "read",
+            "rpc_label": "GET /v0/tokens",
+            "target": {
+              "label": "near.example",
+              "upstream": "https://near-api.example/v0/tokens"
+            },
+            "upstream_headers": {
+              "injected": [
+                [
+                  "Authorization",
+                  "Bearer fake-near-jwt"
+                ]
+              ]
+            }
+          }
+        }
+      },
+      "method": "GET",
+      "name": "tokens",
+      "path": "/v0/tokens"
+    },
+    {
+      "authority": "near.example",
+      "expect": {
+        "mainnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "read",
+            "stage": "third_party_path",
+            "third_party_answer": {
+              "cache_ttl_secs": 300,
+              "cap": {
+                "requests": 120,
+                "window_secs": 60
+              }
+            }
+          },
+          "raw": {
+            "backend_label": "near.example",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "/v0/tokens",
+            "one_sided_write": false,
+            "policy_denied": false,
+            "query_admitted": true,
+            "route_cache_ttl_secs": 300,
+            "route_cap": {
+              "requests": 120,
+              "window_secs": 60
+            },
+            "route_replay_class": "read",
+            "rpc_label": "GET /v0/tokens",
+            "target": {
+              "label": "near.example",
+              "upstream": "https://near-api.example/v0/tokens?chain=zec"
+            },
+            "upstream_headers": {
+              "injected": [
+                [
+                  "Authorization",
+                  "Bearer fake-near-jwt"
+                ]
+              ]
+            }
+          }
+        },
+        "testnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "read",
+            "stage": "third_party_path",
+            "third_party_answer": {
+              "cache_ttl_secs": 300,
+              "cap": {
+                "requests": 120,
+                "window_secs": 60
+              }
+            }
+          },
+          "raw": {
+            "backend_label": "near.example",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "/v0/tokens",
+            "one_sided_write": false,
+            "policy_denied": false,
+            "query_admitted": true,
+            "route_cache_ttl_secs": 300,
+            "route_cap": {
+              "requests": 120,
+              "window_secs": 60
+            },
+            "route_replay_class": "read",
+            "rpc_label": "GET /v0/tokens",
+            "target": {
+              "label": "near.example",
+              "upstream": "https://near-api.example/v0/tokens?chain=zec"
+            },
+            "upstream_headers": {
+              "injected": [
+                [
+                  "Authorization",
+                  "Bearer fake-near-jwt"
+                ]
+              ]
+            }
+          }
+        }
+      },
+      "method": "GET",
+      "name": "tokens with query",
+      "path": "/v0/tokens?chain=zec"
+    },
+    {
+      "authority": "near.example",
+      "expect": {
+        "mainnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "write",
+            "stage": "third_party_path",
+            "third_party_answer": null
+          },
+          "raw": {
+            "backend_label": "near.example",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "(not in policy)",
+            "one_sided_write": false,
+            "policy_denied": true,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": {
+              "requests": 120,
+              "window_secs": 60
+            },
+            "route_replay_class": "write",
+            "rpc_label": "other",
+            "target": {
+              "label": "near.example",
+              "upstream": "https://near-api.example/v0/tokens/extra"
+            },
+            "upstream_headers": {
+              "injected": [
+                [
+                  "Authorization",
+                  "Bearer fake-near-jwt"
+                ]
+              ]
+            }
+          }
+        },
+        "testnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "write",
+            "stage": "third_party_path",
+            "third_party_answer": null
+          },
+          "raw": {
+            "backend_label": "near.example",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "(not in policy)",
+            "one_sided_write": false,
+            "policy_denied": true,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": {
+              "requests": 120,
+              "window_secs": 60
+            },
+            "route_replay_class": "write",
+            "rpc_label": "other",
+            "target": {
+              "label": "near.example",
+              "upstream": "https://near-api.example/v0/tokens/extra"
+            },
+            "upstream_headers": {
+              "injected": [
+                [
+                  "Authorization",
+                  "Bearer fake-near-jwt"
+                ]
+              ]
+            }
+          }
+        }
+      },
+      "method": "GET",
+      "name": "tokens sub-path",
+      "path": "/v0/tokens/extra"
+    },
+    {
+      "authority": "near.example",
+      "expect": {
+        "mainnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "write",
+            "stage": "third_party_path",
+            "third_party_answer": {
+              "cache_ttl_secs": null,
+              "cap": {
+                "requests": 120,
+                "window_secs": 60
+              }
+            }
+          },
+          "raw": {
+            "backend_label": "near.example",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "/v0/quote",
+            "one_sided_write": false,
+            "policy_denied": false,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": {
+              "requests": 120,
+              "window_secs": 60
+            },
+            "route_replay_class": "write",
+            "rpc_label": "POST /v0/quote",
+            "target": {
+              "label": "near.example",
+              "upstream": "https://near-api.example/v0/quote"
+            },
+            "upstream_headers": {
+              "injected": [
+                [
+                  "Authorization",
+                  "Bearer fake-near-jwt"
+                ]
+              ]
+            }
+          }
+        },
+        "testnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "write",
+            "stage": "third_party_path",
+            "third_party_answer": {
+              "cache_ttl_secs": null,
+              "cap": {
+                "requests": 120,
+                "window_secs": 60
+              }
+            }
+          },
+          "raw": {
+            "backend_label": "near.example",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "/v0/quote",
+            "one_sided_write": false,
+            "policy_denied": false,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": {
+              "requests": 120,
+              "window_secs": 60
+            },
+            "route_replay_class": "write",
+            "rpc_label": "POST /v0/quote",
+            "target": {
+              "label": "near.example",
+              "upstream": "https://near-api.example/v0/quote"
+            },
+            "upstream_headers": {
+              "injected": [
+                [
+                  "Authorization",
+                  "Bearer fake-near-jwt"
+                ]
+              ]
+            }
+          }
+        }
+      },
+      "method": "POST",
+      "name": "quote",
+      "path": "/v0/quote"
+    },
+    {
+      "authority": "near.example",
+      "expect": {
+        "mainnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "write",
+            "stage": "third_party_path",
+            "third_party_answer": null
+          },
+          "raw": {
+            "backend_label": "near.example",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "(not in policy)",
+            "one_sided_write": false,
+            "policy_denied": true,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": {
+              "requests": 120,
+              "window_secs": 60
+            },
+            "route_replay_class": "write",
+            "rpc_label": "other",
+            "target": {
+              "label": "near.example",
+              "upstream": "https://near-api.example/v0/quote"
+            },
+            "upstream_headers": {
+              "injected": [
+                [
+                  "Authorization",
+                  "Bearer fake-near-jwt"
+                ]
+              ]
+            }
+          }
+        },
+        "testnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "write",
+            "stage": "third_party_path",
+            "third_party_answer": null
+          },
+          "raw": {
+            "backend_label": "near.example",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "(not in policy)",
+            "one_sided_write": false,
+            "policy_denied": true,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": {
+              "requests": 120,
+              "window_secs": 60
+            },
+            "route_replay_class": "write",
+            "rpc_label": "other",
+            "target": {
+              "label": "near.example",
+              "upstream": "https://near-api.example/v0/quote"
+            },
+            "upstream_headers": {
+              "injected": [
+                [
+                  "Authorization",
+                  "Bearer fake-near-jwt"
+                ]
+              ]
+            }
+          }
+        }
+      },
+      "method": "GET",
+      "name": "quote GET",
+      "path": "/v0/quote"
+    },
+    {
+      "authority": "near.example",
+      "expect": {
+        "mainnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "read",
+            "stage": "third_party_path",
+            "third_party_answer": {
+              "cache_ttl_secs": null,
+              "cap": {
+                "requests": 120,
+                "window_secs": 60
+              }
+            }
+          },
+          "raw": {
+            "backend_label": "near.example",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "/v0/status",
+            "one_sided_write": false,
+            "policy_denied": false,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": {
+              "requests": 120,
+              "window_secs": 60
+            },
+            "route_replay_class": "read",
+            "rpc_label": "GET /v0/status",
+            "target": {
+              "label": "near.example",
+              "upstream": "https://near-api.example/v0/status?depositAddress=t1FakeDepositAddressForTests"
+            },
+            "upstream_headers": {
+              "injected": [
+                [
+                  "Authorization",
+                  "Bearer fake-near-jwt"
+                ]
+              ]
+            }
+          }
+        },
+        "testnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "read",
+            "stage": "third_party_path",
+            "third_party_answer": {
+              "cache_ttl_secs": null,
+              "cap": {
+                "requests": 120,
+                "window_secs": 60
+              }
+            }
+          },
+          "raw": {
+            "backend_label": "near.example",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "/v0/status",
+            "one_sided_write": false,
+            "policy_denied": false,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": {
+              "requests": 120,
+              "window_secs": 60
+            },
+            "route_replay_class": "read",
+            "rpc_label": "GET /v0/status",
+            "target": {
+              "label": "near.example",
+              "upstream": "https://near-api.example/v0/status?depositAddress=t1FakeDepositAddressForTests"
+            },
+            "upstream_headers": {
+              "injected": [
+                [
+                  "Authorization",
+                  "Bearer fake-near-jwt"
+                ]
+              ]
+            }
+          }
+        }
+      },
+      "method": "GET",
+      "name": "status",
+      "path": "/v0/status?depositAddress=t1FakeDepositAddressForTests"
+    },
+    {
+      "authority": "near.example",
+      "expect": {
+        "mainnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "write",
+            "stage": "third_party_path",
+            "third_party_answer": null
+          },
+          "raw": {
+            "backend_label": "near.example",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "(not in policy)",
+            "one_sided_write": false,
+            "policy_denied": true,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": {
+              "requests": 120,
+              "window_secs": 60
+            },
+            "route_replay_class": "write",
+            "rpc_label": "other",
+            "target": {
+              "label": "near.example",
+              "upstream": "https://near-api.example/v0/status"
+            },
+            "upstream_headers": {
+              "injected": [
+                [
+                  "Authorization",
+                  "Bearer fake-near-jwt"
+                ]
+              ]
+            }
+          }
+        },
+        "testnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "write",
+            "stage": "third_party_path",
+            "third_party_answer": null
+          },
+          "raw": {
+            "backend_label": "near.example",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "(not in policy)",
+            "one_sided_write": false,
+            "policy_denied": true,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": {
+              "requests": 120,
+              "window_secs": 60
+            },
+            "route_replay_class": "write",
+            "rpc_label": "other",
+            "target": {
+              "label": "near.example",
+              "upstream": "https://near-api.example/v0/status"
+            },
+            "upstream_headers": {
+              "injected": [
+                [
+                  "Authorization",
+                  "Bearer fake-near-jwt"
+                ]
+              ]
+            }
+          }
+        }
+      },
+      "method": "DELETE",
+      "name": "status DELETE",
+      "path": "/v0/status"
+    },
+    {
+      "authority": "near.example",
+      "expect": {
+        "mainnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "write",
+            "stage": "third_party_path",
+            "third_party_answer": {
+              "cache_ttl_secs": null,
+              "cap": {
+                "requests": 120,
+                "window_secs": 60
+              }
+            }
+          },
+          "raw": {
+            "backend_label": "near.example",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "/v0/deposit/submit",
+            "one_sided_write": false,
+            "policy_denied": false,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": {
+              "requests": 120,
+              "window_secs": 60
+            },
+            "route_replay_class": "write",
+            "rpc_label": "POST /v0/deposit/submit",
+            "target": {
+              "label": "near.example",
+              "upstream": "https://near-api.example/v0/deposit/submit"
+            },
+            "upstream_headers": {
+              "injected": [
+                [
+                  "Authorization",
+                  "Bearer fake-near-jwt"
+                ]
+              ]
+            }
+          }
+        },
+        "testnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "write",
+            "stage": "third_party_path",
+            "third_party_answer": {
+              "cache_ttl_secs": null,
+              "cap": {
+                "requests": 120,
+                "window_secs": 60
+              }
+            }
+          },
+          "raw": {
+            "backend_label": "near.example",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "/v0/deposit/submit",
+            "one_sided_write": false,
+            "policy_denied": false,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": {
+              "requests": 120,
+              "window_secs": 60
+            },
+            "route_replay_class": "write",
+            "rpc_label": "POST /v0/deposit/submit",
+            "target": {
+              "label": "near.example",
+              "upstream": "https://near-api.example/v0/deposit/submit"
+            },
+            "upstream_headers": {
+              "injected": [
+                [
+                  "Authorization",
+                  "Bearer fake-near-jwt"
+                ]
+              ]
+            }
+          }
+        }
+      },
+      "method": "POST",
+      "name": "deposit submit",
+      "path": "/v0/deposit/submit"
+    },
+    {
+      "authority": "near.example",
+      "expect": {
+        "mainnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "write",
+            "stage": "third_party_path",
+            "third_party_answer": null
+          },
+          "raw": {
+            "backend_label": "near.example",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "(not in policy)",
+            "one_sided_write": false,
+            "policy_denied": true,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": {
+              "requests": 120,
+              "window_secs": 60
+            },
+            "route_replay_class": "write",
+            "rpc_label": "other",
+            "target": {
+              "label": "near.example",
+              "upstream": "https://near-api.example/v0/deposit/submit"
+            },
+            "upstream_headers": {
+              "injected": [
+                [
+                  "Authorization",
+                  "Bearer fake-near-jwt"
+                ]
+              ]
+            }
+          }
+        },
+        "testnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "write",
+            "stage": "third_party_path",
+            "third_party_answer": null
+          },
+          "raw": {
+            "backend_label": "near.example",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "(not in policy)",
+            "one_sided_write": false,
+            "policy_denied": true,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": {
+              "requests": 120,
+              "window_secs": 60
+            },
+            "route_replay_class": "write",
+            "rpc_label": "other",
+            "target": {
+              "label": "near.example",
+              "upstream": "https://near-api.example/v0/deposit/submit"
+            },
+            "upstream_headers": {
+              "injected": [
+                [
+                  "Authorization",
+                  "Bearer fake-near-jwt"
+                ]
+              ]
+            }
+          }
+        }
+      },
+      "method": "GET",
+      "name": "deposit submit GET",
+      "path": "/v0/deposit/submit"
+    },
+    {
+      "authority": "near.example",
+      "expect": {
+        "mainnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "write",
+            "stage": "third_party_path",
+            "third_party_answer": null
+          },
+          "raw": {
+            "backend_label": "near.example",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "(not in policy)",
+            "one_sided_write": false,
+            "policy_denied": true,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": {
+              "requests": 120,
+              "window_secs": 60
+            },
+            "route_replay_class": "write",
+            "rpc_label": "other",
+            "target": {
+              "label": "near.example",
+              "upstream": "https://near-api.example/v1/tokens"
+            },
+            "upstream_headers": {
+              "injected": [
+                [
+                  "Authorization",
+                  "Bearer fake-near-jwt"
+                ]
+              ]
+            }
+          }
+        },
+        "testnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "write",
+            "stage": "third_party_path",
+            "third_party_answer": null
+          },
+          "raw": {
+            "backend_label": "near.example",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "(not in policy)",
+            "one_sided_write": false,
+            "policy_denied": true,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": {
+              "requests": 120,
+              "window_secs": 60
+            },
+            "route_replay_class": "write",
+            "rpc_label": "other",
+            "target": {
+              "label": "near.example",
+              "upstream": "https://near-api.example/v1/tokens"
+            },
+            "upstream_headers": {
+              "injected": [
+                [
+                  "Authorization",
+                  "Bearer fake-near-jwt"
+                ]
+              ]
+            }
+          }
+        }
+      },
+      "method": "GET",
+      "name": "other version",
+      "path": "/v1/tokens"
+    },
+    {
+      "authority": "near.example",
+      "expect": {
+        "mainnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "write",
+            "stage": "third_party_path",
+            "third_party_answer": null
+          },
+          "raw": {
+            "backend_label": "near.example",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "(not in policy)",
+            "one_sided_write": false,
+            "policy_denied": true,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": {
+              "requests": 120,
+              "window_secs": 60
+            },
+            "route_replay_class": "write",
+            "rpc_label": "other",
+            "target": {
+              "label": "near.example",
+              "upstream": "https://near-api.example/v0//tokens"
+            },
+            "upstream_headers": {
+              "injected": [
+                [
+                  "Authorization",
+                  "Bearer fake-near-jwt"
+                ]
+              ]
+            }
+          }
+        },
+        "testnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "write",
+            "stage": "third_party_path",
+            "third_party_answer": null
+          },
+          "raw": {
+            "backend_label": "near.example",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "(not in policy)",
+            "one_sided_write": false,
+            "policy_denied": true,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": {
+              "requests": 120,
+              "window_secs": 60
+            },
+            "route_replay_class": "write",
+            "rpc_label": "other",
+            "target": {
+              "label": "near.example",
+              "upstream": "https://near-api.example/v0//tokens"
+            },
+            "upstream_headers": {
+              "injected": [
+                [
+                  "Authorization",
+                  "Bearer fake-near-jwt"
+                ]
+              ]
+            }
+          }
+        }
+      },
+      "method": "GET",
+      "name": "double slash",
+      "path": "/v0//tokens"
+    },
+    {
+      "authority": "near.example",
+      "expect": {
+        "mainnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "write",
+            "stage": "third_party_path",
+            "third_party_answer": {
+              "cache_ttl_secs": null,
+              "cap": {
+                "requests": 120,
+                "window_secs": 60
+              }
+            }
+          },
+          "raw": {
+            "backend_label": "near.example",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "/v0/quote",
+            "one_sided_write": false,
+            "policy_denied": false,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": {
+              "requests": 120,
+              "window_secs": 60
+            },
+            "route_replay_class": "write",
+            "rpc_label": "POST /v0/quote",
+            "target": {
+              "label": "near.example",
+              "upstream": "https://near-api.example/v0/quote"
+            },
+            "upstream_headers": {
+              "injected": [
+                [
+                  "Authorization",
+                  "Bearer fake-near-jwt"
+                ]
+              ]
+            }
+          }
+        },
+        "testnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "write",
+            "stage": "third_party_path",
+            "third_party_answer": {
+              "cache_ttl_secs": null,
+              "cap": {
+                "requests": 120,
+                "window_secs": 60
+              }
+            }
+          },
+          "raw": {
+            "backend_label": "near.example",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "/v0/quote",
+            "one_sided_write": false,
+            "policy_denied": false,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": {
+              "requests": 120,
+              "window_secs": 60
+            },
+            "route_replay_class": "write",
+            "rpc_label": "POST /v0/quote",
+            "target": {
+              "label": "near.example",
+              "upstream": "https://near-api.example/v0/quote"
+            },
+            "upstream_headers": {
+              "injected": [
+                [
+                  "Authorization",
+                  "Bearer fake-near-jwt"
+                ]
+              ]
+            }
+          }
+        }
+      },
+      "headers": [
+        [
+          "authorization",
+          "Bearer client-token"
+        ],
+        [
+          "content-type",
+          "application/json"
+        ]
+      ],
+      "method": "POST",
+      "name": "injected credential, client authorization present",
+      "path": "/v0/quote"
+    }
+  ]
+}
