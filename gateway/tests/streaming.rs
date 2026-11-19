@@ -32,13 +32,13 @@ use hpke::{
     aead::AesGcm128, kdf::HkdfSha256, kem::X25519HkdfSha256, Deserializable, Kem, OpModeS,
     Serializable,
 };
-use ohttp_gateway::chunked_stream::{chunk_nonce, encode_response_stream, UpFrame};
-use ohttp_gateway::config::Config;
-use ohttp_gateway::hpke::{KeyState, ResponseContext, N_K, N_N};
-use ohttp_gateway::ohttp_chunked::decapsulate_chunked_request;
 use rand_core::TryRngCore;
 use sha2::Sha256;
 use std::collections::HashMap;
+use zodl_ohttp_gateway::chunked_stream::{chunk_nonce, encode_response_stream, UpFrame};
+use zodl_ohttp_gateway::config::Config;
+use zodl_ohttp_gateway::hpke::{KeyState, ResponseContext, N_K, N_N};
+use zodl_ohttp_gateway::ohttp_chunked::decapsulate_chunked_request;
 
 const TAG: usize = 16;
 
@@ -86,7 +86,7 @@ fn gateway_config() -> Config {
         dynamic_hosts: Default::default(),
         host_list: Default::default(),
         third_party_query_rules: Default::default(),
-        relay_secret_on_key_config: ohttp_gateway::config::RelaySecretOnKeyConfig::Off,
+        relay_secret_on_key_config: zodl_ohttp_gateway::config::RelaySecretOnKeyConfig::Off,
         lwd_permit_wait_ms: 2000,
         lwd_permit_max_waiters: 0,
     }

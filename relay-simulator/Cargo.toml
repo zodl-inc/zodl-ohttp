@@ -5,6 +5,7 @@ license = "AGPL-3.0-only"
 edition = "2021"
 authors = ["ZODL Inc."]
 description = "OHTTP relay simulator for local testing"
+publish = false
 
 [dependencies]
 # Async runtime

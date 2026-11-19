@@ -29,7 +29,7 @@ use zodl_ohttp_client::{
     Error, KeyConfig, ResponseEvent,
 };
 
-use ohttp_gateway::{
+use zodl_ohttp_gateway::{
     chunked_stream::{encode_response_stream, encode_response_stream_padded, UpFrame},
     config::Config,
     hpke::{KeyState, ResponseContext},
@@ -81,7 +81,7 @@ fn gateway_config(key_id: u8, private_key_hex: &str) -> Config {
         dynamic_hosts: Default::default(),
         host_list: Default::default(),
         third_party_query_rules: Default::default(),
-        relay_secret_on_key_config: ohttp_gateway::config::RelaySecretOnKeyConfig::Off,
+        relay_secret_on_key_config: zodl_ohttp_gateway::config::RelaySecretOnKeyConfig::Off,
         lwd_permit_wait_ms: 2000,
         lwd_permit_max_waiters: 0,
     }
@@ -360,7 +360,7 @@ async fn non_zero_padding_inside_the_final_chunk_is_rejected() {
 
 /// `nonce || varint(0) || Seal(final chunk)` with the gateway's own sealer.
 fn seal_single_final_chunk(ctx: &ResponseContext, plaintext: &[u8]) -> Vec<u8> {
-    use ohttp_gateway::chunked_stream::ChunkSealer;
+    use zodl_ohttp_gateway::chunked_stream::ChunkSealer;
     let nonce = [0x42u8; 16];
     let mut sealer = ChunkSealer::new(ctx, &nonce).unwrap();
     let mut out = nonce.to_vec();
@@ -373,7 +373,7 @@ fn seal_single_final_chunk(ctx: &ResponseContext, plaintext: &[u8]) -> Vec<u8> {
 /// before the final chunk stays `Error::Truncated`.
 #[tokio::test]
 async fn a_non_final_chunk_that_does_not_open_is_an_open_error() {
-    use ohttp_gateway::chunked_stream::ChunkSealer;
+    use zodl_ohttp_gateway::chunked_stream::ChunkSealer;
     let gateway = key_state(5);
     let (ctx, opener) = exchange(&gateway).await;
     let nonce = [0x24u8; 16];
@@ -418,7 +418,7 @@ async fn a_non_final_chunk_that_does_not_open_is_an_open_error() {
 async fn an_empty_non_final_chunk_is_refused() {
     use aes_gcm::aead::{Aead, KeyInit, Payload};
     use aes_gcm::{Aes128Gcm, Nonce};
-    use ohttp_gateway::chunked_stream::chunk_nonce;
+    use zodl_ohttp_gateway::chunked_stream::chunk_nonce;
     let gateway = key_state(9);
     let (ctx, opener) = exchange(&gateway).await;
     let nonce = [0x5au8; 16];

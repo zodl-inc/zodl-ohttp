@@ -15,7 +15,7 @@
 // Commercial licensing: see COMMERCIAL-LICENSE.md.
 
 //! The client against the gateway's own key configuration, signed envelopes, chunked
-//! decapsulation and streaming response encapsulation (`ohttp-gateway`'s library), served
+//! decapsulation and streaming response encapsulation (`zodl-ohttp-gateway`'s library), served
 //! in-process as relay and gateway in one, in front of an echo backend.
 //!
 //! The test server speaks plain HTTP on the loopback interface, so every client here is built
@@ -36,16 +36,16 @@ use axum::{Json, Router};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use futures_util::stream::BoxStream;
 use futures_util::StreamExt;
-use ohttp_gateway::chunked_stream::{collected_upstream, encode_response_stream, UpFrame};
-use ohttp_gateway::config::Config;
-use ohttp_gateway::hpke::KeyState;
-use ohttp_gateway::ohttp::{self as gateway, InnerResponse};
-use ohttp_gateway::ohttp_chunked::decapsulate_chunked_request;
-use ohttp_gateway::signing::SigningState;
 use zodl_ohttp_client::{
     is_unknown_authority, Client, Error, HostListAnswer, HostListScope, HttpErrorKind, KeyConfig,
     KeyConfigSource, Network, NoHostList, OuterHeaders, RefreshOutcome, Request, ThirdPartyHosts,
 };
+use zodl_ohttp_gateway::chunked_stream::{collected_upstream, encode_response_stream, UpFrame};
+use zodl_ohttp_gateway::config::Config;
+use zodl_ohttp_gateway::hpke::KeyState;
+use zodl_ohttp_gateway::ohttp::{self as gateway, InnerResponse};
+use zodl_ohttp_gateway::ohttp_chunked::decapsulate_chunked_request;
+use zodl_ohttp_gateway::signing::SigningState;
 
 const TIMEOUT: Duration = Duration::from_secs(10);
 const NETWORK: &str = "testnet";
@@ -96,7 +96,7 @@ fn gateway_config(key_id: u8, private_key_hex: &str) -> Config {
         dynamic_hosts: Default::default(),
         host_list: Default::default(),
         third_party_query_rules: Default::default(),
-        relay_secret_on_key_config: ohttp_gateway::config::RelaySecretOnKeyConfig::Off,
+        relay_secret_on_key_config: zodl_ohttp_gateway::config::RelaySecretOnKeyConfig::Off,
         lwd_permit_wait_ms: 2000,
         lwd_permit_max_waiters: 0,
     }
@@ -267,7 +267,7 @@ async fn relay(
 fn third_party_answer(gw: &TestGateway, inner: &gateway::InnerRequest) -> Option<InnerResponse> {
     let guard = gw.third_party.lock().unwrap();
     let config = guard.as_ref()?;
-    if ohttp_gateway::host_list::is_request(config, inner) {
+    if zodl_ohttp_gateway::host_list::is_request(config, inner) {
         if gw.oversized_host_list.load(Ordering::SeqCst) {
             // What the gateway itself never sends: more than a wallet reads.
             return Some(InnerResponse {
@@ -276,7 +276,7 @@ fn third_party_answer(gw: &TestGateway, inner: &gateway::InnerRequest) -> Option
                 body: vec![b' '; OVERSIZED_BYTES],
             });
         }
-        return Some(ohttp_gateway::host_list::answer(config, inner));
+        return Some(zodl_ohttp_gateway::host_list::answer(config, inner));
     }
     let refusal = |status: u16, body: &[u8]| {
         Some(InnerResponse {
@@ -285,8 +285,8 @@ fn third_party_answer(gw: &TestGateway, inner: &gateway::InnerRequest) -> Option
             body: body.to_vec(),
         })
     };
-    use ohttp_gateway::proxy::BackendTarget;
-    match ohttp_gateway::proxy::resolve_backend(config, inner) {
+    use zodl_ohttp_gateway::proxy::BackendTarget;
+    match zodl_ohttp_gateway::proxy::resolve_backend(config, inner) {
         BackendTarget::Upstream { .. } => None,
         BackendTarget::Rejected => refusal(403, b"unknown authority"),
         // A malformed authority (upper case, for one) or path: refused, not forwarded.
@@ -748,7 +748,10 @@ const OVERSIZED_BYTES: usize = 2 * 1024 * 1024;
 
 /// A gateway configuration that carries `aliases` (each on `GET /*`) and publishes its host
 /// list in `mode`.
-fn third_party_config(aliases: &[&str], mode: ohttp_gateway::host_list::PublishMode) -> Config {
+fn third_party_config(
+    aliases: &[&str],
+    mode: zodl_ohttp_gateway::host_list::PublishMode,
+) -> Config {
     let mut config = gateway_config(1, &private_key(1));
     config.gateway_hosts = vec![GATEWAY_HOST.to_string()];
     config.lwd_addr = "lwd.example:9067".to_string();
@@ -761,7 +764,7 @@ fn third_party_config(aliases: &[&str], mode: ohttp_gateway::host_list::PublishM
             vec![("GET".to_string(), "/*".to_string())],
         );
     }
-    config.host_list = ohttp_gateway::host_list::HostListSettings {
+    config.host_list = zodl_ohttp_gateway::host_list::HostListSettings {
         mode,
         max_age_secs: 300,
     };
@@ -770,7 +773,7 @@ fn third_party_config(aliases: &[&str], mode: ohttp_gateway::host_list::PublishM
 
 #[tokio::test]
 async fn the_gateways_host_list_is_fetched_revalidated_and_followed() {
-    use ohttp_gateway::host_list::PublishMode;
+    use zodl_ohttp_gateway::host_list::PublishMode;
     let (base, gw) = spawn().await;
     let client = plain_client(&base);
     *gw.third_party.lock().unwrap() = Some(third_party_config(
@@ -901,7 +904,7 @@ async fn the_gateways_host_list_is_fetched_revalidated_and_followed() {
 
 #[tokio::test]
 async fn a_dynamic_scope_list_adds_to_the_bootstrap_list() {
-    use ohttp_gateway::host_list::PublishMode;
+    use zodl_ohttp_gateway::host_list::PublishMode;
     let (base, gw) = spawn().await;
     let client = plain_client(&base);
     // `dynamic`: the static aliases are not published; this gateway has no dynamic source.
@@ -925,8 +928,8 @@ async fn a_dynamic_scope_list_adds_to_the_bootstrap_list() {
 
 #[tokio::test]
 async fn a_gateway_without_a_list_leaves_what_is_held() {
-    use ohttp_gateway::dynamic_hosts::{DynamicHosts, Reserved, Settings};
-    use ohttp_gateway::host_list::PublishMode;
+    use zodl_ohttp_gateway::dynamic_hosts::{DynamicHosts, Reserved, Settings};
+    use zodl_ohttp_gateway::host_list::PublishMode;
     let (base, gw) = spawn().await;
     let client = plain_client(&base);
     let hosts = ThirdPartyHosts::new(["compiled.example.org"]);
@@ -994,7 +997,7 @@ async fn a_gateway_without_a_list_leaves_what_is_held() {
 
 #[tokio::test]
 async fn an_oversized_host_list_is_refused_while_it_streams() {
-    use ohttp_gateway::host_list::PublishMode;
+    use zodl_ohttp_gateway::host_list::PublishMode;
     let (base, gw) = spawn().await;
     let client = plain_client(&base);
     *gw.third_party.lock().unwrap() =
@@ -1029,7 +1032,7 @@ async fn an_oversized_host_list_is_refused_while_it_streams() {
 
 #[tokio::test]
 async fn a_refresh_that_stalls_or_is_dropped_does_not_block_the_next() {
-    use ohttp_gateway::host_list::PublishMode;
+    use zodl_ohttp_gateway::host_list::PublishMode;
     let (base, gw) = spawn().await;
     let client = plain_client(&base);
     *gw.third_party.lock().unwrap() =

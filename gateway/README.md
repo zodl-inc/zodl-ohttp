@@ -6,6 +6,11 @@ with HPKE (RFC 9180), forwards the Binary HTTP (RFC 9292) inner request to light
 or to an allowlisted third-party HTTP API, and seals the answer back to the client as it
 streams.
 
+The crate is `zodl-ohttp-gateway` (library `zodl_ohttp_gateway`, binary `zodl-ohttp-gateway`). It is
+not published on crates.io and is unrelated to the `ohttp-gateway` crate there; it is built into
+the `ohttp-gateway` image only, whose name is unchanged. The image keeps `/app/ohttp-gateway` as
+a link to the binary.
+
 Every setting is an environment variable: see [CONFIG.md](CONFIG.md). The design, privacy model
 and protocol details are in [../docs/architecture.md](../docs/architecture.md); logs and
 metrics in [../docs/observability.md](../docs/observability.md).
@@ -54,7 +59,7 @@ calls.
 ## Build and run
 
 ```bash
-cargo build --release            # binary target/release/ohttp-gateway
+cargo build --release            # binary target/release/zodl-ohttp-gateway
 cargo test                       # store-backed tests need a Redis on 127.0.0.1:6379 and fail without it;
                                  # OHTTP_TEST_ALLOW_NO_STORE=1 skips them instead (ignored when CI is set)
 docker build -t ohttp-gateway .  # from this directory
@@ -75,8 +80,8 @@ cargo run --release
 TLS is terminated in front of the gateway. The relay simulator (`../relay-simulator`) and the
 e2e client (`../e2e-client`, `../scripts/test-e2e.sh`) exercise a running gateway end to end.
 
-`ohttp-gateway backfill` fills the permanent block tier from lightwalletd and exits
-(CONFIG.md, "`ohttp-gateway backfill`").
+`zodl-ohttp-gateway backfill` fills the permanent block tier from lightwalletd and exits
+(CONFIG.md, "`zodl-ohttp-gateway backfill`").
 
 ## Signed key configuration
 

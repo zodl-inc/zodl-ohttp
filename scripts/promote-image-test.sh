@@ -97,13 +97,13 @@ g() { git -C "$repo" -c user.name=test -c user.email=test@example.com "$@"; }
 sg() { g -c "user.signingkey=$1" -c gpg.program=gpg "${@:2}"; }
 write_versions() { # gateway-crate relay-crate [gateway-lock] [relay-lock] [client-lock]
   mkdir -p "$repo/gateway" "$repo/relay-simulator" "$repo/client"
-  printf '[package]\nname = "ohttp-gateway"\nversion = "%s"\n\n[dependencies]\nversion = "9.9.9"\n' "$1" \
+  printf '[package]\nname = "zodl-ohttp-gateway"\nversion = "%s"\n\n[dependencies]\nversion = "9.9.9"\n' "$1" \
     >"$repo/gateway/Cargo.toml"
   printf '[package]\nname = "ohttp-relay-simulator"\nversion = "%s"\n' "$2" >"$repo/relay-simulator/Cargo.toml"
-  printf '[[package]]\nname = "aes"\nversion = "0.8.4"\n\n[[package]]\nname = "ohttp-gateway"\nversion = "%s"\n' \
+  printf '[[package]]\nname = "aes"\nversion = "0.8.4"\n\n[[package]]\nname = "zodl-ohttp-gateway"\nversion = "%s"\n' \
     "${3:-$1}" >"$repo/gateway/Cargo.lock"
   printf '[[package]]\nname = "ohttp-relay-simulator"\nversion = "%s"\n' "${4:-$2}" >"$repo/relay-simulator/Cargo.lock"
-  printf '[[package]]\nname = "ohttp-gateway"\nversion = "%s"\n\n[[package]]\nname = "zodl-ohttp-client"\nversion = "3.0.0"\n' \
+  printf '[[package]]\nname = "zodl-ohttp-gateway"\nversion = "%s"\n\n[[package]]\nname = "zodl-ohttp-client"\nversion = "3.0.0"\n' \
     "${5:-$1}" >"$repo/client/Cargo.lock"
 }
 mkdir -p "$repo/.github"
@@ -180,13 +180,13 @@ expect fail ct --tag v1.2.0 --commit "$on_main" --keys-file ""
 # Merged side commits are on main; lock files and crate versions are checked.
 expect ok ct --tag v1.4.0 --commit "$off_main"
 expect fail ct --tag v1.5.0 --commit "$lock_mismatch"
-contains "gateway/Cargo.lock has ohttp-gateway 1.4.0"
+contains "gateway/Cargo.lock has zodl-ohttp-gateway 1.4.0"
 expect fail ct --tag v1.6.0 --commit "$client_mismatch"
-contains "client/Cargo.lock has ohttp-gateway 1.5.0"
+contains "client/Cargo.lock has zodl-ohttp-gateway 1.5.0"
 expect fail ct --tag v1.7.0 --commit "$crate_mismatch"
 contains "differs from the relay-simulator crate version 1.6.0"
 expect fail ct --tag v1.8.0 --commit "$no_entry"
-contains "gateway/Cargo.lock has no ohttp-gateway entry"
+contains "gateway/Cargo.lock has no zodl-ohttp-gateway entry"
 expect fail ct --tag v1.9.0 --commit "$no_toml"
 contains "relay-simulator/Cargo.toml is missing at $no_toml"
 # A tag object with a malformed name header (an escape character): a fixed message.

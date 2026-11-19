@@ -114,7 +114,7 @@ check_versions() {
     found=""
     while read -r name lv; do
       case "$name" in
-        ohttp-gateway | ohttp-relay-simulator)
+        zodl-ohttp-gateway | ohttp-relay-simulator)
           [[ "$lv" == "$version" ]] ||
             die "$lock/Cargo.lock has $name $lv, expected $version (update the lock file)"
           found="$found $name"
@@ -122,7 +122,7 @@ check_versions() {
       esac
     done < <(git -C "$root" show "$commit:$lock/Cargo.lock" | lock_packages)
     case "$lock" in
-      gateway) [[ "$found" == *" ohttp-gateway"* ]] || die "gateway/Cargo.lock has no ohttp-gateway entry" ;;
+      gateway) [[ "$found" == *" zodl-ohttp-gateway"* ]] || die "gateway/Cargo.lock has no zodl-ohttp-gateway entry" ;;
       relay-simulator)
         [[ "$found" == *" ohttp-relay-simulator"* ]] ||
           die "relay-simulator/Cargo.lock has no ohttp-relay-simulator entry"

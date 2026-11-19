@@ -14,7 +14,7 @@
 //
 // Commercial licensing: see COMMERCIAL-LICENSE.md.
 
-//! `ohttp-gateway backfill`: fill the permanent block tier from lightwalletd.
+//! `zodl-ohttp-gateway backfill`: fill the permanent block tier from lightwalletd.
 //!
 //! Walks `[start, end]` (default Sapling activation .. tip - `PERMANENT_DEPTH`) in batches,
 //! each batch one `MGET` on the permanent tier to find the heights still missing, grouped into
@@ -294,7 +294,7 @@ pub async fn run(
     Ok(stats)
 }
 
-/// Entry point of `ohttp-gateway backfill`. Environment: `NETWORK`, `LWD_ADDR`,
+/// Entry point of `zodl-ohttp-gateway backfill`. Environment: `NETWORK`, `LWD_ADDR`,
 /// `PERMANENT_REDIS_URL` (required); `BACKFILL_START` (default Sapling activation),
 /// `BACKFILL_END` (default and cap: tip - PERMANENT_DEPTH), `BACKFILL_BATCH` (500),
 /// `BACKFILL_CONCURRENCY` (2), `BACKFILL_PAUSE_MS` (200), `PERMANENT_OP_TIMEOUT_MS` (5000),

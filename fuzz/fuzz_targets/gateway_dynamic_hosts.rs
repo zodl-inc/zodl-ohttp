@@ -21,7 +21,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use ohttp_gateway::dynamic_hosts;
+use zodl_ohttp_gateway::dynamic_hosts;
 
 fuzz_target!(|data: &[u8]| {
     dynamic_hosts::fuzz_extract(data);

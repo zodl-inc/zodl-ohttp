@@ -34,15 +34,15 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use ohttp_gateway::cache::{
-    LocalReplayCheck, ReplayPeers, ResponseCache, WriteAdmission, WritePolicy, WriteWaitConfig,
-    REPLAY_TTL_SECS,
-};
-use ohttp_gateway::origin::{ReplayPeerMode, RouteClass};
-use ohttp_gateway::replication::ReplicationConfig;
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
+use zodl_ohttp_gateway::cache::{
+    LocalReplayCheck, ReplayPeers, ResponseCache, WriteAdmission, WritePolicy, WriteWaitConfig,
+    REPLAY_TTL_SECS,
+};
+use zodl_ohttp_gateway::origin::{ReplayPeerMode, RouteClass};
+use zodl_ohttp_gateway::replication::ReplicationConfig;
 
 // ---------------------------------------------------------------------------------------------
 // A link that can be lost: a TCP proxy. `lose` kills the open connections (at their next
@@ -397,7 +397,7 @@ async fn origin(
     standby_wait: bool,
     local_wait: bool,
 ) -> ResponseCache {
-    ohttp_gateway::health::init_metrics();
+    zodl_ohttp_gateway::health::init_metrics();
     let (_cache, cache_addr) = Store::start().await;
     std::mem::forget(_cache);
     let c = ResponseCache::connect(
@@ -457,7 +457,7 @@ async fn admit(c: &ResponseCache, hash: &[u8], class: RouteClass) -> anyhow::Res
 }
 
 fn fallback(network: &str, path: &str, result: &str) -> f64 {
-    ohttp_gateway::health::REGISTRY
+    zodl_ohttp_gateway::health::REGISTRY
         .gather()
         .iter()
         .find(|f| f.get_name() == "ohttp_replay_write_fallback_total")
@@ -522,7 +522,7 @@ async fn world(network: &str, standby_wait: bool) -> World {
 }
 
 fn standby_connected(network: &str) -> bool {
-    ohttp_gateway::health::REGISTRY
+    zodl_ohttp_gateway::health::REGISTRY
         .gather()
         .iter()
         .find(|f| f.get_name() == "ohttp_replay_standby_connected")
@@ -766,7 +766,7 @@ async fn local_replicas_decide(net: &str, fail_closed_writes: bool) {
 
 /// Observations of `ohttp_write_stage_duration_seconds{network, stage, result}`.
 fn stage_count(network: &str, stage: &str, result: &str) -> u64 {
-    ohttp_gateway::health::REGISTRY
+    zodl_ohttp_gateway::health::REGISTRY
         .gather()
         .iter()
         .find(|f| f.get_name() == "ohttp_write_stage_duration_seconds")

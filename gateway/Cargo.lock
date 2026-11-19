@@ -1303,52 +1303,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ohttp-gateway"
-version = "1.1.0"
-dependencies = [
- "aes-gcm",
- "anyhow",
- "arc-swap",
- "async-stream",
- "axum 0.8.9",
- "base64",
- "bhttp",
- "bincode",
- "bytes",
- "ed25519-dalek",
- "futures-util",
- "hex",
- "hkdf",
- "hpke",
- "http-body-util",
- "hyper",
- "hyper-tls",
- "hyper-util",
- "lazy_static",
- "moka",
- "parking_lot",
- "prometheus",
- "prost",
- "rand 0.8.8",
- "rand_core 0.9.5",
- "redis",
- "scopeguard",
- "serde",
- "serde_json",
- "sha2",
- "subtle",
- "thiserror 2.0.21",
- "tokio",
- "tokio-util",
- "tonic",
- "tower 0.5.3",
- "tower-http",
- "tracing",
- "tracing-subscriber",
- "uuid",
-]
-
-[[package]]
 name = "once_cell"
 version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2901,3 +2855,49 @@ name = "zmij"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
+
+[[package]]
+name = "zodl-ohttp-gateway"
+version = "1.1.0"
+dependencies = [
+ "aes-gcm",
+ "anyhow",
+ "arc-swap",
+ "async-stream",
+ "axum 0.8.9",
+ "base64",
+ "bhttp",
+ "bincode",
+ "bytes",
+ "ed25519-dalek",
+ "futures-util",
+ "hex",
+ "hkdf",
+ "hpke",
+ "http-body-util",
+ "hyper",
+ "hyper-tls",
+ "hyper-util",
+ "lazy_static",
+ "moka",
+ "parking_lot",
+ "prometheus",
+ "prost",
+ "rand 0.8.8",
+ "rand_core 0.9.5",
+ "redis",
+ "scopeguard",
+ "serde",
+ "serde_json",
+ "sha2",
+ "subtle",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-util",
+ "tonic",
+ "tower 0.5.3",
+ "tower-http",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]

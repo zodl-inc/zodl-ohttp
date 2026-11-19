@@ -28,12 +28,12 @@ use std::time::{Duration, Instant};
 
 use std::collections::HashMap;
 
-use ohttp_gateway::cache::{
-    LocalReplayCheck, PeerOutcome, ReplayPeers, ResponseCache, WritePolicy, WriteWaitConfig,
-};
-use ohttp_gateway::origin::{ReplayPeerMode, RouteClass};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use zodl_ohttp_gateway::cache::{
+    LocalReplayCheck, PeerOutcome, ReplayPeers, ResponseCache, WritePolicy, WriteWaitConfig,
+};
+use zodl_ohttp_gateway::origin::{ReplayPeerMode, RouteClass};
 
 const REDIS: &str = "127.0.0.1:6379";
 /// What the proxy does to the next `SET ... NX` it sees (once, on any connection).

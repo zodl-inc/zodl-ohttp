@@ -19,8 +19,8 @@ RUN mkdir -p src && \
 # Build application
 COPY src ./src
 RUN touch src/main.rs src/lib.rs && \
-    cargo build --release --locked --bin ohttp-gateway && \
-    strip target/release/ohttp-gateway
+    cargo build --release --locked --bin zodl-ohttp-gateway && \
+    strip target/release/zodl-ohttp-gateway
 
 # Runtime stage
 FROM alpine:3.21@sha256:ce64758a109eb420d874a118f87920e625e12d3634e03b4a5573fd9f6e5d3507
@@ -37,8 +37,10 @@ RUN apk add --no-cache ca-certificates tzdata && \
 
 WORKDIR /app
 
-# Copy binary from builder
-COPY --from=builder /build/target/release/ohttp-gateway /app/ohttp-gateway
+# Copy binary from builder. /app/ohttp-gateway, the binary's former name, stays as a link for
+# callers that still name it.
+COPY --from=builder /build/target/release/zodl-ohttp-gateway /app/zodl-ohttp-gateway
+RUN ln -s zodl-ohttp-gateway /app/ohttp-gateway
 
 # Set ownership
 RUN chown -R gateway:gateway /app
@@ -55,4 +57,4 @@ HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
     CMD wget --no-verbose --tries=1 --spider http://localhost:8080/health/startup || exit 1
 
 # Run
-ENTRYPOINT ["/app/ohttp-gateway"]
+ENTRYPOINT ["/app/zodl-ohttp-gateway"]
