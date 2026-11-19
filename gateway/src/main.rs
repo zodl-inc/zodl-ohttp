@@ -5170,4 +5170,70 @@ mod handler_tests {
         );
         assert_eq!(ask("replica-ack=1").await, (StatusCode::BAD_REQUEST, None));
     }
+
+    /// The forwarded path costs one round trip between the gateways, not two: with the
+    /// receiving listener on port `OHTTP_FORWARD_RTT_PORT` behind an added network delay (the
+    /// test does not add it: e.g. `tc netem` on that port), the median time of a forwarded WRITE
+    /// stays under `OHTTP_FORWARD_RTT_MAX_MS`. Skipped unless both are set.
+    #[tokio::test]
+    async fn a_forwarded_write_costs_one_round_trip() {
+        let (Ok(port), Ok(max_ms)) = (
+            std::env::var("OHTTP_FORWARD_RTT_PORT"),
+            std::env::var("OHTTP_FORWARD_RTT_MAX_MS"),
+        ) else {
+            eprintln!("skipped: set OHTTP_FORWARD_RTT_PORT and OHTTP_FORWARD_RTT_MAX_MS");
+            return;
+        };
+        let max_ms: u128 = max_ms.parse().unwrap();
+        assert!(
+            store_up("redis://127.0.0.1:6379", "the test Redis").await,
+            "the latency test needs the test Redis"
+        );
+        health::init_metrics();
+        let net = "testnet-forward-rtt";
+        let (hub_tp_url, _) = upstream(true).await;
+        let (hub_lwd_url, _) = upstream(false).await;
+        let hub_config = config(net, "redis://127.0.0.1:6379/7", &hub_lwd_url, &hub_tp_url);
+        let hub_cache = own_store_cache(&hub_config).await;
+        let hub = app_state(hub_config, read_routes_origin(), hub_cache);
+        let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{port}"))
+            .await
+            .unwrap();
+        let secrets = config::parse_relay_secrets("origin-a=forward-secret").unwrap();
+        let app = Router::new()
+            .route(
+                write_forward::FORWARD_PATH,
+                axum::routing::post(write_forward_handler),
+            )
+            .with_state(Arc::new(ForwardState { app: hub, secrets }));
+        tokio::spawn(server::serve_http2(listener, app.into_make_service()));
+        let (tp_url, _) = upstream(true).await;
+        let (lwd_url, _) = upstream(false).await;
+        let read_config = config(net, "redis://127.0.0.1:6379/8", &lwd_url, &tp_url);
+        let read_cache = own_store_cache(&read_config).await;
+        let read = forwarding(
+            app_state(read_config, read_routes_origin(), read_cache),
+            &format!("http://127.0.0.1:{port}"),
+            "forward-secret",
+        );
+        // Warm the pooled connection, then measure.
+        post(&read, third_party_write(&Uuid::new_v4().to_string())).await;
+        let mut took = Vec::new();
+        for _ in 0..20 {
+            let started = Instant::now();
+            let (status, _, _) = post(&read, third_party_write(&Uuid::new_v4().to_string())).await;
+            assert_eq!(status, 200);
+            took.push(started.elapsed().as_millis());
+        }
+        took.sort();
+        eprintln!(
+            "forwarded WRITE ms: p50={} p90={} all={took:?}",
+            took[10], took[17]
+        );
+        assert!(
+            took[10] < max_ms,
+            "p50 {} ms >= {max_ms} ms: {took:?}",
+            took[10]
+        );
+    }
 }
