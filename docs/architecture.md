@@ -205,6 +205,56 @@ reply, no reply) is resolved with `SET key value NX GET` and the request's own v
 WRITE can run, so a lost reply never turns the request's own nonce into a replay and never
 admits a WRITE whose nonce another request holds.
 
+### WRITE forwarding
+
+A read origin far from the hub store still pays one round trip to the hub for every WRITE, and
+then another to the upstream. With `REPLAY_WRITE_FORWARD_URL` it sends each WRITE instead to a
+gateway next to the hub store, on that gateway's forwarded-WRITE listener
+(`WRITE_FORWARD_BIND_ADDR`, authenticated with a forwarding secret, never the public port):
+
+1. The read origin does what it does for every request: it takes the nonce of the
+   Encapsulated Request at its own store, decrypts it and classifies it. A replay there is
+   refused at once.
+2. A WRITE is posted, as the very bytes the relay sent, to the receiving gateway, with what
+   the read origin's own decision would require (a second store, a replica acknowledgement).
+   That gateway declines what it cannot meet; otherwise it handles the request as one from a
+   relay, always as a WRITE: it opens it with the same keys (before any store is asked, so a
+   request it cannot open costs no nonce), takes the nonce (computed from those bytes, so it is
+   the nonce every origin uses for them) at its own store (the hub store) with its replica wait
+   and its check of every WRITE at its fallback store, then applies freshness, route policy,
+   third-party rules and the upstream call. Nothing is taken on the read origin's word but the
+   classification as a WRITE, which only adds checks.
+3. The receiving gateway's sealed answer is streamed back unchanged. No plaintext crosses the
+   link between the two gateways.
+
+Replay protection stays global and fail-closed: the WRITE runs only after the stores that
+decide it took its nonce as new, now asked by the receiving gateway, which treats every
+forwarded request as a WRITE and, when the read origin checks a second store, declines unless it
+checks one too. Any answer of the receiving gateway other than its sealed answer or a replay
+means it did not run the WRITE (a refused secret, busy, a replay store not connected, a request
+it cannot open: it opens the request before taking the nonce), and so does a connection that
+cannot be opened: the read origin then decides the WRITE itself, exactly as without forwarding
+(the hub check, the standby stores and their fallbacks). Both paths ask the same stores for the
+same nonce, so the WRITE cannot run twice; a nonce the receiving gateway took before declining
+makes the local decision a replay. A WRITE that was sent and got no answer in time, or whose
+connection broke, fails closed, since the receiving gateway may have run it, and so does one
+whose store there gave no verdict after the nonce may have been stored (deciding it locally
+would find the request's own nonce and answer a replay); the client retries
+with a new Encapsulated Request. The connection is PINGed every 2 s, so a receiving gateway that
+vanished without closing it is noticed within seconds. Third-party WRITEs take the same path, so
+the receiving gateway's per-backend caps and third-party rules apply to them. The link must be
+private and must not answer on the receiving gateway's behalf (no proxy of its own in between).
+
+The receiving gateway's own security store must be the hub store of the read origins, its second
+store their standby stores, with the same one-sided routes and fail-closed settings; the two
+gateways cannot check that against each other. Its second store must never be a forwarding
+origin's own store: an origin with its own replica wait and no standby stores is itself a store
+others fall back to,
+and the receiving gateway would find each nonce that origin took first and refuse the WRITE as a
+replay, so such an origin is refused as a forwarder at startup. It must not share the read origin's own security store (it would find each
+forwarded nonce already taken), and a gateway is never both: the two settings together are a
+startup error.
+
 Every WRITE that the deciding store (the local store in `failover` mode, the hub in
 `async-reads`) admitted is also `SET NX` synchronously at the fallback store (the peers, or a read
 origin's standby stores), and a nonce held there is a replay; an unreachable fallback store keeps

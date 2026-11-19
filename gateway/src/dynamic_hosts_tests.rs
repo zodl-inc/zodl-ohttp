@@ -1765,6 +1765,7 @@ fn state(config: crate::config::Config) -> Arc<crate::AppState> {
         third_party: Default::default(),
         per_backend_semaphores: Arc::new(parking_lot::RwLock::new(HashMap::new())),
         request_semaphore: Arc::new(Semaphore::new(1024)),
+        write_forward: None,
     })
 }
 

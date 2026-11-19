@@ -199,6 +199,97 @@ where
     }
 }
 
+/// The client preface of an HTTP/2 connection must arrive within this long (`serve_http2`).
+pub const HTTP2_PREFACE_DEADLINE: Duration = Duration::from_secs(10);
+/// Connections `serve_http2` keeps at once; more are closed at accept.
+pub const HTTP2_MAX_CONNECTIONS: usize = 256;
+/// HTTP/2 PINGs of `serve_http2` on an idle connection, and how long one may stay unanswered.
+const HTTP2_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(30);
+const HTTP2_KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Streams of one `serve_http2` connection at once: well above the WRITEs one read origin has
+/// in flight, so its requests never queue in its client for a stream.
+const HTTP2_MAX_STREAMS: u32 = 1024;
+
+/// `serve` for a listener that speaks cleartext HTTP/2 only (prior knowledge, no HTTP/1): the
+/// forwarded-WRITE listener (`WRITE_FORWARD_BIND_ADDR`), whose one client is the pooled HTTP/2
+/// client of the read origins, which multiplexes their WRITEs on one connection (an HTTP/1
+/// keep-alive connection closed by the server while a request is being written would also fail
+/// a WRITE closed that never arrived). A connection must send the client
+/// preface within `HTTP2_PREFACE_DEADLINE`, at most `HTTP2_MAX_CONNECTIONS` are kept, and one
+/// whose PINGs go unanswered is closed.
+pub async fn serve_http2<M, S>(listener: TcpListener, mut make_service: M) -> io::Result<()>
+where
+    M: Service<SocketAddr, Response = S, Error = Infallible>,
+    S: Service<Request<Incoming>, Response = axum::response::Response, Error = Infallible>
+        + Clone
+        + Send
+        + 'static,
+    S::Future: Send + 'static,
+{
+    let connections = std::sync::Arc::new(tokio::sync::Semaphore::new(HTTP2_MAX_CONNECTIONS));
+    loop {
+        let (stream, remote_addr) = match listener.accept().await {
+            Ok(accepted) => accepted,
+            Err(e) => {
+                handle_accept_error(e).await;
+                continue;
+            }
+        };
+        let Ok(permit) = connections.clone().try_acquire_owned() else {
+            debug!(peer = %remote_addr, "connection limit reached, closing");
+            continue;
+        };
+        poll_fn(|cx| make_service.poll_ready(cx))
+            .await
+            .unwrap_or_else(|never| match never {});
+        let service = make_service
+            .call(remote_addr)
+            .await
+            .unwrap_or_else(|never| match never {});
+        tokio::spawn(async move {
+            let _permit = permit;
+            if !preface_arrives(&stream, HTTP2_PREFACE_DEADLINE).await {
+                debug!(peer = %remote_addr, "no HTTP/2 client preface in time, closing");
+                return;
+            }
+            let mut builder = auto::Builder::new(TokioExecutor::new()).http2_only();
+            builder
+                .http2()
+                .timer(TokioTimer::new())
+                .keep_alive_interval(HTTP2_KEEP_ALIVE_INTERVAL)
+                .keep_alive_timeout(HTTP2_KEEP_ALIVE_TIMEOUT)
+                .max_concurrent_streams(HTTP2_MAX_STREAMS);
+            let io = TokioIo::new(stream);
+            if let Err(err) = builder
+                .serve_connection(io, TowerToHyperService::new(service))
+                .await
+            {
+                debug!(peer = %remote_addr, error = %err, "connection ended with an error");
+            }
+        });
+    }
+}
+
+/// Whether the 24 bytes of the HTTP/2 client preface arrive on `stream` within `deadline`
+/// (peeked, left for the connection to read).
+async fn preface_arrives(stream: &tokio::net::TcpStream, deadline: Duration) -> bool {
+    let until = tokio::time::Instant::now() + deadline;
+    let mut buf = [0u8; 24];
+    loop {
+        // Checked on every round: a peek with part of the preface waiting returns at once, so
+        // the timeout around it alone would never expire.
+        if tokio::time::Instant::now() >= until {
+            return false;
+        }
+        match tokio::time::timeout_at(until, stream.peek(&mut buf)).await {
+            Ok(Ok(n)) if n >= buf.len() => return true,
+            Ok(Ok(0)) | Ok(Err(_)) | Err(_) => return false,
+            // Part of it so far: look again shortly (peek returns at once while data waits).
+            Ok(Ok(_)) => tokio::time::sleep(Duration::from_millis(5)).await,
+        }
+    }
+}
+
 /// `axum::serve`'s accept error handling: connection-level errors are skipped, anything else
 /// (for example EMFILE) is logged and the loop waits a second before accepting again.
 async fn handle_accept_error(e: io::Error) {
@@ -216,6 +307,42 @@ async fn handle_accept_error(e: io::Error) {
 
 #[cfg(test)]
 mod tests {
+    /// The forwarded-WRITE listener closes a connection that never sends the HTTP/2 preface,
+    /// and serves one that does.
+    #[tokio::test]
+    async fn http2_listener_needs_the_client_preface_in_time() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let accepted = listener.accept().await.unwrap().0;
+        drop(client);
+        assert!(
+            !preface_arrives(&accepted, Duration::from_millis(200)).await,
+            "closed, no preface"
+        );
+
+        let client = tokio::net::TcpStream::connect(addr);
+        let (accepted, client) = tokio::join!(listener.accept(), client);
+        let (accepted, mut client) = (accepted.unwrap().0, client.unwrap());
+        let silent = preface_arrives(&accepted, Duration::from_millis(200));
+        assert!(!silent.await, "no bytes within the deadline");
+        use tokio::io::AsyncWriteExt;
+        // Part of the preface, and then nothing: still closed at the deadline.
+        client.write_all(b"PRI * HTTP/2.0").await.unwrap();
+        let started = std::time::Instant::now();
+        assert!(
+            !preface_arrives(&accepted, Duration::from_millis(200)).await,
+            "partial"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+        client.write_all(b"\r\n\r\nSM\r\n\r\n").await.unwrap();
+        assert!(preface_arrives(&accepted, Duration::from_secs(5)).await);
+    }
+
     #[test]
     fn internal_bind_addr_default_and_overrides() {
         let d: SocketAddr = "0.0.0.0:9090".parse().unwrap();

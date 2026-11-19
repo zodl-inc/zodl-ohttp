@@ -3920,6 +3920,7 @@ mod stream_tests {
                 std::collections::HashMap::new(),
             )),
             request_semaphore: Arc::new(tokio::sync::Semaphore::new(1024)),
+            write_forward: None,
         })
     }
 
@@ -4147,6 +4148,7 @@ mod stream_tests {
                 std::collections::HashMap::new(),
             )),
             request_semaphore: Arc::new(tokio::sync::Semaphore::new(1024)),
+            write_forward: None,
         });
 
         let inner_request = InnerRequest {

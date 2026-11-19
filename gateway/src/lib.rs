@@ -66,3 +66,4 @@ pub mod store_conn;
 pub mod subtree_cache;
 pub mod third_party_cache;
 pub mod write_fallback;
+pub mod write_forward;

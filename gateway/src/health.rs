@@ -46,12 +46,40 @@ lazy_static::lazy_static! {
     static ref OHTTP_WRITE_STAGE_DURATION_SECONDS: HistogramVec = HistogramVec::new(
         prometheus::HistogramOpts::new(
             "ohttp_write_stage_duration_seconds",
-            "Time of one stage of a WRITE (a request not on REPLAY_READ_ROUTES) in seconds. stage: local (the local store's SET NX), hub (the hub's SET NX and replica wait of a read origin), standby (the standby store's SET NX of a read origin), replica_wait (the local replica wait), upstream_lwd (the light client server call), upstream_third_party (a third-party upstream call until its response head)"
+            "Time of one stage of a WRITE (a request not on REPLAY_READ_ROUTES) in seconds. stage: local (the local store's SET NX), hub (the hub's SET NX and replica wait of a read origin), standby (the standby store's SET NX of a read origin), replica_wait (the local replica wait), upstream_lwd (the light client server call), upstream_third_party (a third-party upstream call until its response head), forward (a WRITE a read origin forwarded, until the answer's head)"
         )
         .buckets(WRITE_STAGE_BUCKETS.to_vec()),
         &["network", "stage", "result"]
     )
     .unwrap();
+}
+
+// A block of its own, like the one above.
+lazy_static::lazy_static! {
+    /// `ohttp_write_forward_total`: see `record_write_forward`.
+    static ref OHTTP_WRITE_FORWARD_TOTAL: IntCounterVec = IntCounterVec::new(
+        Opts::new(
+            "ohttp_write_forward_total",
+            "WRITEs a read origin forwarded to the gateway at the hub store (REPLAY_WRITE_FORWARD_URL), by result: answered (streamed back), replay (the hub store held the nonce), connect / declined / declined_once / skipped (not run there: decided here as without forwarding; skipped = within the backoff after a lasting reason, an unclear answer or three one-off declines in a row), timeout / transport / unclear (failed closed: sent without an answer, or its store gave no verdict after the nonce may have been stored)"
+        ),
+        &["network", "result"]
+    )
+    .unwrap();
+}
+
+/// One forwarded WRITE's `result` (`write_forward::Forwarded::label`).
+pub fn record_write_forward(network: &str, result: &str) {
+    OHTTP_WRITE_FORWARD_TOTAL
+        .with_label_values(&[network, result])
+        .inc();
+}
+
+/// Forwarded WRITEs of one result so far (tests).
+#[cfg(test)]
+pub fn write_forwards(network: &str, result: &str) -> u64 {
+    OHTTP_WRITE_FORWARD_TOTAL
+        .with_label_values(&[network, result])
+        .get()
 }
 
 lazy_static::lazy_static! {
@@ -91,7 +119,9 @@ const WRITE_STAGE_BUCKETS: [f64; 22] = [
 ///   | `replay` | `unavailable`;
 /// - `standby`: `fresh` | `replay` | `unavailable`;
 /// - `replica_wait`: `acknowledged` | `failed`;
-/// - `upstream_lwd`, `upstream_third_party`: `ok` | `error`.
+/// - `upstream_lwd`, `upstream_third_party`: `ok` | `error`;
+/// - `forward` (a read origin's forwarded WRITE until the answer's head): `answered` |
+///   `replay` | `declined` | `failed`.
 pub fn observe_write_stage(network: &str, stage: &str, result: &str, elapsed: std::time::Duration) {
     OHTTP_WRITE_STAGE_DURATION_SECONDS
         .with_label_values(&[network, stage, result])
@@ -605,6 +635,9 @@ pub fn init_metrics() {
         .register(Box::new(OHTTP_REPLAY_HUB_CHECK_TOTAL.clone()))
         .ok();
     REGISTRY
+        .register(Box::new(OHTTP_WRITE_FORWARD_TOTAL.clone()))
+        .ok();
+    REGISTRY
         .register(Box::new(OHTTP_REQUESTS_IN_FLIGHT.clone()))
         .ok();
     REGISTRY
@@ -858,6 +891,41 @@ pub fn record_request(status: &str, mode: &str) {
 }
 
 // New API with full observability
+tokio::task_local! {
+    /// Set while a receiving gateway handles a WRITE a read origin forwarded (write_forward.rs).
+    static FORWARDED: ();
+}
+
+/// Run `f`, the handling of a forwarded WRITE, so that its request metrics are told apart:
+/// `ohttp_requests_total` counts it with `mode="forwarded"`, and it observes no
+/// `ohttp_request_duration_seconds` (the read origin that the client reached counts the request
+/// and observes the duration the client saw; counting both would count it twice). It covers the
+/// handler future only, where every request counter and duration is recorded, not tasks it
+/// spawns or the stream of its answer.
+pub async fn as_forwarded<F: std::future::Future>(f: F) -> F::Output {
+    FORWARDED.scope((), f).await
+}
+
+fn forwarded() -> bool {
+    FORWARDED.try_with(|_| ()).is_ok()
+}
+
+/// A request refused as a replay in its outer answer (`ohttp_replay_rejected_total`). Not while a
+/// receiving gateway handles a forwarded WRITE: the read origin turns that outer 409 into its
+/// own answer and counts the refusal.
+pub fn record_replay_rejected(network: &str) {
+    if !forwarded() {
+        OHTTP_REPLAY_REJECTED.with_label_values(&[network]).inc();
+    }
+}
+
+/// A request refused as a replay in its sealed (inner) answer: counted by the gateway that
+/// decided it, also a receiving gateway for a forwarded WRITE, whose answer the read origin
+/// streams back without looking into it.
+pub fn record_replay_rejected_sealed(network: &str) {
+    OHTTP_REPLAY_REJECTED.with_label_values(&[network]).inc();
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn record_request_detailed(
     status: &str,
@@ -870,6 +938,7 @@ pub fn record_request_detailed(
     backend: &str,
     route_class: &str,
 ) {
+    let mode = if forwarded() { "forwarded" } else { mode };
     OHTTP_REQUESTS_TOTAL
         .with_label_values(&[
             status,
@@ -895,6 +964,9 @@ pub fn record_duration(
     duration_secs: f64,
     traced: bool,
 ) {
+    if forwarded() {
+        return;
+    }
     let labels = [network, hop, backend, rpc];
     OHTTP_REQUEST_DURATION_SECONDS
         .with_label_values(&labels)
