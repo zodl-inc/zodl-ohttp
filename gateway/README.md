@@ -62,7 +62,7 @@ calls.
 cargo build --release            # binary target/release/zodl-ohttp-gateway
 cargo test                       # store-backed tests need a Redis on 127.0.0.1:6379 and fail without it;
                                  # OHTTP_TEST_ALLOW_NO_STORE=1 skips them instead (ignored when CI is set)
-docker build -t ohttp-gateway .  # from this directory
+docker build -t ohttp-gateway -f Dockerfile ..  # context: the repository root
 ```
 
 A minimal local run (two Redis databases, a lightwalletd on 9067):

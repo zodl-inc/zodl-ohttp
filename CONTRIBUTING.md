@@ -92,8 +92,10 @@ that the terms are clear up front.
   `relay-simulator/Cargo.toml` and their entries in every `Cargo.lock` of the commit (gateway,
   relay simulator, client, e2e client, fuzz); CI refuses the tag otherwise. Bump both in the
   release pull request, also for a release that changes neither.
-- The gateway crate (`zodl-ohttp-gateway`), the relay simulator and the e2e client are not
-  published on crates.io (`publish = false`); their versions name the images only.
+- The gateway crate (`zodl-ohttp-gateway`), the integrations crate (`zodl-ohttp-integrations`),
+  the relay simulator and the e2e client are not published on crates.io (`publish = false`).
+  The gateway and relay simulator versions name the images; the integrations crate's version
+  names nothing and is not checked.
 - The client library (`zodl-ohttp-client`) keeps its own version, published on crates.io, and is
   not checked against the tag; the e2e client follows the client library version. Record both
   in the release notes.

@@ -1,0 +1,5 @@
+# Build context of the gateway image (the repository root): sources only.
+.git
+**/target
+fuzz/corpus
+fuzz/artifacts

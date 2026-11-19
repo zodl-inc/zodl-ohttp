@@ -29,6 +29,17 @@ docker run --rm -d -p 127.0.0.1:6379:6379 redis:7-alpine
 cd gateway && cargo test --locked
 ```
 
+### Integrations (`integrations/`)
+
+```bash
+cd integrations
+cargo test --locked
+```
+
+Unit tests of the route grammar, the alias table parsers and the providers. The crate does no
+I/O, so its tests need no store or network. CI also runs `cargo fmt --check` and
+`cargo clippy --all-targets -- -D warnings` on it.
+
 ### Client library (`client/`)
 
 ```bash

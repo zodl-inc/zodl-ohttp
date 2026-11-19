@@ -31,8 +31,8 @@ Rules:
   blank line. In Rust files, inner doc comments (`//!`) and attributes
   (`#![...]`) come after the header, never before it.
 - This applies to all first-party source files, whatever the language —
-  today that is Rust (`.rs`) under `client/`, `gateway/`, `e2e-client/`,
-  `relay-simulator/` and `fuzz/`. Use the language's line-comment syntax if
+  today that is Rust (`.rs`) under `client/`, `gateway/`, `integrations/`,
+  `e2e-client/`, `relay-simulator/` and `fuzz/`. Use the language's line-comment syntax if
   it is not `//`.
 - Do NOT add the header to:
   - Generated code (none today) — generated output is left unstamped.

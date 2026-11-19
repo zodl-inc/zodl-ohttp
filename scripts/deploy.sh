@@ -65,7 +65,11 @@ push_image() {
     if ! docker image inspect "$local_tag" &> /dev/null; then
         log_warn "Local image $local_tag not found. Building first..."
         cd "$REPO_ROOT/$component"
-        docker build -t "$local_tag" .
+        if [ "$component" = gateway ]; then
+            docker build -t "$local_tag" -f Dockerfile "$REPO_ROOT"
+        else
+            docker build -t "$local_tag" .
+        fi
     fi
 
     # Tag for registry

@@ -1,0 +1,16 @@
+[package]
+name = "zodl-ohttp-integrations"
+version = "0.1.0"
+license = "AGPL-3.0-only"
+edition = "2021"
+authors = ["ZODL Inc."]
+description = "Third-party integrations of the OHTTP gateway: route policy, credentials, request checks"
+# Not published: a part of the gateway, built into its image only.
+publish = false
+
+[dependencies]
+anyhow = "1.0"
+
+[lib]
+name = "zodl_ohttp_integrations"
+path = "src/lib.rs"

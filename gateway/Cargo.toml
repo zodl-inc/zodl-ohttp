@@ -10,6 +10,9 @@ description = "RFC 9458 Oblivious HTTP Gateway for Zcash Lightwalletd"
 publish = false
 
 [dependencies]
+# Third-party route policy and credentials (no I/O).
+zodl-ohttp-integrations = { path = "../integrations" }
+
 # Async runtime
 tokio = { version = "1.42", features = ["full"] }
 tokio-util = "0.7"
