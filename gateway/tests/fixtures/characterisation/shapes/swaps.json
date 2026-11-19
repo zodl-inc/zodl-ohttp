@@ -1,0 +1,943 @@
+{
+  "description": "Swap quotes: header-key credential, a fixed query on the token list, POST routes without query.",
+  "networks": [
+    "mainnet",
+    "testnet"
+  ],
+  "shapes": [
+    {
+      "authority": "swaps.example",
+      "expect": {
+        "mainnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "read",
+            "stage": "third_party_path",
+            "third_party_answer": {
+              "cache_ttl_secs": 600,
+              "cap": {
+                "requests": 120,
+                "window_secs": 60
+              }
+            }
+          },
+          "raw": {
+            "backend_label": "swaps.example",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "/tokens",
+            "one_sided_write": false,
+            "policy_denied": false,
+            "query_admitted": true,
+            "route_cache_ttl_secs": 600,
+            "route_cap": {
+              "requests": 120,
+              "window_secs": 60
+            },
+            "route_replay_class": "read",
+            "rpc_label": "GET /tokens",
+            "target": {
+              "label": "swaps.example",
+              "upstream": "https://swaps-api.example/tokens?provider=EXAMPLE"
+            },
+            "upstream_headers": {
+              "injected": [
+                [
+                  "x-api-key",
+                  "fake-swaps-api-key"
+                ]
+              ]
+            }
+          }
+        },
+        "testnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "write",
+            "stage": "third_party_path",
+            "third_party_answer": {
+              "cache_ttl_secs": null,
+              "cap": null
+            }
+          },
+          "raw": {
+            "backend_label": "other",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "(unknown authority)",
+            "one_sided_write": false,
+            "policy_denied": false,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": null,
+            "route_replay_class": "write",
+            "rpc_label": "other",
+            "target": "rejected",
+            "upstream_headers": {
+              "injected": []
+            }
+          }
+        }
+      },
+      "method": "GET",
+      "name": "tokens of the listed provider",
+      "path": "/tokens?provider=EXAMPLE"
+    },
+    {
+      "authority": "swaps.example",
+      "expect": {
+        "mainnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "read",
+            "stage": "third_party_path",
+            "third_party_answer": null
+          },
+          "raw": {
+            "backend_label": "swaps.example",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "/tokens",
+            "one_sided_write": false,
+            "policy_denied": true,
+            "query_admitted": false,
+            "route_cache_ttl_secs": 600,
+            "route_cap": {
+              "requests": 120,
+              "window_secs": 60
+            },
+            "route_replay_class": "read",
+            "rpc_label": "GET /tokens",
+            "target": {
+              "label": "swaps.example",
+              "upstream": "https://swaps-api.example/tokens?provider=OTHER"
+            },
+            "upstream_headers": {
+              "injected": [
+                [
+                  "x-api-key",
+                  "fake-swaps-api-key"
+                ]
+              ]
+            }
+          }
+        },
+        "testnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "write",
+            "stage": "third_party_path",
+            "third_party_answer": {
+              "cache_ttl_secs": null,
+              "cap": null
+            }
+          },
+          "raw": {
+            "backend_label": "other",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "(unknown authority)",
+            "one_sided_write": false,
+            "policy_denied": false,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": null,
+            "route_replay_class": "write",
+            "rpc_label": "other",
+            "target": "rejected",
+            "upstream_headers": {
+              "injected": []
+            }
+          }
+        }
+      },
+      "method": "GET",
+      "name": "tokens of another provider",
+      "path": "/tokens?provider=OTHER"
+    },
+    {
+      "authority": "swaps.example",
+      "expect": {
+        "mainnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "read",
+            "stage": "third_party_path",
+            "third_party_answer": null
+          },
+          "raw": {
+            "backend_label": "swaps.example",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "/tokens",
+            "one_sided_write": false,
+            "policy_denied": true,
+            "query_admitted": false,
+            "route_cache_ttl_secs": 600,
+            "route_cap": {
+              "requests": 120,
+              "window_secs": 60
+            },
+            "route_replay_class": "read",
+            "rpc_label": "GET /tokens",
+            "target": {
+              "label": "swaps.example",
+              "upstream": "https://swaps-api.example/tokens"
+            },
+            "upstream_headers": {
+              "injected": [
+                [
+                  "x-api-key",
+                  "fake-swaps-api-key"
+                ]
+              ]
+            }
+          }
+        },
+        "testnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "write",
+            "stage": "third_party_path",
+            "third_party_answer": {
+              "cache_ttl_secs": null,
+              "cap": null
+            }
+          },
+          "raw": {
+            "backend_label": "other",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "(unknown authority)",
+            "one_sided_write": false,
+            "policy_denied": false,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": null,
+            "route_replay_class": "write",
+            "rpc_label": "other",
+            "target": "rejected",
+            "upstream_headers": {
+              "injected": []
+            }
+          }
+        }
+      },
+      "method": "GET",
+      "name": "tokens without query",
+      "path": "/tokens"
+    },
+    {
+      "authority": "swaps.example",
+      "expect": {
+        "mainnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "read",
+            "stage": "third_party_path",
+            "third_party_answer": null
+          },
+          "raw": {
+            "backend_label": "swaps.example",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "/tokens",
+            "one_sided_write": false,
+            "policy_denied": true,
+            "query_admitted": false,
+            "route_cache_ttl_secs": 600,
+            "route_cap": {
+              "requests": 120,
+              "window_secs": 60
+            },
+            "route_replay_class": "read",
+            "rpc_label": "GET /tokens",
+            "target": {
+              "label": "swaps.example",
+              "upstream": "https://swaps-api.example/tokens?provider=EXAMPLE&x=1"
+            },
+            "upstream_headers": {
+              "injected": [
+                [
+                  "x-api-key",
+                  "fake-swaps-api-key"
+                ]
+              ]
+            }
+          }
+        },
+        "testnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "write",
+            "stage": "third_party_path",
+            "third_party_answer": {
+              "cache_ttl_secs": null,
+              "cap": null
+            }
+          },
+          "raw": {
+            "backend_label": "other",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "(unknown authority)",
+            "one_sided_write": false,
+            "policy_denied": false,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": null,
+            "route_replay_class": "write",
+            "rpc_label": "other",
+            "target": "rejected",
+            "upstream_headers": {
+              "injected": []
+            }
+          }
+        }
+      },
+      "method": "GET",
+      "name": "tokens extra parameter",
+      "path": "/tokens?provider=EXAMPLE&x=1"
+    },
+    {
+      "authority": "swaps.example",
+      "expect": {
+        "mainnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "read",
+            "stage": "third_party_path",
+            "third_party_answer": {
+              "cache_ttl_secs": null,
+              "cap": {
+                "requests": 120,
+                "window_secs": 60
+              }
+            }
+          },
+          "raw": {
+            "backend_label": "swaps.example",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "/v1/price",
+            "one_sided_write": false,
+            "policy_denied": false,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": {
+              "requests": 120,
+              "window_secs": 60
+            },
+            "route_replay_class": "read",
+            "rpc_label": "POST /v1/price",
+            "target": {
+              "label": "swaps.example",
+              "upstream": "https://swaps-api.example/v1/price"
+            },
+            "upstream_headers": {
+              "injected": [
+                [
+                  "x-api-key",
+                  "fake-swaps-api-key"
+                ]
+              ]
+            }
+          }
+        },
+        "testnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "write",
+            "stage": "third_party_path",
+            "third_party_answer": {
+              "cache_ttl_secs": null,
+              "cap": null
+            }
+          },
+          "raw": {
+            "backend_label": "other",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "(unknown authority)",
+            "one_sided_write": false,
+            "policy_denied": false,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": null,
+            "route_replay_class": "write",
+            "rpc_label": "other",
+            "target": "rejected",
+            "upstream_headers": {
+              "injected": []
+            }
+          }
+        }
+      },
+      "method": "POST",
+      "name": "price",
+      "path": "/v1/price"
+    },
+    {
+      "authority": "swaps.example",
+      "expect": {
+        "mainnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "read",
+            "stage": "third_party_path",
+            "third_party_answer": null
+          },
+          "raw": {
+            "backend_label": "swaps.example",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "/v1/price",
+            "one_sided_write": false,
+            "policy_denied": true,
+            "query_admitted": false,
+            "route_cache_ttl_secs": null,
+            "route_cap": {
+              "requests": 120,
+              "window_secs": 60
+            },
+            "route_replay_class": "read",
+            "rpc_label": "POST /v1/price",
+            "target": {
+              "label": "swaps.example",
+              "upstream": "https://swaps-api.example/v1/price?x=1"
+            },
+            "upstream_headers": {
+              "injected": [
+                [
+                  "x-api-key",
+                  "fake-swaps-api-key"
+                ]
+              ]
+            }
+          }
+        },
+        "testnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "write",
+            "stage": "third_party_path",
+            "third_party_answer": {
+              "cache_ttl_secs": null,
+              "cap": null
+            }
+          },
+          "raw": {
+            "backend_label": "other",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "(unknown authority)",
+            "one_sided_write": false,
+            "policy_denied": false,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": null,
+            "route_replay_class": "write",
+            "rpc_label": "other",
+            "target": "rejected",
+            "upstream_headers": {
+              "injected": []
+            }
+          }
+        }
+      },
+      "method": "POST",
+      "name": "price with query",
+      "path": "/v1/price?x=1"
+    },
+    {
+      "authority": "swaps.example",
+      "expect": {
+        "mainnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "read",
+            "stage": "third_party_path",
+            "third_party_answer": {
+              "cache_ttl_secs": null,
+              "cap": {
+                "requests": 120,
+                "window_secs": 60
+              }
+            }
+          },
+          "raw": {
+            "backend_label": "swaps.example",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "/v1/quote",
+            "one_sided_write": false,
+            "policy_denied": false,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": {
+              "requests": 120,
+              "window_secs": 60
+            },
+            "route_replay_class": "read",
+            "rpc_label": "POST /v1/quote",
+            "target": {
+              "label": "swaps.example",
+              "upstream": "https://swaps-api.example/v1/quote"
+            },
+            "upstream_headers": {
+              "injected": [
+                [
+                  "x-api-key",
+                  "fake-swaps-api-key"
+                ]
+              ]
+            }
+          }
+        },
+        "testnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "write",
+            "stage": "third_party_path",
+            "third_party_answer": {
+              "cache_ttl_secs": null,
+              "cap": null
+            }
+          },
+          "raw": {
+            "backend_label": "other",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "(unknown authority)",
+            "one_sided_write": false,
+            "policy_denied": false,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": null,
+            "route_replay_class": "write",
+            "rpc_label": "other",
+            "target": "rejected",
+            "upstream_headers": {
+              "injected": []
+            }
+          }
+        }
+      },
+      "method": "POST",
+      "name": "quote",
+      "path": "/v1/quote"
+    },
+    {
+      "authority": "swaps.example",
+      "expect": {
+        "mainnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "write",
+            "stage": "third_party_path",
+            "third_party_answer": null
+          },
+          "raw": {
+            "backend_label": "swaps.example",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "(not in policy)",
+            "one_sided_write": false,
+            "policy_denied": true,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": {
+              "requests": 120,
+              "window_secs": 60
+            },
+            "route_replay_class": "write",
+            "rpc_label": "other",
+            "target": {
+              "label": "swaps.example",
+              "upstream": "https://swaps-api.example/v1/quote"
+            },
+            "upstream_headers": {
+              "injected": [
+                [
+                  "x-api-key",
+                  "fake-swaps-api-key"
+                ]
+              ]
+            }
+          }
+        },
+        "testnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "write",
+            "stage": "third_party_path",
+            "third_party_answer": {
+              "cache_ttl_secs": null,
+              "cap": null
+            }
+          },
+          "raw": {
+            "backend_label": "other",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "(unknown authority)",
+            "one_sided_write": false,
+            "policy_denied": false,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": null,
+            "route_replay_class": "write",
+            "rpc_label": "other",
+            "target": "rejected",
+            "upstream_headers": {
+              "injected": []
+            }
+          }
+        }
+      },
+      "method": "GET",
+      "name": "quote GET",
+      "path": "/v1/quote"
+    },
+    {
+      "authority": "swaps.example",
+      "expect": {
+        "mainnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "write",
+            "stage": "third_party_path",
+            "third_party_answer": {
+              "cache_ttl_secs": null,
+              "cap": {
+                "requests": 120,
+                "window_secs": 60
+              }
+            }
+          },
+          "raw": {
+            "backend_label": "swaps.example",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "/v1/swap",
+            "one_sided_write": false,
+            "policy_denied": false,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": {
+              "requests": 120,
+              "window_secs": 60
+            },
+            "route_replay_class": "write",
+            "rpc_label": "POST /v1/swap",
+            "target": {
+              "label": "swaps.example",
+              "upstream": "https://swaps-api.example/v1/swap"
+            },
+            "upstream_headers": {
+              "injected": [
+                [
+                  "x-api-key",
+                  "fake-swaps-api-key"
+                ]
+              ]
+            }
+          }
+        },
+        "testnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "write",
+            "stage": "third_party_path",
+            "third_party_answer": {
+              "cache_ttl_secs": null,
+              "cap": null
+            }
+          },
+          "raw": {
+            "backend_label": "other",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "(unknown authority)",
+            "one_sided_write": false,
+            "policy_denied": false,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": null,
+            "route_replay_class": "write",
+            "rpc_label": "other",
+            "target": "rejected",
+            "upstream_headers": {
+              "injected": []
+            }
+          }
+        }
+      },
+      "method": "POST",
+      "name": "swap",
+      "path": "/v1/swap"
+    },
+    {
+      "authority": "swaps.example",
+      "expect": {
+        "mainnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "read",
+            "stage": "third_party_path",
+            "third_party_answer": {
+              "cache_ttl_secs": null,
+              "cap": {
+                "requests": 120,
+                "window_secs": 60
+              }
+            }
+          },
+          "raw": {
+            "backend_label": "swaps.example",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "/v1/status",
+            "one_sided_write": false,
+            "policy_denied": false,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": {
+              "requests": 120,
+              "window_secs": 60
+            },
+            "route_replay_class": "read",
+            "rpc_label": "POST /v1/status",
+            "target": {
+              "label": "swaps.example",
+              "upstream": "https://swaps-api.example/v1/status"
+            },
+            "upstream_headers": {
+              "injected": [
+                [
+                  "x-api-key",
+                  "fake-swaps-api-key"
+                ]
+              ]
+            }
+          }
+        },
+        "testnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "write",
+            "stage": "third_party_path",
+            "third_party_answer": {
+              "cache_ttl_secs": null,
+              "cap": null
+            }
+          },
+          "raw": {
+            "backend_label": "other",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "(unknown authority)",
+            "one_sided_write": false,
+            "policy_denied": false,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": null,
+            "route_replay_class": "write",
+            "rpc_label": "other",
+            "target": "rejected",
+            "upstream_headers": {
+              "injected": []
+            }
+          }
+        }
+      },
+      "method": "POST",
+      "name": "status",
+      "path": "/v1/status"
+    },
+    {
+      "authority": "swaps.example",
+      "expect": {
+        "mainnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "write",
+            "stage": "third_party_path",
+            "third_party_answer": null
+          },
+          "raw": {
+            "backend_label": "swaps.example",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "(not in policy)",
+            "one_sided_write": false,
+            "policy_denied": true,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": {
+              "requests": 120,
+              "window_secs": 60
+            },
+            "route_replay_class": "write",
+            "rpc_label": "other",
+            "target": {
+              "label": "swaps.example",
+              "upstream": "https://swaps-api.example/v0/quote"
+            },
+            "upstream_headers": {
+              "injected": [
+                [
+                  "x-api-key",
+                  "fake-swaps-api-key"
+                ]
+              ]
+            }
+          }
+        },
+        "testnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "write",
+            "stage": "third_party_path",
+            "third_party_answer": {
+              "cache_ttl_secs": null,
+              "cap": null
+            }
+          },
+          "raw": {
+            "backend_label": "other",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "(unknown authority)",
+            "one_sided_write": false,
+            "policy_denied": false,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": null,
+            "route_replay_class": "write",
+            "rpc_label": "other",
+            "target": "rejected",
+            "upstream_headers": {
+              "injected": []
+            }
+          }
+        }
+      },
+      "method": "POST",
+      "name": "other quote version",
+      "path": "/v0/quote"
+    },
+    {
+      "authority": "swaps.example",
+      "expect": {
+        "mainnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "read",
+            "stage": "third_party_path",
+            "third_party_answer": {
+              "cache_ttl_secs": null,
+              "cap": {
+                "requests": 120,
+                "window_secs": 60
+              }
+            }
+          },
+          "raw": {
+            "backend_label": "swaps.example",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "/v1/quote",
+            "one_sided_write": false,
+            "policy_denied": false,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": {
+              "requests": 120,
+              "window_secs": 60
+            },
+            "route_replay_class": "read",
+            "rpc_label": "POST /v1/quote",
+            "target": {
+              "label": "swaps.example",
+              "upstream": "https://swaps-api.example/v1/quote"
+            },
+            "upstream_headers": {
+              "injected": [
+                [
+                  "x-api-key",
+                  "fake-swaps-api-key"
+                ]
+              ]
+            }
+          }
+        },
+        "testnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "write",
+            "stage": "third_party_path",
+            "third_party_answer": {
+              "cache_ttl_secs": null,
+              "cap": null
+            }
+          },
+          "raw": {
+            "backend_label": "other",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "(unknown authority)",
+            "one_sided_write": false,
+            "policy_denied": false,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": null,
+            "route_replay_class": "write",
+            "rpc_label": "other",
+            "target": "rejected",
+            "upstream_headers": {
+              "injected": []
+            }
+          }
+        }
+      },
+      "headers": [
+        [
+          "x-api-key",
+          "client-key"
+        ],
+        [
+          "content-type",
+          "application/json"
+        ]
+      ],
+      "method": "POST",
+      "name": "injected credential, client key present",
+      "path": "/v1/quote"
+    }
+  ]
+}

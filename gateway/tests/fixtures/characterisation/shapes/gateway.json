@@ -1,0 +1,1735 @@
+{
+  "description": "The gateway's own hosts (light client server), the host list, unknown and malformed authorities.",
+  "networks": [
+    "mainnet",
+    "testnet"
+  ],
+  "shapes": [
+    {
+      "authority": "gateway.example",
+      "expect": {
+        "mainnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "read",
+            "stage": "lightwalletd",
+            "third_party_answer": null
+          },
+          "raw": {
+            "backend_label": "lwd",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetLatestBlock",
+            "one_sided_write": false,
+            "policy_denied": false,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": null,
+            "route_replay_class": "read",
+            "rpc_label": "GetLatestBlock",
+            "target": {
+              "label": "lwd",
+              "upstream": "http://lwd.example:9067/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetLatestBlock"
+            },
+            "upstream_headers": {
+              "injected": []
+            }
+          }
+        },
+        "testnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "write",
+            "stage": "third_party_path",
+            "third_party_answer": {
+              "cache_ttl_secs": null,
+              "cap": null
+            }
+          },
+          "raw": {
+            "backend_label": "other",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "(unknown authority)",
+            "one_sided_write": false,
+            "policy_denied": false,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": null,
+            "route_replay_class": "write",
+            "rpc_label": "GetLatestBlock",
+            "target": "rejected",
+            "upstream_headers": {
+              "injected": []
+            }
+          }
+        }
+      },
+      "headers": [
+        [
+          "content-type",
+          "application/grpc"
+        ]
+      ],
+      "method": "POST",
+      "name": "gateway.example latest block",
+      "path": "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetLatestBlock"
+    },
+    {
+      "authority": "gateway.example",
+      "expect": {
+        "mainnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "read",
+            "stage": "lightwalletd",
+            "third_party_answer": null
+          },
+          "raw": {
+            "backend_label": "lwd",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetTreeState",
+            "one_sided_write": false,
+            "policy_denied": false,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": null,
+            "route_replay_class": "read",
+            "rpc_label": "GetTreeState",
+            "target": {
+              "label": "lwd",
+              "upstream": "http://lwd.example:9067/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetTreeState"
+            },
+            "upstream_headers": {
+              "injected": []
+            }
+          }
+        },
+        "testnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "write",
+            "stage": "third_party_path",
+            "third_party_answer": {
+              "cache_ttl_secs": null,
+              "cap": null
+            }
+          },
+          "raw": {
+            "backend_label": "other",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "(unknown authority)",
+            "one_sided_write": false,
+            "policy_denied": false,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": null,
+            "route_replay_class": "write",
+            "rpc_label": "GetTreeState",
+            "target": "rejected",
+            "upstream_headers": {
+              "injected": []
+            }
+          }
+        }
+      },
+      "headers": [
+        [
+          "content-type",
+          "application/grpc"
+        ]
+      ],
+      "method": "POST",
+      "name": "gateway.example tree state",
+      "path": "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetTreeState"
+    },
+    {
+      "authority": "gateway.example",
+      "expect": {
+        "mainnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "read",
+            "stage": "lightwalletd",
+            "third_party_answer": null
+          },
+          "raw": {
+            "backend_label": "lwd",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetBlockRange",
+            "one_sided_write": false,
+            "policy_denied": false,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": null,
+            "route_replay_class": "read",
+            "rpc_label": "GetBlockRange",
+            "target": {
+              "label": "lwd",
+              "upstream": "http://lwd.example:9067/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetBlockRange"
+            },
+            "upstream_headers": {
+              "injected": []
+            }
+          }
+        },
+        "testnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "write",
+            "stage": "third_party_path",
+            "third_party_answer": {
+              "cache_ttl_secs": null,
+              "cap": null
+            }
+          },
+          "raw": {
+            "backend_label": "other",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "(unknown authority)",
+            "one_sided_write": false,
+            "policy_denied": false,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": null,
+            "route_replay_class": "write",
+            "rpc_label": "GetBlockRange",
+            "target": "rejected",
+            "upstream_headers": {
+              "injected": []
+            }
+          }
+        }
+      },
+      "headers": [
+        [
+          "content-type",
+          "application/grpc"
+        ]
+      ],
+      "method": "POST",
+      "name": "gateway.example block range",
+      "path": "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetBlockRange"
+    },
+    {
+      "authority": "gateway.example",
+      "expect": {
+        "mainnet": {
+          "effective": {
+            "one_sided_write": true,
+            "replay_class": "write",
+            "stage": "lightwalletd",
+            "third_party_answer": null
+          },
+          "raw": {
+            "backend_label": "lwd",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "/cash.z.wallet.sdk.rpc.CompactTxStreamer/SendTransaction",
+            "one_sided_write": true,
+            "policy_denied": false,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": null,
+            "route_replay_class": "write",
+            "rpc_label": "SendTransaction",
+            "target": {
+              "label": "lwd",
+              "upstream": "http://lwd.example:9067/cash.z.wallet.sdk.rpc.CompactTxStreamer/SendTransaction"
+            },
+            "upstream_headers": {
+              "injected": []
+            }
+          }
+        },
+        "testnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "write",
+            "stage": "third_party_path",
+            "third_party_answer": {
+              "cache_ttl_secs": null,
+              "cap": null
+            }
+          },
+          "raw": {
+            "backend_label": "other",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "(unknown authority)",
+            "one_sided_write": false,
+            "policy_denied": false,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": null,
+            "route_replay_class": "write",
+            "rpc_label": "SendTransaction",
+            "target": "rejected",
+            "upstream_headers": {
+              "injected": []
+            }
+          }
+        }
+      },
+      "headers": [
+        [
+          "content-type",
+          "application/grpc"
+        ]
+      ],
+      "method": "POST",
+      "name": "gateway.example send transaction",
+      "path": "/cash.z.wallet.sdk.rpc.CompactTxStreamer/SendTransaction"
+    },
+    {
+      "authority": "gateway.example",
+      "expect": {
+        "mainnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "write",
+            "stage": "lightwalletd",
+            "third_party_answer": null
+          },
+          "raw": {
+            "backend_label": "lwd",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetSomethingNew",
+            "one_sided_write": false,
+            "policy_denied": false,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": null,
+            "route_replay_class": "write",
+            "rpc_label": "other",
+            "target": {
+              "label": "lwd",
+              "upstream": "http://lwd.example:9067/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetSomethingNew"
+            },
+            "upstream_headers": {
+              "injected": []
+            }
+          }
+        },
+        "testnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "write",
+            "stage": "third_party_path",
+            "third_party_answer": {
+              "cache_ttl_secs": null,
+              "cap": null
+            }
+          },
+          "raw": {
+            "backend_label": "other",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "(unknown authority)",
+            "one_sided_write": false,
+            "policy_denied": false,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": null,
+            "route_replay_class": "write",
+            "rpc_label": "other",
+            "target": "rejected",
+            "upstream_headers": {
+              "injected": []
+            }
+          }
+        }
+      },
+      "headers": [
+        [
+          "content-type",
+          "application/grpc"
+        ]
+      ],
+      "method": "POST",
+      "name": "gateway.example unknown rpc",
+      "path": "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetSomethingNew"
+    },
+    {
+      "authority": "gateway.example",
+      "expect": {
+        "mainnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "write",
+            "stage": "gateway_host_policy_403",
+            "third_party_answer": null
+          },
+          "raw": {
+            "backend_label": "lwd",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": true,
+            "host_list_request": false,
+            "logged_route": "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetLatestBlock",
+            "one_sided_write": false,
+            "policy_denied": false,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": null,
+            "route_replay_class": "write",
+            "rpc_label": "GetLatestBlock",
+            "target": {
+              "label": "lwd",
+              "upstream": "http://lwd.example:9067/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetLatestBlock"
+            },
+            "upstream_headers": {
+              "injected": []
+            }
+          }
+        },
+        "testnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "write",
+            "stage": "third_party_path",
+            "third_party_answer": {
+              "cache_ttl_secs": null,
+              "cap": null
+            }
+          },
+          "raw": {
+            "backend_label": "other",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "(unknown authority)",
+            "one_sided_write": false,
+            "policy_denied": false,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": null,
+            "route_replay_class": "write",
+            "rpc_label": "GetLatestBlock",
+            "target": "rejected",
+            "upstream_headers": {
+              "injected": []
+            }
+          }
+        }
+      },
+      "method": "GET",
+      "name": "gateway.example GET on rpc",
+      "path": "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetLatestBlock"
+    },
+    {
+      "authority": "gateway.example",
+      "expect": {
+        "mainnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "write",
+            "stage": "gateway_host_policy_403",
+            "third_party_answer": null
+          },
+          "raw": {
+            "backend_label": "lwd",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": true,
+            "host_list_request": false,
+            "logged_route": "/other.Service/Call",
+            "one_sided_write": false,
+            "policy_denied": false,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": null,
+            "route_replay_class": "write",
+            "rpc_label": "other",
+            "target": {
+              "label": "lwd",
+              "upstream": "http://lwd.example:9067/other.Service/Call"
+            },
+            "upstream_headers": {
+              "injected": []
+            }
+          }
+        },
+        "testnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "write",
+            "stage": "third_party_path",
+            "third_party_answer": {
+              "cache_ttl_secs": null,
+              "cap": null
+            }
+          },
+          "raw": {
+            "backend_label": "other",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "(unknown authority)",
+            "one_sided_write": false,
+            "policy_denied": false,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": null,
+            "route_replay_class": "write",
+            "rpc_label": "other",
+            "target": "rejected",
+            "upstream_headers": {
+              "injected": []
+            }
+          }
+        }
+      },
+      "method": "POST",
+      "name": "gateway.example other service",
+      "path": "/other.Service/Call"
+    },
+    {
+      "authority": "gateway.example:443",
+      "expect": {
+        "mainnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "read",
+            "stage": "lightwalletd",
+            "third_party_answer": null
+          },
+          "raw": {
+            "backend_label": "lwd",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetLightdInfo",
+            "one_sided_write": false,
+            "policy_denied": false,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": null,
+            "route_replay_class": "read",
+            "rpc_label": "GetLightdInfo",
+            "target": {
+              "label": "lwd",
+              "upstream": "http://lwd.example:9067/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetLightdInfo"
+            },
+            "upstream_headers": {
+              "injected": []
+            }
+          }
+        },
+        "testnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "write",
+            "stage": "third_party_path",
+            "third_party_answer": {
+              "cache_ttl_secs": null,
+              "cap": null
+            }
+          },
+          "raw": {
+            "backend_label": "other",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "(unknown authority)",
+            "one_sided_write": false,
+            "policy_denied": false,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": null,
+            "route_replay_class": "write",
+            "rpc_label": "GetLightdInfo",
+            "target": "rejected",
+            "upstream_headers": {
+              "injected": []
+            }
+          }
+        }
+      },
+      "method": "POST",
+      "name": "gateway.example with port",
+      "path": "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetLightdInfo"
+    },
+    {
+      "authority": "gateway.example",
+      "expect": {
+        "mainnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "read",
+            "stage": "host_list",
+            "third_party_answer": null
+          },
+          "raw": {
+            "backend_label": "lwd",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": true,
+            "host_list_request": true,
+            "logged_route": "/ohttp-gateway/v1/third-party-hosts",
+            "one_sided_write": false,
+            "policy_denied": false,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": null,
+            "route_replay_class": "write",
+            "rpc_label": "other",
+            "target": {
+              "label": "lwd",
+              "upstream": "http://lwd.example:9067/ohttp-gateway/v1/third-party-hosts"
+            },
+            "upstream_headers": {
+              "injected": []
+            }
+          }
+        },
+        "testnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "write",
+            "stage": "third_party_path",
+            "third_party_answer": {
+              "cache_ttl_secs": null,
+              "cap": null
+            }
+          },
+          "raw": {
+            "backend_label": "other",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "(unknown authority)",
+            "one_sided_write": false,
+            "policy_denied": false,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": null,
+            "route_replay_class": "write",
+            "rpc_label": "other",
+            "target": "rejected",
+            "upstream_headers": {
+              "injected": []
+            }
+          }
+        }
+      },
+      "method": "GET",
+      "name": "gateway.example host list",
+      "path": "/ohttp-gateway/v1/third-party-hosts"
+    },
+    {
+      "authority": "gateway.example",
+      "expect": {
+        "mainnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "write",
+            "stage": "gateway_host_policy_403",
+            "third_party_answer": null
+          },
+          "raw": {
+            "backend_label": "lwd",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": true,
+            "host_list_request": false,
+            "logged_route": "/ohttp-gateway/v1/third-party-hosts",
+            "one_sided_write": false,
+            "policy_denied": false,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": null,
+            "route_replay_class": "write",
+            "rpc_label": "other",
+            "target": {
+              "label": "lwd",
+              "upstream": "http://lwd.example:9067/ohttp-gateway/v1/third-party-hosts"
+            },
+            "upstream_headers": {
+              "injected": []
+            }
+          }
+        },
+        "testnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "write",
+            "stage": "third_party_path",
+            "third_party_answer": {
+              "cache_ttl_secs": null,
+              "cap": null
+            }
+          },
+          "raw": {
+            "backend_label": "other",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "(unknown authority)",
+            "one_sided_write": false,
+            "policy_denied": false,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": null,
+            "route_replay_class": "write",
+            "rpc_label": "other",
+            "target": "rejected",
+            "upstream_headers": {
+              "injected": []
+            }
+          }
+        }
+      },
+      "method": "POST",
+      "name": "gateway.example host list POST",
+      "path": "/ohttp-gateway/v1/third-party-hosts"
+    },
+    {
+      "authority": "gateway-testnet.example",
+      "expect": {
+        "mainnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "write",
+            "stage": "third_party_path",
+            "third_party_answer": {
+              "cache_ttl_secs": null,
+              "cap": null
+            }
+          },
+          "raw": {
+            "backend_label": "other",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "(unknown authority)",
+            "one_sided_write": false,
+            "policy_denied": false,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": null,
+            "route_replay_class": "write",
+            "rpc_label": "GetLatestBlock",
+            "target": "rejected",
+            "upstream_headers": {
+              "injected": []
+            }
+          }
+        },
+        "testnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "read",
+            "stage": "lightwalletd",
+            "third_party_answer": null
+          },
+          "raw": {
+            "backend_label": "lwd",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetLatestBlock",
+            "one_sided_write": false,
+            "policy_denied": false,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": null,
+            "route_replay_class": "read",
+            "rpc_label": "GetLatestBlock",
+            "target": {
+              "label": "lwd",
+              "upstream": "http://lwd.example:9067/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetLatestBlock"
+            },
+            "upstream_headers": {
+              "injected": []
+            }
+          }
+        }
+      },
+      "headers": [
+        [
+          "content-type",
+          "application/grpc"
+        ]
+      ],
+      "method": "POST",
+      "name": "gateway-testnet.example latest block",
+      "path": "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetLatestBlock"
+    },
+    {
+      "authority": "gateway-testnet.example",
+      "expect": {
+        "mainnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "write",
+            "stage": "third_party_path",
+            "third_party_answer": {
+              "cache_ttl_secs": null,
+              "cap": null
+            }
+          },
+          "raw": {
+            "backend_label": "other",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "(unknown authority)",
+            "one_sided_write": false,
+            "policy_denied": false,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": null,
+            "route_replay_class": "write",
+            "rpc_label": "GetTreeState",
+            "target": "rejected",
+            "upstream_headers": {
+              "injected": []
+            }
+          }
+        },
+        "testnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "read",
+            "stage": "lightwalletd",
+            "third_party_answer": null
+          },
+          "raw": {
+            "backend_label": "lwd",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetTreeState",
+            "one_sided_write": false,
+            "policy_denied": false,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": null,
+            "route_replay_class": "read",
+            "rpc_label": "GetTreeState",
+            "target": {
+              "label": "lwd",
+              "upstream": "http://lwd.example:9067/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetTreeState"
+            },
+            "upstream_headers": {
+              "injected": []
+            }
+          }
+        }
+      },
+      "headers": [
+        [
+          "content-type",
+          "application/grpc"
+        ]
+      ],
+      "method": "POST",
+      "name": "gateway-testnet.example tree state",
+      "path": "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetTreeState"
+    },
+    {
+      "authority": "gateway-testnet.example",
+      "expect": {
+        "mainnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "write",
+            "stage": "third_party_path",
+            "third_party_answer": {
+              "cache_ttl_secs": null,
+              "cap": null
+            }
+          },
+          "raw": {
+            "backend_label": "other",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "(unknown authority)",
+            "one_sided_write": false,
+            "policy_denied": false,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": null,
+            "route_replay_class": "write",
+            "rpc_label": "GetBlockRange",
+            "target": "rejected",
+            "upstream_headers": {
+              "injected": []
+            }
+          }
+        },
+        "testnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "read",
+            "stage": "lightwalletd",
+            "third_party_answer": null
+          },
+          "raw": {
+            "backend_label": "lwd",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetBlockRange",
+            "one_sided_write": false,
+            "policy_denied": false,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": null,
+            "route_replay_class": "read",
+            "rpc_label": "GetBlockRange",
+            "target": {
+              "label": "lwd",
+              "upstream": "http://lwd.example:9067/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetBlockRange"
+            },
+            "upstream_headers": {
+              "injected": []
+            }
+          }
+        }
+      },
+      "headers": [
+        [
+          "content-type",
+          "application/grpc"
+        ]
+      ],
+      "method": "POST",
+      "name": "gateway-testnet.example block range",
+      "path": "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetBlockRange"
+    },
+    {
+      "authority": "gateway-testnet.example",
+      "expect": {
+        "mainnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "write",
+            "stage": "third_party_path",
+            "third_party_answer": {
+              "cache_ttl_secs": null,
+              "cap": null
+            }
+          },
+          "raw": {
+            "backend_label": "other",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "(unknown authority)",
+            "one_sided_write": false,
+            "policy_denied": false,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": null,
+            "route_replay_class": "write",
+            "rpc_label": "SendTransaction",
+            "target": "rejected",
+            "upstream_headers": {
+              "injected": []
+            }
+          }
+        },
+        "testnet": {
+          "effective": {
+            "one_sided_write": true,
+            "replay_class": "write",
+            "stage": "lightwalletd",
+            "third_party_answer": null
+          },
+          "raw": {
+            "backend_label": "lwd",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "/cash.z.wallet.sdk.rpc.CompactTxStreamer/SendTransaction",
+            "one_sided_write": true,
+            "policy_denied": false,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": null,
+            "route_replay_class": "write",
+            "rpc_label": "SendTransaction",
+            "target": {
+              "label": "lwd",
+              "upstream": "http://lwd.example:9067/cash.z.wallet.sdk.rpc.CompactTxStreamer/SendTransaction"
+            },
+            "upstream_headers": {
+              "injected": []
+            }
+          }
+        }
+      },
+      "headers": [
+        [
+          "content-type",
+          "application/grpc"
+        ]
+      ],
+      "method": "POST",
+      "name": "gateway-testnet.example send transaction",
+      "path": "/cash.z.wallet.sdk.rpc.CompactTxStreamer/SendTransaction"
+    },
+    {
+      "authority": "gateway-testnet.example",
+      "expect": {
+        "mainnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "write",
+            "stage": "third_party_path",
+            "third_party_answer": {
+              "cache_ttl_secs": null,
+              "cap": null
+            }
+          },
+          "raw": {
+            "backend_label": "other",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "(unknown authority)",
+            "one_sided_write": false,
+            "policy_denied": false,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": null,
+            "route_replay_class": "write",
+            "rpc_label": "other",
+            "target": "rejected",
+            "upstream_headers": {
+              "injected": []
+            }
+          }
+        },
+        "testnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "write",
+            "stage": "lightwalletd",
+            "third_party_answer": null
+          },
+          "raw": {
+            "backend_label": "lwd",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetSomethingNew",
+            "one_sided_write": false,
+            "policy_denied": false,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": null,
+            "route_replay_class": "write",
+            "rpc_label": "other",
+            "target": {
+              "label": "lwd",
+              "upstream": "http://lwd.example:9067/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetSomethingNew"
+            },
+            "upstream_headers": {
+              "injected": []
+            }
+          }
+        }
+      },
+      "headers": [
+        [
+          "content-type",
+          "application/grpc"
+        ]
+      ],
+      "method": "POST",
+      "name": "gateway-testnet.example unknown rpc",
+      "path": "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetSomethingNew"
+    },
+    {
+      "authority": "gateway-testnet.example",
+      "expect": {
+        "mainnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "write",
+            "stage": "third_party_path",
+            "third_party_answer": {
+              "cache_ttl_secs": null,
+              "cap": null
+            }
+          },
+          "raw": {
+            "backend_label": "other",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "(unknown authority)",
+            "one_sided_write": false,
+            "policy_denied": false,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": null,
+            "route_replay_class": "write",
+            "rpc_label": "GetLatestBlock",
+            "target": "rejected",
+            "upstream_headers": {
+              "injected": []
+            }
+          }
+        },
+        "testnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "write",
+            "stage": "gateway_host_policy_403",
+            "third_party_answer": null
+          },
+          "raw": {
+            "backend_label": "lwd",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": true,
+            "host_list_request": false,
+            "logged_route": "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetLatestBlock",
+            "one_sided_write": false,
+            "policy_denied": false,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": null,
+            "route_replay_class": "write",
+            "rpc_label": "GetLatestBlock",
+            "target": {
+              "label": "lwd",
+              "upstream": "http://lwd.example:9067/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetLatestBlock"
+            },
+            "upstream_headers": {
+              "injected": []
+            }
+          }
+        }
+      },
+      "method": "GET",
+      "name": "gateway-testnet.example GET on rpc",
+      "path": "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetLatestBlock"
+    },
+    {
+      "authority": "gateway-testnet.example",
+      "expect": {
+        "mainnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "write",
+            "stage": "third_party_path",
+            "third_party_answer": {
+              "cache_ttl_secs": null,
+              "cap": null
+            }
+          },
+          "raw": {
+            "backend_label": "other",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "(unknown authority)",
+            "one_sided_write": false,
+            "policy_denied": false,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": null,
+            "route_replay_class": "write",
+            "rpc_label": "other",
+            "target": "rejected",
+            "upstream_headers": {
+              "injected": []
+            }
+          }
+        },
+        "testnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "write",
+            "stage": "gateway_host_policy_403",
+            "third_party_answer": null
+          },
+          "raw": {
+            "backend_label": "lwd",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": true,
+            "host_list_request": false,
+            "logged_route": "/other.Service/Call",
+            "one_sided_write": false,
+            "policy_denied": false,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": null,
+            "route_replay_class": "write",
+            "rpc_label": "other",
+            "target": {
+              "label": "lwd",
+              "upstream": "http://lwd.example:9067/other.Service/Call"
+            },
+            "upstream_headers": {
+              "injected": []
+            }
+          }
+        }
+      },
+      "method": "POST",
+      "name": "gateway-testnet.example other service",
+      "path": "/other.Service/Call"
+    },
+    {
+      "authority": "gateway-testnet.example:443",
+      "expect": {
+        "mainnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "write",
+            "stage": "third_party_path",
+            "third_party_answer": {
+              "cache_ttl_secs": null,
+              "cap": null
+            }
+          },
+          "raw": {
+            "backend_label": "other",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "(unknown authority)",
+            "one_sided_write": false,
+            "policy_denied": false,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": null,
+            "route_replay_class": "write",
+            "rpc_label": "GetLightdInfo",
+            "target": "rejected",
+            "upstream_headers": {
+              "injected": []
+            }
+          }
+        },
+        "testnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "read",
+            "stage": "lightwalletd",
+            "third_party_answer": null
+          },
+          "raw": {
+            "backend_label": "lwd",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetLightdInfo",
+            "one_sided_write": false,
+            "policy_denied": false,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": null,
+            "route_replay_class": "read",
+            "rpc_label": "GetLightdInfo",
+            "target": {
+              "label": "lwd",
+              "upstream": "http://lwd.example:9067/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetLightdInfo"
+            },
+            "upstream_headers": {
+              "injected": []
+            }
+          }
+        }
+      },
+      "method": "POST",
+      "name": "gateway-testnet.example with port",
+      "path": "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetLightdInfo"
+    },
+    {
+      "authority": "gateway-testnet.example",
+      "expect": {
+        "mainnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "write",
+            "stage": "third_party_path",
+            "third_party_answer": {
+              "cache_ttl_secs": null,
+              "cap": null
+            }
+          },
+          "raw": {
+            "backend_label": "other",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "(unknown authority)",
+            "one_sided_write": false,
+            "policy_denied": false,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": null,
+            "route_replay_class": "write",
+            "rpc_label": "other",
+            "target": "rejected",
+            "upstream_headers": {
+              "injected": []
+            }
+          }
+        },
+        "testnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "read",
+            "stage": "host_list",
+            "third_party_answer": null
+          },
+          "raw": {
+            "backend_label": "lwd",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": true,
+            "host_list_request": true,
+            "logged_route": "/ohttp-gateway/v1/third-party-hosts",
+            "one_sided_write": false,
+            "policy_denied": false,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": null,
+            "route_replay_class": "write",
+            "rpc_label": "other",
+            "target": {
+              "label": "lwd",
+              "upstream": "http://lwd.example:9067/ohttp-gateway/v1/third-party-hosts"
+            },
+            "upstream_headers": {
+              "injected": []
+            }
+          }
+        }
+      },
+      "method": "GET",
+      "name": "gateway-testnet.example host list",
+      "path": "/ohttp-gateway/v1/third-party-hosts"
+    },
+    {
+      "authority": "gateway-testnet.example",
+      "expect": {
+        "mainnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "write",
+            "stage": "third_party_path",
+            "third_party_answer": {
+              "cache_ttl_secs": null,
+              "cap": null
+            }
+          },
+          "raw": {
+            "backend_label": "other",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "(unknown authority)",
+            "one_sided_write": false,
+            "policy_denied": false,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": null,
+            "route_replay_class": "write",
+            "rpc_label": "other",
+            "target": "rejected",
+            "upstream_headers": {
+              "injected": []
+            }
+          }
+        },
+        "testnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "write",
+            "stage": "gateway_host_policy_403",
+            "third_party_answer": null
+          },
+          "raw": {
+            "backend_label": "lwd",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": true,
+            "host_list_request": false,
+            "logged_route": "/ohttp-gateway/v1/third-party-hosts",
+            "one_sided_write": false,
+            "policy_denied": false,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": null,
+            "route_replay_class": "write",
+            "rpc_label": "other",
+            "target": {
+              "label": "lwd",
+              "upstream": "http://lwd.example:9067/ohttp-gateway/v1/third-party-hosts"
+            },
+            "upstream_headers": {
+              "injected": []
+            }
+          }
+        }
+      },
+      "method": "POST",
+      "name": "gateway-testnet.example host list POST",
+      "path": "/ohttp-gateway/v1/third-party-hosts"
+    },
+    {
+      "authority": "unknown.example",
+      "expect": {
+        "mainnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "write",
+            "stage": "third_party_path",
+            "third_party_answer": {
+              "cache_ttl_secs": null,
+              "cap": null
+            }
+          },
+          "raw": {
+            "backend_label": "other",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "(unknown authority)",
+            "one_sided_write": false,
+            "policy_denied": false,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": null,
+            "route_replay_class": "write",
+            "rpc_label": "other",
+            "target": "rejected",
+            "upstream_headers": {
+              "injected": []
+            }
+          }
+        },
+        "testnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "write",
+            "stage": "third_party_path",
+            "third_party_answer": {
+              "cache_ttl_secs": null,
+              "cap": null
+            }
+          },
+          "raw": {
+            "backend_label": "other",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "(unknown authority)",
+            "one_sided_write": false,
+            "policy_denied": false,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": null,
+            "route_replay_class": "write",
+            "rpc_label": "other",
+            "target": "rejected",
+            "upstream_headers": {
+              "injected": []
+            }
+          }
+        }
+      },
+      "method": "GET",
+      "name": "unknown authority",
+      "path": "/"
+    },
+    {
+      "authority": "",
+      "expect": {
+        "mainnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "write",
+            "stage": "third_party_path",
+            "third_party_answer": {
+              "cache_ttl_secs": null,
+              "cap": null
+            }
+          },
+          "raw": {
+            "backend_label": "lwd",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "(unknown authority)",
+            "one_sided_write": false,
+            "policy_denied": false,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": null,
+            "route_replay_class": "write",
+            "rpc_label": "GetLatestBlock",
+            "target": {
+              "malformed_authority": "empty authority"
+            },
+            "upstream_headers": {
+              "injected": []
+            }
+          }
+        },
+        "testnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "write",
+            "stage": "third_party_path",
+            "third_party_answer": {
+              "cache_ttl_secs": null,
+              "cap": null
+            }
+          },
+          "raw": {
+            "backend_label": "lwd",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "(unknown authority)",
+            "one_sided_write": false,
+            "policy_denied": false,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": null,
+            "route_replay_class": "write",
+            "rpc_label": "GetLatestBlock",
+            "target": {
+              "malformed_authority": "empty authority"
+            },
+            "upstream_headers": {
+              "injected": []
+            }
+          }
+        }
+      },
+      "method": "POST",
+      "name": "empty authority",
+      "path": "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetLatestBlock"
+    },
+    {
+      "authority": "GATEWAY.EXAMPLE",
+      "expect": {
+        "mainnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "write",
+            "stage": "third_party_path",
+            "third_party_answer": {
+              "cache_ttl_secs": null,
+              "cap": null
+            }
+          },
+          "raw": {
+            "backend_label": "lwd",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetLatestBlock",
+            "one_sided_write": false,
+            "policy_denied": false,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": null,
+            "route_replay_class": "write",
+            "rpc_label": "GetLatestBlock",
+            "target": {
+              "malformed_authority": "uppercase character in authority"
+            },
+            "upstream_headers": {
+              "injected": []
+            }
+          }
+        },
+        "testnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "write",
+            "stage": "third_party_path",
+            "third_party_answer": {
+              "cache_ttl_secs": null,
+              "cap": null
+            }
+          },
+          "raw": {
+            "backend_label": "other",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "(unknown authority)",
+            "one_sided_write": false,
+            "policy_denied": false,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": null,
+            "route_replay_class": "write",
+            "rpc_label": "GetLatestBlock",
+            "target": {
+              "malformed_authority": "uppercase character in authority"
+            },
+            "upstream_headers": {
+              "injected": []
+            }
+          }
+        }
+      },
+      "method": "POST",
+      "name": "upper-case gateway host",
+      "path": "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetLatestBlock"
+    },
+    {
+      "authority": "user@prices.example",
+      "expect": {
+        "mainnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "write",
+            "stage": "third_party_path",
+            "third_party_answer": {
+              "cache_ttl_secs": null,
+              "cap": null
+            }
+          },
+          "raw": {
+            "backend_label": "other",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "(unknown authority)",
+            "one_sided_write": false,
+            "policy_denied": false,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": null,
+            "route_replay_class": "write",
+            "rpc_label": "other",
+            "target": {
+              "malformed_authority": "invalid character in host"
+            },
+            "upstream_headers": {
+              "injected": []
+            }
+          }
+        },
+        "testnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "write",
+            "stage": "third_party_path",
+            "third_party_answer": {
+              "cache_ttl_secs": null,
+              "cap": null
+            }
+          },
+          "raw": {
+            "backend_label": "other",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "(unknown authority)",
+            "one_sided_write": false,
+            "policy_denied": false,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": null,
+            "route_replay_class": "write",
+            "rpc_label": "other",
+            "target": {
+              "malformed_authority": "invalid character in host"
+            },
+            "upstream_headers": {
+              "injected": []
+            }
+          }
+        }
+      },
+      "method": "GET",
+      "name": "authority with userinfo",
+      "path": "/v1/fiat/map"
+    },
+    {
+      "authority": "gateway.example",
+      "expect": {
+        "mainnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "write",
+            "stage": "third_party_path",
+            "third_party_answer": {
+              "cache_ttl_secs": null,
+              "cap": null
+            }
+          },
+          "raw": {
+            "backend_label": "lwd",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": true,
+            "host_list_request": false,
+            "logged_route": "GetLatestBlock",
+            "one_sided_write": false,
+            "policy_denied": false,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": null,
+            "route_replay_class": "write",
+            "rpc_label": "other",
+            "target": {
+              "malformed_path": "path does not start with /"
+            },
+            "upstream_headers": {
+              "injected": []
+            }
+          }
+        },
+        "testnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "write",
+            "stage": "third_party_path",
+            "third_party_answer": {
+              "cache_ttl_secs": null,
+              "cap": null
+            }
+          },
+          "raw": {
+            "backend_label": "other",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "(unknown authority)",
+            "one_sided_write": false,
+            "policy_denied": false,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": null,
+            "route_replay_class": "write",
+            "rpc_label": "other",
+            "target": {
+              "malformed_path": "path does not start with /"
+            },
+            "upstream_headers": {
+              "injected": []
+            }
+          }
+        }
+      },
+      "method": "POST",
+      "name": "relative path",
+      "path": "GetLatestBlock"
+    }
+  ]
+}

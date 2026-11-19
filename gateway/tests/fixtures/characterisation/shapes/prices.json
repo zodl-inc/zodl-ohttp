@@ -1,0 +1,1875 @@
+{
+  "description": "Price quotes: header-key credential, per-route query rules with a value list (fiat codes), cached routes, an upstream cap.",
+  "networks": [
+    "mainnet",
+    "testnet"
+  ],
+  "shapes": [
+    {
+      "authority": "prices.example",
+      "expect": {
+        "mainnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "read",
+            "stage": "third_party_path",
+            "third_party_answer": {
+              "cache_ttl_secs": 120,
+              "cap": {
+                "requests": 10,
+                "window_secs": 60
+              }
+            }
+          },
+          "raw": {
+            "backend_label": "prices.example",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "/v1/cryptocurrency/quotes/latest",
+            "one_sided_write": false,
+            "policy_denied": false,
+            "query_admitted": true,
+            "route_cache_ttl_secs": 120,
+            "route_cap": {
+              "requests": 10,
+              "window_secs": 60
+            },
+            "route_replay_class": "read",
+            "rpc_label": "GET /v1/cryptocurrency/quotes/latest",
+            "target": {
+              "label": "prices.example",
+              "upstream": "https://prices-api.example/v1/cryptocurrency/quotes/latest?symbol=ZEC&convert=USD"
+            },
+            "upstream_headers": {
+              "injected": [
+                [
+                  "X-PRICES_API_KEY",
+                  "fake-prices-api-key"
+                ]
+              ]
+            }
+          }
+        },
+        "testnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "read",
+            "stage": "third_party_path",
+            "third_party_answer": {
+              "cache_ttl_secs": 120,
+              "cap": {
+                "requests": 10,
+                "window_secs": 60
+              }
+            }
+          },
+          "raw": {
+            "backend_label": "prices.example",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "/v1/cryptocurrency/quotes/latest",
+            "one_sided_write": false,
+            "policy_denied": false,
+            "query_admitted": true,
+            "route_cache_ttl_secs": 120,
+            "route_cap": {
+              "requests": 10,
+              "window_secs": 60
+            },
+            "route_replay_class": "read",
+            "rpc_label": "GET /v1/cryptocurrency/quotes/latest",
+            "target": {
+              "label": "prices.example",
+              "upstream": "https://prices-api.example/v1/cryptocurrency/quotes/latest?symbol=ZEC&convert=USD"
+            },
+            "upstream_headers": {
+              "injected": [
+                [
+                  "X-PRICES_API_KEY",
+                  "fake-prices-api-key"
+                ]
+              ]
+            }
+          }
+        }
+      },
+      "method": "GET",
+      "name": "quote USD admitted",
+      "path": "/v1/cryptocurrency/quotes/latest?symbol=ZEC&convert=USD"
+    },
+    {
+      "authority": "prices.example",
+      "expect": {
+        "mainnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "read",
+            "stage": "third_party_path",
+            "third_party_answer": {
+              "cache_ttl_secs": 120,
+              "cap": {
+                "requests": 10,
+                "window_secs": 60
+              }
+            }
+          },
+          "raw": {
+            "backend_label": "prices.example",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "/v1/cryptocurrency/quotes/latest",
+            "one_sided_write": false,
+            "policy_denied": false,
+            "query_admitted": true,
+            "route_cache_ttl_secs": 120,
+            "route_cap": {
+              "requests": 10,
+              "window_secs": 60
+            },
+            "route_replay_class": "read",
+            "rpc_label": "GET /v1/cryptocurrency/quotes/latest",
+            "target": {
+              "label": "prices.example",
+              "upstream": "https://prices-api.example/v1/cryptocurrency/quotes/latest?symbol=ZEC&convert=EUR"
+            },
+            "upstream_headers": {
+              "injected": [
+                [
+                  "X-PRICES_API_KEY",
+                  "fake-prices-api-key"
+                ]
+              ]
+            }
+          }
+        },
+        "testnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "read",
+            "stage": "third_party_path",
+            "third_party_answer": {
+              "cache_ttl_secs": 120,
+              "cap": {
+                "requests": 10,
+                "window_secs": 60
+              }
+            }
+          },
+          "raw": {
+            "backend_label": "prices.example",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "/v1/cryptocurrency/quotes/latest",
+            "one_sided_write": false,
+            "policy_denied": false,
+            "query_admitted": true,
+            "route_cache_ttl_secs": 120,
+            "route_cap": {
+              "requests": 10,
+              "window_secs": 60
+            },
+            "route_replay_class": "read",
+            "rpc_label": "GET /v1/cryptocurrency/quotes/latest",
+            "target": {
+              "label": "prices.example",
+              "upstream": "https://prices-api.example/v1/cryptocurrency/quotes/latest?symbol=ZEC&convert=EUR"
+            },
+            "upstream_headers": {
+              "injected": [
+                [
+                  "X-PRICES_API_KEY",
+                  "fake-prices-api-key"
+                ]
+              ]
+            }
+          }
+        }
+      },
+      "method": "GET",
+      "name": "quote EUR admitted",
+      "path": "/v1/cryptocurrency/quotes/latest?symbol=ZEC&convert=EUR"
+    },
+    {
+      "authority": "prices.example",
+      "expect": {
+        "mainnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "read",
+            "stage": "third_party_path",
+            "third_party_answer": null
+          },
+          "raw": {
+            "backend_label": "prices.example",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "/v1/cryptocurrency/quotes/latest",
+            "one_sided_write": false,
+            "policy_denied": true,
+            "query_admitted": false,
+            "route_cache_ttl_secs": 120,
+            "route_cap": {
+              "requests": 10,
+              "window_secs": 60
+            },
+            "route_replay_class": "read",
+            "rpc_label": "GET /v1/cryptocurrency/quotes/latest",
+            "target": {
+              "label": "prices.example",
+              "upstream": "https://prices-api.example/v1/cryptocurrency/quotes/latest?symbol=ZEC&convert=QQQ"
+            },
+            "upstream_headers": {
+              "injected": [
+                [
+                  "X-PRICES_API_KEY",
+                  "fake-prices-api-key"
+                ]
+              ]
+            }
+          }
+        },
+        "testnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "read",
+            "stage": "third_party_path",
+            "third_party_answer": null
+          },
+          "raw": {
+            "backend_label": "prices.example",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "/v1/cryptocurrency/quotes/latest",
+            "one_sided_write": false,
+            "policy_denied": true,
+            "query_admitted": false,
+            "route_cache_ttl_secs": 120,
+            "route_cap": {
+              "requests": 10,
+              "window_secs": 60
+            },
+            "route_replay_class": "read",
+            "rpc_label": "GET /v1/cryptocurrency/quotes/latest",
+            "target": {
+              "label": "prices.example",
+              "upstream": "https://prices-api.example/v1/cryptocurrency/quotes/latest?symbol=ZEC&convert=QQQ"
+            },
+            "upstream_headers": {
+              "injected": [
+                [
+                  "X-PRICES_API_KEY",
+                  "fake-prices-api-key"
+                ]
+              ]
+            }
+          }
+        }
+      },
+      "method": "GET",
+      "name": "quote unknown fiat code",
+      "path": "/v1/cryptocurrency/quotes/latest?symbol=ZEC&convert=QQQ"
+    },
+    {
+      "authority": "prices.example",
+      "expect": {
+        "mainnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "read",
+            "stage": "third_party_path",
+            "third_party_answer": null
+          },
+          "raw": {
+            "backend_label": "prices.example",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "/v1/cryptocurrency/quotes/latest",
+            "one_sided_write": false,
+            "policy_denied": true,
+            "query_admitted": false,
+            "route_cache_ttl_secs": 120,
+            "route_cap": {
+              "requests": 10,
+              "window_secs": 60
+            },
+            "route_replay_class": "read",
+            "rpc_label": "GET /v1/cryptocurrency/quotes/latest",
+            "target": {
+              "label": "prices.example",
+              "upstream": "https://prices-api.example/v1/cryptocurrency/quotes/latest?convert=USD&symbol=ZEC"
+            },
+            "upstream_headers": {
+              "injected": [
+                [
+                  "X-PRICES_API_KEY",
+                  "fake-prices-api-key"
+                ]
+              ]
+            }
+          }
+        },
+        "testnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "read",
+            "stage": "third_party_path",
+            "third_party_answer": null
+          },
+          "raw": {
+            "backend_label": "prices.example",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "/v1/cryptocurrency/quotes/latest",
+            "one_sided_write": false,
+            "policy_denied": true,
+            "query_admitted": false,
+            "route_cache_ttl_secs": 120,
+            "route_cap": {
+              "requests": 10,
+              "window_secs": 60
+            },
+            "route_replay_class": "read",
+            "rpc_label": "GET /v1/cryptocurrency/quotes/latest",
+            "target": {
+              "label": "prices.example",
+              "upstream": "https://prices-api.example/v1/cryptocurrency/quotes/latest?convert=USD&symbol=ZEC"
+            },
+            "upstream_headers": {
+              "injected": [
+                [
+                  "X-PRICES_API_KEY",
+                  "fake-prices-api-key"
+                ]
+              ]
+            }
+          }
+        }
+      },
+      "method": "GET",
+      "name": "quote parameters reversed",
+      "path": "/v1/cryptocurrency/quotes/latest?convert=USD&symbol=ZEC"
+    },
+    {
+      "authority": "prices.example",
+      "expect": {
+        "mainnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "read",
+            "stage": "third_party_path",
+            "third_party_answer": null
+          },
+          "raw": {
+            "backend_label": "prices.example",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "/v1/cryptocurrency/quotes/latest",
+            "one_sided_write": false,
+            "policy_denied": true,
+            "query_admitted": false,
+            "route_cache_ttl_secs": 120,
+            "route_cap": {
+              "requests": 10,
+              "window_secs": 60
+            },
+            "route_replay_class": "read",
+            "rpc_label": "GET /v1/cryptocurrency/quotes/latest",
+            "target": {
+              "label": "prices.example",
+              "upstream": "https://prices-api.example/v1/cryptocurrency/quotes/latest?symbol=BTC&convert=USD"
+            },
+            "upstream_headers": {
+              "injected": [
+                [
+                  "X-PRICES_API_KEY",
+                  "fake-prices-api-key"
+                ]
+              ]
+            }
+          }
+        },
+        "testnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "read",
+            "stage": "third_party_path",
+            "third_party_answer": null
+          },
+          "raw": {
+            "backend_label": "prices.example",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "/v1/cryptocurrency/quotes/latest",
+            "one_sided_write": false,
+            "policy_denied": true,
+            "query_admitted": false,
+            "route_cache_ttl_secs": 120,
+            "route_cap": {
+              "requests": 10,
+              "window_secs": 60
+            },
+            "route_replay_class": "read",
+            "rpc_label": "GET /v1/cryptocurrency/quotes/latest",
+            "target": {
+              "label": "prices.example",
+              "upstream": "https://prices-api.example/v1/cryptocurrency/quotes/latest?symbol=BTC&convert=USD"
+            },
+            "upstream_headers": {
+              "injected": [
+                [
+                  "X-PRICES_API_KEY",
+                  "fake-prices-api-key"
+                ]
+              ]
+            }
+          }
+        }
+      },
+      "method": "GET",
+      "name": "quote other symbol",
+      "path": "/v1/cryptocurrency/quotes/latest?symbol=BTC&convert=USD"
+    },
+    {
+      "authority": "prices.example",
+      "expect": {
+        "mainnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "read",
+            "stage": "third_party_path",
+            "third_party_answer": null
+          },
+          "raw": {
+            "backend_label": "prices.example",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "/v1/cryptocurrency/quotes/latest",
+            "one_sided_write": false,
+            "policy_denied": true,
+            "query_admitted": false,
+            "route_cache_ttl_secs": 120,
+            "route_cap": {
+              "requests": 10,
+              "window_secs": 60
+            },
+            "route_replay_class": "read",
+            "rpc_label": "GET /v1/cryptocurrency/quotes/latest",
+            "target": {
+              "label": "prices.example",
+              "upstream": "https://prices-api.example/v1/cryptocurrency/quotes/latest?symbol=zec&convert=usd"
+            },
+            "upstream_headers": {
+              "injected": [
+                [
+                  "X-PRICES_API_KEY",
+                  "fake-prices-api-key"
+                ]
+              ]
+            }
+          }
+        },
+        "testnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "read",
+            "stage": "third_party_path",
+            "third_party_answer": null
+          },
+          "raw": {
+            "backend_label": "prices.example",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "/v1/cryptocurrency/quotes/latest",
+            "one_sided_write": false,
+            "policy_denied": true,
+            "query_admitted": false,
+            "route_cache_ttl_secs": 120,
+            "route_cap": {
+              "requests": 10,
+              "window_secs": 60
+            },
+            "route_replay_class": "read",
+            "rpc_label": "GET /v1/cryptocurrency/quotes/latest",
+            "target": {
+              "label": "prices.example",
+              "upstream": "https://prices-api.example/v1/cryptocurrency/quotes/latest?symbol=zec&convert=usd"
+            },
+            "upstream_headers": {
+              "injected": [
+                [
+                  "X-PRICES_API_KEY",
+                  "fake-prices-api-key"
+                ]
+              ]
+            }
+          }
+        }
+      },
+      "method": "GET",
+      "name": "quote lower case",
+      "path": "/v1/cryptocurrency/quotes/latest?symbol=zec&convert=usd"
+    },
+    {
+      "authority": "prices.example",
+      "expect": {
+        "mainnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "read",
+            "stage": "third_party_path",
+            "third_party_answer": null
+          },
+          "raw": {
+            "backend_label": "prices.example",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "/v1/cryptocurrency/quotes/latest",
+            "one_sided_write": false,
+            "policy_denied": true,
+            "query_admitted": false,
+            "route_cache_ttl_secs": 120,
+            "route_cap": {
+              "requests": 10,
+              "window_secs": 60
+            },
+            "route_replay_class": "read",
+            "rpc_label": "GET /v1/cryptocurrency/quotes/latest",
+            "target": {
+              "label": "prices.example",
+              "upstream": "https://prices-api.example/v1/cryptocurrency/quotes/latest?symbol=ZEC&convert=USD&aux=1"
+            },
+            "upstream_headers": {
+              "injected": [
+                [
+                  "X-PRICES_API_KEY",
+                  "fake-prices-api-key"
+                ]
+              ]
+            }
+          }
+        },
+        "testnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "read",
+            "stage": "third_party_path",
+            "third_party_answer": null
+          },
+          "raw": {
+            "backend_label": "prices.example",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "/v1/cryptocurrency/quotes/latest",
+            "one_sided_write": false,
+            "policy_denied": true,
+            "query_admitted": false,
+            "route_cache_ttl_secs": 120,
+            "route_cap": {
+              "requests": 10,
+              "window_secs": 60
+            },
+            "route_replay_class": "read",
+            "rpc_label": "GET /v1/cryptocurrency/quotes/latest",
+            "target": {
+              "label": "prices.example",
+              "upstream": "https://prices-api.example/v1/cryptocurrency/quotes/latest?symbol=ZEC&convert=USD&aux=1"
+            },
+            "upstream_headers": {
+              "injected": [
+                [
+                  "X-PRICES_API_KEY",
+                  "fake-prices-api-key"
+                ]
+              ]
+            }
+          }
+        }
+      },
+      "method": "GET",
+      "name": "quote extra parameter",
+      "path": "/v1/cryptocurrency/quotes/latest?symbol=ZEC&convert=USD&aux=1"
+    },
+    {
+      "authority": "prices.example",
+      "expect": {
+        "mainnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "read",
+            "stage": "third_party_path",
+            "third_party_answer": null
+          },
+          "raw": {
+            "backend_label": "prices.example",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "/v1/cryptocurrency/quotes/latest",
+            "one_sided_write": false,
+            "policy_denied": true,
+            "query_admitted": false,
+            "route_cache_ttl_secs": 120,
+            "route_cap": {
+              "requests": 10,
+              "window_secs": 60
+            },
+            "route_replay_class": "read",
+            "rpc_label": "GET /v1/cryptocurrency/quotes/latest",
+            "target": {
+              "label": "prices.example",
+              "upstream": "https://prices-api.example/v1/cryptocurrency/quotes/latest"
+            },
+            "upstream_headers": {
+              "injected": [
+                [
+                  "X-PRICES_API_KEY",
+                  "fake-prices-api-key"
+                ]
+              ]
+            }
+          }
+        },
+        "testnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "read",
+            "stage": "third_party_path",
+            "third_party_answer": null
+          },
+          "raw": {
+            "backend_label": "prices.example",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "/v1/cryptocurrency/quotes/latest",
+            "one_sided_write": false,
+            "policy_denied": true,
+            "query_admitted": false,
+            "route_cache_ttl_secs": 120,
+            "route_cap": {
+              "requests": 10,
+              "window_secs": 60
+            },
+            "route_replay_class": "read",
+            "rpc_label": "GET /v1/cryptocurrency/quotes/latest",
+            "target": {
+              "label": "prices.example",
+              "upstream": "https://prices-api.example/v1/cryptocurrency/quotes/latest"
+            },
+            "upstream_headers": {
+              "injected": [
+                [
+                  "X-PRICES_API_KEY",
+                  "fake-prices-api-key"
+                ]
+              ]
+            }
+          }
+        }
+      },
+      "method": "GET",
+      "name": "quote without query",
+      "path": "/v1/cryptocurrency/quotes/latest"
+    },
+    {
+      "authority": "prices.example",
+      "expect": {
+        "mainnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "read",
+            "stage": "third_party_path",
+            "third_party_answer": null
+          },
+          "raw": {
+            "backend_label": "prices.example",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "/v1/cryptocurrency/quotes/latest",
+            "one_sided_write": false,
+            "policy_denied": true,
+            "query_admitted": false,
+            "route_cache_ttl_secs": 120,
+            "route_cap": {
+              "requests": 10,
+              "window_secs": 60
+            },
+            "route_replay_class": "read",
+            "rpc_label": "GET /v1/cryptocurrency/quotes/latest",
+            "target": {
+              "label": "prices.example",
+              "upstream": "https://prices-api.example/v1/cryptocurrency/quotes/latest?"
+            },
+            "upstream_headers": {
+              "injected": [
+                [
+                  "X-PRICES_API_KEY",
+                  "fake-prices-api-key"
+                ]
+              ]
+            }
+          }
+        },
+        "testnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "read",
+            "stage": "third_party_path",
+            "third_party_answer": null
+          },
+          "raw": {
+            "backend_label": "prices.example",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "/v1/cryptocurrency/quotes/latest",
+            "one_sided_write": false,
+            "policy_denied": true,
+            "query_admitted": false,
+            "route_cache_ttl_secs": 120,
+            "route_cap": {
+              "requests": 10,
+              "window_secs": 60
+            },
+            "route_replay_class": "read",
+            "rpc_label": "GET /v1/cryptocurrency/quotes/latest",
+            "target": {
+              "label": "prices.example",
+              "upstream": "https://prices-api.example/v1/cryptocurrency/quotes/latest?"
+            },
+            "upstream_headers": {
+              "injected": [
+                [
+                  "X-PRICES_API_KEY",
+                  "fake-prices-api-key"
+                ]
+              ]
+            }
+          }
+        }
+      },
+      "method": "GET",
+      "name": "quote empty query",
+      "path": "/v1/cryptocurrency/quotes/latest?"
+    },
+    {
+      "authority": "prices.example",
+      "expect": {
+        "mainnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "read",
+            "stage": "third_party_path",
+            "third_party_answer": null
+          },
+          "raw": {
+            "backend_label": "prices.example",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "/v1/cryptocurrency/quotes/latest",
+            "one_sided_write": false,
+            "policy_denied": true,
+            "query_admitted": false,
+            "route_cache_ttl_secs": 120,
+            "route_cap": {
+              "requests": 10,
+              "window_secs": 60
+            },
+            "route_replay_class": "read",
+            "rpc_label": "GET /v1/cryptocurrency/quotes/latest",
+            "target": {
+              "label": "prices.example",
+              "upstream": "https://prices-api.example/v1/cryptocurrency/quotes/latest?symbol=ZEC&convert=USD,EUR"
+            },
+            "upstream_headers": {
+              "injected": [
+                [
+                  "X-PRICES_API_KEY",
+                  "fake-prices-api-key"
+                ]
+              ]
+            }
+          }
+        },
+        "testnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "read",
+            "stage": "third_party_path",
+            "third_party_answer": null
+          },
+          "raw": {
+            "backend_label": "prices.example",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "/v1/cryptocurrency/quotes/latest",
+            "one_sided_write": false,
+            "policy_denied": true,
+            "query_admitted": false,
+            "route_cache_ttl_secs": 120,
+            "route_cap": {
+              "requests": 10,
+              "window_secs": 60
+            },
+            "route_replay_class": "read",
+            "rpc_label": "GET /v1/cryptocurrency/quotes/latest",
+            "target": {
+              "label": "prices.example",
+              "upstream": "https://prices-api.example/v1/cryptocurrency/quotes/latest?symbol=ZEC&convert=USD,EUR"
+            },
+            "upstream_headers": {
+              "injected": [
+                [
+                  "X-PRICES_API_KEY",
+                  "fake-prices-api-key"
+                ]
+              ]
+            }
+          }
+        }
+      },
+      "method": "GET",
+      "name": "quote two fiat codes",
+      "path": "/v1/cryptocurrency/quotes/latest?symbol=ZEC&convert=USD,EUR"
+    },
+    {
+      "authority": "prices.example",
+      "expect": {
+        "mainnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "write",
+            "stage": "third_party_path",
+            "third_party_answer": null
+          },
+          "raw": {
+            "backend_label": "prices.example",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "(not in policy)",
+            "one_sided_write": false,
+            "policy_denied": true,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": {
+              "requests": 10,
+              "window_secs": 60
+            },
+            "route_replay_class": "write",
+            "rpc_label": "other",
+            "target": {
+              "label": "prices.example",
+              "upstream": "https://prices-api.example/v1/cryptocurrency/quotes/latest?symbol=ZEC&convert=USD"
+            },
+            "upstream_headers": {
+              "injected": [
+                [
+                  "X-PRICES_API_KEY",
+                  "fake-prices-api-key"
+                ]
+              ]
+            }
+          }
+        },
+        "testnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "write",
+            "stage": "third_party_path",
+            "third_party_answer": null
+          },
+          "raw": {
+            "backend_label": "prices.example",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "(not in policy)",
+            "one_sided_write": false,
+            "policy_denied": true,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": {
+              "requests": 10,
+              "window_secs": 60
+            },
+            "route_replay_class": "write",
+            "rpc_label": "other",
+            "target": {
+              "label": "prices.example",
+              "upstream": "https://prices-api.example/v1/cryptocurrency/quotes/latest?symbol=ZEC&convert=USD"
+            },
+            "upstream_headers": {
+              "injected": [
+                [
+                  "X-PRICES_API_KEY",
+                  "fake-prices-api-key"
+                ]
+              ]
+            }
+          }
+        }
+      },
+      "method": "POST",
+      "name": "quote POST",
+      "path": "/v1/cryptocurrency/quotes/latest?symbol=ZEC&convert=USD"
+    },
+    {
+      "authority": "prices.example",
+      "expect": {
+        "mainnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "read",
+            "stage": "third_party_path",
+            "third_party_answer": null
+          },
+          "raw": {
+            "backend_label": "prices.example",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "(not in policy)",
+            "one_sided_write": false,
+            "policy_denied": true,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": {
+              "requests": 10,
+              "window_secs": 60
+            },
+            "route_replay_class": "read",
+            "rpc_label": "other",
+            "target": {
+              "label": "prices.example",
+              "upstream": "https://prices-api.example/v1/cryptocurrency/quotes/latest/x?symbol=ZEC&convert=USD"
+            },
+            "upstream_headers": {
+              "injected": [
+                [
+                  "X-PRICES_API_KEY",
+                  "fake-prices-api-key"
+                ]
+              ]
+            }
+          }
+        },
+        "testnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "read",
+            "stage": "third_party_path",
+            "third_party_answer": null
+          },
+          "raw": {
+            "backend_label": "prices.example",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "(not in policy)",
+            "one_sided_write": false,
+            "policy_denied": true,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": {
+              "requests": 10,
+              "window_secs": 60
+            },
+            "route_replay_class": "read",
+            "rpc_label": "other",
+            "target": {
+              "label": "prices.example",
+              "upstream": "https://prices-api.example/v1/cryptocurrency/quotes/latest/x?symbol=ZEC&convert=USD"
+            },
+            "upstream_headers": {
+              "injected": [
+                [
+                  "X-PRICES_API_KEY",
+                  "fake-prices-api-key"
+                ]
+              ]
+            }
+          }
+        }
+      },
+      "method": "GET",
+      "name": "quote sub-path",
+      "path": "/v1/cryptocurrency/quotes/latest/x?symbol=ZEC&convert=USD"
+    },
+    {
+      "authority": "prices.example",
+      "expect": {
+        "mainnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "read",
+            "stage": "third_party_path",
+            "third_party_answer": {
+              "cache_ttl_secs": 21600,
+              "cap": {
+                "requests": 10,
+                "window_secs": 60
+              }
+            }
+          },
+          "raw": {
+            "backend_label": "prices.example",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "/v1/fiat/map",
+            "one_sided_write": false,
+            "policy_denied": false,
+            "query_admitted": true,
+            "route_cache_ttl_secs": 21600,
+            "route_cap": {
+              "requests": 10,
+              "window_secs": 60
+            },
+            "route_replay_class": "read",
+            "rpc_label": "GET /v1/fiat/map",
+            "target": {
+              "label": "prices.example",
+              "upstream": "https://prices-api.example/v1/fiat/map"
+            },
+            "upstream_headers": {
+              "injected": [
+                [
+                  "X-PRICES_API_KEY",
+                  "fake-prices-api-key"
+                ]
+              ]
+            }
+          }
+        },
+        "testnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "read",
+            "stage": "third_party_path",
+            "third_party_answer": {
+              "cache_ttl_secs": 21600,
+              "cap": {
+                "requests": 10,
+                "window_secs": 60
+              }
+            }
+          },
+          "raw": {
+            "backend_label": "prices.example",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "/v1/fiat/map",
+            "one_sided_write": false,
+            "policy_denied": false,
+            "query_admitted": true,
+            "route_cache_ttl_secs": 21600,
+            "route_cap": {
+              "requests": 10,
+              "window_secs": 60
+            },
+            "route_replay_class": "read",
+            "rpc_label": "GET /v1/fiat/map",
+            "target": {
+              "label": "prices.example",
+              "upstream": "https://prices-api.example/v1/fiat/map"
+            },
+            "upstream_headers": {
+              "injected": [
+                [
+                  "X-PRICES_API_KEY",
+                  "fake-prices-api-key"
+                ]
+              ]
+            }
+          }
+        }
+      },
+      "method": "GET",
+      "name": "fiat map admitted",
+      "path": "/v1/fiat/map"
+    },
+    {
+      "authority": "prices.example",
+      "expect": {
+        "mainnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "read",
+            "stage": "third_party_path",
+            "third_party_answer": null
+          },
+          "raw": {
+            "backend_label": "prices.example",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "/v1/fiat/map",
+            "one_sided_write": false,
+            "policy_denied": true,
+            "query_admitted": false,
+            "route_cache_ttl_secs": 21600,
+            "route_cap": {
+              "requests": 10,
+              "window_secs": 60
+            },
+            "route_replay_class": "read",
+            "rpc_label": "GET /v1/fiat/map",
+            "target": {
+              "label": "prices.example",
+              "upstream": "https://prices-api.example/v1/fiat/map?limit=5"
+            },
+            "upstream_headers": {
+              "injected": [
+                [
+                  "X-PRICES_API_KEY",
+                  "fake-prices-api-key"
+                ]
+              ]
+            }
+          }
+        },
+        "testnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "read",
+            "stage": "third_party_path",
+            "third_party_answer": null
+          },
+          "raw": {
+            "backend_label": "prices.example",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "/v1/fiat/map",
+            "one_sided_write": false,
+            "policy_denied": true,
+            "query_admitted": false,
+            "route_cache_ttl_secs": 21600,
+            "route_cap": {
+              "requests": 10,
+              "window_secs": 60
+            },
+            "route_replay_class": "read",
+            "rpc_label": "GET /v1/fiat/map",
+            "target": {
+              "label": "prices.example",
+              "upstream": "https://prices-api.example/v1/fiat/map?limit=5"
+            },
+            "upstream_headers": {
+              "injected": [
+                [
+                  "X-PRICES_API_KEY",
+                  "fake-prices-api-key"
+                ]
+              ]
+            }
+          }
+        }
+      },
+      "method": "GET",
+      "name": "fiat map with limit",
+      "path": "/v1/fiat/map?limit=5"
+    },
+    {
+      "authority": "prices.example",
+      "expect": {
+        "mainnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "write",
+            "stage": "third_party_path",
+            "third_party_answer": null
+          },
+          "raw": {
+            "backend_label": "prices.example",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "(not in policy)",
+            "one_sided_write": false,
+            "policy_denied": true,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": {
+              "requests": 10,
+              "window_secs": 60
+            },
+            "route_replay_class": "write",
+            "rpc_label": "other",
+            "target": {
+              "label": "prices.example",
+              "upstream": "https://prices-api.example/v1/fiat/map"
+            },
+            "upstream_headers": {
+              "injected": [
+                [
+                  "X-PRICES_API_KEY",
+                  "fake-prices-api-key"
+                ]
+              ]
+            }
+          }
+        },
+        "testnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "write",
+            "stage": "third_party_path",
+            "third_party_answer": null
+          },
+          "raw": {
+            "backend_label": "prices.example",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "(not in policy)",
+            "one_sided_write": false,
+            "policy_denied": true,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": {
+              "requests": 10,
+              "window_secs": 60
+            },
+            "route_replay_class": "write",
+            "rpc_label": "other",
+            "target": {
+              "label": "prices.example",
+              "upstream": "https://prices-api.example/v1/fiat/map"
+            },
+            "upstream_headers": {
+              "injected": [
+                [
+                  "X-PRICES_API_KEY",
+                  "fake-prices-api-key"
+                ]
+              ]
+            }
+          }
+        }
+      },
+      "method": "POST",
+      "name": "fiat map POST",
+      "path": "/v1/fiat/map"
+    },
+    {
+      "authority": "prices.example",
+      "expect": {
+        "mainnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "read",
+            "stage": "third_party_path",
+            "third_party_answer": null
+          },
+          "raw": {
+            "backend_label": "prices.example",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "(not in policy)",
+            "one_sided_write": false,
+            "policy_denied": true,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": {
+              "requests": 10,
+              "window_secs": 60
+            },
+            "route_replay_class": "read",
+            "rpc_label": "other",
+            "target": {
+              "label": "prices.example",
+              "upstream": "https://prices-api.example/v1/key/info"
+            },
+            "upstream_headers": {
+              "injected": [
+                [
+                  "X-PRICES_API_KEY",
+                  "fake-prices-api-key"
+                ]
+              ]
+            }
+          }
+        },
+        "testnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "read",
+            "stage": "third_party_path",
+            "third_party_answer": {
+              "cache_ttl_secs": null,
+              "cap": {
+                "requests": 10,
+                "window_secs": 60
+              }
+            }
+          },
+          "raw": {
+            "backend_label": "prices.example",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "/v1/key/info",
+            "one_sided_write": false,
+            "policy_denied": false,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": {
+              "requests": 10,
+              "window_secs": 60
+            },
+            "route_replay_class": "read",
+            "rpc_label": "GET /v1/key/info",
+            "target": {
+              "label": "prices.example",
+              "upstream": "https://prices-api.example/v1/key/info"
+            },
+            "upstream_headers": {
+              "injected": [
+                [
+                  "X-PRICES_API_KEY",
+                  "fake-prices-api-key"
+                ]
+              ]
+            }
+          }
+        }
+      },
+      "method": "GET",
+      "name": "key info",
+      "path": "/v1/key/info"
+    },
+    {
+      "authority": "prices.example",
+      "expect": {
+        "mainnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "read",
+            "stage": "third_party_path",
+            "third_party_answer": null
+          },
+          "raw": {
+            "backend_label": "prices.example",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "(not in policy)",
+            "one_sided_write": false,
+            "policy_denied": true,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": {
+              "requests": 10,
+              "window_secs": 60
+            },
+            "route_replay_class": "read",
+            "rpc_label": "other",
+            "target": {
+              "label": "prices.example",
+              "upstream": "https://prices-api.example/v1/key/info?x=1"
+            },
+            "upstream_headers": {
+              "injected": [
+                [
+                  "X-PRICES_API_KEY",
+                  "fake-prices-api-key"
+                ]
+              ]
+            }
+          }
+        },
+        "testnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "read",
+            "stage": "third_party_path",
+            "third_party_answer": {
+              "cache_ttl_secs": null,
+              "cap": {
+                "requests": 10,
+                "window_secs": 60
+              }
+            }
+          },
+          "raw": {
+            "backend_label": "prices.example",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "/v1/key/info",
+            "one_sided_write": false,
+            "policy_denied": false,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": {
+              "requests": 10,
+              "window_secs": 60
+            },
+            "route_replay_class": "read",
+            "rpc_label": "GET /v1/key/info",
+            "target": {
+              "label": "prices.example",
+              "upstream": "https://prices-api.example/v1/key/info?x=1"
+            },
+            "upstream_headers": {
+              "injected": [
+                [
+                  "X-PRICES_API_KEY",
+                  "fake-prices-api-key"
+                ]
+              ]
+            }
+          }
+        }
+      },
+      "method": "GET",
+      "name": "key info with query",
+      "path": "/v1/key/info?x=1"
+    },
+    {
+      "authority": "prices.example",
+      "expect": {
+        "mainnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "read",
+            "stage": "third_party_path",
+            "third_party_answer": null
+          },
+          "raw": {
+            "backend_label": "prices.example",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "(not in policy)",
+            "one_sided_write": false,
+            "policy_denied": true,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": {
+              "requests": 10,
+              "window_secs": 60
+            },
+            "route_replay_class": "read",
+            "rpc_label": "other",
+            "target": {
+              "label": "prices.example",
+              "upstream": "https://prices-api.example/v2/cryptocurrency/quotes/latest?symbol=ZEC&convert=USD"
+            },
+            "upstream_headers": {
+              "injected": [
+                [
+                  "X-PRICES_API_KEY",
+                  "fake-prices-api-key"
+                ]
+              ]
+            }
+          }
+        },
+        "testnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "read",
+            "stage": "third_party_path",
+            "third_party_answer": null
+          },
+          "raw": {
+            "backend_label": "prices.example",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "(not in policy)",
+            "one_sided_write": false,
+            "policy_denied": true,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": {
+              "requests": 10,
+              "window_secs": 60
+            },
+            "route_replay_class": "read",
+            "rpc_label": "other",
+            "target": {
+              "label": "prices.example",
+              "upstream": "https://prices-api.example/v2/cryptocurrency/quotes/latest?symbol=ZEC&convert=USD"
+            },
+            "upstream_headers": {
+              "injected": [
+                [
+                  "X-PRICES_API_KEY",
+                  "fake-prices-api-key"
+                ]
+              ]
+            }
+          }
+        }
+      },
+      "method": "GET",
+      "name": "unlisted route",
+      "path": "/v2/cryptocurrency/quotes/latest?symbol=ZEC&convert=USD"
+    },
+    {
+      "authority": "prices.example",
+      "expect": {
+        "mainnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "read",
+            "stage": "third_party_path",
+            "third_party_answer": null
+          },
+          "raw": {
+            "backend_label": "prices.example",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "(not in policy)",
+            "one_sided_write": false,
+            "policy_denied": true,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": {
+              "requests": 10,
+              "window_secs": 60
+            },
+            "route_replay_class": "read",
+            "rpc_label": "other",
+            "target": {
+              "malformed_path": "path contains .. segment"
+            },
+            "upstream_headers": {
+              "injected": [
+                [
+                  "X-PRICES_API_KEY",
+                  "fake-prices-api-key"
+                ]
+              ]
+            }
+          }
+        },
+        "testnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "read",
+            "stage": "third_party_path",
+            "third_party_answer": null
+          },
+          "raw": {
+            "backend_label": "prices.example",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "(not in policy)",
+            "one_sided_write": false,
+            "policy_denied": true,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": {
+              "requests": 10,
+              "window_secs": 60
+            },
+            "route_replay_class": "read",
+            "rpc_label": "other",
+            "target": {
+              "malformed_path": "path contains .. segment"
+            },
+            "upstream_headers": {
+              "injected": [
+                [
+                  "X-PRICES_API_KEY",
+                  "fake-prices-api-key"
+                ]
+              ]
+            }
+          }
+        }
+      },
+      "method": "GET",
+      "name": "traversal",
+      "path": "/v1/fiat/../map"
+    },
+    {
+      "authority": "PRICES.EXAMPLE",
+      "expect": {
+        "mainnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "read",
+            "stage": "third_party_path",
+            "third_party_answer": {
+              "cache_ttl_secs": 21600,
+              "cap": {
+                "requests": 10,
+                "window_secs": 60
+              }
+            }
+          },
+          "raw": {
+            "backend_label": "prices.example",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "/v1/fiat/map",
+            "one_sided_write": false,
+            "policy_denied": false,
+            "query_admitted": true,
+            "route_cache_ttl_secs": 21600,
+            "route_cap": {
+              "requests": 10,
+              "window_secs": 60
+            },
+            "route_replay_class": "read",
+            "rpc_label": "GET /v1/fiat/map",
+            "target": {
+              "malformed_authority": "uppercase character in authority"
+            },
+            "upstream_headers": {
+              "injected": [
+                [
+                  "X-PRICES_API_KEY",
+                  "fake-prices-api-key"
+                ]
+              ]
+            }
+          }
+        },
+        "testnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "read",
+            "stage": "third_party_path",
+            "third_party_answer": {
+              "cache_ttl_secs": 21600,
+              "cap": {
+                "requests": 10,
+                "window_secs": 60
+              }
+            }
+          },
+          "raw": {
+            "backend_label": "prices.example",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "/v1/fiat/map",
+            "one_sided_write": false,
+            "policy_denied": false,
+            "query_admitted": true,
+            "route_cache_ttl_secs": 21600,
+            "route_cap": {
+              "requests": 10,
+              "window_secs": 60
+            },
+            "route_replay_class": "read",
+            "rpc_label": "GET /v1/fiat/map",
+            "target": {
+              "malformed_authority": "uppercase character in authority"
+            },
+            "upstream_headers": {
+              "injected": [
+                [
+                  "X-PRICES_API_KEY",
+                  "fake-prices-api-key"
+                ]
+              ]
+            }
+          }
+        }
+      },
+      "method": "GET",
+      "name": "upper-case authority",
+      "path": "/v1/fiat/map"
+    },
+    {
+      "authority": "prices.example:443",
+      "expect": {
+        "mainnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "read",
+            "stage": "third_party_path",
+            "third_party_answer": {
+              "cache_ttl_secs": null,
+              "cap": null
+            }
+          },
+          "raw": {
+            "backend_label": "prices.example",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "(unknown authority)",
+            "one_sided_write": false,
+            "policy_denied": false,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": null,
+            "route_replay_class": "read",
+            "rpc_label": "other",
+            "target": "rejected",
+            "upstream_headers": {
+              "injected": []
+            }
+          }
+        },
+        "testnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "read",
+            "stage": "third_party_path",
+            "third_party_answer": {
+              "cache_ttl_secs": null,
+              "cap": null
+            }
+          },
+          "raw": {
+            "backend_label": "prices.example",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "(unknown authority)",
+            "one_sided_write": false,
+            "policy_denied": false,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": null,
+            "route_replay_class": "read",
+            "rpc_label": "other",
+            "target": "rejected",
+            "upstream_headers": {
+              "injected": []
+            }
+          }
+        }
+      },
+      "method": "GET",
+      "name": "authority with port",
+      "path": "/v1/fiat/map"
+    },
+    {
+      "authority": "prices.example",
+      "expect": {
+        "mainnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "read",
+            "stage": "third_party_path",
+            "third_party_answer": {
+              "cache_ttl_secs": 21600,
+              "cap": {
+                "requests": 10,
+                "window_secs": 60
+              }
+            }
+          },
+          "raw": {
+            "backend_label": "prices.example",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "/v1/fiat/map",
+            "one_sided_write": false,
+            "policy_denied": false,
+            "query_admitted": true,
+            "route_cache_ttl_secs": 21600,
+            "route_cap": {
+              "requests": 10,
+              "window_secs": 60
+            },
+            "route_replay_class": "read",
+            "rpc_label": "GET /v1/fiat/map",
+            "target": {
+              "label": "prices.example",
+              "upstream": "https://prices-api.example/v1/fiat/map"
+            },
+            "upstream_headers": {
+              "injected": [
+                [
+                  "X-PRICES_API_KEY",
+                  "fake-prices-api-key"
+                ]
+              ]
+            }
+          }
+        },
+        "testnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "read",
+            "stage": "third_party_path",
+            "third_party_answer": {
+              "cache_ttl_secs": 21600,
+              "cap": {
+                "requests": 10,
+                "window_secs": 60
+              }
+            }
+          },
+          "raw": {
+            "backend_label": "prices.example",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "/v1/fiat/map",
+            "one_sided_write": false,
+            "policy_denied": false,
+            "query_admitted": true,
+            "route_cache_ttl_secs": 21600,
+            "route_cap": {
+              "requests": 10,
+              "window_secs": 60
+            },
+            "route_replay_class": "read",
+            "rpc_label": "GET /v1/fiat/map",
+            "target": {
+              "label": "prices.example",
+              "upstream": "https://prices-api.example/v1/fiat/map"
+            },
+            "upstream_headers": {
+              "injected": [
+                [
+                  "X-PRICES_API_KEY",
+                  "fake-prices-api-key"
+                ]
+              ]
+            }
+          }
+        }
+      },
+      "headers": [
+        [
+          "x-prices_api_key",
+          "client-supplied"
+        ],
+        [
+          "authorization",
+          "Bearer client"
+        ]
+      ],
+      "method": "GET",
+      "name": "injected credential, client credentials present",
+      "path": "/v1/fiat/map"
+    }
+  ]
+}

@@ -1,0 +1,1079 @@
+{
+  "description": "Payments: placeholder credential swap, extra forwarded headers, never cached, event stream.",
+  "networks": [
+    "mainnet"
+  ],
+  "shapes": [
+    {
+      "authority": "flexa.example",
+      "expect": {
+        "mainnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "write",
+            "stage": "third_party_path",
+            "third_party_answer": {
+              "cache_ttl_secs": null,
+              "cap": {
+                "requests": 600,
+                "window_secs": 60
+              }
+            }
+          },
+          "raw": {
+            "backend_label": "flexa.example",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "/tokens",
+            "one_sided_write": false,
+            "policy_denied": false,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": {
+              "requests": 600,
+              "window_secs": 60
+            },
+            "route_replay_class": "write",
+            "rpc_label": "POST /tokens",
+            "target": {
+              "label": "flexa.example",
+              "upstream": "https://flexa-api.example/tokens"
+            },
+            "upstream_headers": {
+              "flexa": [
+                [
+                  "accept",
+                  "application/json"
+                ],
+                [
+                  "flexa-app",
+                  "wallet"
+                ],
+                [
+                  "flexa-version",
+                  "1"
+                ],
+                [
+                  "client-trace-id",
+                  "00000000-0000-4000-8000-000000000000"
+                ],
+                [
+                  "authorization",
+                  "Basic OnB1Ymxpc2hhYmxlX3Rlc3RfZmFrZV9rZXk="
+                ]
+              ]
+            }
+          }
+        }
+      },
+      "headers": [
+        [
+          "authorization",
+          "Basic OnB1Ymxpc2hhYmxlX2xpdmVfem9kbF9nYXRld2F5X3BsYWNlaG9sZGVy"
+        ],
+        [
+          "flexa-app",
+          "wallet"
+        ],
+        [
+          "flexa-version",
+          "1"
+        ],
+        [
+          "accept",
+          "application/json"
+        ],
+        [
+          "client-trace-id",
+          "00000000-0000-4000-8000-000000000000"
+        ],
+        [
+          "cookie",
+          "c=1"
+        ]
+      ],
+      "method": "POST",
+      "name": "create token with placeholder credential",
+      "path": "/tokens"
+    },
+    {
+      "authority": "flexa.example",
+      "expect": {
+        "mainnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "read",
+            "stage": "third_party_path",
+            "third_party_answer": {
+              "cache_ttl_secs": null,
+              "cap": {
+                "requests": 600,
+                "window_secs": 60
+              }
+            }
+          },
+          "raw": {
+            "backend_label": "flexa.example",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "/accounts/me",
+            "one_sided_write": false,
+            "policy_denied": false,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": {
+              "requests": 600,
+              "window_secs": 60
+            },
+            "route_replay_class": "read",
+            "rpc_label": "GET /accounts/me",
+            "target": {
+              "label": "flexa.example",
+              "upstream": "https://flexa-api.example/accounts/me"
+            },
+            "upstream_headers": {
+              "flexa": [
+                [
+                  "authorization",
+                  "Bearer user-session-token"
+                ]
+              ]
+            }
+          }
+        }
+      },
+      "headers": [
+        [
+          "authorization",
+          "Bearer user-session-token"
+        ]
+      ],
+      "method": "GET",
+      "name": "user token passes through",
+      "path": "/accounts/me"
+    },
+    {
+      "authority": "flexa.example",
+      "expect": {
+        "mainnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "read",
+            "stage": "third_party_path",
+            "third_party_answer": {
+              "cache_ttl_secs": null,
+              "cap": {
+                "requests": 600,
+                "window_secs": 60
+              }
+            }
+          },
+          "raw": {
+            "backend_label": "flexa.example",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "/assets",
+            "one_sided_write": false,
+            "policy_denied": false,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": {
+              "requests": 600,
+              "window_secs": 60
+            },
+            "route_replay_class": "read",
+            "rpc_label": "GET /assets",
+            "target": {
+              "label": "flexa.example",
+              "upstream": "https://flexa-api.example/assets"
+            },
+            "upstream_headers": {
+              "flexa": []
+            }
+          }
+        }
+      },
+      "method": "GET",
+      "name": "no authorization",
+      "path": "/assets"
+    },
+    {
+      "authority": "flexa.example",
+      "expect": {
+        "mainnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "read",
+            "stage": "third_party_path",
+            "third_party_answer": {
+              "cache_ttl_secs": null,
+              "cap": {
+                "requests": 600,
+                "window_secs": 60
+              }
+            }
+          },
+          "raw": {
+            "backend_label": "flexa.example",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "/assets/*",
+            "one_sided_write": false,
+            "policy_denied": false,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": {
+              "requests": 600,
+              "window_secs": 60
+            },
+            "route_replay_class": "read",
+            "rpc_label": "GET /assets/*",
+            "target": {
+              "label": "flexa.example",
+              "upstream": "https://flexa-api.example/assets/asset-1"
+            },
+            "upstream_headers": {
+              "flexa": []
+            }
+          }
+        }
+      },
+      "method": "GET",
+      "name": "asset by id",
+      "path": "/assets/asset-1"
+    },
+    {
+      "authority": "flexa.example",
+      "expect": {
+        "mainnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "write",
+            "stage": "third_party_path",
+            "third_party_answer": {
+              "cache_ttl_secs": null,
+              "cap": {
+                "requests": 600,
+                "window_secs": 60
+              }
+            }
+          },
+          "raw": {
+            "backend_label": "flexa.example",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "/tokens/*",
+            "one_sided_write": false,
+            "policy_denied": false,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": {
+              "requests": 600,
+              "window_secs": 60
+            },
+            "route_replay_class": "write",
+            "rpc_label": "PATCH /tokens/*",
+            "target": {
+              "label": "flexa.example",
+              "upstream": "https://flexa-api.example/tokens/tok-1"
+            },
+            "upstream_headers": {
+              "flexa": []
+            }
+          }
+        }
+      },
+      "method": "PATCH",
+      "name": "patch token",
+      "path": "/tokens/tok-1"
+    },
+    {
+      "authority": "flexa.example",
+      "expect": {
+        "mainnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "write",
+            "stage": "third_party_path",
+            "third_party_answer": {
+              "cache_ttl_secs": null,
+              "cap": {
+                "requests": 600,
+                "window_secs": 60
+              }
+            }
+          },
+          "raw": {
+            "backend_label": "flexa.example",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "/tokens/*",
+            "one_sided_write": false,
+            "policy_denied": false,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": {
+              "requests": 600,
+              "window_secs": 60
+            },
+            "route_replay_class": "write",
+            "rpc_label": "DELETE /tokens/*",
+            "target": {
+              "label": "flexa.example",
+              "upstream": "https://flexa-api.example/tokens/tok-1"
+            },
+            "upstream_headers": {
+              "flexa": []
+            }
+          }
+        }
+      },
+      "method": "DELETE",
+      "name": "delete token",
+      "path": "/tokens/tok-1"
+    },
+    {
+      "authority": "flexa.example",
+      "expect": {
+        "mainnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "write",
+            "stage": "third_party_path",
+            "third_party_answer": {
+              "cache_ttl_secs": null,
+              "cap": {
+                "requests": 600,
+                "window_secs": 60
+              }
+            }
+          },
+          "raw": {
+            "backend_label": "flexa.example",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "/accounts",
+            "one_sided_write": false,
+            "policy_denied": false,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": {
+              "requests": 600,
+              "window_secs": 60
+            },
+            "route_replay_class": "write",
+            "rpc_label": "POST /accounts",
+            "target": {
+              "label": "flexa.example",
+              "upstream": "https://flexa-api.example/accounts"
+            },
+            "upstream_headers": {
+              "flexa": []
+            }
+          }
+        }
+      },
+      "method": "POST",
+      "name": "accounts",
+      "path": "/accounts"
+    },
+    {
+      "authority": "flexa.example",
+      "expect": {
+        "mainnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "read",
+            "stage": "third_party_path",
+            "third_party_answer": null
+          },
+          "raw": {
+            "backend_label": "flexa.example",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "(not in policy)",
+            "one_sided_write": false,
+            "policy_denied": true,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": {
+              "requests": 600,
+              "window_secs": 60
+            },
+            "route_replay_class": "read",
+            "rpc_label": "other",
+            "target": {
+              "label": "flexa.example",
+              "upstream": "https://flexa-api.example/accounts"
+            },
+            "upstream_headers": {
+              "flexa": []
+            }
+          }
+        }
+      },
+      "method": "GET",
+      "name": "accounts GET",
+      "path": "/accounts"
+    },
+    {
+      "authority": "flexa.example",
+      "expect": {
+        "mainnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "write",
+            "stage": "third_party_path",
+            "third_party_answer": {
+              "cache_ttl_secs": null,
+              "cap": {
+                "requests": 600,
+                "window_secs": 60
+              }
+            }
+          },
+          "raw": {
+            "backend_label": "flexa.example",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "/accounts/me/initiate_deletion",
+            "one_sided_write": false,
+            "policy_denied": false,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": {
+              "requests": 600,
+              "window_secs": 60
+            },
+            "route_replay_class": "write",
+            "rpc_label": "POST /accounts/me/initiate_deletion",
+            "target": {
+              "label": "flexa.example",
+              "upstream": "https://flexa-api.example/accounts/me/initiate_deletion"
+            },
+            "upstream_headers": {
+              "flexa": []
+            }
+          }
+        }
+      },
+      "method": "POST",
+      "name": "initiate deletion",
+      "path": "/accounts/me/initiate_deletion"
+    },
+    {
+      "authority": "flexa.example",
+      "expect": {
+        "mainnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "write",
+            "stage": "third_party_path",
+            "third_party_answer": {
+              "cache_ttl_secs": null,
+              "cap": {
+                "requests": 600,
+                "window_secs": 60
+              }
+            }
+          },
+          "raw": {
+            "backend_label": "flexa.example",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "/accounts/me/one_time_keys",
+            "one_sided_write": false,
+            "policy_denied": false,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": {
+              "requests": 600,
+              "window_secs": 60
+            },
+            "route_replay_class": "write",
+            "rpc_label": "PUT /accounts/me/one_time_keys",
+            "target": {
+              "label": "flexa.example",
+              "upstream": "https://flexa-api.example/accounts/me/one_time_keys"
+            },
+            "upstream_headers": {
+              "flexa": []
+            }
+          }
+        }
+      },
+      "method": "PUT",
+      "name": "one time keys",
+      "path": "/accounts/me/one_time_keys"
+    },
+    {
+      "authority": "flexa.example",
+      "expect": {
+        "mainnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "read",
+            "stage": "third_party_path",
+            "third_party_answer": {
+              "cache_ttl_secs": null,
+              "cap": {
+                "requests": 600,
+                "window_secs": 60
+              }
+            }
+          },
+          "raw": {
+            "backend_label": "flexa.example",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "/brands",
+            "one_sided_write": false,
+            "policy_denied": false,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": {
+              "requests": 600,
+              "window_secs": 60
+            },
+            "route_replay_class": "read",
+            "rpc_label": "GET /brands",
+            "target": {
+              "label": "flexa.example",
+              "upstream": "https://flexa-api.example/brands"
+            },
+            "upstream_headers": {
+              "flexa": []
+            }
+          }
+        }
+      },
+      "method": "GET",
+      "name": "brands",
+      "path": "/brands"
+    },
+    {
+      "authority": "flexa.example",
+      "expect": {
+        "mainnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "write",
+            "stage": "third_party_path",
+            "third_party_answer": {
+              "cache_ttl_secs": null,
+              "cap": {
+                "requests": 600,
+                "window_secs": 60
+              }
+            }
+          },
+          "raw": {
+            "backend_label": "flexa.example",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "/commerce_sessions",
+            "one_sided_write": false,
+            "policy_denied": false,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": {
+              "requests": 600,
+              "window_secs": 60
+            },
+            "route_replay_class": "write",
+            "rpc_label": "POST /commerce_sessions",
+            "target": {
+              "label": "flexa.example",
+              "upstream": "https://flexa-api.example/commerce_sessions"
+            },
+            "upstream_headers": {
+              "flexa": []
+            }
+          }
+        }
+      },
+      "method": "POST",
+      "name": "commerce session create",
+      "path": "/commerce_sessions"
+    },
+    {
+      "authority": "flexa.example",
+      "expect": {
+        "mainnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "read",
+            "stage": "third_party_path",
+            "third_party_answer": {
+              "cache_ttl_secs": null,
+              "cap": {
+                "requests": 600,
+                "window_secs": 60
+              }
+            }
+          },
+          "raw": {
+            "backend_label": "flexa.example",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "/commerce_sessions/*",
+            "one_sided_write": false,
+            "policy_denied": false,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": {
+              "requests": 600,
+              "window_secs": 60
+            },
+            "route_replay_class": "read",
+            "rpc_label": "GET /commerce_sessions/*",
+            "target": {
+              "label": "flexa.example",
+              "upstream": "https://flexa-api.example/commerce_sessions/cs-1"
+            },
+            "upstream_headers": {
+              "flexa": []
+            }
+          }
+        }
+      },
+      "method": "GET",
+      "name": "commerce session read",
+      "path": "/commerce_sessions/cs-1"
+    },
+    {
+      "authority": "flexa.example",
+      "expect": {
+        "mainnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "write",
+            "stage": "third_party_path",
+            "third_party_answer": {
+              "cache_ttl_secs": null,
+              "cap": {
+                "requests": 600,
+                "window_secs": 60
+              }
+            }
+          },
+          "raw": {
+            "backend_label": "flexa.example",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "/commerce_sessions/*",
+            "one_sided_write": false,
+            "policy_denied": false,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": {
+              "requests": 600,
+              "window_secs": 60
+            },
+            "route_replay_class": "write",
+            "rpc_label": "PATCH /commerce_sessions/*",
+            "target": {
+              "label": "flexa.example",
+              "upstream": "https://flexa-api.example/commerce_sessions/cs-1"
+            },
+            "upstream_headers": {
+              "flexa": []
+            }
+          }
+        }
+      },
+      "method": "PATCH",
+      "name": "commerce session patch",
+      "path": "/commerce_sessions/cs-1"
+    },
+    {
+      "authority": "flexa.example",
+      "expect": {
+        "mainnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "write",
+            "stage": "third_party_path",
+            "third_party_answer": {
+              "cache_ttl_secs": null,
+              "cap": {
+                "requests": 600,
+                "window_secs": 60
+              }
+            }
+          },
+          "raw": {
+            "backend_label": "flexa.example",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "/commerce_sessions/*",
+            "one_sided_write": false,
+            "policy_denied": false,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": {
+              "requests": 600,
+              "window_secs": 60
+            },
+            "route_replay_class": "write",
+            "rpc_label": "POST /commerce_sessions/*",
+            "target": {
+              "label": "flexa.example",
+              "upstream": "https://flexa-api.example/commerce_sessions/cs-1/approve"
+            },
+            "upstream_headers": {
+              "flexa": []
+            }
+          }
+        }
+      },
+      "method": "POST",
+      "name": "commerce session action",
+      "path": "/commerce_sessions/cs-1/approve"
+    },
+    {
+      "authority": "flexa.example",
+      "expect": {
+        "mainnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "write",
+            "stage": "third_party_path",
+            "third_party_answer": {
+              "cache_ttl_secs": null,
+              "cap": {
+                "requests": 600,
+                "window_secs": 60
+              }
+            }
+          },
+          "raw": {
+            "backend_label": "flexa.example",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "/transactions/*",
+            "one_sided_write": false,
+            "policy_denied": false,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": {
+              "requests": 600,
+              "window_secs": 60
+            },
+            "route_replay_class": "write",
+            "rpc_label": "PATCH /transactions/*",
+            "target": {
+              "label": "flexa.example",
+              "upstream": "https://flexa-api.example/transactions/tx-1"
+            },
+            "upstream_headers": {
+              "flexa": []
+            }
+          }
+        }
+      },
+      "method": "PATCH",
+      "name": "transaction patch",
+      "path": "/transactions/tx-1"
+    },
+    {
+      "authority": "flexa.example",
+      "expect": {
+        "mainnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "read",
+            "stage": "third_party_path",
+            "third_party_answer": {
+              "cache_ttl_secs": null,
+              "cap": {
+                "requests": 600,
+                "window_secs": 60
+              }
+            }
+          },
+          "raw": {
+            "backend_label": "flexa.example",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "/exchange_rates",
+            "one_sided_write": false,
+            "policy_denied": false,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": {
+              "requests": 600,
+              "window_secs": 60
+            },
+            "route_replay_class": "read",
+            "rpc_label": "GET /exchange_rates",
+            "target": {
+              "label": "flexa.example",
+              "upstream": "https://flexa-api.example/exchange_rates"
+            },
+            "upstream_headers": {
+              "flexa": []
+            }
+          }
+        }
+      },
+      "method": "GET",
+      "name": "exchange rates",
+      "path": "/exchange_rates"
+    },
+    {
+      "authority": "flexa.example",
+      "expect": {
+        "mainnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "write",
+            "stage": "third_party_path",
+            "third_party_answer": null
+          },
+          "raw": {
+            "backend_label": "flexa.example",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "(not in policy)",
+            "one_sided_write": false,
+            "policy_denied": true,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": {
+              "requests": 600,
+              "window_secs": 60
+            },
+            "route_replay_class": "write",
+            "rpc_label": "other",
+            "target": {
+              "label": "flexa.example",
+              "upstream": "https://flexa-api.example/exchange_rates"
+            },
+            "upstream_headers": {
+              "flexa": []
+            }
+          }
+        }
+      },
+      "method": "POST",
+      "name": "exchange rates POST",
+      "path": "/exchange_rates"
+    },
+    {
+      "authority": "flexa.example",
+      "expect": {
+        "mainnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "read",
+            "stage": "third_party_path",
+            "third_party_answer": {
+              "cache_ttl_secs": null,
+              "cap": {
+                "requests": 600,
+                "window_secs": 60
+              }
+            }
+          },
+          "raw": {
+            "backend_label": "flexa.example",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "/transaction_fees",
+            "one_sided_write": false,
+            "policy_denied": false,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": {
+              "requests": 600,
+              "window_secs": 60
+            },
+            "route_replay_class": "read",
+            "rpc_label": "GET /transaction_fees",
+            "target": {
+              "label": "flexa.example",
+              "upstream": "https://flexa-api.example/transaction_fees"
+            },
+            "upstream_headers": {
+              "flexa": []
+            }
+          }
+        }
+      },
+      "method": "GET",
+      "name": "transaction fees",
+      "path": "/transaction_fees"
+    },
+    {
+      "authority": "flexa.example",
+      "expect": {
+        "mainnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "write",
+            "stage": "third_party_path",
+            "third_party_answer": {
+              "cache_ttl_secs": null,
+              "cap": {
+                "requests": 600,
+                "window_secs": 60
+              }
+            }
+          },
+          "raw": {
+            "backend_label": "flexa.example",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "/app_notifications/*",
+            "one_sided_write": false,
+            "policy_denied": false,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": {
+              "requests": 600,
+              "window_secs": 60
+            },
+            "route_replay_class": "write",
+            "rpc_label": "DELETE /app_notifications/*",
+            "target": {
+              "label": "flexa.example",
+              "upstream": "https://flexa-api.example/app_notifications/n-1"
+            },
+            "upstream_headers": {
+              "flexa": []
+            }
+          }
+        }
+      },
+      "method": "DELETE",
+      "name": "notification delete",
+      "path": "/app_notifications/n-1"
+    },
+    {
+      "authority": "flexa.example",
+      "expect": {
+        "mainnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "read",
+            "stage": "third_party_path",
+            "third_party_answer": {
+              "cache_ttl_secs": null,
+              "cap": {
+                "requests": 600,
+                "window_secs": 60
+              }
+            }
+          },
+          "raw": {
+            "backend_label": "flexa.example",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "/events",
+            "one_sided_write": false,
+            "policy_denied": false,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": {
+              "requests": 600,
+              "window_secs": 60
+            },
+            "route_replay_class": "read",
+            "rpc_label": "GET /events",
+            "target": {
+              "label": "flexa.example",
+              "upstream": "https://flexa-api.example/events"
+            },
+            "upstream_headers": {
+              "flexa": [
+                [
+                  "accept",
+                  "text/event-stream"
+                ],
+                [
+                  "last-event-id",
+                  "42"
+                ]
+              ]
+            }
+          }
+        }
+      },
+      "headers": [
+        [
+          "accept",
+          "text/event-stream"
+        ],
+        [
+          "last-event-id",
+          "42"
+        ]
+      ],
+      "method": "GET",
+      "name": "events stream",
+      "path": "/events"
+    },
+    {
+      "authority": "flexa.example",
+      "expect": {
+        "mainnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "read",
+            "stage": "third_party_path",
+            "third_party_answer": null
+          },
+          "raw": {
+            "backend_label": "flexa.example",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "(not in policy)",
+            "one_sided_write": false,
+            "policy_denied": true,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": {
+              "requests": 600,
+              "window_secs": 60
+            },
+            "route_replay_class": "read",
+            "rpc_label": "other",
+            "target": {
+              "label": "flexa.example",
+              "upstream": "https://flexa-api.example/admin"
+            },
+            "upstream_headers": {
+              "flexa": []
+            }
+          }
+        }
+      },
+      "method": "GET",
+      "name": "unlisted",
+      "path": "/admin"
+    }
+  ]
+}

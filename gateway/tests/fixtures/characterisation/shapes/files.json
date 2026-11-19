@@ -1,0 +1,351 @@
+{
+  "description": "Static files: one path prefix, GET only.",
+  "networks": [
+    "mainnet",
+    "testnet"
+  ],
+  "shapes": [
+    {
+      "authority": "files.example",
+      "expect": {
+        "mainnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "write",
+            "stage": "third_party_path",
+            "third_party_answer": {
+              "cache_ttl_secs": null,
+              "cap": null
+            }
+          },
+          "raw": {
+            "backend_label": "files.example",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "/example-org/voting-config/*",
+            "one_sided_write": false,
+            "policy_denied": false,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": null,
+            "route_replay_class": "write",
+            "rpc_label": "GET /example-org/voting-config/*",
+            "target": {
+              "label": "files.example",
+              "upstream": "https://files.example/example-org/voting-config/main/config.json"
+            },
+            "upstream_headers": {
+              "injected": []
+            }
+          }
+        },
+        "testnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "write",
+            "stage": "third_party_path",
+            "third_party_answer": {
+              "cache_ttl_secs": null,
+              "cap": null
+            }
+          },
+          "raw": {
+            "backend_label": "files.example",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "/example-org/voting-config/*",
+            "one_sided_write": false,
+            "policy_denied": false,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": null,
+            "route_replay_class": "write",
+            "rpc_label": "GET /example-org/voting-config/*",
+            "target": {
+              "label": "files.example",
+              "upstream": "https://files.example/example-org/voting-config/main/config.json"
+            },
+            "upstream_headers": {
+              "injected": []
+            }
+          }
+        }
+      },
+      "method": "GET",
+      "name": "config file",
+      "path": "/example-org/voting-config/main/config.json"
+    },
+    {
+      "authority": "files.example",
+      "expect": {
+        "mainnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "write",
+            "stage": "third_party_path",
+            "third_party_answer": {
+              "cache_ttl_secs": null,
+              "cap": null
+            }
+          },
+          "raw": {
+            "backend_label": "files.example",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "/example-org/voting-config/*",
+            "one_sided_write": false,
+            "policy_denied": false,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": null,
+            "route_replay_class": "write",
+            "rpc_label": "GET /example-org/voting-config/*",
+            "target": {
+              "label": "files.example",
+              "upstream": "https://files.example/example-org/voting-config"
+            },
+            "upstream_headers": {
+              "injected": []
+            }
+          }
+        },
+        "testnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "write",
+            "stage": "third_party_path",
+            "third_party_answer": {
+              "cache_ttl_secs": null,
+              "cap": null
+            }
+          },
+          "raw": {
+            "backend_label": "files.example",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "/example-org/voting-config/*",
+            "one_sided_write": false,
+            "policy_denied": false,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": null,
+            "route_replay_class": "write",
+            "rpc_label": "GET /example-org/voting-config/*",
+            "target": {
+              "label": "files.example",
+              "upstream": "https://files.example/example-org/voting-config"
+            },
+            "upstream_headers": {
+              "injected": []
+            }
+          }
+        }
+      },
+      "method": "GET",
+      "name": "prefix itself",
+      "path": "/example-org/voting-config"
+    },
+    {
+      "authority": "files.example",
+      "expect": {
+        "mainnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "write",
+            "stage": "third_party_path",
+            "third_party_answer": null
+          },
+          "raw": {
+            "backend_label": "files.example",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "(not in policy)",
+            "one_sided_write": false,
+            "policy_denied": true,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": null,
+            "route_replay_class": "write",
+            "rpc_label": "other",
+            "target": {
+              "label": "files.example",
+              "upstream": "https://files.example/example-org/voting-configx/a"
+            },
+            "upstream_headers": {
+              "injected": []
+            }
+          }
+        },
+        "testnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "write",
+            "stage": "third_party_path",
+            "third_party_answer": null
+          },
+          "raw": {
+            "backend_label": "files.example",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "(not in policy)",
+            "one_sided_write": false,
+            "policy_denied": true,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": null,
+            "route_replay_class": "write",
+            "rpc_label": "other",
+            "target": {
+              "label": "files.example",
+              "upstream": "https://files.example/example-org/voting-configx/a"
+            },
+            "upstream_headers": {
+              "injected": []
+            }
+          }
+        }
+      },
+      "method": "GET",
+      "name": "prefix sibling",
+      "path": "/example-org/voting-configx/a"
+    },
+    {
+      "authority": "files.example",
+      "expect": {
+        "mainnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "write",
+            "stage": "third_party_path",
+            "third_party_answer": null
+          },
+          "raw": {
+            "backend_label": "files.example",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "(not in policy)",
+            "one_sided_write": false,
+            "policy_denied": true,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": null,
+            "route_replay_class": "write",
+            "rpc_label": "other",
+            "target": {
+              "label": "files.example",
+              "upstream": "https://files.example/other-org/repo/main/file"
+            },
+            "upstream_headers": {
+              "injected": []
+            }
+          }
+        },
+        "testnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "write",
+            "stage": "third_party_path",
+            "third_party_answer": null
+          },
+          "raw": {
+            "backend_label": "files.example",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "(not in policy)",
+            "one_sided_write": false,
+            "policy_denied": true,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": null,
+            "route_replay_class": "write",
+            "rpc_label": "other",
+            "target": {
+              "label": "files.example",
+              "upstream": "https://files.example/other-org/repo/main/file"
+            },
+            "upstream_headers": {
+              "injected": []
+            }
+          }
+        }
+      },
+      "method": "GET",
+      "name": "other repository",
+      "path": "/other-org/repo/main/file"
+    },
+    {
+      "authority": "files.example",
+      "expect": {
+        "mainnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "write",
+            "stage": "third_party_path",
+            "third_party_answer": null
+          },
+          "raw": {
+            "backend_label": "files.example",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "(not in policy)",
+            "one_sided_write": false,
+            "policy_denied": true,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": null,
+            "route_replay_class": "write",
+            "rpc_label": "other",
+            "target": {
+              "label": "files.example",
+              "upstream": "https://files.example/example-org/voting-config/main/config.json"
+            },
+            "upstream_headers": {
+              "injected": []
+            }
+          }
+        },
+        "testnet": {
+          "effective": {
+            "one_sided_write": false,
+            "replay_class": "write",
+            "stage": "third_party_path",
+            "third_party_answer": null
+          },
+          "raw": {
+            "backend_label": "files.example",
+            "dynamic_host": false,
+            "gateway_host_policy_denied": false,
+            "host_list_request": false,
+            "logged_route": "(not in policy)",
+            "one_sided_write": false,
+            "policy_denied": true,
+            "query_admitted": true,
+            "route_cache_ttl_secs": null,
+            "route_cap": null,
+            "route_replay_class": "write",
+            "rpc_label": "other",
+            "target": {
+              "label": "files.example",
+              "upstream": "https://files.example/example-org/voting-config/main/config.json"
+            },
+            "upstream_headers": {
+              "injected": []
+            }
+          }
+        }
+      },
+      "method": "POST",
+      "name": "POST",
+      "path": "/example-org/voting-config/main/config.json"
+    }
+  ]
+}
