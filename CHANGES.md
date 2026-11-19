@@ -96,6 +96,16 @@ keeps its own log in [client/CHANGELOG.md](client/CHANGELOG.md).
   the read origin for the receiving gateway's outer 409 and by the receiving gateway when its
   sealed answer refuses it. `POST /gateway` is
   unchanged; the forwarded-WRITE route exists only on the new listener.
+- The forwarded-WRITE listener (`WRITE_FORWARD_BIND_ADDR`) turns Nagle off on its connections
+  (`TCP_NODELAY`). Without it the answer to a forwarded WRITE, written as a HEADERS frame and then
+  DATA frames, waited for the read origin's acknowledgement of the first write: about one extra
+  round trip (plus the delayed acknowledgement) per forwarded WRITE, which ate the gain of
+  forwarding (with 90 ms of added round-trip delay on the listener port: 231 ms per forwarded
+  WRITE before, 99 ms after). The forwarding client also keeps its pooled connection open while
+  idle (it was closed after 60 s without WRITEs, so the next one paid a TCP handshake); its PINGs
+  (every 2 s, 5 s timeout) still close a dead one. The test
+  `a_forwarded_write_costs_one_round_trip` measures it behind an added delay on the listener port
+  (`OHTTP_FORWARD_RTT_PORT`, `OHTTP_FORWARD_RTT_MAX_MS`; skipped unless set).
 - The hub check of a WRITE at an `async-reads` origin (its peer store, with
   `REPLAY_PEER_WAIT_REPLICAS` >= 1) takes one round trip instead of two: the nonce's `SET NX`
   and the peer's `WAIT` go out as one pipeline on one of the peer's `WAIT` connections. A `WAIT`

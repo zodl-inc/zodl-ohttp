@@ -310,7 +310,9 @@ impl Forwarder {
         let client = Client::builder(TokioExecutor::new())
             .http2_only(true)
             .pool_timer(TokioTimer::new())
-            .pool_idle_timeout(Duration::from_secs(60))
+            // Kept open while idle (the PINGs below close a dead one): a WRITE after a quiet
+            // minute must not pay a new TCP handshake, one more round trip between the gateways.
+            .pool_idle_timeout(None)
             .timer(TokioTimer::new())
             .http2_keep_alive_interval(KEEP_ALIVE_INTERVAL)
             .http2_keep_alive_timeout(KEEP_ALIVE_TIMEOUT)

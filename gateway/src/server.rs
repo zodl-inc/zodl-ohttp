@@ -239,6 +239,7 @@ where
             debug!(peer = %remote_addr, "connection limit reached, closing");
             continue;
         };
+        set_nodelay(&stream, remote_addr);
         poll_fn(|cx| make_service.poll_ready(cx))
             .await
             .unwrap_or_else(|never| match never {});
@@ -267,6 +268,16 @@ where
                 debug!(peer = %remote_addr, error = %err, "connection ended with an error");
             }
         });
+    }
+}
+
+/// Turn Nagle off on an accepted `serve_http2` connection. An answer goes out as several small
+/// writes (the HEADERS frame, then DATA frames); with Nagle each write after the first waits
+/// until the client acknowledges the one before, which on a long link adds a round trip (and
+/// the client's delayed acknowledgement) to every answer.
+fn set_nodelay(stream: &tokio::net::TcpStream, peer: SocketAddr) {
+    if let Err(e) = stream.set_nodelay(true) {
+        debug!(peer = %peer, error = %e, "TCP_NODELAY not set");
     }
 }
 
@@ -341,6 +352,20 @@ mod tests {
         );
         client.write_all(b"\r\n\r\nSM\r\n\r\n").await.unwrap();
         assert!(preface_arrives(&accepted, Duration::from_secs(5)).await);
+    }
+
+    /// The helper `serve_http2` calls on every accepted connection turns Nagle off (that it is
+    /// called, and its effect on a long link, is what `a_forwarded_write_costs_one_round_trip`
+    /// measures).
+    #[tokio::test]
+    async fn http2_listener_connections_have_nodelay() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (accepted, peer) = listener.accept().await.unwrap();
+        assert!(!accepted.nodelay().unwrap(), "off by default");
+        set_nodelay(&accepted, peer);
+        assert!(accepted.nodelay().unwrap());
     }
 
     #[test]
