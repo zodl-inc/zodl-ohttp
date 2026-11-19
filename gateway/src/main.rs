@@ -78,6 +78,7 @@ mod store_conn;
 mod subtree_cache;
 mod third_party_cache;
 mod write_fallback;
+mod write_forward;
 
 mod signing;
 use config::Config;
@@ -833,7 +834,57 @@ async fn main() -> anyhow::Result<()> {
         cache::spawn_replay_stores_gate(c.clone(), bound);
     }
 
+    // WRITE forwarding (write_forward.rs): a read origin sends its WRITEs to the gateway at the
+    // hub store (REPLAY_WRITE_FORWARD_URL); that gateway accepts them on a listener of its own
+    // (WRITE_FORWARD_BIND_ADDR). Never both on one gateway: a gateway forwarding to itself would
+    // find every forwarded nonce already in its own store and refuse each WRITE as a replay.
+    let write_forward_config = write_forward::ForwardConfig::from_env()?;
+    let write_forward_receiver = write_forward::ReceiverConfig::from_env()?;
+    if write_forward_config.is_some() && write_forward_receiver.is_some() {
+        anyhow::bail!(
+            "REPLAY_WRITE_FORWARD_URL and WRITE_FORWARD_BIND_ADDR are both set: a gateway either forwards its WRITEs or receives forwarded ones"
+        );
+    }
+    if write_forward_config.is_some() && cache_state.is_none() {
+        anyhow::bail!("REPLAY_WRITE_FORWARD_URL needs the replay check (REDIS_SECURITY_URL)");
+    }
+    // An origin with its own replica wait and no standby stores is a store other origins fall
+    // back to (a standby):
+    // the receiving gateway's check at that store would find the nonce this origin took first,
+    // and refuse every forwarded WRITE as a replay.
+    if write_forward_config.is_some()
+        && cache_state
+            .as_ref()
+            .is_some_and(|c| c.write_wait().is_some() && c.standby_replicator().is_none())
+    {
+        anyhow::bail!(
+            "REPLAY_WRITE_FORWARD_URL is for a read origin whose store no other origin falls back to: not with REPLAY_WRITE_WAIT_REPLICAS > 0 and no REPLAY_STANDBY_URLS"
+        );
+    }
+    if let Some(c) = &write_forward_config {
+        info!(
+            network = %config.network,
+            connect_timeout_ms = c.connect_timeout.as_millis() as u64,
+            timeout_secs = c.timeout.as_secs(),
+            backoff_ms = c.backoff.as_millis() as u64,
+            "WRITE forwarding to the gateway at the hub store (REPLAY_WRITE_FORWARD_URL)"
+        );
+        // Any other mode writes the nonce to the peers' stores before the request is
+        // classified (sync) or decides at the local store (failover): the receiving gateway
+        // would find the nonce taken, or the hub check would be skipped.
+        if origin.replay_peer_mode != origin::ReplayPeerMode::AsyncReads
+            || origin.replay_peer_urls.is_empty()
+        {
+            anyhow::bail!(
+                "REPLAY_WRITE_FORWARD_URL is for a read origin: REPLAY_PEER_MODE=async-reads with REPLAY_PEER_URLS"
+            );
+        }
+    }
+    let write_forward = write_forward_config
+        .map(|c| Arc::new(write_forward::Forwarder::new(c, config.network.clone())));
+
     let app_state = Arc::new(AppState {
+        write_forward,
         config: config.clone(),
         origin: origin.clone(),
         hpke: hpke_state,
@@ -1049,6 +1100,7 @@ async fn main() -> anyhow::Result<()> {
     } else {
         public_app.fallback(ohttp_required_handler)
     };
+    let forward_app_state = app_state.clone();
     let public_app = public_app.with_state(app_state.clone());
 
     // Internal observability server
@@ -1070,6 +1122,41 @@ async fn main() -> anyhow::Result<()> {
 
     let public_listener = tokio::net::TcpListener::bind(&public_addr).await?;
     let internal_listener = tokio::net::TcpListener::bind(internal_addr).await?;
+    // WRITE_FORWARD_BIND_ADDR: the forwarded WRITEs of read origins, on a listener of its own
+    // (never the public port), one route.
+    let forward_server = match write_forward_receiver {
+        Some(receiver) => {
+            info!(
+                "Forwarded WRITE listener on {} ({} accepted forwarding secret(s))",
+                receiver.bind,
+                receiver.secrets.len()
+            );
+            if forward_app_state.cache.is_none() {
+                anyhow::bail!(
+                    "WRITE_FORWARD_BIND_ADDR needs the replay check (REDIS_SECURITY_URL)"
+                );
+            }
+            if !receiver_checks_second_store(&forward_app_state)
+                || forward_app_state
+                    .cache
+                    .as_ref()
+                    .is_some_and(|c| c.write_wait().is_none())
+            {
+                warn!("WRITE_FORWARD_BIND_ADDR: this gateway has no check at a second replay store or no replica wait: forwarded WRITEs that require them are declined here and decided at their read origin");
+            }
+            let listener = tokio::net::TcpListener::bind(receiver.bind).await?;
+            let app = Router::new()
+                .route(write_forward::FORWARD_PATH, post(write_forward_handler))
+                .fallback(|| async { StatusCode::NOT_FOUND })
+                .layer(DefaultBodyLimit::max(MAX_ENCAPSULATED_REQUEST_BYTES))
+                .with_state(Arc::new(ForwardState {
+                    app: forward_app_state.clone(),
+                    secrets: receiver.secrets,
+                }));
+            Some((listener, app))
+        }
+        None => None,
+    };
 
     // Request header read timeout (HEADER_READ_TIMEOUT_SECS): hyper's `header_read_timeout`
     // with a timer, which `axum::serve` does not set. It also bounds the idle time of a
@@ -1086,7 +1173,13 @@ async fn main() -> anyhow::Result<()> {
         ),
     }
 
-    // Run both servers concurrently
+    // Run the servers concurrently
+    let forward = async {
+        match forward_server {
+            Some((listener, app)) => server::serve_http2(listener, app.into_make_service()).await,
+            None => Ok(()),
+        }
+    };
     tokio::try_join!(
         server::serve(
             public_listener,
@@ -1098,6 +1191,7 @@ async fn main() -> anyhow::Result<()> {
             internal_app.into_make_service(),
             header_read_timeout,
         ),
+        forward,
     )?;
 
     Ok(())
@@ -1137,6 +1231,8 @@ pub struct AppState {
     pub third_party: third_party_cache::ThirdParty,
     /// MAX_INFLIGHT_REQUESTS: OHTTP requests in flight, a permit per request until its body ends.
     pub request_semaphore: Arc<Semaphore>,
+    /// REPLAY_WRITE_FORWARD_URL: WRITEs go to the gateway at the hub store (write_forward.rs).
+    pub write_forward: Option<Arc<write_forward::Forwarder>>,
 }
 
 /// Largest Encapsulated Request the gateway reads (ZIP: Gateways and Relays accept at least 10 MiB).
@@ -1158,6 +1254,47 @@ struct ChunkedResponder {
     pad: bool,
     /// The request's MAX_INFLIGHT_REQUESTS permit, released when the response body ends.
     permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+/// The sealed answer of the gateway at the hub store to a forwarded WRITE, streamed back to the
+/// relay as it is (it is sealed to the client already). The request's MAX_INFLIGHT_REQUESTS
+/// permit is held until its body ends; a body that sends nothing for `idle`
+/// (REPLAY_WRITE_FORWARD_TIMEOUT_SECS) is cut off, which releases it.
+fn forwarded_answer(
+    answer: hyper::Response<hyper::body::Incoming>,
+    responder: ChunkedResponder,
+    idle: Duration,
+) -> axum::response::Response {
+    use futures_util::StreamExt;
+    use http_body_util::BodyExt;
+    type BoxError = Box<dyn std::error::Error + Send + Sync>;
+    let permit = responder.permit;
+    let mut data = answer.into_body().into_data_stream();
+    let body = async_stream::stream! {
+        let _permit = permit;
+        loop {
+            match tokio::time::timeout(idle, data.next()).await {
+                Ok(Some(item)) => yield item.map_err(|e| Box::new(e) as BoxError),
+                Ok(None) => break,
+                Err(_) => {
+                    yield Err(Box::new(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "the forwarded answer stalled",
+                    )) as BoxError);
+                    break;
+                }
+            }
+        }
+    };
+    (
+        StatusCode::OK,
+        [
+            ("Content-Type", ohttp_chunked::CONTENT_TYPE_CHUNKED_RES),
+            ("Cache-Control", "no-store"),
+        ],
+        Body::from_stream(body),
+    )
+        .into_response()
 }
 
 impl ChunkedResponder {
@@ -1501,13 +1638,227 @@ async fn ohttp_configs_signed_handler(
     }
 }
 
+/// Decapsulate the Encapsulated Request `body` (`ohttp_chunked`): the plaintext and the context
+/// its answer is sealed under, or the outer answer when it cannot be opened (503 without HPKE
+/// keys, 400 otherwise; neither can be encrypted).
+async fn open_request(
+    state: &AppState,
+    body: &bytes::Bytes,
+    request_id: Uuid,
+    network: &str,
+) -> Result<(Vec<u8>, hpke::ResponseContext), axum::response::Response> {
+    let Some(hpke_state) = &state.hpke else {
+        warn!(
+            request_id = %request_id,
+            network = %network,
+            "OHTTP mode not enabled"
+        );
+        health::record_request_detailed(
+            "disabled", "ohttp", network, "ohttp", "-", 503, "-", "-", "other",
+        );
+        return Err((StatusCode::SERVICE_UNAVAILABLE, "OHTTP mode disabled").into_response());
+    };
+    match ohttp_chunked::decapsulate_chunked_request(
+        std::io::Cursor::new(body.to_vec()),
+        hpke_state,
+    )
+    .await
+    {
+        Ok(v) => Ok(v),
+        Err(e) => {
+            warn!(
+                request_id = %request_id,
+                network = %network,
+                error = %e,
+                "OHTTP decapsulation failed"
+            );
+            health::record_decrypt_error();
+            health::record_request_detailed(
+                "decrypt_error",
+                "ohttp",
+                network,
+                "ohttp",
+                "-",
+                400,
+                "-",
+                "-",
+                "other",
+            );
+            health::record_upstream_error(network, "-", "decrypt");
+            Err((
+                StatusCode::BAD_REQUEST,
+                [("Content-Type", "text/plain")],
+                "Bad Request",
+            )
+                .into_response())
+        }
+    }
+}
+
 // POST /gateway — OHTTP request handler
 async fn gateway_handler(
     State(state): State<Arc<AppState>>,
     axum::extract::ConnectInfo(_peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
     headers: axum::http::HeaderMap,
     body: Body,
-) -> impl IntoResponse {
+) -> axum::response::Response {
+    handle_ohttp(state, headers, body, Entry::Relay).await
+}
+
+/// The state of the forwarded-WRITE listener (`WRITE_FORWARD_BIND_ADDR`).
+struct ForwardState {
+    app: Arc<AppState>,
+    secrets: Vec<config::RelaySecret>,
+}
+
+/// POST `write_forward::FORWARD_PATH` on the forwarded-WRITE listener: an Encapsulated Request a
+/// read origin forwarded (write_forward.rs), handled like one from a relay once its forwarding
+/// secret matched, as a WRITE. Every answer but a sealed one or a replay (409) means this gateway
+/// did not run it, and the read origin then decides it itself.
+async fn write_forward_handler(
+    State(forward): State<Arc<ForwardState>>,
+    headers: axum::http::HeaderMap,
+    body: Body,
+) -> axum::response::Response {
+    let network = forward.app.config.network.clone();
+    // A decline for a lasting reason (the secret, readiness, a requirement): the read origin
+    // stops trying for its backoff.
+    let lasting = |mut response: axum::response::Response| {
+        response.headers_mut().insert(
+            write_forward::DECLINE_HEADER,
+            axum::http::HeaderValue::from_static(write_forward::DECLINE_LASTING),
+        );
+        response
+    };
+    let declined = |status: &str, http: u16| {
+        health::record_request_detailed(
+            status,
+            "forwarded",
+            &network,
+            "forward",
+            "-",
+            http,
+            "-",
+            "-",
+            "other",
+        );
+    };
+    let Some(i) = write_forward::authenticated(&forward.secrets, &headers) else {
+        if health::warn_due(&network, "forward_unauthorized") {
+            warn!(network = %network, "Unauthorized forwarded WRITE (forwarding secret missing, duplicated or invalid)");
+        }
+        declined("unauthorized", 401);
+        return lasting((StatusCode::UNAUTHORIZED, "Unauthorized").into_response());
+    };
+    // Declined while not every replay peer and standby store is connected (at startup, or a
+    // peer lost): a WRITE that needs one would fail closed here, while the read origin, which
+    // asks the same stores over its own links, may still decide it.
+    if forward
+        .app
+        .cache
+        .as_ref()
+        .is_some_and(|c| !c.replay_stores_connected())
+    {
+        declined("not_ready", 503);
+        return lasting((StatusCode::SERVICE_UNAVAILABLE, "Not ready").into_response());
+    }
+    // What the read origin's own decision requires: this gateway must meet each of it, or the
+    // read origin decides the WRITE itself (`write_forward::REQUIRES_HEADER`).
+    let requires = headers
+        .get(write_forward::REQUIRES_HEADER)
+        .map(|v| {
+            v.to_str()
+                .map_err(|_| "not visible ASCII".to_string())
+                .and_then(write_forward::Requirement::parse_list)
+        })
+        .unwrap_or(Ok(Vec::new()));
+    let unmet = match &requires {
+        Err(unknown) => Some(format!("unknown requirement {unknown:?}")),
+        Ok(list) => list
+            .iter()
+            .find(|r| !receiver_meets(&forward.app, **r))
+            .map(|r| format!("requirement {} not met", r.render())),
+    };
+    if let Some(why) = unmet {
+        if health::warn_due(&network, "forward_requirement") {
+            warn!(network = %network, reason = %why, "Forwarded WRITE declined: this gateway cannot decide it as the read origin would; decided there");
+        }
+        declined("requirement_unmet", 503);
+        return lasting((StatusCode::SERVICE_UNAVAILABLE, "Requirement not met").into_response());
+    }
+    health::as_forwarded(handle_ohttp(
+        forward.app.clone(),
+        headers,
+        body,
+        Entry::Forwarded {
+            name: &forward.secrets[i].name,
+        },
+    ))
+    .await
+}
+
+/// Whether this gateway checks every WRITE at a second replay store synchronously: its peers
+/// in `sync` mode, or the check of every WRITE at a fallback store
+/// (`ResponseCache::checks_writes_at_fallback_store`).
+fn receiver_checks_second_store(state: &AppState) -> bool {
+    state.cache.as_ref().is_some_and(|c| {
+        c.checks_writes_at_fallback_store()
+            || c.replay_peers()
+                .is_some_and(|p| p.mode() == origin::ReplayPeerMode::Sync && !p.is_empty())
+    })
+}
+
+/// Whether this gateway meets one requirement of a forwarded WRITE: `replica-ack=N` = its own
+/// store's replica wait for at least N replicas (`REPLAY_WRITE_WAIT_REPLICAS`).
+fn receiver_meets(state: &AppState, requirement: write_forward::Requirement) -> bool {
+    match requirement {
+        write_forward::Requirement::SecondStore => receiver_checks_second_store(state),
+        write_forward::Requirement::ReplicaAck(n) => state
+            .cache
+            .as_ref()
+            .and_then(|c| c.write_wait())
+            .is_some_and(|w| w.replicas >= n),
+    }
+}
+
+/// What a read origin's own decision of a WRITE requires of the stores, stated to the receiving
+/// gateway (`write_forward::REQUIRES_HEADER`): `second-store` with confirming standby stores
+/// (the check of every WRITE at a fallback store), `replica-ack=N` with the hub's replica wait.
+fn forward_requirements(cache: &cache::ResponseCache) -> Vec<write_forward::Requirement> {
+    let mut requires = Vec::new();
+    if cache.checks_writes_at_fallback_store() {
+        requires.push(write_forward::Requirement::SecondStore);
+    }
+    let replicas = [
+        cache.replay_peers().and_then(|p| p.wait()),
+        cache.write_wait(),
+    ]
+    .into_iter()
+    .flatten()
+    .map(|w| w.replicas)
+    .max();
+    if let Some(n) = replicas.filter(|n| *n > 0) {
+        requires.push(write_forward::Requirement::ReplicaAck(n));
+    }
+    requires
+}
+
+/// Where an Encapsulated Request came from.
+enum Entry<'a> {
+    /// A relay (`POST /gateway`), authenticated by its `X-Relay-Secret`.
+    Relay,
+    /// A read origin's forwarded WRITE, authenticated by the forwarding secret `name`: always a
+    /// WRITE here, opened before the replay check (a request this gateway cannot open costs no
+    /// nonce), and never forwarded again.
+    Forwarded { name: &'a str },
+}
+
+async fn handle_ohttp(
+    state: Arc<AppState>,
+    headers: axum::http::HeaderMap,
+    body: Body,
+    entry: Entry<'_>,
+) -> axum::response::Response {
     let start = Instant::now();
     let network = state.config.network.clone();
 
@@ -1546,9 +1897,12 @@ async fn gateway_handler(
         .unwrap_or("-");
 
     // Validate relay secret (required unless explicitly disabled); the name of the relay whose
-    // secret matched goes to the metrics and logs.
+    // secret matched goes to the metrics and logs. A forwarded WRITE was authenticated by its
+    // forwarding secret (`write_forward_handler`).
     let mut relay_name = "-";
-    if !state.config.relay_secrets.is_empty() {
+    if let Entry::Forwarded { name, .. } = &entry {
+        relay_name = *name;
+    } else if !state.config.relay_secrets.is_empty() {
         // Reject duplicate X-Relay-Secret headers
         let secret_headers: Vec<_> = headers.get_all("X-Relay-Secret").iter().collect();
         if secret_headers.len() > 1 {
@@ -1806,6 +2160,17 @@ async fn gateway_handler(
         );
     }
 
+    // A forwarded WRITE is opened first (no side effects): one this gateway cannot open (keys
+    // that differ from the read origin's, e.g. during a rotation) is answered before its nonce
+    // is taken, so the read origin can still decide it itself.
+    let mut opened = None;
+    if let Entry::Forwarded { .. } = &entry {
+        match open_request(&state, &body, request_id, &network).await {
+            Ok(v) => opened = Some(v),
+            Err(response) => return response,
+        }
+    }
+
     // Replay protection: check if this exact request body has been seen before.
     // Compute sha256(body) and check against Redis replay cache.
     let body_hash = {
@@ -1821,10 +2186,8 @@ async fn gateway_handler(
     // The local check's duration: a stage of a WRITE (`ohttp_write_stage_duration_seconds`),
     // recorded once the inner request is classified.
     let local_started = Instant::now();
-    let mut local_elapsed = Duration::ZERO;
     if let Some(ref cache) = state.cache {
         let checked = cache.check_replay_detailed(&body_hash).await;
-        local_elapsed = local_started.elapsed();
         let verdict = checked
             .as_ref()
             .map(|c| c.verdict())
@@ -1843,9 +2206,7 @@ async fn gateway_handler(
                 health::record_request_detailed(
                     "replay", "ohttp", &network, "ohttp", "-", 409, "-", "-", "other",
                 );
-                crate::health::OHTTP_REPLAY_REJECTED
-                    .with_label_values(&[&network])
-                    .inc();
+                health::record_replay_rejected(&network);
                 return (
                     StatusCode::CONFLICT,
                     [(axum::http::header::CONTENT_TYPE, "application/json")],
@@ -1875,11 +2236,20 @@ async fn gateway_handler(
                     "-",
                     "other",
                 );
-                return (
+                let mut response = (
                     StatusCode::SERVICE_UNAVAILABLE,
                     "Replay protection unavailable",
                 )
                     .into_response();
+                // Its SET NX may have landed: the read origin must not decide it after this
+                // answer (it would find this request's own nonce and call it a replay).
+                if let Entry::Forwarded { .. } = &entry {
+                    response.headers_mut().insert(
+                        write_forward::DECLINE_HEADER,
+                        axum::http::HeaderValue::from_static(write_forward::DECLINE_UNCLEAR),
+                    );
+                }
+                return response;
             }
         }
     } else {
@@ -1907,56 +2277,16 @@ async fn gateway_handler(
             .into_response();
     }
 
-    let hpke_state = match &state.hpke {
-        Some(hs) => hs,
-        None => {
-            warn!(
-                request_id = %request_id,
-                network = %network,
-                "OHTTP mode not enabled"
-            );
-            health::record_request_detailed(
-                "disabled", "ohttp", &network, "ohttp", "-", 503, "-", "-", "other",
-            );
-            return (StatusCode::SERVICE_UNAVAILABLE, "OHTTP mode disabled").into_response();
-        }
-    };
+    let local_elapsed = local_started.elapsed();
 
-    // Stage 1: Chunked OHTTP decapsulation (failures here cannot be encrypted)
-    let (plaintext, response_ctx) = match ohttp_chunked::decapsulate_chunked_request(
-        std::io::Cursor::new(body.to_vec()),
-        hpke_state,
-    )
-    .await
-    {
-        Ok(v) => v,
-        Err(e) => {
-            warn!(
-                request_id = %request_id,
-                network = %network,
-                error = %e,
-                "OHTTP decapsulation failed"
-            );
-            health::record_decrypt_error();
-            health::record_request_detailed(
-                "decrypt_error",
-                "ohttp",
-                &network,
-                "ohttp",
-                "-",
-                400,
-                "-",
-                "-",
-                "other",
-            );
-            health::record_upstream_error(&network, "-", "decrypt");
-            return (
-                StatusCode::BAD_REQUEST,
-                [("Content-Type", "text/plain")],
-                "Bad Request",
-            )
-                .into_response();
-        }
+    // Stage 1: Chunked OHTTP decapsulation (failures here cannot be encrypted); a forwarded
+    // WRITE was opened before the replay check.
+    let (plaintext, response_ctx) = match opened.take() {
+        Some(v) => v,
+        None => match open_request(&state, &body, request_id, &network).await {
+            Ok(v) => v,
+            Err(response) => return response,
+        },
     };
 
     // Every answer from here on is sealed under this request's context.
@@ -2070,7 +2400,11 @@ async fn gateway_handler(
     // The replay class, decided once for all replay stages. READ: the host list; for a dynamic
     // host, what its lists call a READ (REPLAY_READ_ROUTES is not consulted for it); for
     // anything else, a route on REPLAY_READ_ROUTES. Everything else is a WRITE.
-    let route_class = if host_list_request {
+    let route_class = if let Entry::Forwarded { .. } = &entry {
+        // The read origin classified it as a WRITE: decided as one here too, whatever this
+        // gateway's own read routes say (they may differ for a moment, e.g. during a rollout).
+        origin::RouteClass::Write
+    } else if host_list_request {
         origin::RouteClass::Read
     } else {
         route.replay_class(
@@ -2127,6 +2461,138 @@ async fn gateway_handler(
         });
     }
 
+    // REPLAY_WRITE_FORWARD_URL (write_forward.rs): a WRITE the local store took as new (or gave
+    // no verdict on) goes, as the Encapsulated Request the relay sent, to the gateway at the hub
+    // store, which decides it at its own stores, runs it and seals the answer to the client.
+    // READs never do. Forwarded WRITEs themselves are never forwarded again.
+    if let (Entry::Relay, Some(forwarder), true) = (
+        &entry,
+        state.write_forward.as_ref(),
+        route_class == origin::RouteClass::Write && local_check.is_some(),
+    ) {
+        let backend = route.backend_label(&state.config, &inner_request.authority);
+        let method_label = health::normalize_method(&inner_request.method);
+        let requires = state
+            .cache
+            .as_ref()
+            .map(forward_requirements)
+            .unwrap_or_default();
+        match forwarder.forward(body.clone(), &requires).await {
+            write_forward::Forwarded::Answer(answer) => {
+                // The duration the client sees, observed here (the receiving gateway does not).
+                let rpc = if cache_allowed {
+                    health::normalize_rpc_name(&inner_request.path, &inner_request.method)
+                } else {
+                    proxy::rpc_label_in(&state.config, &inner_request, &route)
+                };
+                health::record_duration(
+                    &network,
+                    "ohttp",
+                    &backend,
+                    &rpc,
+                    start.elapsed().as_secs_f64(),
+                    client_trace_id.is_some(),
+                );
+                health::record_request_detailed(
+                    "forwarded",
+                    "ohttp",
+                    &network,
+                    "forward",
+                    method_label,
+                    200,
+                    "-",
+                    &backend,
+                    "other",
+                );
+                info!(
+                    request_id = %request_id,
+                    client_trace_id = log.trace(),
+                    method = %log.method,
+                    path = %log.path,
+                    duration_ms = start.elapsed().as_millis() as u64,
+                    network = %network,
+                    origin = %log.origin,
+                    hop = "forward",
+                    "WRITE answered by the gateway at the hub store"
+                );
+                return forwarded_answer(answer, responder, forwarder.config().timeout);
+            }
+            write_forward::Forwarded::Replay => {
+                warn!(
+                    request_id = %request_id,
+                    network = %network,
+                    origin = state.origin.label(),
+                    "Replay detected at a peer origin (forwarded WRITE)"
+                );
+                health::record_replay_rejected(&network);
+                if inner_request.is_grpc() {
+                    health::record_request_detailed(
+                        "replay", "ohttp", &network, "ohttp", "-", 200, "10", "-", "other",
+                    );
+                    log.served("replay", "10", 0);
+                    return responder
+                        .grpc_error("10", "Request aborted: replay detected at peer origin");
+                }
+                health::record_request_detailed(
+                    "replay", "ohttp", &network, "ohttp", "-", 409, "-", "-", "other",
+                );
+                log.served("replay", "-", 0);
+                return responder.collected(ohttp::InnerResponse {
+                    status: 409,
+                    headers: vec![("content-type".to_string(), "text/plain".to_string())],
+                    body: b"Conflict: replay detected".to_vec(),
+                });
+            }
+            // No replay store was asked there: decided here, as without forwarding.
+            write_forward::Forwarded::Declined(why) => {
+                if health::warn_due(&network, "write_forward_declined") {
+                    warn!(network = %network, reason = why, "WRITE not run by the gateway at the hub store, deciding it here");
+                }
+            }
+            write_forward::Forwarded::Failed(why) => {
+                warn!(
+                    request_id = %request_id,
+                    network = %network,
+                    reason = why,
+                    "Forwarded WRITE without an answer (fail-closed)"
+                );
+                if inner_request.is_grpc() {
+                    health::record_request_detailed(
+                        "replay_unavailable",
+                        "ohttp",
+                        &network,
+                        "forward",
+                        "-",
+                        200,
+                        "14",
+                        "-",
+                        "other",
+                    );
+                    log.served("replay_unavailable", "14", 0);
+                    return responder
+                        .grpc_error("14", "Service unavailable: the WRITE could not be decided");
+                }
+                health::record_request_detailed(
+                    "replay_unavailable",
+                    "ohttp",
+                    &network,
+                    "forward",
+                    "-",
+                    503,
+                    "-",
+                    "-",
+                    "other",
+                );
+                log.served("replay_unavailable", "-", 0);
+                return responder.collected(ohttp::InnerResponse {
+                    status: 503,
+                    headers: vec![("content-type".to_string(), "text/plain".to_string())],
+                    body: b"Service unavailable: the WRITE could not be decided".to_vec(),
+                });
+            }
+        }
+    }
+
     // GW-REPLAY-INNER: Cross-origin replay protection by request class (REPLAY_PEER_MODE=async-reads|failover;
     // a no-op in sync mode, where check_replay above already consulted the peers). Decided
     // before anything is executed or served from the cache. The nonce is already in the local
@@ -2166,9 +2632,9 @@ async fn gateway_handler(
                     class = class.as_str(),
                     "Replay detected at a peer origin"
                 );
-                crate::health::OHTTP_REPLAY_REJECTED
-                    .with_label_values(&[&network])
-                    .inc();
+                // A sealed answer: counted here, also for a forwarded WRITE (the read origin
+                // only streams it back).
+                health::record_replay_rejected_sealed(&network);
                 // GW-REPLAY-INNER: gRPC requests get grpc-status, third-party HTTP gets HTTP 409
                 if inner_request.is_grpc() {
                     health::record_request_detailed(
@@ -2260,9 +2726,9 @@ async fn gateway_handler(
                     origin = state.origin.label(),
                     "Replay detected at a peer origin (WRITE confirmed at the peer stores)"
                 );
-                crate::health::OHTTP_REPLAY_REJECTED
-                    .with_label_values(&[&network])
-                    .inc();
+                // A sealed answer: counted here, also for a forwarded WRITE (the read origin
+                // only streams it back).
+                health::record_replay_rejected_sealed(&network);
                 // GW-REPLAY-INNER: gRPC requests get grpc-status, third-party HTTP gets HTTP 409
                 if inner_request.is_grpc() {
                     health::record_request_detailed(
@@ -3281,6 +3747,7 @@ mod handler_tests {
             )),
             third_party: third_party_cache::ThirdParty::from_env(None, None).unwrap(),
             request_semaphore: Arc::new(Semaphore::new(16)),
+            write_forward: None,
             config,
         })
     }
@@ -3858,6 +4325,45 @@ mod handler_tests {
         format!("redis://{addr}")
     }
 
+    /// A store that answers every SET with an error (as one whose reply was lost would leave the
+    /// caller): PING and ROLE as a primary, anything else +OK.
+    async fn erroring_store() -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut chunk = vec![0u8; 8192];
+                    loop {
+                        let Ok(n) = sock.read(&mut chunk).await else {
+                            return;
+                        };
+                        if n == 0 {
+                            return;
+                        }
+                        buf.extend_from_slice(&chunk[..n]);
+                        while let Some((args, used)) = resp_command(&buf) {
+                            buf.drain(..used);
+                            let reply: &[u8] =
+                                match args.first().map(|a| a.to_ascii_uppercase()).as_deref() {
+                                    Some("PING") => b"+PONG\r\n",
+                                    Some("ROLE") => b"*3\r\n$6\r\nmaster\r\n:0\r\n*0\r\n",
+                                    Some("SET") => b"-ERR no verdict\r\n",
+                                    _ => b"+OK\r\n",
+                                };
+                            if sock.write_all(reply).await.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        format!("redis://{addr}")
+    }
+
     /// One whole RESP command (an array of bulk strings) at the start of `buf`, and its length.
     fn resp_command(buf: &[u8]) -> Option<(Vec<String>, usize)> {
         let line = |at: usize| -> Option<(&[u8], usize)> {
@@ -4013,5 +4519,655 @@ mod handler_tests {
             lwd_hits,
         )
         .await;
+    }
+
+    /// A gateway that accepts forwarded WRITEs for `hub` (`WRITE_FORWARD_BIND_ADDR`, one
+    /// forwarding secret `secret`): its URL.
+    async fn forward_listener(hub: Arc<AppState>, secret: &str) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let secrets = config::parse_relay_secrets(&format!("origin-a={secret}")).unwrap();
+        let app = Router::new()
+            .route(
+                write_forward::FORWARD_PATH,
+                axum::routing::post(write_forward_handler),
+            )
+            .with_state(Arc::new(ForwardState { app: hub, secrets }));
+        tokio::spawn(server::serve_http2(listener, app.into_make_service()));
+        format!("http://{addr}")
+    }
+
+    /// `state` with `REPLAY_WRITE_FORWARD_URL=url` and the forwarding secret `secret`.
+    fn forwarding(state: Arc<AppState>, url: &str, secret: &str) -> Arc<AppState> {
+        forwarding_with(state, url, secret, "5")
+    }
+
+    /// `forwarding` with REPLAY_WRITE_FORWARD_TIMEOUT_SECS=`timeout_secs`.
+    fn forwarding_with(
+        state: Arc<AppState>,
+        url: &str,
+        secret: &str,
+        timeout_secs: &str,
+    ) -> Arc<AppState> {
+        let config = write_forward::ForwardConfig::parse(
+            Some(url),
+            Some(secret),
+            None,
+            Some(timeout_secs),
+            Some("60000"),
+        )
+        .unwrap()
+        .unwrap();
+        let network = state.config.network.clone();
+        let state = Arc::try_unwrap(state).ok().expect("not shared yet");
+        Arc::new(AppState {
+            write_forward: Some(Arc::new(write_forward::Forwarder::new(config, network))),
+            ..state
+        })
+    }
+
+    /// A security store of its own (`db`), no peers.
+    async fn own_store_cache(config: &Config) -> cache::ResponseCache {
+        cache::ResponseCache::connect(
+            &config.redis_url,
+            Some(&config.redis_security_url),
+            config.network.clone(),
+            "lwd.example.com".to_string(),
+            config.redis_op_timeout_ms,
+            config.max_block_range,
+            &config.backends_policy,
+        )
+        .await
+        .unwrap()
+    }
+
+    const LIGHTD_INFO: &str = "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetLightdInfo";
+
+    fn read_routes_origin() -> origin::OriginSettings {
+        let routes = format!("lwd=POST {LIGHTD_INFO}");
+        origin::OriginSettings::parse_env(origin::RawOriginEnv {
+            read_routes: Some(&routes),
+            ..origin::RawOriginEnv::default()
+        })
+        .unwrap()
+    }
+
+    fn send_tx(nonce: &str) -> Vec<u8> {
+        let mut raw = vec![0x0a, nonce.len() as u8];
+        raw.extend_from_slice(nonce.as_bytes());
+        let mut grpc = vec![0u8, 0, 0, 0, raw.len() as u8];
+        grpc.extend_from_slice(&raw);
+        bhttp(
+            "POST",
+            "lwd.example.com",
+            SEND_TX,
+            "application/grpc",
+            &grpc,
+        )
+    }
+
+    fn third_party_write(nonce: &str) -> Vec<u8> {
+        bhttp(
+            "POST",
+            "api.example.com",
+            "/v1/send",
+            "application/json",
+            format!("{{\"n\":\"{nonce}\"}}").as_bytes(),
+        )
+    }
+
+    struct Pair {
+        hub: Arc<AppState>,
+        read: Arc<AppState>,
+        hub_tp: Arc<AtomicUsize>,
+        hub_lwd: Arc<AtomicUsize>,
+        tp: Arc<AtomicUsize>,
+        lwd: Arc<AtomicUsize>,
+    }
+
+    /// The gateway at the hub store (security store db 7) and a read origin (db 8) forwarding
+    /// its WRITEs there with `secret` (the hub accepts `forward-secret`), each with upstreams of
+    /// its own; `url` replaces the hub's listener (an unreachable one).
+    async fn pair(net: &str, secret: &str, url: Option<&str>) -> Pair {
+        let (hub_tp_url, hub_tp) = upstream(true).await;
+        let (hub_lwd_url, hub_lwd) = upstream(false).await;
+        let hub_config = config(net, "redis://127.0.0.1:6379/7", &hub_lwd_url, &hub_tp_url);
+        let hub_cache = own_store_cache(&hub_config).await;
+        let hub = app_state(hub_config, read_routes_origin(), hub_cache);
+        let listener = forward_listener(hub.clone(), "forward-secret").await;
+        let (tp_url, tp) = upstream(true).await;
+        let (lwd_url, lwd) = upstream(false).await;
+        let read_config = config(net, "redis://127.0.0.1:6379/8", &lwd_url, &tp_url);
+        let read_cache = own_store_cache(&read_config).await;
+        let read = forwarding(
+            app_state(read_config, read_routes_origin(), read_cache),
+            url.unwrap_or(&listener),
+            secret,
+        );
+        Pair {
+            hub,
+            read,
+            hub_tp,
+            hub_lwd,
+            tp,
+            lwd,
+        }
+    }
+
+    /// REPLAY_WRITE_FORWARD_URL: the read origin's WRITEs (third-party and SendTransaction) are
+    /// run by the gateway at the hub store, whose sealed answer reaches the client unchanged;
+    /// READs stay at the read origin; a nonce the hub store holds is refused as a peer replay.
+    #[tokio::test]
+    async fn a_read_origin_forwards_its_writes_to_the_gateway_at_the_hub_store() {
+        if !store_up("redis://127.0.0.1:6379", "the test Redis").await {
+            return;
+        }
+        health::init_metrics();
+        let net = "testnet-forward";
+        let p = pair(net, "forward-secret", None).await;
+
+        let n = Uuid::new_v4().to_string();
+        let (status, _, body) = post(&p.read, third_party_write(&n)).await;
+        assert_eq!(
+            (status, body.as_slice()),
+            (200, &b"ok"[..]),
+            "the hub's answer"
+        );
+        assert_eq!(p.hub_tp.load(Ordering::SeqCst), 1, "run at the hub");
+        assert_eq!(p.tp.load(Ordering::SeqCst), 0, "not at the read origin");
+        assert_eq!(health::write_forwards(net, "answered"), 1);
+
+        let (_, fields, body) = post(&p.read, send_tx(&n)).await;
+        let answer = format!("{fields}{}", String::from_utf8_lossy(&body));
+        assert!(p.hub_lwd.load(Ordering::SeqCst) >= 1, "{answer}");
+        assert_eq!(p.lwd.load(Ordering::SeqCst), 0, "{answer}");
+        assert_eq!(health::write_forwards(net, "answered"), 2);
+        // Counted once per side, told apart: the read origin's `forwarded`, the receiving
+        // gateway's own outcome under mode="forwarded".
+        assert_eq!(
+            counter(
+                "ohttp_requests_total",
+                &[("network", net), ("status", "forwarded"), ("mode", "ohttp")]
+            ),
+            2.0
+        );
+        assert!(
+            counter(
+                "ohttp_requests_total",
+                &[("network", net), ("mode", "forwarded")]
+            ) >= 2.0
+        );
+
+        // A READ is decided and served at the read origin.
+        let hub_lwd = p.hub_lwd.load(Ordering::SeqCst);
+        let read = bhttp(
+            "POST",
+            "lwd.example.com",
+            LIGHTD_INFO,
+            "application/grpc",
+            &[0, 0, 0, 0, 0],
+        );
+        post(&p.read, read).await;
+        assert!(
+            p.lwd.load(Ordering::SeqCst) >= 1,
+            "the read origin's upstream"
+        );
+        assert_eq!(
+            p.hub_lwd.load(Ordering::SeqCst),
+            hub_lwd,
+            "nothing forwarded"
+        );
+        assert_eq!(health::write_forwards(net, "answered"), 2);
+
+        // The same Encapsulated Request first at the hub, then at the read origin (whose own
+        // store has not seen it): the hub store holds the nonce, a replay.
+        let key_config = p.read.hpke.as_ref().unwrap().public_config();
+        let (sealed, enc, secret) = seal(&key_config, &third_party_write(&format!("{n}-again")));
+        let (status, _) = post_sealed(&p.hub, sealed.clone()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(p.hub_tp.load(Ordering::SeqCst), 2);
+        let (status, wire) = post_sealed(&p.read, sealed).await;
+        assert_eq!(status, StatusCode::OK, "an inner answer");
+        let (inner, _, body) = open(&enc, &secret, &wire);
+        assert_eq!(inner, 409, "{}", String::from_utf8_lossy(&body));
+        assert_eq!(p.hub_tp.load(Ordering::SeqCst), 2, "not run again");
+        assert_eq!(p.tp.load(Ordering::SeqCst), 0);
+        assert_eq!(health::write_forwards(net, "replay"), 1);
+        assert!(health::write_stage_count(net, "forward", "answered") >= 2);
+    }
+
+    /// Where the gateway at the hub store did not run the WRITE (no connection, a refused
+    /// forwarding secret, a request it cannot open), the read origin decides it itself, as
+    /// without forwarding; for the backoff afterwards without trying. A WRITE sent there that
+    /// gets no answer in time fails closed, and nothing runs at the read origin.
+    #[tokio::test]
+    async fn a_write_the_hub_gateway_did_not_run_is_decided_locally_and_no_answer_fails_closed() {
+        if !store_up("redis://127.0.0.1:6379", "the test Redis").await {
+            return;
+        }
+        health::init_metrics();
+
+        let net = "testnet-forward-down";
+        let p = pair(net, "forward-secret", Some("http://127.0.0.1:1")).await;
+        let (status, _, body) = post(&p.read, third_party_write(&Uuid::new_v4().to_string())).await;
+        assert_eq!((status, body.as_slice()), (200, &b"ok"[..]));
+        assert_eq!(p.tp.load(Ordering::SeqCst), 1, "decided and run here");
+        assert_eq!(health::write_forwards(net, "connect"), 1);
+        post(&p.read, third_party_write(&Uuid::new_v4().to_string())).await;
+        assert_eq!(p.tp.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            health::write_forwards(net, "skipped"),
+            1,
+            "within the backoff"
+        );
+        assert_eq!(p.hub_tp.load(Ordering::SeqCst), 0);
+
+        let net = "testnet-forward-secret";
+        let p = pair(net, "wrong-secret", None).await;
+        let (status, _, body) = post(&p.read, third_party_write(&Uuid::new_v4().to_string())).await;
+        assert_eq!((status, body.as_slice()), (200, &b"ok"[..]));
+        assert_eq!(p.tp.load(Ordering::SeqCst), 1);
+        assert_eq!(p.hub_tp.load(Ordering::SeqCst), 0);
+        assert_eq!(health::write_forwards(net, "declined"), 1);
+
+        // The hub gateway with other keys cannot open the request: it answers 400 before its
+        // replay check, so the nonce stays free and the read origin runs the WRITE itself.
+        let net = "testnet-forward-keys";
+        let (hub_tp_url, hub_tp) = upstream(true).await;
+        let (hub_lwd_url, _) = upstream(false).await;
+        let mut hub_config = config(net, "redis://127.0.0.1:6379/7", &hub_lwd_url, &hub_tp_url);
+        hub_config.hpke_keys = vec![(1, format!("{:064x}", 0xb2u64))];
+        let hub_cache = own_store_cache(&hub_config).await;
+        let hub = app_state(hub_config, read_routes_origin(), hub_cache);
+        let url = forward_listener(hub, "forward-secret").await;
+        let (tp_url, tp) = upstream(true).await;
+        let (lwd_url, _) = upstream(false).await;
+        let read_config = config(net, "redis://127.0.0.1:6379/8", &lwd_url, &tp_url);
+        let read_cache = own_store_cache(&read_config).await;
+        let read = forwarding(
+            app_state(read_config, read_routes_origin(), read_cache),
+            &url,
+            "forward-secret",
+        );
+        let (status, _, body) = post(&read, third_party_write(&Uuid::new_v4().to_string())).await;
+        assert_eq!((status, body.as_slice()), (200, &b"ok"[..]));
+        assert_eq!(tp.load(Ordering::SeqCst), 1, "run here");
+        assert_eq!(hub_tp.load(Ordering::SeqCst), 0);
+        assert_eq!(health::write_forwards(net, "declined_once"), 1);
+
+        // The hub gateway's upstream never answers: the forwarded WRITE gets no answer within
+        // REPLAY_WRITE_FORWARD_TIMEOUT_SECS and fails closed; the read origin runs nothing.
+        let net = "testnet-forward-timeout";
+        let silent = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let silent_url = format!("http://{}", silent.local_addr().unwrap());
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((sock, _)) = silent.accept().await {
+                held.push(sock);
+            }
+        });
+        let (hub_lwd_url, _) = upstream(false).await;
+        let hub_config = config(net, "redis://127.0.0.1:6379/7", &hub_lwd_url, &silent_url);
+        let hub_cache = own_store_cache(&hub_config).await;
+        let hub = app_state(hub_config, read_routes_origin(), hub_cache);
+        let url = forward_listener(hub, "forward-secret").await;
+        let (tp_url, tp) = upstream(true).await;
+        let (lwd_url, _) = upstream(false).await;
+        let read_config = config(net, "redis://127.0.0.1:6379/8", &lwd_url, &tp_url);
+        let read_cache = own_store_cache(&read_config).await;
+        let read = forwarding_with(
+            app_state(read_config, read_routes_origin(), read_cache),
+            &url,
+            "forward-secret",
+            "1",
+        );
+        let (status, _, body) = post(&read, third_party_write(&Uuid::new_v4().to_string())).await;
+        assert_eq!(status, 503, "{}", String::from_utf8_lossy(&body));
+        assert_eq!(tp.load(Ordering::SeqCst), 0, "nothing run here");
+        assert_eq!(health::write_forwards(net, "timeout"), 1);
+    }
+
+    /// The receiving gateway decides a forwarded WRITE at every store it checks itself, as a
+    /// WRITE even where its own read routes would call it a READ: here a `sync`-mode peer that
+    /// already holds the nonce makes it a replay, although the read origin's and the receiving
+    /// gateway's own stores took it as new. A read origin that checks a second store is
+    /// declined by a receiving gateway that does not.
+    #[tokio::test]
+    async fn a_forwarded_write_is_checked_at_the_receiving_gateways_stores() {
+        if !store_up("redis://127.0.0.1:6379", "the test Redis").await {
+            return;
+        }
+        health::init_metrics();
+        let net = "testnet-forward-peer";
+        let (hub_tp_url, hub_tp) = upstream(true).await;
+        let (hub_lwd_url, _) = upstream(false).await;
+        let hub_config = config(net, "redis://127.0.0.1:6379/7", &hub_lwd_url, &hub_tp_url);
+        // The third-party POST is a READ by this gateway's own routes.
+        let routes = format!("lwd=POST {LIGHTD_INFO};api.example.com=POST /v1/send");
+        let hub_origin = origin::OriginSettings::parse_env(origin::RawOriginEnv {
+            peer_urls: Some("redis://127.0.0.1:6379/10"),
+            peer_mode: Some("sync"),
+            peer_fail_closed: Some("1"),
+            read_routes: Some(&routes),
+            ..origin::RawOriginEnv::default()
+        })
+        .unwrap();
+        let hub_cache = base_cache(&hub_config, &hub_origin, None).await;
+        let hub = app_state(hub_config, hub_origin, hub_cache);
+        assert!(receiver_checks_second_store(&hub));
+        let url = forward_listener(hub, "forward-secret").await;
+        let (tp_url, tp) = upstream(true).await;
+        let (lwd_url, _) = upstream(false).await;
+        let read_config = config(net, "redis://127.0.0.1:6379/8", &lwd_url, &tp_url);
+        let read_cache = own_store_cache(&read_config).await;
+        let read = forwarding(
+            app_state(read_config, read_routes_origin(), read_cache),
+            &url,
+            "forward-secret",
+        );
+
+        // Classified as a WRITE on both sides: the local stage is observed at each.
+        let locals = health::write_stage_count(net, "local", "new");
+        let (status, _, body) = post(&read, third_party_write(&Uuid::new_v4().to_string())).await;
+        assert_eq!((status, body.as_slice()), (200, &b"ok"[..]));
+        assert_eq!(hub_tp.load(Ordering::SeqCst), 1);
+        assert_eq!(health::write_stage_count(net, "local", "new"), locals + 2);
+
+        let key_config = read.hpke.as_ref().unwrap().public_config();
+        let (sealed, enc, secret) =
+            seal(&key_config, &third_party_write(&Uuid::new_v4().to_string()));
+        let key = format!(
+            "replay:{net}:{}",
+            hex::encode(sha2::Sha256::digest(&sealed))
+        );
+        let mut peer = redis::aio::ConnectionManager::new(
+            redis::Client::open("redis://127.0.0.1:6379/10").unwrap(),
+        )
+        .await
+        .unwrap();
+        let _: () = redis::cmd("SET")
+            .arg(&key)
+            .arg("1")
+            .arg("EX")
+            .arg(600)
+            .query_async(&mut peer)
+            .await
+            .unwrap();
+        let (status, wire) = post_sealed(&read, sealed).await;
+        assert_eq!(status, StatusCode::OK);
+        let (inner, _, body) = open(&enc, &secret, &wire);
+        assert_eq!(inner, 409, "{}", String::from_utf8_lossy(&body));
+        assert_eq!(hub_tp.load(Ordering::SeqCst), 1, "not run");
+        assert_eq!(tp.load(Ordering::SeqCst), 0);
+        assert_eq!(health::write_forwards(net, "replay"), 1);
+
+        // A receiving gateway without a second store, asked by a read origin that has one.
+        let (lone_tp_url, _) = upstream(true).await;
+        let lone_config = config(net, "redis://127.0.0.1:6379/7", &hub_lwd_url, &lone_tp_url);
+        let lone_cache = own_store_cache(&lone_config).await;
+        let lone = app_state(lone_config, read_routes_origin(), lone_cache);
+        assert!(!receiver_checks_second_store(&lone));
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            "content-type",
+            ohttp_chunked::CONTENT_TYPE_CHUNKED_REQ.parse().unwrap(),
+        );
+        headers.insert(
+            write_forward::SECRET_HEADER,
+            "forward-secret".parse().unwrap(),
+        );
+        headers.insert(
+            write_forward::REQUIRES_HEADER,
+            "second-store".parse().unwrap(),
+        );
+        let response = write_forward_handler(
+            State(Arc::new(ForwardState {
+                app: lone,
+                secrets: config::parse_relay_secrets("origin-a=forward-secret").unwrap(),
+            })),
+            headers,
+            Body::from(vec![0u8; 64]),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response
+                .headers()
+                .get(write_forward::DECLINE_HEADER)
+                .and_then(|v| v.to_str().ok()),
+            Some(write_forward::DECLINE_LASTING)
+        );
+    }
+
+    /// A receiving gateway whose own replay store answers without a verdict (its SET NX may have
+    /// landed) marks its 503, and the read origin fails the WRITE closed instead of deciding it
+    /// (it would find the request's own nonce and call it a replay). A receiving gateway whose
+    /// replay peer is not connected declines for a lasting reason.
+    #[tokio::test]
+    async fn an_unclear_receiving_store_fails_closed_and_an_unready_receiver_declines() {
+        if !store_up("redis://127.0.0.1:6379", "the test Redis").await {
+            return;
+        }
+        health::init_metrics();
+        let net = "testnet-forward-unclear";
+        let (hub_tp_url, hub_tp) = upstream(true).await;
+        let (hub_lwd_url, _) = upstream(false).await;
+        let hub_config = config(net, &erroring_store().await, &hub_lwd_url, &hub_tp_url);
+        let hub_cache = own_store_cache(&hub_config).await;
+        let hub = app_state(hub_config, read_routes_origin(), hub_cache);
+        let url = forward_listener(hub, "forward-secret").await;
+        let (tp_url, tp) = upstream(true).await;
+        let (lwd_url, _) = upstream(false).await;
+        let read_config = config(net, "redis://127.0.0.1:6379/8", &lwd_url, &tp_url);
+        let read_cache = own_store_cache(&read_config).await;
+        let read = forwarding(
+            app_state(read_config, read_routes_origin(), read_cache),
+            &url,
+            "forward-secret",
+        );
+        let (status, _, body) = post(&read, third_party_write(&Uuid::new_v4().to_string())).await;
+        assert_eq!(status, 503, "{}", String::from_utf8_lossy(&body));
+        assert_eq!(tp.load(Ordering::SeqCst), 0);
+        assert_eq!(hub_tp.load(Ordering::SeqCst), 0);
+        assert_eq!(health::write_forwards(net, "unclear"), 1);
+        // The next WRITE (another nonce) is decided here during the backoff.
+        let (status, _, body) = post(&read, third_party_write(&Uuid::new_v4().to_string())).await;
+        assert_eq!((status, body.as_slice()), (200, &b"ok"[..]));
+        assert_eq!(tp.load(Ordering::SeqCst), 1, "run here");
+        assert_eq!(health::write_forwards(net, "skipped"), 1);
+
+        // A sync-mode peer that is not connected: not ready.
+        let net = "testnet-forward-unready";
+        let (unready_tp, _) = upstream(true).await;
+        let unready_config = config(net, "redis://127.0.0.1:6379/7", &hub_lwd_url, &unready_tp);
+        let unready_origin = origin::OriginSettings::parse_env(origin::RawOriginEnv {
+            peer_urls: Some(NO_PEER),
+            peer_mode: Some("sync"),
+            ..origin::RawOriginEnv::default()
+        })
+        .unwrap();
+        let unready_cache = base_cache(&unready_config, &unready_origin, None).await;
+        let unready = app_state(unready_config, unready_origin, unready_cache);
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            write_forward::SECRET_HEADER,
+            "forward-secret".parse().unwrap(),
+        );
+        let response = write_forward_handler(
+            State(Arc::new(ForwardState {
+                app: unready,
+                secrets: config::parse_relay_secrets("origin-a=forward-secret").unwrap(),
+            })),
+            headers,
+            Body::from(vec![0u8; 64]),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response
+                .headers()
+                .get(write_forward::DECLINE_HEADER)
+                .and_then(|v| v.to_str().ok()),
+            Some(write_forward::DECLINE_LASTING)
+        );
+    }
+
+    /// An HTTP/2 server on `FORWARD_PATH` that records the requirements header of each request
+    /// and answers `status` (no marker): a stand-in for a receiving gateway.
+    async fn capture_listener(
+        status: StatusCode,
+    ) -> (String, Arc<parking_lot::Mutex<Vec<Option<String>>>>) {
+        let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let s = seen.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new().route(
+            write_forward::FORWARD_PATH,
+            axum::routing::post(move |headers: axum::http::HeaderMap| {
+                let s = s.clone();
+                async move {
+                    s.lock().push(
+                        headers
+                            .get(write_forward::REQUIRES_HEADER)
+                            .and_then(|v| v.to_str().ok())
+                            .map(str::to_string),
+                    );
+                    status
+                }
+            }),
+        );
+        tokio::spawn(server::serve_http2(listener, app.into_make_service()));
+        (format!("http://{addr}"), seen)
+    }
+
+    /// What a read origin states it requires: `replica-ack=N` from the hub's replica wait (an
+    /// `async-reads` origin with a hub peer, as startup demands), nothing without one; the
+    /// header reaches the receiving gateway. Three one-off declines in a row pause forwarding,
+    /// and a URL that is not a receiving gateway (404) is a lasting decline.
+    #[tokio::test]
+    async fn a_read_origin_states_its_requirements_and_pauses_on_repeated_declines() {
+        if !store_up("redis://127.0.0.1:6379", "the test Redis").await {
+            return;
+        }
+        health::init_metrics();
+        let net = "testnet-forward-requires";
+        let hub_origin = || {
+            origin::OriginSettings::parse_env(origin::RawOriginEnv {
+                peer_urls: Some("redis://127.0.0.1:6379/9"),
+                peer_mode: Some("async-reads"),
+                ..origin::RawOriginEnv::default()
+            })
+            .unwrap()
+        };
+        let (tp_url, tp) = upstream(true).await;
+        let (lwd_url, _) = upstream(false).await;
+        let config_a = config(net, "redis://127.0.0.1:6379/8", &lwd_url, &tp_url);
+        let with_wait = base_cache(&config_a, &hub_origin(), PEER_WAIT).await;
+        assert_eq!(
+            forward_requirements(&with_wait),
+            vec![write_forward::Requirement::ReplicaAck(1)]
+        );
+        let without = base_cache(&config_a, &hub_origin(), None).await;
+        assert!(forward_requirements(&without).is_empty());
+
+        // The header on the wire; a one-off decline (503 without a marker) three times in a
+        // row, then a pause.
+        let (url, seen) = capture_listener(StatusCode::SERVICE_UNAVAILABLE).await;
+        let read = forwarding(app_state(config_a, hub_origin(), with_wait), &url, "s");
+        for _ in 0..4 {
+            post(&read, third_party_write(&Uuid::new_v4().to_string())).await;
+        }
+        assert_eq!(
+            seen.lock().first().cloned().flatten().as_deref(),
+            Some("replica-ack=1")
+        );
+        assert_eq!(seen.lock().len(), 3, "the fourth was not forwarded");
+        assert_eq!(health::write_forwards(net, "declined_once"), 3);
+        assert_eq!(health::write_forwards(net, "skipped"), 1);
+        // Each of them decided here instead: the hub's replica wait (no replica in the test
+        // store) fails them closed, so nothing ran anywhere.
+        assert_eq!(tp.load(Ordering::SeqCst), 0);
+
+        // Not a receiving gateway at that URL: lasting at once.
+        let net = "testnet-forward-404";
+        let (url, seen) = capture_listener(StatusCode::NOT_FOUND).await;
+        let (tp_url, _) = upstream(true).await;
+        let config_b = config(net, "redis://127.0.0.1:6379/8", &lwd_url, &tp_url);
+        let cache_b = own_store_cache(&config_b).await;
+        let read = forwarding(
+            app_state(config_b, read_routes_origin(), cache_b),
+            &url,
+            "s",
+        );
+        post(&read, third_party_write(&Uuid::new_v4().to_string())).await;
+        post(&read, third_party_write(&Uuid::new_v4().to_string())).await;
+        assert_eq!(seen.lock().len(), 1);
+        assert_eq!(health::write_forwards(net, "declined"), 1);
+        assert_eq!(health::write_forwards(net, "skipped"), 1);
+    }
+
+    /// A receiving gateway declines (lasting, no store asked) a WRITE whose stated replica
+    /// requirement exceeds its own replica wait, or that states a requirement it does not
+    /// know; one it meets goes on to the request itself (here a body it cannot open: 400).
+    #[tokio::test]
+    async fn a_receiving_gateway_declines_requirements_it_cannot_meet() {
+        if !store_up("redis://127.0.0.1:6379", "the test Redis").await {
+            return;
+        }
+        health::init_metrics();
+        let net = "testnet-forward-meets";
+        let (tp_url, _) = upstream(true).await;
+        let (lwd_url, _) = upstream(false).await;
+        let security = "redis://127.0.0.1:6379/7";
+        let hub_config = config(net, security, &lwd_url, &tp_url);
+        let hub_cache = own_store_cache(&hub_config)
+            .await
+            .with_write_wait(
+                security,
+                cache::WriteWaitConfig {
+                    replicas: 1,
+                    timeout_ms: 50,
+                },
+            )
+            .await
+            .unwrap();
+        let hub = app_state(hub_config, read_routes_origin(), hub_cache);
+        let forward = Arc::new(ForwardState {
+            app: hub,
+            secrets: config::parse_relay_secrets("origin-a=forward-secret").unwrap(),
+        });
+        let ask = |requires: &'static str| {
+            let forward = forward.clone();
+            async move {
+                let mut headers = axum::http::HeaderMap::new();
+                headers.insert(
+                    "content-type",
+                    ohttp_chunked::CONTENT_TYPE_CHUNKED_REQ.parse().unwrap(),
+                );
+                headers.insert(
+                    write_forward::SECRET_HEADER,
+                    "forward-secret".parse().unwrap(),
+                );
+                headers.insert(write_forward::REQUIRES_HEADER, requires.parse().unwrap());
+                let r =
+                    write_forward_handler(State(forward), headers, Body::from(vec![0u8; 64])).await;
+                let marker = r
+                    .headers()
+                    .get(write_forward::DECLINE_HEADER)
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_string);
+                (r.status(), marker)
+            }
+        };
+        let lasting = Some(write_forward::DECLINE_LASTING.to_string());
+        assert_eq!(
+            ask("replica-ack=2").await,
+            (StatusCode::SERVICE_UNAVAILABLE, lasting.clone())
+        );
+        assert_eq!(
+            ask("replica-ack=1,future-thing").await,
+            (StatusCode::SERVICE_UNAVAILABLE, lasting)
+        );
+        assert_eq!(ask("replica-ack=1").await, (StatusCode::BAD_REQUEST, None));
     }
 }

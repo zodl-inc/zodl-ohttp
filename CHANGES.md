@@ -62,6 +62,40 @@ keeps its own log in [client/CHANGELOG.md](client/CHANGELOG.md).
 
 ### Gateway
 
+- New, off by default: **WRITE forwarding** (`REPLAY_WRITE_FORWARD_URL`,
+  `REPLAY_WRITE_FORWARD_SECRET`, `..._CONNECT_TIMEOUT_MS` 1000, `..._TIMEOUT_SECS` 90,
+  `..._BACKOFF_MS` 5000 on a read origin, which must be `async-reads` with `REPLAY_PEER_URLS`
+  and not with its own replica wait but no standby stores;
+  `WRITE_FORWARD_BIND_ADDR` and `WRITE_FORWARD_SECRETS` on the receiving gateway). A read origin
+  posts the Encapsulated Request of each WRITE (after its own local check) to a gateway next to
+  the hub store, which handles it like a request from a relay on a listener of its own
+  (cleartext HTTP/2 only, preface deadline, connection cap), always as a WRITE: it opens it
+  first, then the hub store's nonce, replica wait and fallback-store check, freshness, route
+  policy, third-party rules, upstream; the read origin streams its sealed answer back unchanged.
+  A WRITE then costs the read origin one round trip to that gateway instead of the hub check plus
+  the upstream call. Failure semantics: a `409` there is a peer replay; any other answer of that
+  gateway (a refused secret, busy, not every replay store connected, a requirement it cannot
+  meet, a request it cannot open) or no
+  connection means it did not run the WRITE, and the read origin decides it as before (and,
+  after a lasting reason, an unclear store answer there or three one-off declines in a row,
+  without trying for the backoff); a WRITE sent without an answer in
+  time, or whose connection broke, or whose store there gave no verdict after the nonce may have
+  been stored, fails closed (inner 503 / grpc-status 14). The read origin states what its own
+  decision requires (`ohttp-write-forward-requires`: `second-store`, `replica-ack=N`) and the
+  receiving gateway declines what it cannot meet. The receiving gateway's own security store
+  must be the read origins' hub store and its second store their standby stores, with the same
+  one-sided routes and fail-closed settings (not checked). The forwarding connection is PINGed every 2 s and closed after 5 s without an
+  answer. READs and the caches are unchanged. New metric
+  `ohttp_write_forward_total{network, result}` and stage `forward` of
+  `ohttp_write_stage_duration_seconds`. Each forwarded WRITE is counted once on each side, told
+  apart: the read origin counts it in `ohttp_requests_total{status="forwarded", hop="forward"}`
+  and observes the duration the client saw in `ohttp_request_duration_seconds` (until the head
+  of the answer); the receiving gateway counts its own outcome with `mode="forwarded"` and
+  observes no request duration, so sums over all gateways count every request once when
+  `mode="forwarded"` is left out; a replay is counted in `ohttp_replay_rejected_total` once, by
+  the read origin for the receiving gateway's outer 409 and by the receiving gateway when its
+  sealed answer refuses it. `POST /gateway` is
+  unchanged; the forwarded-WRITE route exists only on the new listener.
 - The hub check of a WRITE at an `async-reads` origin (its peer store, with
   `REPLAY_PEER_WAIT_REPLICAS` >= 1) takes one round trip instead of two: the nonce's `SET NX`
   and the peer's `WAIT` go out as one pipeline on one of the peer's `WAIT` connections. A `WAIT`

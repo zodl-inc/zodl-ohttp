@@ -39,4 +39,5 @@ pub struct AppState {
     pub large_response_semaphore: Arc<Semaphore>,
     pub third_party: crate::third_party_cache::ThirdParty,
     pub request_semaphore: Arc<Semaphore>,
+    pub write_forward: Option<Arc<crate::write_forward::Forwarder>>,
 }
