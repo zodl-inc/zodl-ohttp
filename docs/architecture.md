@@ -196,6 +196,15 @@ The same applies to an `async-reads` origin's WRITE check at the hub (its peer s
 acknowledgement there is covered by the standby stores (`REPLAY_STANDBY_URLS`, `SET NX` + `WAIT`)
 or by the origin's own replica wait, and the nonce is written back to the hub.
 
+That check costs one round trip to the hub: the `SET NX` and the hub's `WAIT` are pipelined on
+one of the hub's `WAIT` connections. `WAIT` acknowledges every write its connection made before
+it, so when it acknowledges, the nonce that `SET NX` stored is on the hub's replicas, which is
+what a separate `SET XX` + `WAIT` established before. A short acknowledgement gets one more
+attempt (`SET XX` + `WAIT`); an answer that does not tell whether the nonce was stored (an error
+reply, no reply) is resolved with `SET key value NX GET` and the request's own value before the
+WRITE can run, so a lost reply never turns the request's own nonce into a replay and never
+admits a WRITE whose nonce another request holds.
+
 Every WRITE that the deciding store (the local store in `failover` mode, the hub in
 `async-reads`) admitted is also `SET NX` synchronously at the fallback store (the peers, or a read
 origin's standby stores), and a nonce held there is a replay; an unreachable fallback store keeps

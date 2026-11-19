@@ -41,6 +41,69 @@ lazy_static::lazy_static! {
         &["network", "hop", "backend", "rpc"]
     )
     .unwrap();
+
+    /// `ohttp_write_stage_duration_seconds`: see `observe_write_stage`.
+    static ref OHTTP_WRITE_STAGE_DURATION_SECONDS: HistogramVec = HistogramVec::new(
+        prometheus::HistogramOpts::new(
+            "ohttp_write_stage_duration_seconds",
+            "Time of one stage of a WRITE (a request not on REPLAY_READ_ROUTES) in seconds. stage: local (the local store's SET NX), hub (the hub's SET NX and replica wait of a read origin), standby (the standby store's SET NX of a read origin), replica_wait (the local replica wait), upstream_lwd (the light client server call), upstream_third_party (a third-party upstream call until its response head)"
+        )
+        .buckets(WRITE_STAGE_BUCKETS.to_vec()),
+        &["network", "stage", "result"]
+    )
+    .unwrap();
+}
+
+lazy_static::lazy_static! {
+    /// `ohttp_replay_hub_check_total`: see `record_hub_check_path`.
+    static ref OHTTP_REPLAY_HUB_CHECK_TOTAL: IntCounterVec = IntCounterVec::new(
+        Opts::new(
+            "ohttp_replay_hub_check_total",
+            "WRITE nonce checks at a hub peer with a replica acknowledgement, by path: pipelined (SET NX and WAIT in one round trip on an idle WAIT connection) or main (SET NX on the main connection, then the acknowledgement: no idle WAIT connection, or a pool of one)"
+        ),
+        &["network", "path"]
+    )
+    .unwrap();
+}
+
+/// One hub nonce check went `path` (`pipelined` | `main`).
+pub fn record_hub_check_path(network: &str, path: &str) {
+    OHTTP_REPLAY_HUB_CHECK_TOTAL
+        .with_label_values(&[network, path])
+        .inc();
+}
+
+/// Buckets of `ohttp_write_stage_duration_seconds`: from a store on the same host (well under a
+/// millisecond) to a long round trip between origins and a slow upstream, with bounds every
+/// 25 to 50 ms between 25 ms and 300 ms (then 400 ms), where one round trip between distant
+/// origins falls.
+const WRITE_STAGE_BUCKETS: [f64; 22] = [
+    0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.125, 0.15, 0.175, 0.2, 0.25,
+    0.3, 0.4, 0.5, 0.75, 1.0, 2.5, 5.0, 10.0,
+];
+
+/// One stage of a WRITE took `elapsed` (`ohttp_write_stage_duration_seconds`). `stage` and
+/// `result` come from fixed lists of the call sites (no request identifiers):
+///
+/// - `local`: `new` | `unavailable` (the local store gave no verdict);
+/// - `hub`: `acknowledged` | `short` (taken, the replicas did not acknowledge) | `failed`
+///   (taken, the acknowledgement failed otherwise) | `fresh` (taken, no acknowledgement asked)
+///   | `replay` | `unavailable`;
+/// - `standby`: `fresh` | `replay` | `unavailable`;
+/// - `replica_wait`: `acknowledged` | `failed`;
+/// - `upstream_lwd`, `upstream_third_party`: `ok` | `error`.
+pub fn observe_write_stage(network: &str, stage: &str, result: &str, elapsed: std::time::Duration) {
+    OHTTP_WRITE_STAGE_DURATION_SECONDS
+        .with_label_values(&[network, stage, result])
+        .observe(elapsed.as_secs_f64());
+}
+
+/// The number of observations of one WRITE stage (tests).
+#[cfg(test)]
+pub fn write_stage_count(network: &str, stage: &str, result: &str) -> u64 {
+    OHTTP_WRITE_STAGE_DURATION_SECONDS
+        .with_label_values(&[network, stage, result])
+        .get_sample_count()
 }
 
 lazy_static::lazy_static! {
@@ -534,6 +597,12 @@ pub fn init_metrics() {
         .ok();
     REGISTRY
         .register(Box::new(OHTTP_TRACED_REQUEST_DURATION_SECONDS.clone()))
+        .ok();
+    REGISTRY
+        .register(Box::new(OHTTP_WRITE_STAGE_DURATION_SECONDS.clone()))
+        .ok();
+    REGISTRY
+        .register(Box::new(OHTTP_REPLAY_HUB_CHECK_TOTAL.clone()))
         .ok();
     REGISTRY
         .register(Box::new(OHTTP_REQUESTS_IN_FLIGHT.clone()))
@@ -1978,6 +2047,41 @@ pub fn record_third_party_limited(network: &str, authority: &str) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn write_stages_are_counted_by_stage_and_result() {
+        init_metrics();
+        let net = "write-stage-test";
+        observe_write_stage(
+            net,
+            "hub",
+            "acknowledged",
+            std::time::Duration::from_millis(120),
+        );
+        observe_write_stage(
+            net,
+            "hub",
+            "acknowledged",
+            std::time::Duration::from_millis(80),
+        );
+        observe_write_stage(net, "standby", "fresh", std::time::Duration::from_millis(3));
+        assert_eq!(write_stage_count(net, "hub", "acknowledged"), 2);
+        assert_eq!(write_stage_count(net, "standby", "fresh"), 1);
+        assert_eq!(write_stage_count(net, "hub", "replay"), 0);
+        assert!(WRITE_STAGE_BUCKETS.windows(2).all(|w| w[0] < w[1]));
+        let family = REGISTRY
+            .gather()
+            .into_iter()
+            .find(|f| f.get_name() == "ohttp_write_stage_duration_seconds")
+            .expect("registered");
+        let mut labels: Vec<String> = family.get_metric()[0]
+            .get_label()
+            .iter()
+            .map(|l| l.get_name().to_string())
+            .collect();
+        labels.sort();
+        assert_eq!(labels, ["network", "result", "stage"]);
+    }
+
     #[test]
     fn readiness_waits_60_seconds_of_lwd_failures() {
         use std::time::{Duration, Instant};

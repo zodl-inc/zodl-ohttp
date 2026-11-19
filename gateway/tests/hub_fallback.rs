@@ -28,7 +28,7 @@
 //! store that is unreachable or without replica fails closed; the nonce is written back to `H`;
 //! without a second store nothing changes.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -126,7 +126,26 @@ async fn pump(
 type CommandLog = Arc<Mutex<Vec<String>>>;
 
 struct Store {
-    keys: Mutex<HashSet<String>>,
+    /// The keys and their values.
+    keys: Mutex<HashMap<String, String>>,
+    /// Per connection (numbered in accept order): "<COMMAND> [NX|XX]" and whether the next
+    /// command had already arrived when this one was read (sent in the same pipeline).
+    by_conn: Mutex<Vec<(u64, String, bool)>>,
+    conns: AtomicU64,
+    /// WAIT answers an error (a store that refuses it).
+    wait_error: AtomicBool,
+    /// The next WAIT never answers (a stuck connection).
+    hang_next_wait: AtomicBool,
+    /// A SET read while nothing else waits on its connection holds its reply for up to 200 ms
+    /// to see whether the next command arrives first: one that does was sent before the client
+    /// could have read the reply, in the same pipeline (`by_conn`).
+    detect_pipeline: AtomicBool,
+    /// The next SET answers an error (a store that refuses it).
+    fail_next_set: AtomicBool,
+    /// The next SET is never processed nor answered (a stuck connection, the nonce not stored).
+    hang_next_set: AtomicBool,
+    /// The connection that reads the next WAIT is closed instead of answering it.
+    close_on_next_wait: AtomicBool,
     /// The answer to WAIT: the replicas that acknowledged (0 = a primary whose replicas resync).
     acks: AtomicI64,
     /// Delay before each SET and WAIT reply, in ms: a store a long round trip away.
@@ -139,6 +158,14 @@ impl Default for Store {
     fn default() -> Self {
         Self {
             keys: Mutex::default(),
+            by_conn: Mutex::default(),
+            conns: AtomicU64::new(0),
+            wait_error: AtomicBool::new(false),
+            hang_next_wait: AtomicBool::new(false),
+            detect_pipeline: AtomicBool::new(false),
+            fail_next_set: AtomicBool::new(false),
+            hang_next_set: AtomicBool::new(false),
+            close_on_next_wait: AtomicBool::new(false),
             acks: AtomicI64::new(1),
             delay_ms: AtomicU64::new(0),
             log: Mutex::default(),
@@ -161,7 +188,7 @@ impl Store {
     }
 
     fn has(&self, key: &str) -> bool {
-        self.keys.lock().unwrap().contains(key)
+        self.keys.lock().unwrap().contains_key(key)
     }
 
     /// The node that holds the nonce is lost (a demoted primary the endpoint left behind).
@@ -170,7 +197,15 @@ impl Store {
     }
 
     fn put(&self, key: &str) {
-        self.keys.lock().unwrap().insert(key.to_string());
+        self.keys
+            .lock()
+            .unwrap()
+            .insert(key.to_string(), "1".to_string());
+    }
+
+    /// The commands of every connection, in arrival order (`by_conn`).
+    fn commands(&self) -> Vec<(u64, String, bool)> {
+        self.by_conn.lock().unwrap().clone()
     }
 
     fn set_acks(&self, n: i64) {
@@ -187,11 +222,58 @@ impl Store {
     }
 
     async fn serve(self: Arc<Self>, sock: TcpStream) {
+        let conn = self.conns.fetch_add(1, Ordering::SeqCst);
         let (r, mut w) = sock.into_split();
         let mut r = BufReader::new(r);
         while let Some(args) = read_command(&mut r).await {
             let delay = self.delay_ms.load(Ordering::SeqCst);
             let cmd = args.first().map(|c| c.to_ascii_uppercase());
+            {
+                let flag = args
+                    .iter()
+                    .skip(3)
+                    .map(|a| a.to_ascii_uppercase())
+                    .find(|a| a == "NX" || a == "XX")
+                    .unwrap_or_default();
+                let get = args.iter().skip(3).any(|a| a.eq_ignore_ascii_case("GET"));
+                let entry = format!(
+                    "{} {flag}{}",
+                    cmd.clone().unwrap_or_default(),
+                    if get { " GET" } else { "" }
+                );
+                let mut pipelined = !r.buffer().is_empty();
+                if !pipelined
+                    && cmd.as_deref() == Some("SET")
+                    && !get
+                    && self.detect_pipeline.load(Ordering::SeqCst)
+                {
+                    pipelined = matches!(
+                        tokio::time::timeout(Duration::from_millis(200), r.fill_buf()).await,
+                        Ok(Ok(next)) if !next.is_empty()
+                    );
+                }
+                self.by_conn
+                    .lock()
+                    .unwrap()
+                    .push((conn, entry.trim_end().to_string(), pipelined));
+            }
+            if cmd.as_deref() == Some("WAIT") && self.hang_next_wait.swap(false, Ordering::SeqCst) {
+                std::future::pending::<()>().await;
+            }
+            if cmd.as_deref() == Some("SET") && self.hang_next_set.swap(false, Ordering::SeqCst) {
+                std::future::pending::<()>().await;
+            }
+            if cmd.as_deref() == Some("WAIT")
+                && self.close_on_next_wait.swap(false, Ordering::SeqCst)
+            {
+                return;
+            }
+            if cmd.as_deref() == Some("SET") && self.fail_next_set.swap(false, Ordering::SeqCst) {
+                if w.write_all(b"-ERR SET refused\r\n").await.is_err() {
+                    return;
+                }
+                continue;
+            }
             if let Some((name, log)) = self.log.lock().unwrap().as_ref() {
                 let flag = args
                     .iter()
@@ -222,16 +304,26 @@ impl Store {
             "SET" => {
                 let key = args[1].clone();
                 let flags: Vec<String> = args[3..].iter().map(|a| a.to_ascii_uppercase()).collect();
+                let get = flags.iter().any(|f| f == "GET");
                 let mut keys = self.keys.lock().unwrap();
-                let exists = keys.contains(&key);
-                if (flags.iter().any(|f| f == "NX") && exists)
-                    || (flags.iter().any(|f| f == "XX") && !exists)
+                let old = keys.get(&key).cloned();
+                let bulk = |v: &Option<String>| match v {
+                    Some(v) => format!("${}\r\n{v}\r\n", v.len()),
+                    None => "$-1\r\n".into(),
+                };
+                if (flags.iter().any(|f| f == "NX") && old.is_some())
+                    || (flags.iter().any(|f| f == "XX") && old.is_none())
                 {
-                    return "$-1\r\n".into();
+                    return if get { bulk(&old) } else { "$-1\r\n".into() };
                 }
-                keys.insert(key);
-                "+OK\r\n".into()
+                keys.insert(key, args[2].clone());
+                if get {
+                    bulk(&old)
+                } else {
+                    "+OK\r\n".into()
+                }
             }
+            "WAIT" if self.wait_error.load(Ordering::SeqCst) => "-ERR WAIT refused\r\n".into(),
             "WAIT" => format!(":{}\r\n", self.acks.load(Ordering::SeqCst)),
             "GET" => "$-1\r\n".into(),
             _ => "+OK\r\n".into(),
@@ -670,4 +762,242 @@ async fn local_replicas_decide(net: &str, fail_closed_writes: bool) {
         c.hub_fallback().unwrap().pending_len() == 0
     })
     .await;
+}
+
+/// Observations of `ohttp_write_stage_duration_seconds{network, stage, result}`.
+fn stage_count(network: &str, stage: &str, result: &str) -> u64 {
+    ohttp_gateway::health::REGISTRY
+        .gather()
+        .iter()
+        .find(|f| f.get_name() == "ohttp_write_stage_duration_seconds")
+        .and_then(|f| {
+            f.get_metric()
+                .iter()
+                .find(|m| {
+                    let has = |n: &str, v: &str| {
+                        m.get_label()
+                            .iter()
+                            .any(|l| l.get_name() == n && l.get_value() == v)
+                    };
+                    has("network", network) && has("stage", stage) && has("result", result)
+                })
+                .map(|m| m.get_histogram().get_sample_count())
+        })
+        .unwrap_or(0)
+}
+
+/// Wait until every `WAIT` connection of the hub is open (opened in the background at startup).
+async fn hub_wait_conns_open(c: &ResponseCache) {
+    let peers = c.replay_peers().expect("a hub");
+    until("hub WAIT connections open", Duration::from_secs(10), || {
+        peers.wait_conns_open().iter().all(|n| *n > 0)
+    })
+    .await;
+}
+
+/// Admission of a WRITE that both stores must take (`WritePolicy::BOTH_STORES`).
+async fn admit_both(c: &ResponseCache, hash: &[u8]) -> anyhow::Result<bool> {
+    let local = c.check_replay_detailed(hash).await?;
+    if local.verdict() == LocalReplayCheck::Replay {
+        return Ok(false);
+    }
+    let check = c
+        .replicate_nonce_checked(&local, RouteClass::Write, WritePolicy::BOTH_STORES)
+        .await?;
+    if check.replay() {
+        return Ok(false);
+    }
+    c.replicate_write_to_standby(&local, check);
+    Ok(true)
+}
+
+/// The hub's `SET NX` of a WRITE and its `WAIT` go out together, on one `WAIT` connection: the
+/// `WAIT` had already arrived when the store read the `SET NX`, and no `SET XX` follows. The
+/// verdicts are those of the two round trips before: taken and acknowledged runs; held at the
+/// hub is a replay; short at the hub takes the short-acknowledgement path to the standby store.
+#[tokio::test]
+async fn read_origin_takes_the_hub_nonce_and_its_wait_in_one_round_trip() {
+    let net = "testnet-hub-one-rtt";
+    let w = world(net, true).await;
+    hub_wait_conns_open(&w.read_origin).await;
+    w.hub.detect_pipeline.store(true, Ordering::SeqCst);
+    let write = request("one round trip");
+    let before = w.hub.commands().len();
+    assert!(admit(&w.read_origin, &write, RouteClass::Write)
+        .await
+        .unwrap());
+    let sent: Vec<(u64, String, bool)> = w.hub.commands()[before..].to_vec();
+    let set = sent
+        .iter()
+        .position(|(_, c, _)| c == "SET NX")
+        .unwrap_or_else(|| panic!("no SET NX: {sent:?}"));
+    let (conn, _, pipelined) = &sent[set];
+    assert!(*pipelined, "the WAIT went out with the SET NX: {sent:?}");
+    assert_eq!(
+        sent.get(set + 1).map(|(c, cmd, _)| (*c, cmd.as_str())),
+        Some((*conn, "WAIT")),
+        "the WAIT right behind the SET NX on its connection: {sent:?}"
+    );
+    assert!(
+        !sent.iter().any(|(_, c, _)| c == "SET XX"),
+        "no second round trip: {sent:?}"
+    );
+    assert!(w.hub.has(&key(net, &write)) && w.standby.has(&key(net, &write)));
+    assert_eq!(stage_count(net, "hub", "acknowledged"), 1);
+    w.hub.detect_pipeline.store(false, Ordering::SeqCst);
+    assert_eq!(stage_count(net, "standby", "fresh"), 1);
+
+    // Held at the hub: a replay, as before.
+    let held = request("held at the hub");
+    w.hub.put(&key(net, &held));
+    assert!(!admit(&w.read_origin, &held, RouteClass::Write)
+        .await
+        .unwrap());
+
+    // Short at the hub: the second attempt (SET XX + WAIT) is short too, and the standby store
+    // confirms it (the short-acknowledgement path, unchanged).
+    w.hub.set_acks(0);
+    let short = request("short at the hub");
+    let before = w.hub.commands().len();
+    assert!(admit(&w.read_origin, &short, RouteClass::Write)
+        .await
+        .unwrap());
+    let sent: Vec<String> = w.hub.commands()[before..]
+        .iter()
+        .map(|(_, c, _)| c.clone())
+        .collect();
+    assert_eq!(
+        sent.iter().filter(|c| *c == "SET XX").count(),
+        1,
+        "one more attempt after the pipelined WAIT: {sent:?}"
+    );
+    assert_eq!(fallback(net, "hub_short_ack", "accepted"), 1.0);
+    assert_eq!(stage_count(net, "hub", "replay"), 1);
+    assert_eq!(stage_count(net, "hub", "short"), 1);
+}
+
+/// A pipeline whose SET NX never reached the store (a stuck connection), and one whose
+/// connection breaks after the SET NX: both are asked again on another connection and the
+/// WRITE runs, for each policy, with the nonce at the hub exactly once.
+#[tokio::test]
+async fn read_origin_retries_a_pipeline_that_stuck_or_broke() {
+    let net = "testnet-hub-stuck";
+    let w = world(net, true).await;
+    for (tag, both) in [("one-sided", false), ("both stores", true)] {
+        for case in ["SET never processed", "connection closed on WAIT"] {
+            hub_wait_conns_open(&w.read_origin).await;
+            w.hub.detect_pipeline.store(true, Ordering::SeqCst);
+            let before = w.hub.commands().len();
+            match case {
+                "SET never processed" => w.hub.hang_next_set.store(true, Ordering::SeqCst),
+                _ => w.hub.close_on_next_wait.store(true, Ordering::SeqCst),
+            }
+            let write = request(&format!("{case}, {tag}"));
+            let admitted = if both {
+                admit_both(&w.read_origin, &write).await
+            } else {
+                admit(&w.read_origin, &write, RouteClass::Write).await
+            };
+            assert!(admitted.unwrap(), "{case}, {tag}");
+            assert!(w.hub.has(&key(net, &write)), "{case}, {tag}");
+            let sent = w.hub.commands()[before..].to_vec();
+            assert!(
+                sent.iter()
+                    .find(|(_, c, _)| c == "SET NX")
+                    .is_some_and(|e| e.2)
+                    && sent.iter().any(|(_, c, _)| c == "SET NX GET"),
+                "{case}, {tag}: the pipeline, then asked again: {sent:?}"
+            );
+            // A replay of it afterwards is still refused.
+            assert!(!admit(&w.read_origin, &write, RouteClass::Write)
+                .await
+                .unwrap());
+        }
+    }
+}
+
+/// A `WAIT` the hub refuses with an error (it may also have been the `SET NX`'s): the nonce is
+/// asked for once more (`SET ... NX GET`), found to be this request's, and the acknowledgement
+/// fails closed as an attempt that failed before did. A pipeline that never answers (a stuck
+/// connection) is asked again on another connection, for every policy: the nonce is this
+/// request's, and the acknowledgement on a working connection lets the WRITE run.
+#[tokio::test]
+async fn read_origin_resolves_an_unclear_hub_answer_without_a_replay() {
+    let net = "testnet-hub-unclear";
+    let w = world(net, true).await;
+    hub_wait_conns_open(&w.read_origin).await;
+
+    w.hub.wait_error.store(true, Ordering::SeqCst);
+    let refused = request("WAIT refused");
+    let err = admit(&w.read_origin, &refused, RouteClass::Write)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("not acknowledged"), "{err}");
+    assert!(w.hub.has(&key(net, &refused)), "taken by this request");
+    let sent: Vec<String> = w.hub.commands().iter().map(|(_, c, _)| c.clone()).collect();
+    assert!(sent.iter().any(|c| c == "SET NX"), "{sent:?}");
+    assert!(
+        sent.iter().any(|c| c == "SET NX GET"),
+        "asked for the nonce again: {sent:?}"
+    );
+    // The same error while another request holds the nonce: a replay, never admitted.
+    let held = request("WAIT refused, held elsewhere");
+    w.hub.put(&key(net, &held));
+    assert!(!admit(&w.read_origin, &held, RouteClass::Write)
+        .await
+        .unwrap());
+    w.hub.wait_error.store(false, Ordering::SeqCst);
+    // An error on the SET itself (also asked again, the store refuses once): this request's
+    // nonce was not stored by the pipeline, the second ask stores it.
+    hub_wait_conns_open(&w.read_origin).await;
+    w.hub.detect_pipeline.store(true, Ordering::SeqCst);
+    let before = w.hub.commands().len();
+    w.hub.fail_next_set.store(true, Ordering::SeqCst);
+    let set_refused = request("SET refused once");
+    assert!(admit(&w.read_origin, &set_refused, RouteClass::Write)
+        .await
+        .unwrap());
+    assert!(w.hub.has(&key(net, &set_refused)));
+    let sent = w.hub.commands()[before..].to_vec();
+    assert!(
+        sent.iter()
+            .find(|(_, c, _)| c == "SET NX")
+            .is_some_and(|e| e.2)
+            && sent.iter().any(|(_, c, _)| c == "SET NX GET"),
+        "the pipeline, then asked again: {sent:?}"
+    );
+    w.hub.detect_pipeline.store(false, Ordering::SeqCst);
+
+    for (tag, both) in [("one-sided", false), ("both stores", true)] {
+        // Every connection open again (a failed or stuck one is replaced in the background),
+        // so the pipeline runs.
+        hub_wait_conns_open(&w.read_origin).await;
+        w.hub.detect_pipeline.store(true, Ordering::SeqCst);
+        w.hub.hang_next_wait.store(true, Ordering::SeqCst);
+        let before = w.hub.commands().len();
+        let stuck = request(&format!("stuck pipeline, {tag}"));
+        let admitted = if both {
+            admit_both(&w.read_origin, &stuck).await
+        } else {
+            admit(&w.read_origin, &stuck, RouteClass::Write).await
+        };
+        assert!(
+            admitted.unwrap(),
+            "{tag}: asked again on another connection"
+        );
+        assert!(w.hub.has(&key(net, &stuck)));
+        let sent = w.hub.commands()[before..].to_vec();
+        let first = sent
+            .iter()
+            .find(|(_, c, _)| c == "SET NX")
+            .unwrap_or_else(|| panic!("{tag}: no SET NX: {sent:?}"));
+        let retry = sent
+            .iter()
+            .find(|(_, c, _)| c == "SET NX GET")
+            .unwrap_or_else(|| panic!("{tag}: no retry: {sent:?}"));
+        assert!(
+            first.2 && retry.0 != first.0,
+            "{tag}: the pipeline, then the retry on another connection: {sent:?}"
+        );
+    }
 }
