@@ -26,9 +26,20 @@
 //! - [`core::policy`]: the parsers of the static alias tables (`BACKENDS`, `BACKENDS_POLICY`,
 //!   `BACKEND_HEADERS`).
 //! - [`core::provider`]: the [`core::provider::Provider`] interface and its verdict types.
+//! - [`core::query`]: the per-route query rules (`THIRD_PARTY_QUERY_RULES`).
+//! - [`core::value_source`]: the lists of allowed query values read from an upstream
+//!   (`THIRD_PARTY_QUERY_VALUE_SOURCES`): grammar, extraction, acceptance; the gateway fetches.
 //! - [`generic`]: the declarative provider (route policy and fixed upstream headers).
+//! - [`keyed`]: generic providers with a key header and a query rule on every route, refused at
+//!   construction otherwise; `cmc`, `swapkit` (cargo features of the same names, on by default)
+//!   are its kinds, assigned by the configuration file only.
 //! - [`registry`]: the provider of an alias.
 
+#[cfg(feature = "cmc")]
+pub mod cmc;
 pub mod core;
 pub mod generic;
+pub mod keyed;
 pub mod registry;
+#[cfg(feature = "swapkit")]
+pub mod swapkit;

@@ -10,6 +10,14 @@ publish = false
 
 [dependencies]
 anyhow = "1.0"
+# Value-source documents are JSON.
+serde_json = "1.0"
+
+[features]
+# One feature per provider kind beyond the generic one; the gateway builds with all of them.
+default = ["cmc", "swapkit"]
+cmc = []
+swapkit = []
 
 [lib]
 name = "zodl_ohttp_integrations"

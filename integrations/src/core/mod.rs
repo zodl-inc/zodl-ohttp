@@ -18,4 +18,6 @@
 
 pub mod policy;
 pub mod provider;
+pub mod query;
 pub mod route;
+pub mod value_source;
