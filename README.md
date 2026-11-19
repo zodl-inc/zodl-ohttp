@@ -21,6 +21,7 @@ See [docs/architecture.md](docs/architecture.md) for the system design and threa
 ```
 ohttp/
 ├── gateway/              # Rust OHTTP gateway (crate zodl-ohttp-gateway, not on crates.io): HPKE, lightwalletd proxy, caches
+├── integrations/         # Third-party integrations of the gateway (route policy, credentials; no I/O)
 ├── relay-simulator/      # Test relay for local end-to-end runs
 ├── client/               # Rust client library (zodl-ohttp-client), shared by the wallet SDKs
 ├── e2e-client/           # Minimal end-to-end client (one real exchange through a relay)
@@ -40,7 +41,10 @@ the response. Replay protection, response caching, a signed key-configuration en
 (`/ohttp-configs/signed`) and Prometheus metrics are built in.
 
 See [gateway/README.md](gateway/README.md) for endpoints, metrics and key rotation, and
-[gateway/CONFIG.md](gateway/CONFIG.md) for every environment variable.
+[gateway/CONFIG.md](gateway/CONFIG.md) for every environment variable. The rules of the
+third-party aliases (route policy, credentials) live in `integrations/`, a library the gateway
+links in process; it does no I/O. Both crates are built into the gateway image only (not
+published); its build context is the repository root.
 
 ### Relay Simulator (`relay-simulator/`)
 

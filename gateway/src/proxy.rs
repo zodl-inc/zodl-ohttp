@@ -34,7 +34,7 @@ use hyper_util::{
 };
 use std::pin::Pin;
 use std::sync::{Arc, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
@@ -260,36 +260,15 @@ pub(crate) fn count_grpc_messages(buf: &[u8], up_to: usize) -> usize {
     count
 }
 
-/// The `BACKENDS_POLICY` entry of `policies` that admits `method` and `path`, if any.
-///
-/// Path matching semantics:
-/// - EXACT unless entry ends with /*
-/// - GET /v0/tokens matches only /v0/tokens (query OK), NOT /v0/tokens/extra or /v0/tokensX
-/// - GET /rounds/* matches /rounds/<anything> (segment-bounded)
-/// - GET /* matches everything
+/// The `BACKENDS_POLICY` entry of `policies` that admits `method` and `path`, if any (the route
+/// grammar of [`zodl_ohttp_integrations::core::route`]: exact with a query string allowed, or a
+/// segment-bounded `/*` prefix; `*` any method).
 fn matching_rule<'a>(
     policies: &'a [(String, String)],
     method: &str,
     path: &str,
 ) -> Option<&'a (String, String)> {
-    policies
-        .iter()
-        .find(|(allowed_method, allowed_path_prefix)| {
-            // Method wildcard: * matches any method
-            let method_matches =
-                allowed_method == "*" || method.eq_ignore_ascii_case(allowed_method);
-            method_matches
-                && if let Some(prefix_without_wildcard) = allowed_path_prefix.strip_suffix("/*") {
-                    // Wildcard case: /foo/* matches /foo/bar but NOT /foobar; /* matches everything
-                    prefix_without_wildcard.is_empty()
-                        || path == prefix_without_wildcard
-                        || path.starts_with(&format!("{}/", prefix_without_wildcard))
-                } else {
-                    // Exact match: the prefix, or prefix + query string (no path extension)
-                    path == allowed_path_prefix.as_str()
-                        || path.starts_with(&format!("{}?", allowed_path_prefix))
-                }
-        })
+    zodl_ohttp_integrations::core::route::matching_rule(policies, method, path)
 }
 
 /// The path of a `BACKENDS` (third-party) request as logged: the path pattern of the policy entry
@@ -374,20 +353,7 @@ pub fn rpc_label_in(config: &Config, inner_request: &InnerRequest, route: &Route
 
 /// Paths no policy admits: directory traversal, encoded dots, double slashes.
 fn path_trick(path: &str) -> Option<&'static str> {
-    // Reject paths with directory traversal or encoding tricks
-    if path.contains("..") || path.contains("%2e") || path.contains("%2E") {
-        return Some("path contains directory traversal");
-    }
-    // Reject paths with double slashes (beyond the first byte; bytes, since the path is not
-    // validated yet and may start with a multi-byte character)
-    if path
-        .as_bytes()
-        .get(1..)
-        .is_some_and(|rest| rest.windows(2).any(|w| w == b"//"))
-    {
-        return Some("path contains double slashes");
-    }
-    None
+    zodl_ohttp_integrations::core::route::path_trick(path)
 }
 
 /// The request-side path rejections ([`path_trick`], [`validate_path`]) for a
@@ -409,30 +375,72 @@ fn check_dynamic_policy(host: &DynamicHost, method: &str, path: &str) -> Option<
     }
 }
 
-/// The policy verdict for a request the forwarder resolved: the routes of `dynamic` when the
-/// authority is a dynamic host, the `BACKENDS_POLICY` of a `BACKENDS` alias otherwise.
-fn route_denial(
+/// The verdict of a request the forwarder resolved and, when admitted, the credential headers
+/// of its upstream request: for a dynamic host its list's routes and no header; for a
+/// `BACKENDS` alias its provider's admission, query rule and upstream headers; for any other
+/// authority (a gateway host) no check here and its `BACKEND_HEADERS` entry, if any.
+fn forward_admission(
     config: &Config,
     dynamic: Option<&DynamicHost>,
     query_admitted: Option<bool>,
     inner_request: &InnerRequest,
-) -> Option<&'static str> {
+) -> Result<Vec<(String, String)>, &'static str> {
+    use zodl_ohttp_integrations::core::provider::Provider;
     if let Some(host) = dynamic {
-        return check_dynamic_policy(host, &inner_request.method, &inner_request.path);
+        return match check_dynamic_policy(host, &inner_request.method, &inner_request.path) {
+            Some(reason) => Err(reason),
+            None => Ok(Vec::new()),
+        };
     }
-    if !config
-        .backends
-        .contains_key(&inner_request.authority.to_ascii_lowercase())
-    {
-        return None;
+    let authority_lower = inner_request.authority.to_ascii_lowercase();
+    let registry = integrations(config);
+    let Some(provider) = registry.provider(&authority_lower) else {
+        return Ok(config
+            .backend_headers
+            .get(&authority_lower)
+            .cloned()
+            .unwrap_or_default());
+    };
+    let view = request_view(inner_request);
+    let admitted = alias_admission(config, &provider, &authority_lower, &view, query_admitted)?;
+    provider
+        .upstream_headers(&view, &admitted, SystemTime::now())
+        .map_err(|denial| denial.reason())
+}
+
+/// The parts of `inner_request` a provider sees.
+fn request_view(
+    inner_request: &InnerRequest,
+) -> zodl_ohttp_integrations::core::provider::RequestView<'_> {
+    zodl_ohttp_integrations::core::provider::RequestView {
+        method: &inner_request.method,
+        path: &inner_request.path,
+        headers: &inner_request.headers,
+        body: &inner_request.body,
     }
-    check_operation_policy_with(
-        config,
-        &inner_request.authority,
-        &inner_request.method,
-        &inner_request.path,
-        query_admitted,
-    )
+}
+
+/// The admission of a request to the `BACKENDS` alias `authority_lower` by its provider (path
+/// tricks, operation policy), then, for a route with a `THIRD_PARTY_QUERY_RULES` entry, its query
+/// rule: the request's verdict when it was taken already (`query_admitted`), else evaluated now.
+fn alias_admission(
+    config: &Config,
+    provider: &zodl_ohttp_integrations::generic::Generic<'_>,
+    authority_lower: &str,
+    view: &zodl_ohttp_integrations::core::provider::RequestView<'_>,
+    query_admitted: Option<bool>,
+) -> Result<zodl_ohttp_integrations::core::provider::Admitted, &'static str> {
+    use zodl_ohttp_integrations::core::provider::Provider;
+    let admitted = provider.admit(view).map_err(|denial| denial.reason())?;
+    let query_ok = query_admitted.unwrap_or_else(|| {
+        config
+            .third_party_query_rules
+            .admits(authority_lower, view.method, view.path)
+    });
+    if !query_ok {
+        return Err("query not allowed");
+    }
+    Ok(admitted)
 }
 
 /// Check if a request matches the per-alias operation policy and, for a route with a
@@ -447,48 +455,39 @@ fn check_operation_policy(
     method: &str,
     path: &str,
 ) -> Option<&'static str> {
-    check_operation_policy_with(config, authority, method, path, None)
-}
-
-/// [`check_operation_policy`] with the request's query verdict when it was taken already
-/// (`query_admitted`), else evaluated now.
-fn check_operation_policy_with(
-    config: &Config,
-    authority: &str,
-    method: &str,
-    path: &str,
-    query_admitted: Option<bool>,
-) -> Option<&'static str> {
-    if let Some(reason) = path_trick(path) {
-        return Some(reason);
-    }
-
     let authority_lower = authority.to_ascii_lowercase();
-
-    // If policy exists for this alias, check it
-    if let Some(policies) = config.backends_policy.get(&authority_lower) {
-        if matching_rule(policies, method, path).is_none() {
-            return Some("operation not in alias policy");
+    let registry = integrations(config);
+    match registry.provider(&authority_lower) {
+        Some(provider) => {
+            let view = zodl_ohttp_integrations::core::provider::RequestView {
+                method,
+                path,
+                headers: &[],
+                body: &[],
+            };
+            alias_admission(config, &provider, &authority_lower, &view, None).err()
         }
-    } else if config.backends.contains_key(&authority_lower)
-        && !config.backends_policy_default_allow
-    {
-        // No policy for this alias: check default
-        return Some("alias has no operation policy");
+        // Not an alias (a gateway host): its entry only, if it has one, then the query rules
+        // (which name aliases only, so they admit it).
+        None => {
+            if let Err(denial) = zodl_ohttp_integrations::generic::check_policy(
+                config
+                    .backends_policy
+                    .get(&authority_lower)
+                    .map(Vec::as_slice),
+                false,
+                config.backends_policy_default_allow,
+                method,
+                path,
+            ) {
+                return Some(denial.reason());
+            }
+            (!config
+                .third_party_query_rules
+                .admits(&authority_lower, method, path))
+            .then_some("query not allowed")
+        }
     }
-
-    // An allowed operation whose exact route has a THIRD_PARTY_QUERY_RULES entry must carry
-    // one of the query shapes listed there.
-    let admitted = query_admitted.unwrap_or_else(|| {
-        config
-            .third_party_query_rules
-            .admits(&authority_lower, method, path)
-    });
-    if !admitted {
-        return Some("query not allowed");
-    }
-
-    None
 }
 
 /// Whether `inner_request` maps to a `BACKENDS` entry whose policy refuses it: such a request
@@ -511,17 +510,18 @@ pub fn policy_denies_in(
     if let Some(host) = route.dynamic() {
         return check_dynamic_policy(host, &inner_request.method, &inner_request.path).is_some();
     }
-    config
-        .backends
-        .contains_key(&inner_request.authority.to_ascii_lowercase())
-        && check_operation_policy_with(
+    let authority_lower = inner_request.authority.to_ascii_lowercase();
+    let registry = integrations(config);
+    registry.provider(&authority_lower).is_some_and(|provider| {
+        alias_admission(
             config,
-            &inner_request.authority,
-            &inner_request.method,
-            &inner_request.path,
+            &provider,
+            &authority_lower,
+            &request_view(inner_request),
             route.query_admitted,
         )
-        .is_some()
+        .is_err()
+    })
 }
 
 /// Whether a request to a `GATEWAY_HOSTS` authority (the light client server) is refused by
@@ -539,6 +539,16 @@ pub fn gateway_host_policy_denies(config: &Config, inner_request: &InnerRequest)
         && config.backends_policy.contains_key(&host)
         && check_operation_policy(config, &host, &inner_request.method, &inner_request.path)
             .is_some()
+}
+
+/// The provider registry over the static alias tables of `config`.
+pub(crate) fn integrations(config: &Config) -> zodl_ohttp_integrations::registry::Registry<'_> {
+    zodl_ohttp_integrations::registry::Registry {
+        backends: &config.backends,
+        policy: &config.backends_policy,
+        default_allow: config.backends_policy_default_allow,
+        headers: &config.backend_headers,
+    }
 }
 
 /// A gRPC call (`content-type: application/grpc...`): its upstream also gets `grpc-request-id`.
@@ -1282,13 +1292,16 @@ async fn forward_to_backend_internal(
 
     // Check operation policy for mapped backends
     let authority_lower = inner_request.authority.to_ascii_lowercase();
-    {
-        if let Some(reason) = route_denial(
-            config,
-            dynamic.as_deref(),
-            route.query_admitted,
-            inner_request,
-        ) {
+    // The credential headers are taken with the verdict, so that a request is either refused here
+    // or forwarded with them, never without.
+    let credentials = match forward_admission(
+        config,
+        dynamic.as_deref(),
+        route.query_admitted,
+        inner_request,
+    ) {
+        Ok(credentials) => credentials,
+        Err(reason) => {
             warn!(
                 policy = "deny",
                 request_id = ?request_id,
@@ -1319,7 +1332,7 @@ async fn forward_to_backend_internal(
                 body: b"policy denied".to_vec(),
             });
         }
-    }
+    };
 
     // The per-host cap of a dynamic host (its source's `rate_limit`): inner 429, no upstream call.
     if let Some(retry_after) = dynamic_host_limited(config, dynamic.as_deref()) {
@@ -1513,16 +1526,10 @@ async fn forward_to_backend_internal(
         req_builder = req_builder.header("grpc-accept-encoding", "identity");
     }
 
-    // Inject per-backend credentials (REPLACES any client auth, never appends). Never for a
-    // dynamic host: credentials belong to `BACKENDS` aliases only.
-    if let Some(extra) = config
-        .backend_headers
-        .get(&authority_lower)
-        .filter(|_| dynamic.is_none())
-    {
-        for (name, value) in extra {
-            req_builder = req_builder.header(name.as_str(), value.as_str());
-        }
+    // Per-backend credentials (added; the client's own auth headers are never forwarded). None
+    // for a dynamic host: credentials belong to `BACKENDS` aliases only.
+    for (name, value) in credentials {
+        req_builder = req_builder.header(name, value);
     }
     let http_request = req_builder
         .body(Full::new(Bytes::from(inner_request.body.clone())))
@@ -1886,13 +1893,16 @@ pub async fn forward_to_backend_stream_in(
 
     // Check operation policy for mapped backends
     let authority_lower = inner_request.authority.to_ascii_lowercase();
-    {
-        if let Some(reason) = route_denial(
-            config,
-            dynamic.as_deref(),
-            route.query_admitted,
-            inner_request,
-        ) {
+    // The credential headers are taken with the verdict, so that a request is either refused here
+    // or forwarded with them, never without.
+    let credentials = match forward_admission(
+        config,
+        dynamic.as_deref(),
+        route.query_admitted,
+        inner_request,
+    ) {
+        Ok(credentials) => credentials,
+        Err(reason) => {
             warn!(
                 policy = "deny",
                 request_id = ?request_id,
@@ -1929,7 +1939,7 @@ pub async fn forward_to_backend_stream_in(
                 })),
             ));
         }
-    }
+    };
 
     // The per-host cap of a dynamic host (its source's `rate_limit`): inner 429, no upstream call.
     if let Some(retry_after) = dynamic_host_limited(config, dynamic.as_deref()) {
@@ -2138,16 +2148,10 @@ pub async fn forward_to_backend_stream_in(
         req_builder = req_builder.header("grpc-accept-encoding", "identity");
     }
 
-    // Inject per-backend credentials. Never for a dynamic host: credentials belong to
-    // `BACKENDS` aliases only.
-    if let Some(extra) = config
-        .backend_headers
-        .get(&authority_lower)
-        .filter(|_| dynamic.is_none())
-    {
-        for (name, value) in extra {
-            req_builder = req_builder.header(name.as_str(), value.as_str());
-        }
+    // Per-backend credentials (added; the client's own auth headers are never forwarded). None
+    // for a dynamic host: credentials belong to `BACKENDS` aliases only.
+    for (name, value) in credentials {
+        req_builder = req_builder.header(name, value);
     }
 
     let http_request = req_builder
@@ -4900,5 +4904,143 @@ mod stream_tests {
     #[tokio::test]
     async fn https_backend_client_is_shared() {
         assert!(std::ptr::eq(https_backend_client(), https_backend_client()));
+    }
+}
+
+#[cfg(test)]
+mod forward_admission_tests {
+    use super::*;
+
+    fn pairs(list: &[(&str, &str)]) -> Vec<(String, String)> {
+        list.iter()
+            .map(|(a, b)| (a.to_string(), b.to_string()))
+            .collect()
+    }
+
+    fn config(default_allow: bool) -> Config {
+        let mut c = crate::config::test_config();
+        c.gateway_hosts = vec!["gw.example".to_string()];
+        c.backends = [
+            ("keyed.example", "https://keyed-api.example"),
+            ("open.example", "https://open-api.example"),
+        ]
+        .into_iter()
+        .map(|(a, u)| (a.to_string(), u.to_string()))
+        .collect();
+        c.backends_policy = [("keyed.example", pairs(&[("GET", "/v1/x")]))]
+            .into_iter()
+            .map(|(a, p)| (a.to_string(), p))
+            .collect();
+        c.backends_policy_default_allow = default_allow;
+        c.backend_headers = [
+            ("keyed.example", pairs(&[("X-Key", "k1"), ("X-Key", "k2")])),
+            ("open.example", pairs(&[("Authorization", "Bearer t")])),
+            ("gw.example", pairs(&[("X-Gw", "g")])),
+        ]
+        .into_iter()
+        .map(|(a, h)| (a.to_string(), h))
+        .collect();
+        c
+    }
+
+    fn request(authority: &str, method: &str, path: &str) -> InnerRequest {
+        InnerRequest {
+            method: method.to_string(),
+            path: path.to_string(),
+            authority: authority.to_string(),
+            headers: pairs(&[("authorization", "Bearer client")]),
+            body: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn an_admitted_alias_request_carries_its_headers_in_order() {
+        let c = config(false);
+        assert_eq!(
+            forward_admission(
+                &c,
+                None,
+                None,
+                &request("Keyed.example", "GET", "/v1/x?a=1")
+            ),
+            Ok(pairs(&[("X-Key", "k1"), ("X-Key", "k2")]))
+        );
+    }
+
+    #[test]
+    fn a_refused_alias_request_gets_its_reason_and_no_header() {
+        let c = config(true);
+        assert_eq!(
+            forward_admission(&c, None, None, &request("keyed.example", "POST", "/v1/x")),
+            Err("operation not in alias policy")
+        );
+        assert_eq!(
+            forward_admission(&c, None, None, &request("keyed.example", "GET", "/v1/../x")),
+            Err("path contains directory traversal")
+        );
+        // A query verdict taken earlier is the one that counts.
+        assert_eq!(
+            forward_admission(
+                &c,
+                None,
+                Some(false),
+                &request("keyed.example", "GET", "/v1/x")
+            ),
+            Err("query not allowed")
+        );
+    }
+
+    #[test]
+    fn an_alias_without_policy_follows_the_default() {
+        assert_eq!(
+            forward_admission(
+                &config(false),
+                None,
+                None,
+                &request("open.example", "GET", "/y")
+            ),
+            Err("alias has no operation policy")
+        );
+        assert_eq!(
+            forward_admission(
+                &config(true),
+                None,
+                None,
+                &request("open.example", "GET", "/y")
+            ),
+            Ok(pairs(&[("Authorization", "Bearer t")]))
+        );
+    }
+
+    #[test]
+    fn other_authorities_get_their_table_entry_without_a_check() {
+        let c = config(false);
+        assert_eq!(
+            forward_admission(&c, None, None, &request("gw.example", "POST", "/any")),
+            Ok(pairs(&[("X-Gw", "g")]))
+        );
+        assert_eq!(
+            forward_admission(&c, None, None, &request("unknown.example", "GET", "/")),
+            Ok(Vec::new())
+        );
+    }
+
+    #[test]
+    fn the_handler_precheck_agrees_with_the_forward() {
+        let c = config(false);
+        let route = RouteContext::default();
+        for (authority, method, path) in [
+            ("keyed.example", "GET", "/v1/x"),
+            ("keyed.example", "POST", "/v1/x"),
+            ("open.example", "GET", "/y"),
+            ("gw.example", "GET", "/z"),
+        ] {
+            let req = request(authority, method, path);
+            assert_eq!(
+                policy_denies_in(&c, &req, &route),
+                forward_admission(&c, None, None, &req).is_err(),
+                "{authority} {method} {path}"
+            );
+        }
     }
 }

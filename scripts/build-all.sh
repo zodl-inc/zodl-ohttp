@@ -39,7 +39,12 @@ build_component() {
         return 1
     fi
 
-    docker build -t "ohttp-$component:latest" .
+    # The gateway builds from the repository root (the integrations crate is a path dependency).
+    if [ "$component" = gateway ]; then
+        docker build -t "ohttp-$component:latest" -f Dockerfile "$REPO_ROOT"
+    else
+        docker build -t "ohttp-$component:latest" .
+    fi
     log_info "✓ Built ohttp-$component:latest"
 }
 

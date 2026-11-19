@@ -361,89 +361,9 @@ impl Config {
             };
 
         // Parse backends policy with strict validation
-        let backends_policy_str = env::var("BACKENDS_POLICY").unwrap_or_default();
-        let mut backends_policy: HashMap<String, Vec<(String, String)>> = HashMap::new();
-
-        if !backends_policy_str.is_empty() {
-            for entry in backends_policy_str.split(';') {
-                let entry = entry.trim();
-                if entry.is_empty() {
-                    continue;
-                }
-                if !entry.contains('=') {
-                    anyhow::bail!("Malformed BACKENDS_POLICY entry (missing '='): {}", entry);
-                }
-                let mut parts = entry.splitn(2, '=');
-                let authority = parts
-                    .next()
-                    .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "Malformed BACKENDS_POLICY: missing authority in '{}'",
-                            entry
-                        )
-                    })?
-                    .trim()
-                    .to_ascii_lowercase();
-                let policies = parts
-                    .next()
-                    .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "Malformed BACKENDS_POLICY: missing policies in '{}'",
-                            entry
-                        )
-                    })?
-                    .trim();
-
-                let mut policy_list = Vec::new();
-                for policy in policies.split(',') {
-                    let mut p = policy.trim().splitn(2, ' ');
-                    let method = p
-                        .next()
-                        .ok_or_else(|| {
-                            anyhow::anyhow!(
-                                "Malformed BACKENDS_POLICY: missing method in '{}' (entry: '{}')",
-                                policy,
-                                entry
-                            )
-                        })?
-                        .to_string();
-                    let path = p
-                        .next()
-                        .ok_or_else(|| {
-                            anyhow::anyhow!(
-                                "Malformed BACKENDS_POLICY: missing path in '{}' (entry: '{}')",
-                                policy,
-                                entry
-                            )
-                        })?
-                        .to_string();
-
-                    // Validate method token: must be GET/POST/PUT/DELETE/HEAD/OPTIONS/PATCH/* or a typo causes silent denial
-                    let method_upper = method.to_ascii_uppercase();
-                    if !matches!(
-                        method_upper.as_str(),
-                        "GET" | "POST" | "PUT" | "DELETE" | "HEAD" | "OPTIONS" | "PATCH" | "*"
-                    ) {
-                        anyhow::bail!(
-                            "Invalid BACKENDS_POLICY method '{}' in '{}': must be GET/POST/PUT/DELETE/HEAD/OPTIONS/PATCH/* (typos silently deny traffic)",
-                            method,
-                            policy
-                        );
-                    }
-
-                    policy_list.push((method, path));
-                }
-
-                if policy_list.is_empty() {
-                    anyhow::bail!(
-                        "Malformed BACKENDS_POLICY: no valid policies for authority '{}'",
-                        authority
-                    );
-                }
-
-                backends_policy.insert(authority, policy_list);
-            }
-        }
+        let backends_policy = zodl_ohttp_integrations::core::policy::parse_backends_policy(
+            &env::var("BACKENDS_POLICY").unwrap_or_default(),
+        )?;
 
         let backends_policy_default_allow = env::var("BACKENDS_POLICY_DEFAULT")
             .map(|v| v.eq_ignore_ascii_case("allow"))
@@ -514,128 +434,13 @@ impl Config {
             },
             redis_url: env::var("REDIS_URL").unwrap_or_default(),
             redis_security_url: env::var("REDIS_SECURITY_URL").unwrap_or_default(),
-            backends: {
-                // Strict BACKENDS parsing: error on malformed entries instead of silently skipping them.
-                let backends_str = env::var("BACKENDS").unwrap_or_default();
-                let mut backends = HashMap::new();
-
-                if !backends_str.is_empty() {
-                    for (i, pair) in backends_str.split(',').enumerate() {
-                        let trimmed = pair.trim();
-                        if trimmed.is_empty() {
-                            continue; // Allow trailing commas
-                        }
-
-                        if !trimmed.contains('=') {
-                            anyhow::bail!(
-                                "Malformed BACKENDS entry at position {}: missing '=' in '{}' (format: 'alias=url')",
-                                i, trimmed
-                            );
-                        }
-
-                        let mut parts = trimmed.splitn(2, '=');
-                        let authority = parts.next().unwrap().trim();
-                        let url = parts.next().unwrap().trim();
-
-                        if authority.is_empty() {
-                            anyhow::bail!(
-                                "Malformed BACKENDS entry at position {}: empty authority in '{}'",
-                                i,
-                                trimmed
-                            );
-                        }
-
-                        if url.is_empty() {
-                            anyhow::bail!(
-                                "Malformed BACKENDS entry at position {}: empty URL in '{}'",
-                                i,
-                                trimmed
-                            );
-                        }
-
-                        // Lowercase authority for consistent matching (case-insensitive hostnames per RFC 3986)
-                        let authority_lower = authority.to_ascii_lowercase();
-
-                        // ZIP conformance: "lwd" is reserved for own-LWD, cannot be a backend alias
-                        if authority_lower == "lwd" {
-                            anyhow::bail!(
-                                "Malformed BACKENDS entry at position {}: '{}' is reserved (own-LWD label)",
-                                i, authority
-                            );
-                        }
-
-                        // Scheme check: require http:// or https:// (http:// is accepted, e.g. for testing)
-                        if !url.starts_with("https://") && !url.starts_with("http://") {
-                            anyhow::bail!(
-                                "Malformed BACKENDS entry at position {}: URL must start with http:// or https:// in '{}'",
-                                i, trimmed
-                            );
-                        }
-
-                        backends.insert(authority_lower, url.to_string());
-                    }
-                }
-
-                backends
-            },
-            backend_headers: {
-                // Strict BACKEND_HEADERS parsing: error on malformed entries instead of silently skipping them.
-                let headers_str = env::var("BACKEND_HEADERS").unwrap_or_default();
-                let mut headers_map: HashMap<String, Vec<(String, String)>> = HashMap::new();
-
-                if !headers_str.is_empty() {
-                    for (i, pair) in headers_str.split(',').enumerate() {
-                        let trimmed = pair.trim();
-                        if trimmed.is_empty() {
-                            continue; // Allow trailing commas
-                        }
-
-                        if !trimmed.contains('=') {
-                            anyhow::bail!(
-                                "Malformed BACKEND_HEADERS entry at position {}: missing '=' in '{}' (format: 'alias=HeaderName:value')",
-                                i, trimmed
-                            );
-                        }
-
-                        let mut parts = trimmed.splitn(2, '=');
-                        let authority = parts.next().unwrap().trim();
-                        let header_pair = parts.next().unwrap().trim();
-
-                        if authority.is_empty() {
-                            anyhow::bail!(
-                                "Malformed BACKEND_HEADERS entry at position {}: empty authority in '{}'",
-                                i, trimmed
-                            );
-                        }
-
-                        if !header_pair.contains(':') {
-                            anyhow::bail!(
-                                "Malformed BACKEND_HEADERS entry at position {}: missing ':' in header '{}' (format: 'HeaderName:value')",
-                                i, header_pair
-                            );
-                        }
-
-                        let mut hp = header_pair.splitn(2, ':');
-                        let name = hp.next().unwrap().trim();
-                        let value = hp.next().unwrap().trim();
-
-                        if name.is_empty() {
-                            anyhow::bail!(
-                                "Malformed BACKEND_HEADERS entry at position {}: empty header name in '{}'",
-                                i, trimmed
-                            );
-                        }
-
-                        let authority_lower = authority.to_ascii_lowercase();
-                        headers_map
-                            .entry(authority_lower)
-                            .or_default()
-                            .push((name.to_string(), value.to_string()));
-                    }
-                }
-
-                headers_map
-            },
+            // Strict parsing: a malformed entry is an error, never skipped.
+            backends: zodl_ohttp_integrations::core::policy::parse_backends(
+                &env::var("BACKENDS").unwrap_or_default(),
+            )?,
+            backend_headers: zodl_ohttp_integrations::core::policy::parse_backend_headers(
+                &env::var("BACKEND_HEADERS").unwrap_or_default(),
+            )?,
             proxy_allow_suffixes: env::var("PROXY_ALLOW_SUFFIXES")
                 .unwrap_or_default()
                 .split(',')

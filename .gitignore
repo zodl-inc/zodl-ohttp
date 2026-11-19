@@ -18,9 +18,6 @@ target/
 .env.*
 secrets/
 
-# Docker
-.dockerignore
-
 # Logs
 *.log
 

@@ -259,10 +259,7 @@ impl ReadRoutes {
                 };
                 let method = method.trim().to_ascii_uppercase();
                 let path = path.trim().to_string();
-                if !matches!(
-                    method.as_str(),
-                    "GET" | "POST" | "PUT" | "DELETE" | "HEAD" | "OPTIONS" | "PATCH" | "*"
-                ) {
+                if !zodl_ohttp_integrations::core::route::is_policy_method(&method) {
                     anyhow::bail!(
                         "Invalid {name} method '{method}' in '{policy}': must be GET/POST/PUT/DELETE/HEAD/OPTIONS/PATCH/*"
                     );
@@ -319,7 +316,7 @@ impl ReadRoutes {
                 continue;
             };
             for (allowed_method, pattern) in rules {
-                if allowed_method != "*" && !method.eq_ignore_ascii_case(allowed_method) {
+                if !zodl_ohttp_integrations::core::route::method_matches(allowed_method, method) {
                     continue;
                 }
                 if path_matches(pattern, path) {
@@ -343,11 +340,7 @@ impl ReadRoutes {
 /// which is a segment-bounded prefix (`/foo/*` matches `/foo` and `/foo/bar`, not `/foobar`);
 /// `/*` matches everything.
 pub(crate) fn path_matches(pattern: &str, path: &str) -> bool {
-    if let Some(prefix) = pattern.strip_suffix("/*") {
-        prefix.is_empty() || path == prefix || path.starts_with(&format!("{prefix}/"))
-    } else {
-        path == pattern || path.starts_with(&format!("{pattern}?"))
-    }
+    zodl_ohttp_integrations::core::route::path_matches(pattern, path)
 }
 
 impl fmt::Display for ReadRoutes {

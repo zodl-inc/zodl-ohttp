@@ -84,6 +84,13 @@ jobs:
           OHTTP_FAILOVER_REDIS: "1"
         run: cargo test --locked
 
+      - name: Integrations (fmt, clippy, tests)
+        working-directory: integrations
+        run: |
+          cargo fmt --check
+          cargo clippy --locked --all-targets -- -D warnings
+          cargo test --locked
+
       - name: Test relay-simulator
         working-directory: relay-simulator
         run: cargo test --locked
@@ -138,7 +145,7 @@ jobs:
         image:
           - name: ohttp-gateway
             short: gateway
-            context: ./gateway
+            context: .
             file: ./gateway/Dockerfile
           - name: ohttp-relay-simulator
             short: relay-simulator

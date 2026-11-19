@@ -5,6 +5,16 @@ keeps its own log in [client/CHANGELOG.md](client/CHANGELOG.md).
 
 ## Unreleased
 
+### Integrations crate
+
+- New library crate `zodl-ohttp-integrations` (`integrations/`, not published), linked into the
+  gateway: the route grammar shared by the alias policy, the dynamic hosts and the replay
+  classes, the parsers of `BACKENDS`, `BACKENDS_POLICY` and `BACKEND_HEADERS`, a `Provider`
+  interface and the generic provider (route policy, fixed upstream headers). It does no I/O. The
+  gateway asks it for the policy verdict and the credential headers of an alias; behaviour,
+  error messages, log fields and metrics are unchanged. The gateway image now builds from the
+  repository root (`docker build -f gateway/Dockerfile .`).
+
 ### Crate names
 
 - The gateway crate is renamed `zodl-ohttp-gateway` (library `zodl_ohttp_gateway`, binary

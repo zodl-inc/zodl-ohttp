@@ -6,19 +6,24 @@ FROM rust:1-alpine@sha256:7cc1c22d77d9432f7fe012a70e6d3e555af54c2a6832700ed7d553
 # Install build dependencies
 RUN apk add --no-cache musl-dev openssl-dev openssl-libs-static pkgconfig
 
+# Build context: the repository root (the integrations crate is a path dependency).
 WORKDIR /build
 
-# Cache dependencies
-COPY Cargo.toml Cargo.lock ./
-RUN mkdir -p src && \
-    echo "fn main() {}" > src/main.rs && \
-    echo "pub fn placeholder() {}" > src/lib.rs && \
-    cargo build --release --locked && \
-    rm -rf src
+# Cache dependencies (manifests only, stub sources)
+COPY integrations/Cargo.toml integrations/Cargo.lock ./integrations/
+COPY gateway/Cargo.toml gateway/Cargo.lock ./gateway/
+RUN mkdir -p integrations/src gateway/src && \
+    echo "pub fn placeholder() {}" > integrations/src/lib.rs && \
+    echo "fn main() {}" > gateway/src/main.rs && \
+    echo "pub fn placeholder() {}" > gateway/src/lib.rs && \
+    cd gateway && cargo build --release --locked && \
+    cd .. && rm -rf integrations/src gateway/src
 
 # Build application
-COPY src ./src
-RUN touch src/main.rs src/lib.rs && \
+COPY integrations/src ./integrations/src
+COPY gateway/src ./gateway/src
+WORKDIR /build/gateway
+RUN touch ../integrations/src/lib.rs src/main.rs src/lib.rs && \
     cargo build --release --locked --bin zodl-ohttp-gateway && \
     strip target/release/zodl-ohttp-gateway
 
@@ -39,7 +44,7 @@ WORKDIR /app
 
 # Copy binary from builder. /app/ohttp-gateway, the binary's former name, stays as a link for
 # callers that still name it.
-COPY --from=builder /build/target/release/zodl-ohttp-gateway /app/zodl-ohttp-gateway
+COPY --from=builder /build/gateway/target/release/zodl-ohttp-gateway /app/zodl-ohttp-gateway
 RUN ln -s zodl-ohttp-gateway /app/ohttp-gateway
 
 # Set ownership

@@ -2965,4 +2965,12 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "zodl-ohttp-integrations",
+]
+
+[[package]]
+name = "zodl-ohttp-integrations"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
 ]

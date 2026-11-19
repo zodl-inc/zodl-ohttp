@@ -463,10 +463,7 @@ pub fn parse_rules(name: &str, spec: &str) -> Result<Vec<Rule>> {
         };
         let method = method.trim().to_ascii_uppercase();
         let path = path.trim();
-        if !matches!(
-            method.as_str(),
-            "GET" | "POST" | "PUT" | "DELETE" | "HEAD" | "OPTIONS" | "PATCH" | "*"
-        ) {
+        if !zodl_ohttp_integrations::core::route::is_policy_method(&method) {
             bail!("Invalid {name} method '{method}' in '{rule}': must be GET/POST/PUT/DELETE/HEAD/OPTIONS/PATCH/*");
         }
         if !path.starts_with('/') || path.bytes().any(|b| b <= 0x20 || b >= 0x7f) {
@@ -557,10 +554,7 @@ pub struct Grant {
 }
 
 fn rule_matches(rules: &[Rule], method: &str, path: &str) -> bool {
-    rules.iter().any(|(allowed, pattern)| {
-        (allowed == "*" || method.eq_ignore_ascii_case(allowed))
-            && crate::origin::path_matches(pattern, path)
-    })
+    zodl_ohttp_integrations::core::route::matching_rule(rules, method, path).is_some()
 }
 
 /// What a source last accepted.
