@@ -22,7 +22,7 @@
 
 use bytes::Bytes;
 use libfuzzer_sys::fuzz_target;
-use ohttp_gateway::{
+use zodl_ohttp_gateway::{
     block_cache::GrpcSplitter,
     fuzzing::{count_grpc_messages, last_complete_grpc_message_offset},
     ohttp::InnerResponse,

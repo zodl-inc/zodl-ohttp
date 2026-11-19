@@ -39,14 +39,14 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use ohttp_gateway::cache::{
-    LocalReplayCheck, PeerOutcome, ReplayPeers, ResponseCache, WritePolicy, REPLAY_TTL_SECS,
-};
-use ohttp_gateway::origin::{ReplayPeerMode, RouteClass};
-use ohttp_gateway::replication::ReplicationConfig;
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
+use zodl_ohttp_gateway::cache::{
+    LocalReplayCheck, PeerOutcome, ReplayPeers, ResponseCache, WritePolicy, REPLAY_TTL_SECS,
+};
+use zodl_ohttp_gateway::origin::{ReplayPeerMode, RouteClass};
+use zodl_ohttp_gateway::replication::ReplicationConfig;
 
 // ---------------------------------------------------------------------------------------------
 // A link that can be lost: a TCP proxy. `lose` kills the open connections (at their next
@@ -297,7 +297,7 @@ async fn admit(c: &ResponseCache, hash: &[u8], class: RouteClass) -> anyhow::Res
 /// The value of `name{network=net, peer}`, None when the series does not exist. Each test has
 /// a network of its own: the gauges are process-wide, and tests run concurrently.
 fn gauge(net: &str, name: &str, peer: &str) -> Option<f64> {
-    ohttp_gateway::health::REGISTRY
+    zodl_ohttp_gateway::health::REGISTRY
         .gather()
         .iter()
         .find(|f| f.get_name() == name)?
@@ -337,7 +337,7 @@ impl World {
 }
 
 async fn world(net: &'static str, read_origin_replicates_to_standby: bool) -> World {
-    ohttp_gateway::health::init_metrics();
+    zodl_ohttp_gateway::health::init_metrics();
     let (_cache, cache_addr) = Store::start().await;
     let (hub, hub_addr) = Store::start().await;
     let (standby_store, e_addr) = Store::start().await;

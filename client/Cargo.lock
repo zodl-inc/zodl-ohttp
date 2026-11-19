@@ -1474,51 +1474,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ohttp-gateway"
-version = "1.1.0"
-dependencies = [
- "aes-gcm",
- "anyhow",
- "arc-swap",
- "async-stream",
- "axum 0.8.9",
- "base64 0.22.1",
- "bhttp",
- "bincode",
- "bytes",
- "ed25519-dalek",
- "futures-util",
- "hex",
- "hkdf",
- "hpke",
- "http-body-util",
- "hyper",
- "hyper-tls",
- "hyper-util",
- "lazy_static",
- "moka",
- "parking_lot",
- "prometheus",
- "prost",
- "rand 0.8.8",
- "redis",
- "scopeguard",
- "serde",
- "serde_json",
- "sha2",
- "subtle",
- "thiserror 2.0.21",
- "tokio",
- "tokio-util",
- "tonic",
- "tower 0.5.3",
- "tower-http",
- "tracing",
- "tracing-subscriber",
- "uuid",
-]
-
-[[package]]
 name = "oid-registry"
 version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3345,7 +3300,6 @@ dependencies = [
  "hex",
  "hkdf",
  "hpke",
- "ohttp-gateway",
  "rand_core 0.9.5",
  "rcgen",
  "reqwest",
@@ -3358,4 +3312,50 @@ dependencies = [
  "tokio-rustls 0.26.6",
  "url",
  "zeroize",
+ "zodl-ohttp-gateway",
+]
+
+[[package]]
+name = "zodl-ohttp-gateway"
+version = "1.1.0"
+dependencies = [
+ "aes-gcm",
+ "anyhow",
+ "arc-swap",
+ "async-stream",
+ "axum 0.8.9",
+ "base64 0.22.1",
+ "bhttp",
+ "bincode",
+ "bytes",
+ "ed25519-dalek",
+ "futures-util",
+ "hex",
+ "hkdf",
+ "hpke",
+ "http-body-util",
+ "hyper",
+ "hyper-tls",
+ "hyper-util",
+ "lazy_static",
+ "moka",
+ "parking_lot",
+ "prometheus",
+ "prost",
+ "rand 0.8.8",
+ "redis",
+ "scopeguard",
+ "serde",
+ "serde_json",
+ "sha2",
+ "subtle",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-util",
+ "tonic",
+ "tower 0.5.3",
+ "tower-http",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
 ]

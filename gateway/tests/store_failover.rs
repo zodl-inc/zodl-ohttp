@@ -35,13 +35,13 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use ohttp_gateway::cache::{
-    LocalReplayCheck, ResponseCache, WriteAdmission, WritePolicy, WriteWaitConfig,
-};
-use ohttp_gateway::origin::RouteClass;
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
+use zodl_ohttp_gateway::cache::{
+    LocalReplayCheck, ResponseCache, WriteAdmission, WritePolicy, WriteWaitConfig,
+};
+use zodl_ohttp_gateway::origin::RouteClass;
 
 // ---------------------------------------------------------------------------------------------
 // The endpoint name: a switchable TCP proxy.

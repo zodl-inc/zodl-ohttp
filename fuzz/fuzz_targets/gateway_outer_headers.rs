@@ -21,7 +21,7 @@
 
 use http::{HeaderMap, HeaderName, HeaderValue};
 use libfuzzer_sys::fuzz_target;
-use ohttp_gateway::{enforcement, freshness, request_id};
+use zodl_ohttp_gateway::{enforcement, freshness, request_id};
 
 fuzz_target!(|data: &[u8]| {
     let mut headers = HeaderMap::new();

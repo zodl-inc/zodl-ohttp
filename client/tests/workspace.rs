@@ -15,12 +15,12 @@
 // Commercial licensing: see COMMERCIAL-LICENSE.md.
 
 //! Checks that need the rest of the repository: the gateway's request parser
-//! (`ohttp-gateway`'s library) and the documented test vector. Like `gateway.rs`,
+//! (`zodl-ohttp-gateway`'s library) and the documented test vector. Like `gateway.rs`,
 //! `gateway_core.rs` and `chunked.rs`, this file is left out of the published crate
 //! (`exclude` in `Cargo.toml`), whose dev-dependencies do not include the gateway.
 
-use ohttp_gateway::ohttp::parse_inner_request;
 use zodl_ohttp_client::{encode_request, Request};
+use zodl_ohttp_gateway::ohttp::parse_inner_request;
 
 const SEND_TRANSACTION: &str = "/cash.z.wallet.sdk.rpc.CompactTxStreamer/SendTransaction";
 

@@ -14,7 +14,7 @@
 //
 // Commercial licensing: see COMMERCIAL-LICENSE.md.
 
-//! The sans-IO core against the gateway's own code (`ohttp-gateway`'s library): its key
+//! The sans-IO core against the gateway's own code (`zodl-ohttp-gateway`'s library): its key
 //! configuration document, its chunked request decapsulation, its streaming response encoder
 //! and its signed envelope, under every client profile.
 
@@ -23,18 +23,18 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use futures_util::StreamExt;
-use ohttp_gateway::chunked_stream::{
-    collected_upstream, encode_response_stream, split_grpc_trailers,
-};
-use ohttp_gateway::config::Config;
-use ohttp_gateway::hpke::{KeyState, ResponseContext};
-use ohttp_gateway::ohttp::{self as gateway, InnerResponse};
-use ohttp_gateway::ohttp_chunked::decapsulate_chunked_request;
-use ohttp_gateway::signing::SigningState;
 use zodl_ohttp_client::{
     encapsulate_chunked_request, encode_bhttp_request, verify_signed_config_with, BhttpRequest,
     ChunkedResponseOpener, ClientProfile, KeyConfig,
 };
+use zodl_ohttp_gateway::chunked_stream::{
+    collected_upstream, encode_response_stream, split_grpc_trailers,
+};
+use zodl_ohttp_gateway::config::Config;
+use zodl_ohttp_gateway::hpke::{KeyState, ResponseContext};
+use zodl_ohttp_gateway::ohttp::{self as gateway, InnerResponse};
+use zodl_ohttp_gateway::ohttp_chunked::decapsulate_chunked_request;
+use zodl_ohttp_gateway::signing::SigningState;
 
 const SIGNING_SEED: &str = "2222222222222222222222222222222222222222222222222222222222222222";
 const PROFILES: [ClientProfile; 4] = [
@@ -89,7 +89,7 @@ fn gateway_config(keys: Vec<(u8, String)>) -> Config {
         dynamic_hosts: Default::default(),
         host_list: Default::default(),
         third_party_query_rules: Default::default(),
-        relay_secret_on_key_config: ohttp_gateway::config::RelaySecretOnKeyConfig::Off,
+        relay_secret_on_key_config: zodl_ohttp_gateway::config::RelaySecretOnKeyConfig::Off,
         lwd_permit_wait_ms: 2000,
         lwd_permit_max_waiters: 0,
     }
@@ -236,7 +236,7 @@ async fn an_unknown_key_id_is_a_request_the_gateway_cannot_open() {
 
 #[tokio::test]
 async fn every_client_profile_is_fresh_at_the_gateway() {
-    use ohttp_gateway::freshness;
+    use zodl_ohttp_gateway::freshness;
     let keys = KeyState::new(&gateway_config(vec![(7, private_key(7))])).unwrap();
     let document = keys.public_config();
     for (profile, stamps) in [

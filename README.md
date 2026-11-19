@@ -20,7 +20,7 @@ See [docs/architecture.md](docs/architecture.md) for the system design and threa
 
 ```
 ohttp/
-├── gateway/              # Rust OHTTP gateway (RFC 9458 HPKE decapsulation, lightwalletd proxy, caches)
+├── gateway/              # Rust OHTTP gateway (crate zodl-ohttp-gateway, not on crates.io): HPKE, lightwalletd proxy, caches
 ├── relay-simulator/      # Test relay for local end-to-end runs
 ├── client/               # Rust client library (zodl-ohttp-client), shared by the wallet SDKs
 ├── e2e-client/           # Minimal end-to-end client (one real exchange through a relay)

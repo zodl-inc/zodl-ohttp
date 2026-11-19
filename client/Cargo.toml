@@ -12,7 +12,7 @@ readme = "README.md"
 keywords = ["ohttp", "rfc9458", "privacy", "zcash", "hpke"]
 categories = ["cryptography", "network-programming"]
 # The tests that run against the gateway's own code need the repository around the crate (the
-# path-only dev-dependency `ohttp-gateway`, stripped on publishing, and `../docs`): they run in
+# path-only dev-dependency `zodl-ohttp-gateway`, stripped on publishing, and `../docs`): they run in
 # the repository's CI and are not shipped, so that `cargo test` passes on the published crate.
 exclude = [
     "tests/chunked.rs",
@@ -65,7 +65,7 @@ required-features = ["client", "insecure-plain-key-config"]
 [dev-dependencies]
 # The gateway's own decapsulation and key configuration, so the tests check this client
 # against the server it talks to.
-ohttp-gateway = { path = "../gateway" }
+zodl-ohttp-gateway = { path = "../gateway" }
 axum = "0.8"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time", "test-util", "io-util"] }
 # A local TLS server for the `Client` tests, on the ring provider reqwest uses (rustls itself

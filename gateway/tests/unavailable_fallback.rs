@@ -34,15 +34,15 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use ohttp_gateway::cache::{
-    FallbackHealth, LocalReplayCheck, ReplayPeers, ResponseCache, WriteAdmission, WritePolicy,
-    WriteWaitConfig, DEFAULT_REPLAY_WAIT_CONNS, REPLAY_TTL_SECS,
-};
-use ohttp_gateway::origin::{ReplayPeerMode, RouteClass};
-use ohttp_gateway::replication::ReplicationConfig;
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
+use zodl_ohttp_gateway::cache::{
+    FallbackHealth, LocalReplayCheck, ReplayPeers, ResponseCache, WriteAdmission, WritePolicy,
+    WriteWaitConfig, DEFAULT_REPLAY_WAIT_CONNS, REPLAY_TTL_SECS,
+};
+use zodl_ohttp_gateway::origin::{ReplayPeerMode, RouteClass};
+use zodl_ohttp_gateway::replication::ReplicationConfig;
 
 // ---------------------------------------------------------------------------------------------
 // A link that can be lost: a TCP proxy. `lose` kills the open connections (at their next
@@ -503,7 +503,7 @@ async fn primary_origin_wait(
     conns: usize,
     wait: WriteWaitConfig,
 ) -> ResponseCache {
-    ohttp_gateway::health::init_metrics();
+    zodl_ohttp_gateway::health::init_metrics();
     let c = ResponseCache::connect(
         &cache_store().await,
         Some(primary),
@@ -540,7 +540,7 @@ async fn read_origin_with(
     on: bool,
     fail_closed_writes: bool,
 ) -> ResponseCache {
-    ohttp_gateway::health::init_metrics();
+    zodl_ohttp_gateway::health::init_metrics();
     let (local, l_addr) = Store::start().await;
     std::mem::forget(local);
     let c = ResponseCache::connect(
@@ -576,7 +576,7 @@ async fn read_origin_with(
 
 /// `read_origin`, with its local store at `local` (a link the test can cut).
 async fn read_origin_at(network: &str, local: &str, hub: &str, fallback: &str) -> ResponseCache {
-    ohttp_gateway::health::init_metrics();
+    zodl_ohttp_gateway::health::init_metrics();
     let c = ResponseCache::connect(
         &cache_store().await,
         Some(local),
@@ -617,7 +617,7 @@ async fn spoke_origin_with(
     on: bool,
     fail_closed_writes: bool,
 ) -> ResponseCache {
-    ohttp_gateway::health::init_metrics();
+    zodl_ohttp_gateway::health::init_metrics();
     let c = ResponseCache::connect(
         &cache_store().await,
         Some(own),
@@ -684,7 +684,7 @@ async fn admit_with(
 }
 
 fn counter(name: &str, labels: &[(&str, &str)]) -> f64 {
-    ohttp_gateway::health::REGISTRY
+    zodl_ohttp_gateway::health::REGISTRY
         .gather()
         .iter()
         .find(|f| f.get_name() == name)
@@ -718,7 +718,7 @@ fn read_fallback(network: &str, result: &str) -> f64 {
 }
 
 fn gauge(name: &str, network: &str) -> bool {
-    ohttp_gateway::health::REGISTRY
+    zodl_ohttp_gateway::health::REGISTRY
         .gather()
         .iter()
         .find(|f| f.get_name() == name)
@@ -1105,7 +1105,7 @@ async fn an_origin_that_tolerates_an_unreachable_hub_still_asks_the_fallback_sto
 
 #[tokio::test]
 async fn primary_origin_stays_healthy_while_the_peer_decides_for_its_unreachable_store() {
-    use ohttp_gateway::health::{
+    use zodl_ohttp_gateway::health::{
         healthz_ok, is_replay_serving_via_fallback, is_security_redis_connected,
     };
     let net = "testnet-ufb-healthz";
@@ -1182,7 +1182,7 @@ async fn primary_origin_stays_healthy_while_the_peer_decides_for_its_unreachable
 
 #[tokio::test]
 async fn without_the_setting_an_unreachable_store_still_fails_healthz() {
-    use ohttp_gateway::health::{
+    use zodl_ohttp_gateway::health::{
         healthz_ok, is_replay_serving_via_fallback, is_security_redis_connected,
     };
     let net = "testnet-ufb-healthz-off";
@@ -1208,7 +1208,7 @@ async fn without_the_setting_an_unreachable_store_still_fails_healthz() {
 
 #[tokio::test]
 async fn spoke_decides_at_the_hub_while_its_own_store_is_unreachable() {
-    use ohttp_gateway::health::{
+    use zodl_ohttp_gateway::health::{
         healthz_ok, is_replay_serving_via_fallback, is_security_redis_connected,
     };
     let net = "testnet-ufb-spoke-own";
@@ -1294,7 +1294,7 @@ async fn spoke_decides_at_the_hub_while_its_own_store_is_unreachable() {
 
 #[tokio::test]
 async fn spoke_fails_closed_when_neither_its_own_store_nor_the_hub_answers() {
-    use ohttp_gateway::health::is_replay_serving_via_fallback;
+    use zodl_ohttp_gateway::health::is_replay_serving_via_fallback;
     let net = "testnet-ufb-spoke-nothing";
     let w = World::new().await;
     let (hub_link, hub_url) = w.to_p().await;
@@ -1462,7 +1462,7 @@ fn refused(network: &str, path: &str) -> f64 {
 /// A `sync`-mode origin: its own store `own`, the peer `peer` asked on every request, an
 /// unreachable peer tolerated (`REPLAY_PEER_FAIL_CLOSED=0`).
 async fn sync_origin(network: &str, own: &str, peer: &str) -> ResponseCache {
-    ohttp_gateway::health::init_metrics();
+    zodl_ohttp_gateway::health::init_metrics();
     let c = ResponseCache::connect(
         &cache_store().await,
         Some(own),
@@ -1902,7 +1902,7 @@ async fn writes_beyond_the_wait_connections_are_short_acknowledgements() {
 async fn writes_beyond_the_peer_wait_connections_are_short_acknowledgements() {
     let net = "testnet-wait-saturated-peer";
     let w = World::new().await;
-    ohttp_gateway::health::init_metrics();
+    zodl_ohttp_gateway::health::init_metrics();
     let (local, l_addr) = Store::start().await;
     std::mem::forget(local);
     let c = ResponseCache::connect(
@@ -2160,7 +2160,7 @@ fn reconnects(network: &str, store: &str, reason: &str) -> f64 {
 }
 
 fn healthz(network: &str) -> bool {
-    use ohttp_gateway::health::{
+    use zodl_ohttp_gateway::health::{
         healthz_ok, is_replay_serving_via_fallback, is_security_redis_connected,
     };
     healthz_ok(
@@ -2258,7 +2258,7 @@ async fn housekeeping_leaves_a_peer_that_became_a_replica() {
 
 #[tokio::test]
 async fn healthz_fails_while_the_security_connection_waits_for_a_primary() {
-    use ohttp_gateway::health::is_security_redis_connected;
+    use zodl_ohttp_gateway::health::is_security_redis_connected;
     let net = "testnet-conn-demoted";
     let w = World::new().await;
     let primary = primary_origin(net, &addr_url(w.p_addr), &addr_url(w.f_addr), false).await;
@@ -2287,7 +2287,7 @@ async fn healthz_fails_while_the_security_connection_waits_for_a_primary() {
 
 #[tokio::test]
 async fn healthz_fails_when_every_write_decided_at_the_peer_fails() {
-    use ohttp_gateway::health::is_replay_serving_via_fallback;
+    use zodl_ohttp_gateway::health::is_replay_serving_via_fallback;
     let net = "testnet-conn-fallback-health";
     let w = World::new().await;
     let (p_link, p_url) = w.to_p().await;
@@ -2441,7 +2441,7 @@ fn fallback_health_is_consistent_under_concurrent_updates() {
 // Startup: /healthz waits for the stores both-store admission needs.
 
 async fn reader_with_standby_at(network: &str, hub: &str, standby: &str) -> ResponseCache {
-    ohttp_gateway::health::init_metrics();
+    zodl_ohttp_gateway::health::init_metrics();
     let c = ResponseCache::connect(
         &cache_store().await,
         Some(&cache_store().await),
@@ -2467,14 +2467,16 @@ async fn reader_with_standby_at(network: &str, hub: &str, standby: &str) -> Resp
 
 #[tokio::test]
 async fn a_read_origin_reports_ready_once_its_standby_store_is_connected() {
-    use ohttp_gateway::health::is_replay_stores_ready;
+    use zodl_ohttp_gateway::health::is_replay_stores_ready;
     let net = "testnet-ready-standby";
     let w = World::new().await;
     let (f_link, f_url) = w.to_f().await;
     f_link.lose();
     let reader = reader_with_standby_at(net, &addr_url(w.p_addr), &f_url).await;
-    let gate =
-        ohttp_gateway::cache::spawn_replay_stores_gate(reader.clone(), Duration::from_secs(10));
+    let gate = zodl_ohttp_gateway::cache::spawn_replay_stores_gate(
+        reader.clone(),
+        Duration::from_secs(10),
+    );
     assert!(
         !is_replay_stores_ready(net),
         "not ready without the standby store"
@@ -2497,15 +2499,17 @@ async fn a_read_origin_reports_ready_once_its_standby_store_is_connected() {
 
 #[tokio::test]
 async fn a_read_origin_reports_ready_after_the_bound_without_its_standby_store() {
-    use ohttp_gateway::health::is_replay_stores_ready;
+    use zodl_ohttp_gateway::health::is_replay_stores_ready;
     let net = "testnet-ready-bound";
     let w = World::new().await;
     let (f_link, f_url) = w.to_f().await;
     f_link.lose();
     let reader = reader_with_standby_at(net, &addr_url(w.p_addr), &f_url).await;
     let started = Instant::now();
-    let gate =
-        ohttp_gateway::cache::spawn_replay_stores_gate(reader.clone(), Duration::from_millis(500));
+    let gate = zodl_ohttp_gateway::cache::spawn_replay_stores_gate(
+        reader.clone(),
+        Duration::from_millis(500),
+    );
     assert!(!is_replay_stores_ready(net));
     assert!(!gate.await.unwrap(), "the standby store never connected");
     assert!(started.elapsed() >= Duration::from_millis(450));
@@ -2551,7 +2555,7 @@ async fn one_sided_refusals_count_toward_withdrawal_only_for_the_local_store() {
 async fn housekeeping_checks_hanging_peers_concurrently() {
     let net = "testnet-conn-hanging-peers";
     let w = World::new().await;
-    ohttp_gateway::health::init_metrics();
+    zodl_ohttp_gateway::health::init_metrics();
     let mut links = Vec::new();
     let mut urls = Vec::new();
     for _ in 0..6 {
@@ -2598,7 +2602,7 @@ async fn housekeeping_checks_hanging_peers_concurrently() {
     assert!(!c.replay_peers().unwrap().any_answering());
     // One peer: a PING (250 ms) and its WAIT connections' PINGs (300 ms). Six in a row: 3.3 s.
     assert!(took < Duration::from_millis(2200), "{took:?}");
-    assert!(ohttp_gateway::health::is_security_redis_connected(net));
+    assert!(zodl_ohttp_gateway::health::is_security_redis_connected(net));
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -2644,7 +2648,7 @@ async fn a_tolerated_peer_gets_only_the_nonces_of_writes_that_ran() {
 async fn the_hand_off_follows_the_admission_with_65_peers() {
     let net = "testnet-handoff-65";
     let w = World::new().await;
-    ohttp_gateway::health::init_metrics();
+    zodl_ohttp_gateway::health::init_metrics();
     // 65 hub stores: databases 0..=64 of one fake store; the last one behind a link.
     let (link, link_url) = w.to_p().await;
     let mut urls: Vec<String> = (0..64)
@@ -2772,7 +2776,7 @@ async fn an_epoch_bump_at_the_peer_is_seen_while_the_own_store_is_silent() {
 }
 /// A cache whose security store is `own` and whose replay peers are `peers`, in that order.
 async fn epoch_origin(network: &str, own: &str, peers: &[String]) -> ResponseCache {
-    ohttp_gateway::health::init_metrics();
+    zodl_ohttp_gateway::health::init_metrics();
     let c = ResponseCache::connect(
         &cache_store().await,
         Some(own),

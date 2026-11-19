@@ -1,10 +1,13 @@
 [package]
-name = "ohttp-gateway"
+name = "zodl-ohttp-gateway"
 version = "1.1.0"
 license = "AGPL-3.0-only"
 edition = "2021"
 authors = ["ZODL Inc."]
 description = "RFC 9458 Oblivious HTTP Gateway for Zcash Lightwalletd"
+# Not published: the crate is built into the gateway image only. Unrelated to the `ohttp-gateway`
+# crate on crates.io.
+publish = false
 
 [dependencies]
 # Async runtime
@@ -82,8 +85,12 @@ rand_core = { version = "0.9", features = ["os_rng"] }
 fuzzing = []
 
 [lib]
-name = "ohttp_gateway"
+name = "zodl_ohttp_gateway"
 path = "src/lib.rs"
+
+[[bin]]
+name = "zodl-ohttp-gateway"
+path = "src/main.rs"
 
 [profile.release]
 lto = true

@@ -46,16 +46,16 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 
-use ohttp_gateway::config::Config;
-use ohttp_gateway::dynamic_hosts::parse_deny_cidrs;
-use ohttp_gateway::flexa;
-use ohttp_gateway::host_list;
-use ohttp_gateway::ohttp::InnerRequest;
-use ohttp_gateway::ohttp::InnerResponse;
-use ohttp_gateway::origin::OriginSettings;
-use ohttp_gateway::proxy::{self, BackendTarget, RouteContext};
-use ohttp_gateway::third_party_cache::{self, Aliases, CacheRoutes, RateLimiters, ThirdParty};
 use serde_json::{json, Value};
+use zodl_ohttp_gateway::config::Config;
+use zodl_ohttp_gateway::dynamic_hosts::parse_deny_cidrs;
+use zodl_ohttp_gateway::flexa;
+use zodl_ohttp_gateway::host_list;
+use zodl_ohttp_gateway::ohttp::InnerRequest;
+use zodl_ohttp_gateway::ohttp::InnerResponse;
+use zodl_ohttp_gateway::origin::OriginSettings;
+use zodl_ohttp_gateway::proxy::{self, BackendTarget, RouteContext};
+use zodl_ohttp_gateway::third_party_cache::{self, Aliases, CacheRoutes, RateLimiters, ThirdParty};
 
 /// The process environment is global: every test of this file that sets or reads it (directly
 /// or through a gateway `from_env`) must hold this lock.

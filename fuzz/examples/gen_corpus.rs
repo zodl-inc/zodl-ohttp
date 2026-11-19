@@ -22,11 +22,11 @@ use std::path::Path;
 use ohttp_fuzz::{
     key_state, seal_request, seal_response, signed_envelope, ALIASES, GATEWAY_HOST, VECTOR_NOW,
 };
-use ohttp_gateway::{
+use zodl_ohttp_client::{encode_bhttp_request, BhttpRequest, EncodeOptions};
+use zodl_ohttp_gateway::{
     block_cache::BlockRangeRequest, rpc_cache, signing::SigningState,
     subtree_cache::SubtreeRootsRequest,
 };
-use zodl_ohttp_client::{encode_bhttp_request, BhttpRequest, EncodeOptions};
 
 const LWD: &str = "/cash.z.wallet.sdk.rpc.CompactTxStreamer/";
 

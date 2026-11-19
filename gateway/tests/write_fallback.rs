@@ -37,15 +37,15 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use ohttp_gateway::cache::{
-    LocalReplayCheck, ReplayPeers, ResponseCache, WriteAdmission, WritePolicy, WriteWaitConfig,
-    REPLAY_TTL_SECS,
-};
-use ohttp_gateway::origin::{ReplayPeerMode, RouteClass};
-use ohttp_gateway::replication::ReplicationConfig;
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
+use zodl_ohttp_gateway::cache::{
+    LocalReplayCheck, ReplayPeers, ResponseCache, WriteAdmission, WritePolicy, WriteWaitConfig,
+    REPLAY_TTL_SECS,
+};
+use zodl_ohttp_gateway::origin::{ReplayPeerMode, RouteClass};
+use zodl_ohttp_gateway::replication::ReplicationConfig;
 
 // ---------------------------------------------------------------------------------------------
 // A link that can be lost: a TCP proxy. `lose` kills the open connections (at their next
@@ -281,7 +281,7 @@ async fn origin_with_peer_wait(
     peer: Option<(&str, ReplayPeerMode, bool)>,
     peer_wait: Option<WriteWaitConfig>,
 ) -> ResponseCache {
-    ohttp_gateway::health::init_metrics();
+    zodl_ohttp_gateway::health::init_metrics();
     let c = ResponseCache::connect(
         cache,
         Some(security),
@@ -333,7 +333,7 @@ async fn admit(c: &ResponseCache, hash: &[u8], class: RouteClass) -> anyhow::Res
 
 /// `ohttp_replay_write_fallback_total{network, path, result}` (0 when absent).
 fn fallback(network: &str, path: &str, result: &str) -> f64 {
-    ohttp_gateway::health::REGISTRY
+    zodl_ohttp_gateway::health::REGISTRY
         .gather()
         .iter()
         .find(|f| f.get_name() == "ohttp_replay_write_fallback_total")

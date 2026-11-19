@@ -95,7 +95,7 @@ async fn main() -> anyhow::Result<()> {
 
     health::init_metrics();
 
-    // `ohttp-gateway backfill`: fill the permanent block tier and exit.
+    // `zodl-ohttp-gateway backfill`: fill the permanent block tier and exit.
     if std::env::args().nth(1).as_deref() == Some("backfill") {
         return backfill::main().await;
     }

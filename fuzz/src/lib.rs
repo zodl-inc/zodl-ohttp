@@ -22,7 +22,10 @@ use std::sync::OnceLock;
 
 use base64::Engine as _;
 use ed25519_dalek::{Signer, SigningKey};
-use ohttp_gateway::{
+use rand_core::{CryptoRng, RngCore};
+use sha2::{Digest, Sha256};
+use zodl_ohttp_client::{ChunkedResponseOpener, KeyConfig};
+use zodl_ohttp_gateway::{
     block_cache::{BlockRangeRequest, GET_BLOCK_RANGE_PATH},
     chunked_stream::ChunkSealer,
     config::Config,
@@ -33,9 +36,6 @@ use ohttp_gateway::{
     rpc_cache,
     subtree_cache::SubtreeRootsRequest,
 };
-use rand_core::{CryptoRng, RngCore};
-use sha2::{Digest, Sha256};
-use zodl_ohttp_client::{ChunkedResponseOpener, KeyConfig};
 
 pub const KEY_ID: u8 = 7;
 pub const PRIVATE_KEY_HEX: &str =
@@ -140,10 +140,7 @@ pub fn block_on<F: std::future::Future>(future: F) -> F::Output {
 }
 
 pub fn decapsulate(sealed: &[u8]) -> anyhow::Result<(Vec<u8>, ResponseContext)> {
-    block_on(ohttp_gateway::ohttp_chunked::decapsulate_chunked_request(
-        sealed,
-        key_state(),
-    ))
+    block_on(zodl_ohttp_gateway::ohttp_chunked::decapsulate_chunked_request(sealed, key_state()))
 }
 
 /// One fixed exchange: the gateway's response context and the client's opener for it.
