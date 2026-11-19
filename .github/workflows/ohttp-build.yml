@@ -89,7 +89,12 @@ jobs:
         run: |
           cargo fmt --check
           cargo clippy --locked --all-targets -- -D warnings
+          cargo clippy --locked --no-default-features --all-targets -- -D warnings
+          for feature in cmc swapkit; do
+            cargo clippy --locked --no-default-features --features "$feature" --all-targets -- -D warnings
+          done
           cargo test --locked
+          cargo test --locked --no-default-features
 
       - name: Test relay-simulator
         working-directory: relay-simulator

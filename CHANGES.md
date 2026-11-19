@@ -14,6 +14,15 @@ keeps its own log in [client/CHANGELOG.md](client/CHANGELOG.md).
   gateway asks it for the policy verdict and the credential headers of an alias; behaviour,
   error messages, log fields and metrics are unchanged. The gateway image now builds from the
   repository root (`docker build -f gateway/Dockerfile .`).
+- The query rules (`THIRD_PARTY_QUERY_RULES`) and the value sources
+  (`THIRD_PARTY_QUERY_VALUE_SOURCES`: grammar, JSON pointer extraction, list acceptance) move
+  into the integrations crate, as do the request path checks their parsers share with the
+  forwarder; the gateway keeps reading the variables, fetching the lists, logging and recording
+  the metrics. New provider kinds `cmc` and `swapkit` (cargo features, on by default): keyed
+  providers, the generic provider that cannot be built unless every route has a query rule and
+  the alias carries a header credential, for the configuration file to come; no environment
+  variable assigns them, so every alias stays generic. Verdicts, error messages, log fields and
+  metrics are unchanged.
 
 ### Crate names
 

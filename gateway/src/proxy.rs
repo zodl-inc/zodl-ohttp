@@ -356,12 +356,6 @@ fn path_trick(path: &str) -> Option<&'static str> {
     zodl_ohttp_integrations::core::route::path_trick(path)
 }
 
-/// The request-side path rejections ([`path_trick`], [`validate_path`]) for a
-/// `THIRD_PARTY_QUERY_RULES` rule path, checked at startup.
-pub(crate) fn rule_path_rejection(path: &str) -> Option<&'static str> {
-    path_trick(path).or_else(|| validate_path(path))
-}
-
 /// Whether a dynamic host's routes refuse `method path`: `None` if allowed, `Some(reason)` if
 /// not. Only the routes of the host's list count; `BACKENDS_POLICY_DEFAULT` never applies.
 fn check_dynamic_policy(host: &DynamicHost, method: &str, path: &str) -> Option<&'static str> {
@@ -664,52 +658,11 @@ fn validate_authority(authority: &str) -> Option<&'static str> {
     None
 }
 
-/// Validate an RFC 9292 :path pseudo-header value.
+/// Validate an RFC 9292 :path pseudo-header value
+/// ([`zodl_ohttp_integrations::core::route::validate_path`]).
 /// Returns None if valid, Some(reason) if invalid.
-///
-/// Rules:
-/// - Must start with /
-/// - Only visible ASCII (0x21-0x7E)
-/// - No # (fragment)
-/// - No // immediately after start (could be read as authority)
-/// - No .. path segments
-/// - Length ≤ 8 KiB
 fn validate_path(path: &str) -> Option<&'static str> {
-    if path.is_empty() {
-        return Some("empty path");
-    }
-
-    if !path.starts_with('/') {
-        return Some("path does not start with /");
-    }
-
-    if path.len() > 8192 {
-        return Some("path too long");
-    }
-
-    if path.starts_with("//") {
-        return Some("path starts with //");
-    }
-
-    if path.contains('#') {
-        return Some("path contains fragment");
-    }
-
-    // Check for visible ASCII only and .. segments
-    for c in path.chars() {
-        if !c.is_ascii() || (c as u8) < 0x21 || (c as u8) > 0x7E {
-            return Some("path contains non-visible ASCII");
-        }
-    }
-
-    // Check for .. segments
-    for segment in path.split('/') {
-        if segment == ".." {
-            return Some("path contains .. segment");
-        }
-    }
-
-    None
+    zodl_ohttp_integrations::core::route::validate_path(path)
 }
 
 /// Create a 400 Binary HTTP response for malformed path.

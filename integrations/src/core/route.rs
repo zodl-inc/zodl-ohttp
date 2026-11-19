@@ -79,6 +79,54 @@ pub fn path_trick(path: &str) -> Option<&'static str> {
     None
 }
 
+/// Why `path` is not a valid RFC 9292 `:path` value, if it is not: it must start with `/`, hold
+/// visible ASCII only (0x21-0x7E), no `#` (fragment), no `//` at the start (it could be read as
+/// an authority), no `..` segment, and be at most 8 KiB long.
+pub fn validate_path(path: &str) -> Option<&'static str> {
+    if path.is_empty() {
+        return Some("empty path");
+    }
+
+    if !path.starts_with('/') {
+        return Some("path does not start with /");
+    }
+
+    if path.len() > 8192 {
+        return Some("path too long");
+    }
+
+    if path.starts_with("//") {
+        return Some("path starts with //");
+    }
+
+    if path.contains('#') {
+        return Some("path contains fragment");
+    }
+
+    // Check for visible ASCII only and .. segments
+    for c in path.chars() {
+        if !c.is_ascii() || (c as u8) < 0x21 || (c as u8) > 0x7E {
+            return Some("path contains non-visible ASCII");
+        }
+    }
+
+    // Check for .. segments
+    for segment in path.split('/') {
+        if segment == ".." {
+            return Some("path contains .. segment");
+        }
+    }
+
+    None
+}
+
+/// The request-side path rejections ([`path_trick`], [`validate_path`]) for the path of a
+/// configured rule (a query rule, a value source), checked at startup: a rule for a path no
+/// request can have is a mistake.
+pub fn rule_path_rejection(path: &str) -> Option<&'static str> {
+    path_trick(path).or_else(|| validate_path(path))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -142,5 +190,26 @@ mod tests {
         assert_eq!(path_trick("/a/b?c=d"), None);
         assert_eq!(path_trick("/"), None);
         assert_eq!(path_trick("é//"), Some("path contains double slashes"));
+    }
+
+    #[test]
+    fn rule_paths_get_both_rejections() {
+        assert_eq!(rule_path_rejection("/v1/x"), None);
+        assert_eq!(
+            rule_path_rejection("/a/%2e/b"),
+            Some("path contains directory traversal")
+        );
+        assert_eq!(rule_path_rejection("x"), Some("path does not start with /"));
+        assert_eq!(rule_path_rejection("//x"), Some("path starts with //"));
+        assert_eq!(rule_path_rejection("/x#f"), Some("path contains fragment"));
+        assert_eq!(
+            rule_path_rejection("/x\u{7f}"),
+            Some("path contains non-visible ASCII")
+        );
+        assert_eq!(validate_path(""), Some("empty path"));
+        assert_eq!(
+            validate_path(&format!("/{}", "a".repeat(8192))),
+            Some("path too long")
+        );
     }
 }
