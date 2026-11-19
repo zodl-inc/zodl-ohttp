@@ -89,6 +89,38 @@ fn dynamic_backend_client() -> &'static DynamicBackendClient {
     })
 }
 
+/// Test hook: the URI and header map (contents and iteration order) of every request built for
+/// a dynamic host. Such a request is only ever connected to a public address, so no local test
+/// backend can receive it.
+#[cfg(test)]
+pub(crate) static DYNAMIC_REQUESTS: std::sync::Mutex<Vec<RecordedRequest>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// A request [`DYNAMIC_REQUESTS`] recorded: its URI and its header map, in order.
+#[cfg(test)]
+pub(crate) type RecordedRequest = (String, Vec<(String, String)>);
+
+/// Record `request` in [`DYNAMIC_REQUESTS`] when it is for a dynamic host.
+#[cfg(test)]
+fn record_dynamic_request(dynamic: bool, request: &Request<Full<Bytes>>) {
+    if dynamic {
+        let headers = request
+            .headers()
+            .iter()
+            .map(|(k, v)| {
+                (
+                    k.as_str().to_string(),
+                    String::from_utf8_lossy(v.as_bytes()).into_owned(),
+                )
+            })
+            .collect();
+        DYNAMIC_REQUESTS
+            .lock()
+            .unwrap()
+            .push((request.uri().to_string(), headers));
+    }
+}
+
 /// The dynamic host an inner authority (lowercase) names, if any. Static configuration wins:
 /// a `BACKENDS` alias or a `GATEWAY_HOSTS` name is never a dynamic host.
 pub fn dynamic_host(config: &Config, authority_lower: &str) -> Option<Arc<DynamicHost>> {
@@ -388,7 +420,7 @@ fn forward_admission(
     }
     let authority_lower = inner_request.authority.to_ascii_lowercase();
     let registry = integrations(config);
-    let Some(provider) = registry.provider(&authority_lower) else {
+    let Some(provider) = registry.integration(&authority_lower) else {
         return Ok(config
             .backend_headers
             .get(&authority_lower)
@@ -419,7 +451,7 @@ fn request_view(
 /// rule: the request's verdict when it was taken already (`query_admitted`), else evaluated now.
 fn alias_admission(
     config: &Config,
-    provider: &zodl_ohttp_integrations::generic::Generic<'_>,
+    provider: &zodl_ohttp_integrations::registry::Integration<'_>,
     authority_lower: &str,
     view: &zodl_ohttp_integrations::core::provider::RequestView<'_>,
     query_admitted: Option<bool>,
@@ -451,7 +483,7 @@ fn check_operation_policy(
 ) -> Option<&'static str> {
     let authority_lower = authority.to_ascii_lowercase();
     let registry = integrations(config);
-    match registry.provider(&authority_lower) {
+    match registry.integration(&authority_lower) {
         Some(provider) => {
             let view = zodl_ohttp_integrations::core::provider::RequestView {
                 method,
@@ -506,16 +538,18 @@ pub fn policy_denies_in(
     }
     let authority_lower = inner_request.authority.to_ascii_lowercase();
     let registry = integrations(config);
-    registry.provider(&authority_lower).is_some_and(|provider| {
-        alias_admission(
-            config,
-            &provider,
-            &authority_lower,
-            &request_view(inner_request),
-            route.query_admitted,
-        )
-        .is_err()
-    })
+    registry
+        .integration(&authority_lower)
+        .is_some_and(|provider| {
+            alias_admission(
+                config,
+                &provider,
+                &authority_lower,
+                &request_view(inner_request),
+                route.query_admitted,
+            )
+            .is_err()
+        })
 }
 
 /// Whether a request to a `GATEWAY_HOSTS` authority (the light client server) is refused by
@@ -542,7 +576,29 @@ pub(crate) fn integrations(config: &Config) -> zodl_ohttp_integrations::registry
         policy: &config.backends_policy,
         default_allow: config.backends_policy_default_allow,
         headers: &config.backend_headers,
+        aliases: zodl_ohttp_integrations::registry::Aliases {
+            flexa: config.flexa_alias.as_deref(),
+            near: config.near_alias.as_deref(),
+        },
+        flexa_key: config.flexa_publishable_key.as_deref(),
     }
+}
+
+/// The headers a request's provider forwards besides the gateway's allowlist (the Flexa
+/// alias's protocol headers and swapped credential), added after the allowlist and before the
+/// `User-Agent`. None for a dynamic host.
+fn provider_forwarded_headers(
+    config: &Config,
+    dynamic: Option<&DynamicHost>,
+    inner_request: &InnerRequest,
+) -> Vec<(String, String)> {
+    if dynamic.is_some() {
+        return Vec::new();
+    }
+    integrations(config).forwarded_headers(
+        &inner_request.authority.to_ascii_lowercase(),
+        &request_view(inner_request),
+    )
 }
 
 /// A gRPC call (`content-type: application/grpc...`): its upstream also gets `grpc-request-id`.
@@ -552,7 +608,7 @@ fn is_grpc_request(inner_request: &InnerRequest) -> bool {
 
 /// Request headers that are forwarded to backends. Closed list for gRPC negotiation.
 /// Authorization/Cookie/API-key headers are REPLACED (not forwarded) — see backend_headers injection
-/// (the Flexa alias forwards a few more, see `flexa.rs`).
+/// (the Flexa alias forwards a few more, see `zodl_ohttp_integrations::flexa`).
 fn forward_header(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     matches!(
@@ -1244,7 +1300,6 @@ async fn forward_to_backend_internal(
     };
 
     // Check operation policy for mapped backends
-    let authority_lower = inner_request.authority.to_ascii_lowercase();
     // The credential headers are taken with the verdict, so that a request is either refused here
     // or forwarded with them, never without.
     let credentials = match forward_admission(
@@ -1460,14 +1515,9 @@ async fn forward_to_backend_internal(
             req_builder = req_builder.header(name.as_str(), value.as_str());
         }
     }
-    if dynamic.is_none() && crate::flexa::is_alias(config.flexa_alias.as_deref(), &authority_lower)
-    {
-        for (name, value) in crate::flexa::upstream_headers(
-            &inner_request.headers,
-            config.flexa_publishable_key.as_deref(),
-        ) {
-            req_builder = req_builder.header(name, value);
-        }
+    // The headers the provider forwards besides the allowlist (the Flexa alias's).
+    for (name, value) in provider_forwarded_headers(config, dynamic.as_deref(), inner_request) {
+        req_builder = req_builder.header(name, value);
     }
 
     // Fixed user-agent
@@ -1487,6 +1537,8 @@ async fn forward_to_backend_internal(
     let http_request = req_builder
         .body(Full::new(Bytes::from(inner_request.body.clone())))
         .map_err(|e| anyhow!("Failed to build HTTP request: {:?}", e))?;
+    #[cfg(test)]
+    record_dynamic_request(dynamic.is_some(), &http_request);
 
     let overall = Duration::from_secs(config.lwd_timeout_secs);
     let deadline = Instant::now() + overall;
@@ -1845,7 +1897,6 @@ pub async fn forward_to_backend_stream_in(
     };
 
     // Check operation policy for mapped backends
-    let authority_lower = inner_request.authority.to_ascii_lowercase();
     // The credential headers are taken with the verdict, so that a request is either refused here
     // or forwarded with them, never without.
     let credentials = match forward_admission(
@@ -2083,14 +2134,9 @@ pub async fn forward_to_backend_stream_in(
             req_builder = req_builder.header(name.as_str(), value.as_str());
         }
     }
-    if dynamic.is_none() && crate::flexa::is_alias(config.flexa_alias.as_deref(), &authority_lower)
-    {
-        for (name, value) in crate::flexa::upstream_headers(
-            &inner_request.headers,
-            config.flexa_publishable_key.as_deref(),
-        ) {
-            req_builder = req_builder.header(name, value);
-        }
+    // The headers the provider forwards besides the allowlist (the Flexa alias's).
+    for (name, value) in provider_forwarded_headers(config, dynamic.as_deref(), inner_request) {
+        req_builder = req_builder.header(name, value);
     }
 
     // Fixed user-agent
@@ -2110,6 +2156,8 @@ pub async fn forward_to_backend_stream_in(
     let http_request = req_builder
         .body(Full::new(Bytes::from(inner_request.body.clone())))
         .map_err(|e| anyhow!("Failed to build HTTP request: {:?}", e))?;
+    #[cfg(test)]
+    record_dynamic_request(dynamic.is_some(), &http_request);
 
     let overall = Duration::from_secs(config.lwd_timeout_secs);
 
@@ -4223,8 +4271,9 @@ mod stream_tests {
     async fn test_flexa_placeholder_replaced_upstream() {
         let url = make_echo_server().await;
         let state = flexa_state(&url, Some("publishable_live_real"), 5);
-        let placeholder =
-            crate::flexa::basic_authorization(crate::flexa::PLACEHOLDER_PUBLISHABLE_KEY);
+        let placeholder = zodl_ohttp_integrations::flexa::basic_authorization(
+            zodl_ohttp_integrations::flexa::PLACEHOLDER_PUBLISHABLE_KEY,
+        );
         for (method, path) in [
             ("POST", "/tokens"),
             ("PATCH", "/tokens/tok_1"),
@@ -4238,10 +4287,10 @@ mod stream_tests {
             assert_eq!(status, 200);
             let expected = format!(
                 "authorization: {}",
-                crate::flexa::basic_authorization("publishable_live_real")
+                zodl_ohttp_integrations::flexa::basic_authorization("publishable_live_real")
             );
             assert!(seen.lines().any(|l| l == expected), "{seen}");
-            assert!(!seen.contains(crate::flexa::PLACEHOLDER_PUBLISHABLE_KEY));
+            assert!(!seen.contains(zodl_ohttp_integrations::flexa::PLACEHOLDER_PUBLISHABLE_KEY));
             assert!(!seen.contains(&placeholder["Basic ".len()..]));
         }
 
@@ -4259,7 +4308,8 @@ mod stream_tests {
     async fn test_flexa_user_token_and_headers_pass_through() {
         let url = make_echo_server().await;
         let state = flexa_state(&url, Some("publishable_live_real"), 5);
-        let token = crate::flexa::basic_authorization("eyJhbGciOiJFUzI1NiJ9.user.sig");
+        let token =
+            zodl_ohttp_integrations::flexa::basic_authorization("eyJhbGciOiJFUzI1NiJ9.user.sig");
         let (status, seen) = collect_body(
             &state,
             &flexa_request(
@@ -4857,6 +4907,506 @@ mod stream_tests {
     #[tokio::test]
     async fn https_backend_client_is_shared() {
         assert!(std::ptr::eq(https_backend_client(), https_backend_client()));
+    }
+    /// The requests a header-capture backend got: per request its path and query and its
+    /// header map as received, in iteration order (names lowercase; the values of one name
+    /// together, in their order).
+    type Captured = Arc<parking_lot::Mutex<Vec<(String, Vec<(String, String)>)>>>;
+
+    /// A backend that records every request's header list in the order received and answers
+    /// `ok`.
+    async fn make_header_capture_server() -> (String, Captured) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen: Captured = Default::default();
+        let recorded = seen.clone();
+        tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let recorded = recorded.clone();
+                let service = service_fn(move |req: Request<hyper::body::Incoming>| {
+                    let recorded = recorded.clone();
+                    async move {
+                        let headers = req
+                            .headers()
+                            .iter()
+                            .map(|(k, v)| {
+                                (
+                                    k.as_str().to_string(),
+                                    String::from_utf8_lossy(v.as_bytes()).into_owned(),
+                                )
+                            })
+                            .collect();
+                        let target = req
+                            .uri()
+                            .path_and_query()
+                            .map(|pq| pq.as_str().to_string())
+                            .unwrap_or_default();
+                        recorded.lock().push((target, headers));
+                        Ok::<_, Infallible>(Response::new(http_body_util::Full::new(
+                            Bytes::from_static(b"ok"),
+                        )))
+                    }
+                });
+                tokio::spawn(async move {
+                    let _ = hyper_util::server::conn::auto::Builder::new(
+                        hyper_util::rt::TokioExecutor::new(),
+                    )
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await;
+                });
+            }
+        });
+        (format!("http://127.0.0.1:{}", addr.port()), seen)
+    }
+
+    fn header_list(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(n, v)| (n.to_string(), v.to_string()))
+            .collect()
+    }
+
+    /// The request id of the header-order test.
+    const HEADER_TEST_REQUEST_ID: &str = "6b0e2a4c-1f3d-4e5a-9b7c-0d1e2f3a4b5c";
+
+    /// What one request sent upstream: path and query, header list.
+    type Sent = (String, Vec<(String, String)>);
+
+    /// Send `request` once through the collected and once through the streamed forward: the
+    /// requests the backend got for each.
+    async fn upstream_header_lists(
+        state: &Arc<AppState>,
+        seen: &Captured,
+        request: &InnerRequest,
+    ) -> [Vec<Sent>; 2] {
+        let id = uuid::Uuid::parse_str(HEADER_TEST_REQUEST_ID).unwrap();
+        let route = RouteContext::resolve(&state.config, request);
+        seen.lock().clear();
+        let _ = forward_to_backend_internal(state, request, Some(id), None, Some(&route)).await;
+        let collected = std::mem::take(&mut *seen.lock());
+        if let Ok((_, _, mut stream)) =
+            forward_to_backend_stream_in(state, request, id, None, &route).await
+        {
+            while stream.next().await.is_some() {}
+        }
+        let streamed = std::mem::take(&mut *seen.lock());
+        [collected, streamed]
+    }
+
+    /// The handler state of the header-order tests: aliases to the capture backend `url` (a
+    /// credential alias, one with two headers of one name, one without policy under
+    /// `BACKENDS_POLICY_DEFAULT=allow`, the NEAR alias, the alias `pay.example`), the gateway
+    /// host `ohttp-gateway.example` (its lightwalletd is the capture backend too) with a
+    /// `BACKEND_HEADERS` entry, `FLEXA_ALIAS=flexa_alias` and `FLEXA_PUBLISHABLE_KEY=key`.
+    fn header_test_state(url: &str, flexa_alias: &str, key: Option<&str>) -> Arc<AppState> {
+        let state = make_test_state(url, 1024 * 1024);
+        let mut config = state.config.clone();
+        config.backends = [
+            "key.example",
+            "dup.example",
+            "open.example",
+            "near.example",
+            FLEXA_TEST_ALIAS,
+        ]
+        .iter()
+        .map(|a| (a.to_string(), url.to_string()))
+        .collect();
+        config.backends_policy = [
+            ("key.example", header_list(&[("GET", "/v1/x")])),
+            ("dup.example", header_list(&[("GET", "/*")])),
+            ("near.example", header_list(&[("GET", "/v0/tokens")])),
+            (
+                FLEXA_TEST_ALIAS,
+                header_list(&[("POST", "/tokens"), ("GET", "/events")]),
+            ),
+        ]
+        .into_iter()
+        .map(|(a, p)| (a.to_string(), p))
+        .collect();
+        // `open.example` has no policy entry: the default admits it.
+        config.backends_policy_default_allow = true;
+        config.backend_headers = [
+            (
+                "key.example",
+                header_list(&[("X-Api-Key", "key-1"), ("Authorization", "Bearer token-1")]),
+            ),
+            (
+                "dup.example",
+                header_list(&[("X-Dup", "1"), ("X-Other", "o"), ("X-Dup", "2")]),
+            ),
+            ("open.example", header_list(&[("X-Open", "1")])),
+            (
+                "near.example",
+                header_list(&[("Authorization", "Bearer fake.jwt.near")]),
+            ),
+            (FLEXA_TEST_ALIAS, header_list(&[("X-Pay", "p")])),
+            ("ohttp-gateway.example", header_list(&[("X-Gw", "g")])),
+        ]
+        .into_iter()
+        .map(|(a, h)| (a.to_string(), h))
+        .collect();
+        config.flexa_alias = Some(flexa_alias.to_string());
+        config.flexa_publishable_key = key.map(str::to_string);
+        config.near_alias = Some("near.example".to_string());
+        // The gateway host forwards to its lightwalletd: the capture backend.
+        config.lwd_addr = url.trim_start_matches("http://").to_string();
+        let state = Arc::try_unwrap(state).ok().unwrap();
+        Arc::new(AppState { config, ..state })
+    }
+
+    fn header_test_request(
+        authority: &str,
+        method: &str,
+        path: &str,
+        headers: &[(&str, &str)],
+    ) -> InnerRequest {
+        InnerRequest {
+            method: method.to_string(),
+            path: path.to_string(),
+            authority: authority.to_string(),
+            headers: header_list(headers),
+            body: vec![],
+        }
+    }
+
+    /// Each request reaches the backend exactly once on each forward path, with `expected`.
+    async fn assert_upstream_headers(
+        state: &Arc<AppState>,
+        seen: &Captured,
+        cases: &[(InnerRequest, Vec<(String, String)>)],
+    ) {
+        for (request, expected) in cases {
+            let lists = upstream_header_lists(state, seen, request).await;
+            for (path, got) in ["collected", "streamed"].into_iter().zip(lists) {
+                let what = format!(
+                    "{path}: {} {} {}",
+                    request.authority, request.method, request.path
+                );
+                assert_eq!(got.len(), 1, "{what}: {got:?}");
+                let (target, headers) = &got[0];
+                assert_eq!(target, &request.path, "{what}");
+                assert_eq!(headers, expected, "{what}");
+            }
+        }
+    }
+
+    /// The upstream header map (contents and iteration order; the values of one name together)
+    /// of every kind of static authority, for the collected and the streamed forward alike: the
+    /// gateway's request ids, the forwarded allowlist, the Flexa headers, the `User-Agent`,
+    /// `grpc-accept-encoding: identity` (an h2c upstream), then the `BACKEND_HEADERS` of the
+    /// authority; never a client credential. A refused request reaches no upstream.
+    #[tokio::test]
+    async fn test_upstream_header_lists_are_pinned() {
+        let (url, seen) = make_header_capture_server().await;
+        let state = header_test_state(&url, FLEXA_TEST_ALIAS, Some("publishable_live_real"));
+        let entries = |list: &[(&str, &str)]| header_list(list);
+        let request = header_test_request;
+        // What a client may send besides the allowlist: never forwarded.
+        let noise: &[(&str, &str)] = &[
+            ("Content-Type", "application/json"),
+            ("Authorization", "Bearer client-token"),
+            ("X-Api-Key", "client-key"),
+            ("Cookie", "a=b"),
+            ("User-Agent", "app/1.0"),
+            ("grpc-timeout", "5S"),
+            ("grpc-accept-encoding", "gzip"),
+            ("X-Request-Id", "client-id"),
+        ];
+        let placeholder = zodl_ohttp_integrations::flexa::basic_authorization(
+            zodl_ohttp_integrations::flexa::PLACEHOLDER_PUBLISHABLE_KEY,
+        );
+        let user_token = zodl_ohttp_integrations::flexa::basic_authorization("user-token");
+        let real = zodl_ohttp_integrations::flexa::basic_authorization("publishable_live_real");
+        let id = HEADER_TEST_REQUEST_ID;
+        let flexa_tokens = request(
+            FLEXA_TEST_ALIAS,
+            "POST",
+            "/tokens",
+            &[
+                ("Content-Type", "application/json"),
+                ("Authorization", &placeholder),
+                ("Flexa-Version", "2025-11-04"),
+                ("Accept", "application/json"),
+                ("Cookie", "a=b"),
+                ("User-Agent", "sdk/1.0"),
+            ],
+        );
+        let gateway_call = request(
+            "ohttp-gateway.example",
+            "POST",
+            "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetLightdInfo",
+            &[
+                ("content-type", "application/grpc"),
+                ("grpc-accept-encoding", "gzip"),
+                ("Authorization", &placeholder),
+                ("Flexa-Version", "2025-11-04"),
+            ],
+        );
+        let cases: Vec<(InnerRequest, Vec<(String, String)>)> = vec![
+            // A credential alias: its BACKEND_HEADERS, never the client's credentials.
+            (
+                request("key.example", "GET", "/v1/x?a=1", noise),
+                entries(&[
+                    ("x-request-id", id),
+                    ("content-type", "application/json"),
+                    ("grpc-timeout", "5S"),
+                    ("user-agent", "ohttp-gateway/1.0"),
+                    ("grpc-accept-encoding", "identity"),
+                    ("x-api-key", "key-1"),
+                    ("authorization", "Bearer token-1"),
+                ]),
+            ),
+            // Two entries of one name: both, in order (a header map keeps a name's values
+            // together).
+            (
+                request("dup.example", "GET", "/d", &[]),
+                entries(&[
+                    ("x-request-id", id),
+                    ("user-agent", "ohttp-gateway/1.0"),
+                    ("grpc-accept-encoding", "identity"),
+                    ("x-dup", "1"),
+                    ("x-dup", "2"),
+                    ("x-other", "o"),
+                ]),
+            ),
+            // No policy entry, admitted by BACKENDS_POLICY_DEFAULT=allow.
+            (
+                request("open.example", "PATCH", "/any/thing", noise),
+                entries(&[
+                    ("x-request-id", id),
+                    ("content-type", "application/json"),
+                    ("grpc-timeout", "5S"),
+                    ("user-agent", "ohttp-gateway/1.0"),
+                    ("grpc-accept-encoding", "identity"),
+                    ("x-open", "1"),
+                    ("content-length", "0"),
+                ]),
+            ),
+            // The NEAR alias: its bearer, never the client's.
+            (
+                request("near.example", "GET", "/v0/tokens", noise),
+                entries(&[
+                    ("x-request-id", id),
+                    ("content-type", "application/json"),
+                    ("grpc-timeout", "5S"),
+                    ("user-agent", "ohttp-gateway/1.0"),
+                    ("grpc-accept-encoding", "identity"),
+                    ("authorization", "Bearer fake.jwt.near"),
+                ]),
+            ),
+            // The Flexa alias: its forwarded headers and the swapped placeholder before the
+            // User-Agent, its BACKEND_HEADERS after.
+            (
+                flexa_tokens.clone(),
+                entries(&[
+                    ("x-request-id", id),
+                    ("content-type", "application/json"),
+                    ("accept", "application/json"),
+                    ("flexa-version", "2025-11-04"),
+                    ("authorization", &real),
+                    ("user-agent", "ohttp-gateway/1.0"),
+                    ("grpc-accept-encoding", "identity"),
+                    ("x-pay", "p"),
+                    ("content-length", "0"),
+                ]),
+            ),
+            // A user token passes untouched.
+            (
+                request(
+                    FLEXA_TEST_ALIAS,
+                    "GET",
+                    "/events",
+                    &[
+                        ("Accept", "text/event-stream"),
+                        ("Last-Event-ID", "evt_1"),
+                        ("Authorization", &user_token),
+                        ("Client-Trace-Id", "t-1"),
+                        ("Flexa-App", "app"),
+                    ],
+                ),
+                entries(&[
+                    ("x-request-id", id),
+                    ("accept", "text/event-stream"),
+                    ("flexa-app", "app"),
+                    ("client-trace-id", "t-1"),
+                    ("last-event-id", "evt_1"),
+                    ("authorization", &user_token),
+                    ("user-agent", "ohttp-gateway/1.0"),
+                    ("grpc-accept-encoding", "identity"),
+                    ("x-pay", "p"),
+                ]),
+            ),
+            // A gateway host (no BACKENDS alias) with a BACKEND_HEADERS entry, a gRPC call:
+            // no Flexa header (it is not FLEXA_ALIAS), no client credential.
+            (
+                gateway_call.clone(),
+                entries(&[
+                    ("x-request-id", id),
+                    ("grpc-request-id", id),
+                    ("content-type", "application/grpc"),
+                    ("user-agent", "ohttp-gateway/1.0"),
+                    ("grpc-accept-encoding", "identity"),
+                    ("x-gw", "g"),
+                    ("content-length", "0"),
+                ]),
+            ),
+        ];
+        assert_upstream_headers(&state, &seen, &cases).await;
+
+        // Refused by the policy (or the path check): no upstream request at all.
+        for request in [
+            request("key.example", "GET", "/v1/other", noise),
+            request("key.example", "GET", "/v1/x/../y", noise),
+            request("near.example", "POST", "/v0/quote", noise),
+            request(
+                FLEXA_TEST_ALIAS,
+                "GET",
+                "/tokens",
+                &[("Authorization", &placeholder)],
+            ),
+            request("dup.example", "POST", "/d", &[]),
+        ] {
+            let [collected, streamed] = upstream_header_lists(&state, &seen, &request).await;
+            assert!(
+                collected.is_empty() && streamed.is_empty(),
+                "{} {} {}: {collected:?} {streamed:?}",
+                request.authority,
+                request.method,
+                request.path
+            );
+        }
+
+        // No publishable key: the placeholder is dropped, nothing else changes.
+        let no_key = header_test_state(&url, FLEXA_TEST_ALIAS, None);
+        let cases = vec![(
+            flexa_tokens.clone(),
+            entries(&[
+                ("x-request-id", id),
+                ("content-type", "application/json"),
+                ("accept", "application/json"),
+                ("flexa-version", "2025-11-04"),
+                ("user-agent", "ohttp-gateway/1.0"),
+                ("grpc-accept-encoding", "identity"),
+                ("x-pay", "p"),
+                ("content-length", "0"),
+            ]),
+        )];
+        assert_upstream_headers(&no_key, &seen, &cases).await;
+
+        // FLEXA_ALIAS naming an authority outside BACKENDS (the gateway host; the gateway warns
+        // about it at startup): that authority gets the Flexa headers, the former alias none.
+        let unlisted =
+            header_test_state(&url, "ohttp-gateway.example", Some("publishable_live_real"));
+        let cases = vec![
+            (
+                gateway_call,
+                entries(&[
+                    ("x-request-id", id),
+                    ("grpc-request-id", id),
+                    ("content-type", "application/grpc"),
+                    ("flexa-version", "2025-11-04"),
+                    ("authorization", &real),
+                    ("user-agent", "ohttp-gateway/1.0"),
+                    ("grpc-accept-encoding", "identity"),
+                    ("x-gw", "g"),
+                    ("content-length", "0"),
+                ]),
+            ),
+            (
+                flexa_tokens,
+                entries(&[
+                    ("x-request-id", id),
+                    ("content-type", "application/json"),
+                    ("user-agent", "ohttp-gateway/1.0"),
+                    ("grpc-accept-encoding", "identity"),
+                    ("x-pay", "p"),
+                    ("content-length", "0"),
+                ]),
+            ),
+        ];
+        assert_upstream_headers(&unlisted, &seen, &cases).await;
+    }
+
+    /// A dynamic host connects to public addresses only, so no local backend can receive its
+    /// request: its header map is taken from the request as built ([`DYNAMIC_REQUESTS`]).
+    /// No request id, no credential or Flexa header (not even for a name that has
+    /// `BACKEND_HEADERS` and is `FLEXA_ALIAS`), no `grpc-accept-encoding: identity` (HTTPS),
+    /// the client's allowlisted headers as sent.
+    #[tokio::test]
+    async fn test_dynamic_host_upstream_header_list() {
+        let hosts = ["hdr-collected.example", "hdr-streamed.example"];
+        let state_for = |host: &str| {
+            let state = make_test_state("http://127.0.0.1:9", 1024 * 1024);
+            let mut config = state.config.clone();
+            config.dynamic_hosts = crate::dynamic_hosts::DynamicHosts::for_tests(
+                "hdr",
+                "GET /*",
+                &[
+                    "https://hdr-collected.example",
+                    "https://hdr-streamed.example",
+                ],
+                crate::dynamic_hosts::Reserved::default(),
+            );
+            config.backend_headers = hosts
+                .iter()
+                .map(|h| (h.to_string(), header_list(&[("X-Api-Key", "key-1")])))
+                .collect();
+            config.flexa_alias = Some(host.to_string());
+            config.flexa_publishable_key = Some("publishable_live_real".to_string());
+            // The name does not resolve; bound the wait anyway.
+            config.lwd_timeout_secs = 1;
+            let state = Arc::try_unwrap(state).ok().unwrap();
+            Arc::new(AppState { config, ..state })
+        };
+        let id = uuid::Uuid::parse_str(HEADER_TEST_REQUEST_ID).unwrap();
+        let placeholder = zodl_ohttp_integrations::flexa::basic_authorization(
+            zodl_ohttp_integrations::flexa::PLACEHOLDER_PUBLISHABLE_KEY,
+        );
+        let headers = header_list(&[
+            ("Content-Type", "application/json"),
+            ("Authorization", &placeholder),
+            ("Flexa-Version", "2025-11-04"),
+            ("Accept", "application/json"),
+            ("Cookie", "a=b"),
+            ("grpc-accept-encoding", "gzip"),
+            ("User-Agent", "app/1.0"),
+        ]);
+        let request = |authority: &str| InnerRequest {
+            method: "GET".to_string(),
+            path: "/v/1".to_string(),
+            authority: authority.to_string(),
+            headers: headers.clone(),
+            body: vec![],
+        };
+        let state = state_for(hosts[0]);
+        let collected = request(hosts[0]);
+        let route = RouteContext::resolve(&state.config, &collected);
+        assert!(route.dynamic().is_some());
+        let _ = forward_to_backend_internal(&state, &collected, Some(id), None, Some(&route)).await;
+        let state = state_for(hosts[1]);
+        let streamed = request(hosts[1]);
+        let route = RouteContext::resolve(&state.config, &streamed);
+        assert!(route.dynamic().is_some());
+        if let Ok((_, _, mut stream)) =
+            forward_to_backend_stream_in(&state, &streamed, id, None, &route).await
+        {
+            while stream.next().await.is_some() {}
+        }
+        let expected = header_list(&[
+            ("content-type", "application/json"),
+            ("grpc-accept-encoding", "gzip"),
+            ("user-agent", "ohttp-gateway/1.0"),
+        ]);
+        let recorded = DYNAMIC_REQUESTS.lock().unwrap().clone();
+        for host in hosts {
+            let lists: Vec<&Vec<(String, String)>> = recorded
+                .iter()
+                .filter(|(uri, _)| uri == &format!("https://{host}/v/1"))
+                .map(|(_, h)| h)
+                .collect();
+            assert_eq!(lists, vec![&expected], "{host}");
+        }
     }
 }
 

@@ -88,6 +88,13 @@ pub trait Provider: Send + Sync {
     /// Whether the request is admitted. Runs before the third-party cache and the upstream cap.
     fn admit(&self, req: &RequestView<'_>) -> Result<Admitted, Denial>;
 
+    /// Inner request headers the provider forwards besides the gateway's allowlist (`Flexa`:
+    /// its protocol headers and the client's `Authorization`, the placeholder swapped). The
+    /// gateway adds them after its allowlist and before its `User-Agent`. None by default.
+    fn forwarded_headers(&self, _req: &RequestView<'_>) -> Vec<(String, String)> {
+        Vec::new()
+    }
+
     /// The headers the provider adds to the upstream request of an admitted request: its
     /// credential. The gateway never forwards the client's own credential headers, and adds these
     /// after its own. `now` is the time a signed credential is issued at.

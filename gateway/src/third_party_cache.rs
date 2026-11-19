@@ -51,39 +51,30 @@
 //!
 //! The inner 429 is NOT counted as a replay/freshness error and does not affect lightwalletd paths.
 
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use parking_lot::Mutex;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::warn;
+use zodl_ohttp_integrations::core::{cache as core_cache, caps};
 
 use crate::cache::ResponseCache;
 use crate::ohttp::InnerResponse;
-use crate::origin::path_matches;
 
-/// Cache route: method, path pattern, TTL in seconds.
-#[derive(Clone, Debug)]
-struct CacheRoute {
-    method: String,
-    path: String,
-    ttl_secs: u64,
-}
+/// One `REQUESTS/WINDOWs` cap ([`zodl_ohttp_integrations::core::caps::parse_rate_spec`]).
+pub(crate) use zodl_ohttp_integrations::core::caps::parse_rate_spec;
+pub use zodl_ohttp_integrations::registry::Aliases;
 
-/// The aliases whose cache routes are restricted (`FLEXA_ALIAS`, `NEAR_ALIAS`), lowercase.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct Aliases<'a> {
-    /// Never cacheable (per-user answers).
-    pub flexa: Option<&'a str>,
-    /// Only `GET /v0/tokens` is cacheable.
-    pub near: Option<&'a str>,
-}
+/// Per-backend cache routes ([`zodl_ohttp_integrations::core::cache::CacheRoutes`]).
+#[derive(Clone)]
+pub struct CacheRoutes(core_cache::CacheRoutes);
 
-/// Per-backend cache routes.
-#[derive(Clone, Debug)]
-pub struct CacheRoutes {
-    routes: HashMap<String, Vec<CacheRoute>>,
+impl std::fmt::Debug for CacheRoutes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
 }
 
 impl CacheRoutes {
@@ -102,200 +93,41 @@ impl CacheRoutes {
     }
 
     fn parse(s: &str, aliases: Aliases<'_>) -> Result<Self> {
-        let mut routes = HashMap::new();
-        for entry in s.split(';') {
-            let entry = entry.trim();
-            if entry.is_empty() {
-                continue;
-            }
-            let Some((authority, policies)) = entry.split_once('=') else {
-                anyhow::bail!(
-                    "Malformed THIRD_PARTY_CACHE_ROUTES: '{entry}' must be 'authority=METHOD /path@TTL,...'"
-                );
-            };
-            let authority = authority.trim().to_ascii_lowercase();
-            if authority.is_empty() {
-                anyhow::bail!("Malformed THIRD_PARTY_CACHE_ROUTES: missing authority in '{entry}'");
-            }
-            let mut list = Vec::new();
-            for policy in policies.split(',') {
-                let policy = policy.trim();
-                if policy.is_empty() {
-                    continue;
-                }
-                // Parse "METHOD /path@TTL"
-                let Some((method_path, ttl_str)) = policy.split_once('@') else {
-                    anyhow::bail!(
-                        "Malformed THIRD_PARTY_CACHE_ROUTES: '{policy}' must be 'METHOD /path@TTL' (entry: '{entry}')"
-                    );
-                };
-                let Some((method, path)) = method_path.trim().split_once(' ') else {
-                    anyhow::bail!(
-                        "Malformed THIRD_PARTY_CACHE_ROUTES: '{method_path}' must be 'METHOD /path' (entry: '{entry}')"
-                    );
-                };
-                let method = method.trim().to_ascii_uppercase();
-                if method != "GET" {
-                    anyhow::bail!(
-                        "Invalid THIRD_PARTY_CACHE_ROUTES method '{method}' in '{policy}': only GET is allowed"
-                    );
-                }
-                let path = path.trim().to_string();
-                if !path.starts_with('/') {
-                    anyhow::bail!(
-                        "Invalid THIRD_PARTY_CACHE_ROUTES path '{path}' in '{policy}': must start with /"
-                    );
-                }
-
-                // Flexa answers are per user (the cache key has no Authorization): never cached.
-                if aliases.flexa == Some(authority.as_str()) {
-                    anyhow::bail!(
-                        "Invalid THIRD_PARTY_CACHE_ROUTES: {} (FLEXA_ALIAS) answers are per user and never cacheable",
-                        authority
-                    );
-                }
-
-                // NEAR_ALIAS constraint: only GET /v0/tokens is allowed to be cached.
-                // Deny: POST /v0/quote (creates quote+address), GET /v0/status (per-deposit state),
-                // POST /v0/deposit/submit, and any non-GET.
-                if aliases.near == Some(authority.as_str()) {
-                    if method != "GET" {
-                        anyhow::bail!(
-                            "Invalid THIRD_PARTY_CACHE_ROUTES: {} (NEAR_ALIAS) non-GET '{}' is not cacheable (only GET /v0/tokens allowed)",
-                            authority,
-                            method
-                        );
-                    }
-                    // Only /v0/tokens is allowed
-                    if path != "/v0/tokens" {
-                        anyhow::bail!(
-                            "Invalid THIRD_PARTY_CACHE_ROUTES: {} (NEAR_ALIAS) '{}' is not cacheable \
-                             (only GET /v0/tokens allowed; POST /v0/quote, GET /v0/status, POST /v0/deposit/submit are denied)",
-                            authority,
-                            path
-                        );
-                    }
-                }
-
-                let ttl_str = ttl_str.trim();
-                let ttl_secs = ttl_str.parse::<u64>().map_err(|_| {
-                    anyhow!(
-                        "Invalid THIRD_PARTY_CACHE_ROUTES TTL '{ttl_str}' in '{policy}': must be a positive integer"
-                    )
-                })?;
-                if ttl_secs == 0 {
-                    anyhow::bail!(
-                        "Invalid THIRD_PARTY_CACHE_ROUTES TTL '{ttl_secs}' in '{policy}': must be > 0"
-                    );
-                }
-                list.push(CacheRoute {
-                    method,
-                    path,
-                    ttl_secs,
-                });
-            }
-            if list.is_empty() {
-                anyhow::bail!(
-                    "Malformed THIRD_PARTY_CACHE_ROUTES: no routes for authority '{authority}'"
-                );
-            }
-            routes.insert(authority, list);
-        }
-        if routes.is_empty() {
-            anyhow::bail!("Malformed THIRD_PARTY_CACHE_ROUTES: no entries");
-        }
-        Ok(Self { routes })
+        core_cache::CacheRoutes::parse(s, |authority, method, path| {
+            aliases.check_cache_route(authority, method, path)
+        })
+        .map(Self)
     }
 
     /// Find a matching route for (authority, method, path). Returns the TTL if found.
     pub fn find_ttl(&self, authority: &str, method: &str, path: &str) -> Option<u64> {
-        let authority = authority.to_ascii_lowercase();
-        let routes = self.routes.get(&authority)?;
-        for route in routes {
-            if method.eq_ignore_ascii_case(&route.method) && path_matches(&route.path, path) {
-                return Some(route.ttl_secs);
-            }
-        }
-        None
+        self.0.find_ttl(authority, method, path)
     }
 
     /// Total number of configured routes across all authorities.
     #[allow(clippy::len_without_is_empty)]
     pub fn len(&self) -> usize {
-        self.routes.values().map(Vec::len).sum()
+        self.0.len()
     }
 }
 
-/// Parse one `REQUESTS/WINDOWs` cap (`120/60s`) of the variable `name`: both parts positive.
-pub(crate) fn parse_rate_spec(name: &str, spec: &str) -> Result<(u64, Duration)> {
-    let Some((requests, window)) = spec.split_once('/') else {
-        anyhow::bail!("Malformed {name}: '{spec}' must be 'REQUESTS/WINDOW'");
-    };
-    let requests = requests
-        .trim()
-        .parse::<u64>()
-        .map_err(|_| anyhow!("Invalid {name} requests in '{spec}': must be a positive integer"))?;
-    if requests == 0 {
-        anyhow::bail!("Invalid {name} requests in '{spec}': must be > 0");
-    }
-    let window = window.trim();
-    let Some(secs) = window.strip_suffix('s') else {
-        anyhow::bail!(
-            "Invalid {name} window '{window}' in '{spec}': must end with 's' (e.g., '60s')"
-        );
-    };
-    let secs = secs.parse::<u64>().map_err(|_| {
-        anyhow!("Invalid {name} window '{window}' in '{spec}': must be a positive integer followed by 's'")
-    })?;
-    if secs == 0 {
-        anyhow::bail!("Invalid {name} window '{window}' in '{spec}': must be > 0");
-    }
-    Ok((requests, Duration::from_secs(secs)))
-}
-
-/// Rate limit window: fixed window per backend.
+/// Rate limit window: fixed window per backend
+/// ([`zodl_ohttp_integrations::core::caps::RateWindow`] on the process clock).
 #[derive(Debug)]
-pub(crate) struct RateWindow {
-    /// Window start time.
-    window_start: Instant,
-    /// Window duration.
-    window_duration: Duration,
-    /// Request count in the current window.
-    count: u64,
-    /// Max requests per window.
-    limit: u64,
-}
+pub(crate) struct RateWindow(caps::RateWindow);
 
 impl RateWindow {
     pub(crate) fn new(limit: u64, window_duration: Duration) -> Self {
-        Self {
-            window_start: Instant::now(),
-            window_duration,
-            count: 0,
+        Self(caps::RateWindow::new(
             limit,
-        }
+            window_duration,
+            Instant::now(),
+        ))
     }
 
     /// Check and increment. Returns Ok(()) if allowed, Err(retry_after_secs) if limited.
     pub(crate) fn check_and_increment(&mut self) -> Result<(), u64> {
-        let now = Instant::now();
-        let elapsed = now.duration_since(self.window_start);
-
-        // Reset window if expired
-        if elapsed >= self.window_duration {
-            self.window_start = now;
-            self.count = 0;
-        }
-
-        if self.count >= self.limit {
-            // Calculate seconds until window expires
-            let remaining = self.window_duration.saturating_sub(elapsed);
-            let retry_after_secs = remaining.as_secs().max(1);
-            return Err(retry_after_secs);
-        }
-
-        self.count += 1;
-        Ok(())
+        self.0.check_and_increment(Instant::now())
     }
 }
 
@@ -322,31 +154,9 @@ impl RateLimiters {
     }
 
     fn parse(s: &str) -> Result<Self> {
-        let mut configs = HashMap::new();
-        for entry in s.split(',') {
-            let entry = entry.trim();
-            if entry.is_empty() {
-                continue;
-            }
-            let Some((authority, limit_window)) = entry.split_once('=') else {
-                anyhow::bail!(
-                    "Malformed THIRD_PARTY_RATE_LIMITS: '{entry}' must be 'authority=REQUESTS/WINDOW'"
-                );
-            };
-            let authority = authority.trim().to_ascii_lowercase();
-            if authority.is_empty() {
-                anyhow::bail!("Malformed THIRD_PARTY_RATE_LIMITS: missing authority in '{entry}'");
-            }
-            let (requests, duration) = parse_rate_spec("THIRD_PARTY_RATE_LIMITS", limit_window)
-                .map_err(|e| anyhow!("{e} (entry: '{entry}')"))?;
-            configs.insert(authority, (requests, duration));
-        }
-        if configs.is_empty() {
-            anyhow::bail!("Malformed THIRD_PARTY_RATE_LIMITS: no entries");
-        }
         Ok(Self {
             limits: Arc::new(Mutex::new(HashMap::new())),
-            configs,
+            configs: caps::parse_rate_limits(s)?,
         })
     }
 
@@ -443,6 +253,8 @@ impl ThirdParty {
             flexa: flexa_alias,
             near: near_alias,
         };
+        // An alias whose provider kind this build lacks is refused.
+        aliases.check_built()?;
         Ok(Self {
             routes: CacheRoutes::from_env(aliases)?,
             limits: RateLimiters::from_env()?,
@@ -562,6 +374,7 @@ impl ThirdParty {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::anyhow;
 
     /// The Flexa and NEAR aliases of these tests (`FLEXA_ALIAS`, `NEAR_ALIAS`).
     const TEST_ALIASES: Aliases<'static> = Aliases {

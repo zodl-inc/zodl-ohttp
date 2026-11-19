@@ -270,15 +270,17 @@ pub struct Config {
     pub chunk_size: usize,
     /// Chunked OHTTP response flush interval in milliseconds (default 50)
     pub chunk_flush_ms: u64,
-    /// Flexa publishable key swapped in for the apps' placeholder credential (`flexa.rs`).
+    /// Flexa publishable key swapped in for the apps' placeholder credential
+    /// (`zodl_ohttp_integrations::flexa`).
     pub flexa_publishable_key: Option<String>,
     /// `FLEXA_ALIAS`: the `BACKENDS` alias (inner authority) of the Flexa API, lowercase. Requests
-    /// to it get the Flexa header handling of `flexa.rs` and are never cached. `None` (unset or
-    /// empty) = no alias is treated as Flexa.
+    /// to it get the Flexa header handling of `zodl_ohttp_integrations::flexa` and are never
+    /// cached. `None` (unset or empty) = no alias is treated as Flexa.
     pub flexa_alias: Option<String>,
-    /// `NEAR_ALIAS`: the `BACKENDS` alias of the NEAR Intents 1Click API, lowercase. Only its
-    /// public `GET /v0/tokens` may be listed in `THIRD_PARTY_CACHE_ROUTES` (its other routes carry
-    /// per-deposit state). `None` (unset or empty) = no such restriction.
+    /// `NEAR_ALIAS`: the `BACKENDS` alias of the NEAR Intents 1Click API, lowercase
+    /// (`zodl_ohttp_integrations::near`). Only its public `GET /v0/tokens` may be listed in
+    /// `THIRD_PARTY_CACHE_ROUTES` (its other routes carry per-deposit state). `None` (unset or
+    /// empty) = no such restriction.
     pub near_alias: Option<String>,
     /// `RELAY_SECRET_ON_KEY_CONFIG` (default `off`).
     pub relay_secret_on_key_config: RelaySecretOnKeyConfig,

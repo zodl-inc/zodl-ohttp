@@ -51,7 +51,6 @@ mod chunked_stream;
 mod config;
 mod dynamic_hosts;
 mod enforcement;
-mod flexa;
 mod freshness;
 mod health;
 mod host_list;

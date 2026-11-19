@@ -23,6 +23,18 @@ keeps its own log in [client/CHANGELOG.md](client/CHANGELOG.md).
   the alias carries a header credential, for the configuration file to come; no environment
   variable assigns them, so every alias stays generic. Verdicts, error messages, log fields and
   metrics are unchanged.
+- The Flexa and NEAR handling become providers of the integrations crate (cargo features
+  `flexa`, `near`, on by default): the registry gives the alias named by `FLEXA_ALIAS` the Flexa
+  provider (forwarded headers, placeholder swap) and the one named by `NEAR_ALIAS` the NEAR
+  provider, whose only cacheable route stays `GET /v0/tokens`. Both cache restrictions apply
+  in every build; a build without one of the two features refuses to start when its alias is
+  set. The two copies of the Flexa header code in the collected and the streamed forward are
+  now one provider call. Credentials are built by the crate's signers (a header template, the
+  placeholder swap). The parsers of `THIRD_PARTY_CACHE_ROUTES` and `THIRD_PARTY_RATE_LIMITS` and
+  the fixed-window cap move into the crate too; the cache store, its single flight and the cap state stay in the gateway. The
+  upstream headers (names, values, order), startup errors, log fields and metrics are
+  unchanged; a new test pins the exact upstream header list of every kind of authority on both
+  forward paths.
 
 ### Crate names
 

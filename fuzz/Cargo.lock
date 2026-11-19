@@ -2973,5 +2973,6 @@ name = "zodl-ohttp-integrations"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64",
  "serde_json",
 ]
