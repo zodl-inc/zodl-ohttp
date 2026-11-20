@@ -154,8 +154,9 @@ const fn secret(env: &'static str, place: Place) -> Setting {
 use Kind::{Bool, Float, Int, List, Str};
 
 /// Every setting of the gateway that is not policy. The serving process reads exactly these and
-/// the policy variables (besides `CONFIG_SOURCE` and the two file paths, [`BOOTSTRAP_ENV_KEYS`]);
-/// the `backfill` subcommand reads its own variables from the environment ([`BACKFILL_ENV_KEYS`]).
+/// the policy variables, from its configuration files only (from the environment it reads no
+/// more than the transition's [`BOOTSTRAP_ENV_KEYS`]); the `backfill` subcommand reads these and
+/// its own variables from the environment ([`BACKFILL_ENV_KEYS`]).
 pub const SETTINGS: &[Setting] = &[
     // Mode, listener, logs.
     tuning("GATEWAY_MODE", Str),
@@ -269,7 +270,9 @@ pub const SETTINGS: &[Setting] = &[
     secret("WRITE_FORWARD_SECRETS", Place::Host),
 ];
 
-/// The variables that choose the configuration source: always from the environment.
+/// The variables of the transition the environment may still hold: the two file paths (read when
+/// `--config` / `--host-config` are not given and `CONFIG_SOURCE=file` is set, with a warning,
+/// for one release; refused without it) and `CONFIG_SOURCE` (refused unless it is `file`).
 #[allow(dead_code)] // documentation and tests
 pub const BOOTSTRAP_ENV_KEYS: &[&str] = &[
     crate::config_source::SOURCE_ENV,
@@ -277,8 +280,8 @@ pub const BOOTSTRAP_ENV_KEYS: &[&str] = &[
     crate::config_source::HOST_FILE_ENV,
 ];
 
-/// The variables only the `backfill` subcommand reads (it reads the environment only, whatever
-/// `CONFIG_SOURCE` says).
+/// The variables only the `backfill` subcommand reads (it reads its configuration from the
+/// environment).
 #[allow(dead_code)] // documentation and tests
 pub const BACKFILL_ENV_KEYS: &[&str] = &[
     "BACKFILL_START",

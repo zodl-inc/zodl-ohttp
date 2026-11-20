@@ -3,3 +3,4 @@
 **/target
 fuzz/corpus
 fuzz/artifacts
+gateway/local

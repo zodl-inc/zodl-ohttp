@@ -157,22 +157,20 @@ mod cache_storage {
 #[cfg(test)]
 mod startup_validation {
     use crate::config::Config;
-    use std::env;
 
     #[test]
     fn test_both_relay_secret_vars_error_before_fix() {
-        let _env = crate::config::test_env_lock();
         // Setting both RELAY_SECRET and RELAY_SECRETS should ERROR at startup,
         // instead of one silently shadowing the other.
 
-        env::set_var("RELAY_SECRET", "secret1");
-        env::set_var("RELAY_SECRETS", "secret2,secret3");
-
         // This should error after the fix
-        let result = Config::from_env();
-
-        env::remove_var("RELAY_SECRET");
-        env::remove_var("RELAY_SECRETS");
+        let result = crate::config_source::with_vars(
+            [
+                ("RELAY_SECRET", "secret1"),
+                ("RELAY_SECRETS", "secret2,secret3"),
+            ],
+            Config::from_env,
+        );
 
         // Before fix: this would succeed (shadowing)
         // After fix: this should error

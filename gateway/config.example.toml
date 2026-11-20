@@ -1,25 +1,25 @@
-# An example common configuration file of the gateway (CONFIG_SOURCE=compare or file, --config
-# or GATEWAY_CONFIG_FILE; see CONFIG.md "Configuration file"). Placeholder names and values only.
+# An example common configuration file of the gateway (--config; see CONFIG.md). Placeholder
+# names and values only.
 #
 # The file holds the routing policy and, in [settings], the settings that are the same on every
 # origin of a network (tuning, and references to the secrets they share). The per-host settings
-# (addresses, stores, identity, sizing) go in the host file (host.example.toml). Without a
-# [settings] table and without a host file, every setting stays in the environment. Every list
-# entry is written in the grammar of the variable it stands for.
-# `zodl-ohttp-gateway --export-config` prints the file of the current environment's policy,
-# `--export-config --host host.toml` the two files of all of it;
-# `zodl-ohttp-gateway --config gateway.toml --host-config host.toml --check-config` checks them.
+# (addresses, stores, identity, sizing) go in the host file (host.example.toml). The gateway
+# reads nothing else: a setting left out is its default. Every list entry is written in the
+# grammar of the variable it stands for.
+# `zodl-ohttp-gateway --config gateway.toml --host-config host.toml --check-config` checks them;
+# `zodl-ohttp-gateway --export-config --host host.toml` writes the two files of an environment
+# (migration; point each secret at a file before use).
 
 schema = 1
 gateway_hosts = ["gateway.example"]            # GATEWAY_HOSTS
 backends_policy_default = "deny"               # BACKENDS_POLICY_DEFAULT
 relay_secret_on_key_config = "require"         # RELAY_SECRET_ON_KEY_CONFIG
 
-# Secrets: never in the file, only where to read them.
+# Secrets: never in the file, only the file to read each from (files only).
 [secrets]
-prices_key = { env = "PRICES_API_KEY" }
+prices_key = { file = "/run/secrets/prices_key" }
 swap_jwt = { file = "/run/secrets/swap_jwt" }  # the file's content, without its final line break
-quotes_key = { env = "QUOTES_API_KEY" }
+quotes_key = { file = "/run/secrets/quotes_key" }
 hpke_keys = { file = "/run/secrets/hpke_keys" }
 relay_secrets = { file = "/run/secrets/relay_secrets" }
 configs_signing_seed = { file = "/run/secrets/configs_signing_seed" }

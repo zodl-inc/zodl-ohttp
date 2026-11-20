@@ -11,8 +11,8 @@ not published on crates.io and is unrelated to the `ohttp-gateway` crate there; 
 the `ohttp-gateway` image only, whose name is unchanged. The image keeps `/app/ohttp-gateway` as
 a link to the binary.
 
-Every setting is an environment variable or a key of the configuration files: see
-[CONFIG.md](CONFIG.md). The design, privacy model
+Every setting is a key of the configuration files (named after the environment variable it
+replaces, which only `backfill` still reads): see [CONFIG.md](CONFIG.md). The design, privacy model
 and protocol details are in [../docs/architecture.md](../docs/architecture.md); logs and
 metrics in [../docs/observability.md](../docs/observability.md).
 
@@ -66,23 +66,47 @@ cargo test                       # store-backed tests need a Redis on 127.0.0.1:
 docker build -t ohttp-gateway -f Dockerfile ..  # context: the repository root
 ```
 
-A minimal local run (two Redis databases, a lightwalletd on 9067):
+A minimal local run (two Redis databases, a lightwalletd on 9067). The gateway reads its
+configuration from the files on its command line only (CONFIG.md), secrets from files:
 
 ```bash
-export GATEWAY_MODE=ohttp NETWORK=testnet LWD_ADDR=localhost:9067
-export GATEWAY_HOSTS=ohttp-gateway.example
-export RELAY_SECRET="local=$(openssl rand -hex 32)"
-export HPKE_KEYS="1:$(openssl rand -hex 32)"
-export CONFIGS_SIGNING_SEED_HEX="$(openssl rand -hex 32)"
-export REDIS_URL=redis://127.0.0.1:6379/0 REDIS_SECURITY_URL=redis://127.0.0.1:6379/1
-cargo run --release
+mkdir -p local/secrets && chmod 700 local/secrets
+echo "local=$(openssl rand -hex 32)" > local/secrets/relay_secrets
+echo "1:$(openssl rand -hex 32)" > local/secrets/hpke_keys
+openssl rand -hex 32 > local/secrets/configs_signing_seed
+cat > local/gateway.toml <<'TOML'
+schema = 1
+gateway_hosts = ["ohttp-gateway.example"]
+
+[secrets]
+relay_secrets = { file = "local/secrets/relay_secrets" }
+hpke_keys = { file = "local/secrets/hpke_keys" }
+configs_signing_seed = { file = "local/secrets/configs_signing_seed" }
+
+[settings]
+relay_secrets = { secret = "relay_secrets" }
+hpke_keys = { secret = "hpke_keys" }
+configs_signing_seed_hex = { secret = "configs_signing_seed" }
+TOML
+cat > local/host.toml <<'TOML'
+schema = 1
+
+[settings]
+network = "testnet"
+lwd_addr = "localhost:9067"
+redis_url = "redis://127.0.0.1:6379/0"
+redis_security_url = "redis://127.0.0.1:6379/1"
+TOML
+cargo run --release -- --config local/gateway.toml --host-config local/host.toml --check-config
+cargo run --release -- --config local/gateway.toml --host-config local/host.toml
 ```
 
 TLS is terminated in front of the gateway. The relay simulator (`../relay-simulator`) and the
 e2e client (`../e2e-client`, `../scripts/test-e2e.sh`) exercise a running gateway end to end.
 
-`zodl-ohttp-gateway backfill` fills the permanent block tier from lightwalletd and exits
-(CONFIG.md, "`zodl-ohttp-gateway backfill`").
+`zodl-ohttp-gateway backfill` fills the permanent block tier from lightwalletd and exits; it
+reads its configuration from the environment, the one exception (CONFIG.md,
+"`zodl-ohttp-gateway backfill`").
 
 ## Signed key configuration
 
@@ -110,6 +134,8 @@ their OHTTP configuration; `../docs/signed-configs-test-vector.json` is a test v
 
 ## HPKE key rotation
 
+`HPKE_KEYS` and `HPKE_ACCEPT_ONLY_KEYS` below are the settings `hpke_keys` and
+`hpke_accept_only_keys`, each a secret file; a phase is a change of those files and a restart.
 A key is accepted before it is advertised and stays accepted after it is no longer advertised,
 long enough for every cached configuration to expire. Signed envelopes live 21600 s, so a key
 must stay accepted for **21720 s after the last moment it was advertised** (21600 + 120 s of

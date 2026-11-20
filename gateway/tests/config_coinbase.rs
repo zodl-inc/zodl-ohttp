@@ -15,8 +15,9 @@
 // Commercial licensing: see COMMERCIAL-LICENSE.md.
 
 //! A `coinbase` integration in the configuration file: its key document read from a secret
-//! file (a key generated here), the policy the file stands for, `--check-config`, and how
-//! `compare` reports a table no environment can express.
+//! file (a key generated here), the policy the file stands for, `--check-config`, and how the
+//! comparison with an environment (the export's check) reports a table no environment can
+//! express.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -96,6 +97,9 @@ countries = {{ US = {{ buy = true, sell = true }} }}
     )
 }
 
+/// A host file that makes the gateway a testnet one.
+const TESTNET_HOST: &str = "schema = 1\n[settings]\nnetwork = \"testnet\"\n";
+
 /// Every policy and secret variable of the process removed (this test's process only).
 fn clear_policy_env() {
     for k in policy_file::POLICY_ENV_KEYS {
@@ -147,7 +151,7 @@ fn a_coinbase_table_loads_with_its_key_from_a_secret_file() {
     }
     let _ = key;
 
-    // Outside the file's scope (the environment's policy): no provider.
+    // Outside the file's scope (nothing installed, the environment never read): no provider.
     let config = Config::from_env().unwrap();
     assert!(config.coinbase.is_empty());
 
@@ -156,16 +160,18 @@ fn a_coinbase_table_loads_with_its_key_from_a_secret_file() {
     let config = skipped.run_in(|| Config::from_env().unwrap());
     assert!(!config.coinbase.get(ALIAS).unwrap().provider.has_signer());
 
-    // Mainnet only.
+    // Mainnet only: the network of the files (the environment's is not read).
     std::env::set_var("NETWORK", "testnet");
+    config_source::load_file(file.path(), Secrets::Require).unwrap();
+    std::env::remove_var("NETWORK");
+    let testnet = TempFile::new("testnet-host.toml", TESTNET_HOST);
     let text = format!(
         "{:#}",
-        config_source::load_file(file.path(), Secrets::Require).unwrap_err()
+        config_source::load_files(file.path(), Some(testnet.path()), Secrets::Require).unwrap_err()
     );
-    std::env::remove_var("NETWORK");
     assert!(text.contains("mainnet gateway only"), "{text}");
 
-    // A key read from a variable is a secret's variable, not a setting the files leave out.
+    // A key in a variable is refused (files only), by the secret's name, never its value.
     std::env::set_var("CONFIG_TEST_CDP_KEY", &document);
     let env_file = TempFile::new(
         "env.toml",
@@ -174,17 +180,17 @@ fn a_coinbase_table_loads_with_its_key_from_a_secret_file() {
             "cdp_key = { env = \"CONFIG_TEST_CDP_KEY\" }",
         ),
     );
-    let from_env = config_source::load_file(env_file.path(), Secrets::Require).unwrap();
-    assert!(from_env
-        .secret_variables()
-        .contains(&"CONFIG_TEST_CDP_KEY".to_string()));
-    assert!(!config_source::ignored_env_settings(
-        &std::env::vars().collect(),
-        &from_env.secret_variables()
-    )
-    .contains(&"CONFIG_TEST_CDP_KEY".to_string()));
-    let config = from_env.run_in(|| Config::from_env().unwrap());
-    assert!(config.coinbase.get(ALIAS).unwrap().provider.has_signer());
+    for mode in [Secrets::Require, Secrets::Skip] {
+        let text = format!(
+            "{:#}",
+            config_source::load_file(env_file.path(), mode).unwrap_err()
+        );
+        assert!(
+            text.contains("secret 'cdp_key'") && text.contains("files only"),
+            "{text}"
+        );
+        assert!(!text.contains("privateKey"), "{text}");
+    }
     std::env::remove_var("CONFIG_TEST_CDP_KEY");
 
     // The 32-byte seed form of the key works too.
@@ -285,7 +291,7 @@ fn the_key_is_a_secret_of_the_common_file() {
 }
 
 #[test]
-fn compare_reports_a_coinbase_table_as_a_difference() {
+fn an_environment_cannot_stand_for_a_coinbase_table() {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     clear_policy_env();
     let (_, document) = generated_key();
@@ -382,10 +388,18 @@ fn check_config_of_a_coinbase_table() {
     assert_eq!(code, Some(0));
     assert!(stdout.contains("\"kind\":\"coinbase\"") && !stdout.contains("privateKey"));
     // Without the secrets the table is still checked like a serving process builds it:
-    // mainnet only, its upstream.
+    // mainnet only (the network of the files), its upstream.
+    let testnet = TempFile::new("cli-testnet-host.toml", TESTNET_HOST);
     let (code, _, stderr) = run(
-        &["--config", file.path(), "--check-config", "--secrets=skip"],
-        &[("NETWORK", "testnet")],
+        &[
+            "--config",
+            file.path(),
+            "--host-config",
+            testnet.path(),
+            "--check-config",
+            "--secrets=skip",
+        ],
+        &[],
     );
     assert_eq!(code, Some(1));
     assert!(stderr.contains("mainnet gateway only"), "{stderr}");

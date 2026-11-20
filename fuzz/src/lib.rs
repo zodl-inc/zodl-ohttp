@@ -72,15 +72,18 @@ const ENV: [(&str, &str); 6] = [
     ("MAX_BLOCK_RANGE", "1000"),
 ];
 
-/// The gateway's configuration, from the environment as in production.
+/// The gateway's configuration, read by its own parsers from these variables (as from the
+/// values its configuration files render).
 pub fn config() -> &'static Config {
     static CONFIG: OnceLock<Config> = OnceLock::new();
     CONFIG.get_or_init(|| {
-        std::env::set_var("HPKE_KEYS", format!("{KEY_ID}:{PRIVATE_KEY_HEX}"));
-        for (name, value) in ENV {
-            std::env::set_var(name, value);
-        }
-        Config::from_env().expect("the fuzz gateway configuration parses")
+        let keys = format!("{KEY_ID}:{PRIVATE_KEY_HEX}");
+        let vars = ENV
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .chain([("HPKE_KEYS".to_string(), keys)]);
+        zodl_ohttp_gateway::config_source::with_vars(vars, Config::from_env)
+            .expect("the fuzz gateway configuration parses")
     })
 }
 

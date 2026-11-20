@@ -277,11 +277,11 @@ fn the_structure_is_checked() {
         ),
         (
             "schema = 1\n[secrets]\nk = { env = \"K\", file = \"/k\" }",
-            "exactly one of env or file",
+            "secret 'k' needs a file (k = { file = \"/path\" })",
         ),
         (
             "schema = 1\n[secrets]\nk = {}",
-            "exactly one of env or file",
+            "secret 'k' needs a file (k = { file = \"/path\" })",
         ),
         (
             "schema = 1\n[integrations.a]\nalias = \"a.example\"\nupstream = \"https://a\"\nroutes = [\"GET /x\"]\ncache = [\"GET /y@60\"]",

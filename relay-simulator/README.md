@@ -39,7 +39,7 @@ front of real users (no rate limiting, no address rotation, no edge protection).
 ## Usage
 
 ```bash
-# a gateway on :8080 with RELAY_SECRET=local=<secret> (gateway/README.md, "Build and run")
+# a gateway (gateway/README.md, "Build and run"), e.g. on :8080, its relay_secrets file local=<secret>
 GATEWAY_URL=http://localhost:8080/gateway RELAY_SECRET=<secret> NETWORK=testnet cargo run
 
 # one exchange through it with the e2e client

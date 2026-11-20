@@ -101,30 +101,31 @@ async fn main() -> anyhow::Result<()> {
         cli.action,
         config_source::Action::Serve | config_source::Action::Backfill
     ) {
+        // Diagnostics of the command-line tools; only the export (a migration tool that reads
+        // the environment anyway) takes RUST_LOG from it.
+        let filter = match cli.action {
+            config_source::Action::ExportConfig => {
+                tracing_subscriber::EnvFilter::try_from_default_env().ok()
+            }
+            _ => None,
+        };
         tracing_subscriber::fmt()
-            .with_env_filter(
-                tracing_subscriber::EnvFilter::try_from_default_env()
-                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
-            )
+            .with_env_filter(filter.unwrap_or_else(|| tracing_subscriber::EnvFilter::new("warn")))
             .with_writer(std::io::stderr)
             .init();
         std::process::exit(config_source::run_command(&command));
     }
 
-    // RUST_LOG: the environment's, or the files' when they are in force and carry the
-    // settings (`backfill` reads the environment only).
-    let log_filter = match cli.action {
-        config_source::Action::Backfill => None,
-        _ => config_source::log_filter(&command),
+    // RUST_LOG: the files' `rust_log` (default `info`); `backfill` reads the environment's.
+    let filter = match cli.action {
+        config_source::Action::Backfill => tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        _ => config_source::log_filter(&command)
+            .and_then(|d| tracing_subscriber::EnvFilter::try_new(d).ok())
+            .unwrap_or_else(|| tracing_subscriber::EnvFilter::new("info")),
     };
     tracing_subscriber::fmt()
-        .with_env_filter(match log_filter {
-            None => tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-            Some(directives) => directives
-                .and_then(|d| tracing_subscriber::EnvFilter::try_new(d).ok())
-                .unwrap_or_else(|| tracing_subscriber::EnvFilter::new("info")),
-        })
+        .with_env_filter(filter)
         .json()
         .init();
 
@@ -133,10 +134,11 @@ async fn main() -> anyhow::Result<()> {
     // `zodl-ohttp-gateway backfill`: fill the permanent block tier and exit (as before: from
     // the environment, whatever follows on the command line).
     if cli.action == config_source::Action::Backfill {
+        config_source::install_environment()?;
         return backfill::main().await;
     }
 
-    // CONFIG_SOURCE: the environment (default), or the configuration file.
+    // The configuration: the files of the command line, and nothing else.
     let policy_source = config_source::install_command(&command)?;
 
     let config = Config::from_env()?;
@@ -4382,17 +4384,17 @@ mod handler_tests {
             .unwrap();
         let origin = origin::OriginSettings::default();
         let cache = base_cache(&config, &origin, None).await;
-        // ThirdParty::from_env (in app_state) reads both variables; nothing awaits here.
-        let _env = config::test_env_lock();
-        std::env::set_var(
-            "THIRD_PARTY_CACHE_ROUTES",
-            "quotes.example=GET /v1/quotes@300",
-        );
-        std::env::set_var("THIRD_PARTY_RATE_LIMITS", "quotes.example=1/3600s");
-        let state = app_state(config, origin, cache);
-        std::env::remove_var("THIRD_PARTY_CACHE_ROUTES");
-        std::env::remove_var("THIRD_PARTY_RATE_LIMITS");
-        state
+        // ThirdParty::from_env (in app_state) reads both variables.
+        config_source::with_vars(
+            [
+                (
+                    "THIRD_PARTY_CACHE_ROUTES",
+                    "quotes.example=GET /v1/quotes@300",
+                ),
+                ("THIRD_PARTY_RATE_LIMITS", "quotes.example=1/3600s"),
+            ],
+            || app_state(config, origin, cache),
+        )
     }
 
     /// `ohttp_third_party_cache_total` (hits + misses) and `ohttp_third_party_limited_total` of

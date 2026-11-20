@@ -30,7 +30,6 @@
 
 use std::collections::HashMap;
 
-use anyhow::bail;
 use zodl_ohttp_integrations::core::query as core;
 
 use crate::query_value_sources::QueryValueSources;
@@ -54,15 +53,14 @@ impl std::fmt::Debug for QueryRules {
 }
 
 impl QueryRules {
-    /// Parse `THIRD_PARTY_QUERY_RULES` and `THIRD_PARTY_QUERY_VALUE_SOURCES` from the
-    /// environment. Unset or blank: no rule (no source); a value that is not UTF-8 is an error.
+    /// Parse `THIRD_PARTY_QUERY_RULES` and `THIRD_PARTY_QUERY_VALUE_SOURCES` of the configuration
+    /// in force ([`crate::config_source::var`]). Unset or blank: no rule (no source).
     pub fn from_env() -> anyhow::Result<Self> {
         let sources = QueryValueSources::from_env()?;
         match crate::config_source::var(ENV) {
             Ok(raw) if raw.trim().is_empty() => Self::parse_with_sources("", sources),
             Ok(raw) => Self::parse_with_sources(&raw, sources),
-            Err(std::env::VarError::NotPresent) => Self::parse_with_sources("", sources),
-            Err(std::env::VarError::NotUnicode(_)) => bail!("Invalid {ENV}: not valid UTF-8"),
+            Err(_) => Self::parse_with_sources("", sources),
         }
     }
 

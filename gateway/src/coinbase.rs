@@ -18,8 +18,8 @@
 //! from the configuration file in force, and the answer to a request to one of their aliases.
 //!
 //! Only a configuration file sets them (`[integrations.<label>] kind = "coinbase"`), and only
-//! on a mainnet gateway (`NETWORK=mainnet`): no environment variable can, and with
-//! `CONFIG_SOURCE=env` or `compare` there is none. The alias is a `BACKENDS` alias like any
+//! on a mainnet gateway (`NETWORK=mainnet`): no environment variable can (the export of an
+//! environment has none). The alias is a `BACKENDS` alias like any
 //! other (routing, replay class: every route a WRITE, labels), but its requests never take the
 //! generic forward: the provider validates the body, builds the upstream request, signs it,
 //! and scrubs the answer, all here, with a cap per route. Nothing of the client's request but

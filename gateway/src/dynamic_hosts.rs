@@ -868,7 +868,7 @@ impl DynamicHosts {
         if let Some(raw) = env_value("DYNAMIC_HOSTS_DENY_CIDRS") {
             // Read once per process; the resolver of the dynamic hosts' client consults it.
             let blocks = parse_deny_cidrs(&raw)?;
-            // A validation of a configuration file (--check-config, CONFIG_SOURCE=compare) only
+            // A validation of a configuration file (--check-config, the export's check) only
             // parses the list: the process's own startup puts its list in force.
             if crate::config_source::in_scope() {
                 return match env_value("DYNAMIC_HOST_SOURCES") {

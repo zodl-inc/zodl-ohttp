@@ -149,7 +149,7 @@ the OHTTP configuration of the network in its environment (`OHTTP_E2E_*_MAINNET`
 ### Locally, with the relay simulator
 
 ```bash
-# 1. a gateway (gateway/README.md, "Build and run"), e.g. on :8080 with RELAY_SECRET=local=<secret>
+# 1. a gateway (gateway/README.md, "Build and run"), e.g. on :8080, its relay_secrets file local=<secret>
 # 2. the relay simulator in front of it
 cd relay-simulator
 GATEWAY_URL=http://localhost:8080/gateway RELAY_SECRET=<secret> NETWORK=testnet cargo run
