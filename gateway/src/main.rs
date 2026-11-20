@@ -49,6 +49,7 @@ mod cache;
 mod chain;
 mod chunked_stream;
 mod config;
+mod config_source;
 mod dynamic_hosts;
 mod enforcement;
 mod freshness;
@@ -84,6 +85,29 @@ use config::Config;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // The command line: no flag serves; `backfill`; the configuration file actions, which
+    // print and exit (diagnostics on stderr).
+    let cli = match config_source::Cli::parse(std::env::args_os()) {
+        Ok(cli) => cli,
+        Err(usage) => {
+            eprintln!("{usage}");
+            std::process::exit(2);
+        }
+    };
+    if !matches!(
+        cli.action,
+        config_source::Action::Serve | config_source::Action::Backfill
+    ) {
+        tracing_subscriber::fmt()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+            )
+            .with_writer(std::io::stderr)
+            .init();
+        std::process::exit(config_source::run(&cli));
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -94,12 +118,17 @@ async fn main() -> anyhow::Result<()> {
 
     health::init_metrics();
 
-    // `zodl-ohttp-gateway backfill`: fill the permanent block tier and exit.
-    if std::env::args().nth(1).as_deref() == Some("backfill") {
+    // `zodl-ohttp-gateway backfill`: fill the permanent block tier and exit (as before: from
+    // the environment, whatever follows on the command line).
+    if cli.action == config_source::Action::Backfill {
         return backfill::main().await;
     }
 
+    // CONFIG_SOURCE: the environment (default), or the configuration file.
+    let policy_source = config_source::install(&cli)?;
+
     let config = Config::from_env()?;
+    config_source::report(&policy_source);
     // Multi-origin settings (ORIGIN_ID, REPLAY_PEER_URLS, ...): all inert when unset.
     let origin = origin::OriginSettings::from_env()?;
     let freshness_settings = freshness::Settings::from_env(cache::REPLAY_TTL_SECS)?;

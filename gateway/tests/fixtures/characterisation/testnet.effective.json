@@ -1,0 +1,281 @@
+{
+  "authorities": {
+    "files.example": {
+      "kind": "generic",
+      "routes": [
+        "GET /example-org/voting-config/*"
+      ],
+      "upstream": "https://files.example"
+    },
+    "flexa.example": {
+      "read_routes": [
+        "GET /*"
+      ]
+    },
+    "gateway-testnet.example": {
+      "routes": [
+        "POST /cash.z.wallet.sdk.rpc.CompactTxStreamer/*"
+      ]
+    },
+    "lwd": {
+      "one_sided_write_routes": [
+        "POST /cash.z.wallet.sdk.rpc.CompactTxStreamer/SendTransaction"
+      ],
+      "read_routes": [
+        "POST /cash.z.wallet.sdk.rpc.CompactTxStreamer/GetLatestBlock",
+        "POST /cash.z.wallet.sdk.rpc.CompactTxStreamer/GetBlock",
+        "POST /cash.z.wallet.sdk.rpc.CompactTxStreamer/GetBlockNullifiers",
+        "POST /cash.z.wallet.sdk.rpc.CompactTxStreamer/GetBlockRange",
+        "POST /cash.z.wallet.sdk.rpc.CompactTxStreamer/GetBlockRangeNullifiers",
+        "POST /cash.z.wallet.sdk.rpc.CompactTxStreamer/GetTransaction",
+        "POST /cash.z.wallet.sdk.rpc.CompactTxStreamer/GetTaddressTxids",
+        "POST /cash.z.wallet.sdk.rpc.CompactTxStreamer/GetTaddressBalance",
+        "POST /cash.z.wallet.sdk.rpc.CompactTxStreamer/GetTaddressBalanceStream",
+        "POST /cash.z.wallet.sdk.rpc.CompactTxStreamer/GetMempoolTx",
+        "POST /cash.z.wallet.sdk.rpc.CompactTxStreamer/GetMempoolStream",
+        "POST /cash.z.wallet.sdk.rpc.CompactTxStreamer/GetTreeState",
+        "POST /cash.z.wallet.sdk.rpc.CompactTxStreamer/GetLatestTreeState",
+        "POST /cash.z.wallet.sdk.rpc.CompactTxStreamer/GetSubtreeRoots",
+        "POST /cash.z.wallet.sdk.rpc.CompactTxStreamer/GetAddressUtxos",
+        "POST /cash.z.wallet.sdk.rpc.CompactTxStreamer/GetAddressUtxosStream",
+        "POST /cash.z.wallet.sdk.rpc.CompactTxStreamer/GetLightdInfo",
+        "POST /cash.z.wallet.sdk.rpc.CompactTxStreamer/Ping"
+      ]
+    },
+    "near.example": {
+      "cache": [
+        "GET /v0/tokens@300"
+      ],
+      "headers": [
+        {
+          "name": "Authorization",
+          "value": "<redacted>"
+        }
+      ],
+      "kind": "near",
+      "rate_limit": "120/60s",
+      "read_routes": [
+        "GET /v0/tokens",
+        "GET /v0/status"
+      ],
+      "routes": [
+        "GET /v0/tokens",
+        "POST /v0/quote",
+        "GET /v0/status",
+        "POST /v0/deposit/submit"
+      ],
+      "upstream": "https://near-api.example"
+    },
+    "prices.example": {
+      "cache": [
+        "GET /v1/cryptocurrency/quotes/latest@120",
+        "GET /v1/fiat/map@21600"
+      ],
+      "headers": [
+        {
+          "name": "X-PRICES_API_KEY",
+          "value": "<redacted>"
+        }
+      ],
+      "kind": "generic",
+      "query_rules": [
+        "GET /v1/cryptocurrency/quotes/latest?symbol=ZEC&convert={from:fiat}",
+        "GET /v1/fiat/map?"
+      ],
+      "rate_limit": "10/60s",
+      "read_routes": [
+        "GET /*"
+      ],
+      "routes": [
+        "GET /v1/cryptocurrency/quotes/latest",
+        "GET /v1/fiat/map",
+        "GET /v1/key/info"
+      ],
+      "upstream": "https://prices-api.example"
+    },
+    "service.example": {
+      "kind": "generic",
+      "read_routes": [
+        "GET /v1/info",
+        "GET /v1/slots/*"
+      ],
+      "routes": [
+        "GET /v1/info",
+        "POST /v1/slots",
+        "GET /v1/slots/*",
+        "POST /v1/slots/*"
+      ],
+      "upstream": "https://service.example"
+    },
+    "vote.example": {
+      "kind": "generic",
+      "read_routes": [
+        "GET /*"
+      ],
+      "routes": [
+        "GET /*",
+        "POST /*",
+        "PUT /*",
+        "DELETE /*",
+        "HEAD /*",
+        "OPTIONS /*"
+      ],
+      "upstream": "https://voting.example"
+    },
+    "voting.example": {
+      "kind": "generic",
+      "read_routes": [
+        "GET /*"
+      ],
+      "routes": [
+        "GET /*",
+        "POST /*",
+        "PUT /*",
+        "DELETE /*",
+        "HEAD /*",
+        "OPTIONS /*"
+      ],
+      "upstream": "https://voting.example"
+    }
+  },
+  "backends_policy_default": "deny",
+  "dynamic_hosts": {
+    "deny_cidrs": [
+      "192.0.2.0/28",
+      "2001:db8::/32"
+    ],
+    "sources": [
+      {
+        "lists": [
+          {
+            "pointer": "/hosts_a",
+            "read_routes": "GET /*",
+            "routes": "GET /*,POST /*,PUT /*,DELETE /*,HEAD /*,OPTIONS /*",
+            "url_field": "url"
+          },
+          {
+            "pointer": "/hosts_b",
+            "read_routes": "GET /a,GET /b,GET /c/d,POST /d/query",
+            "routes": "GET /a,GET /b,GET /c/d,POST /d/query",
+            "url_field": "url"
+          }
+        ],
+        "max_hosts": 40,
+        "name": "voting",
+        "url": "https://voting.example/prod/dynamic-voting-config.json"
+      }
+    ]
+  },
+  "gateway_hosts": [
+    "gateway-testnet.example"
+  ],
+  "host_list": {
+    "max_age_secs": null,
+    "publish": "all"
+  },
+  "relay_secret_on_key_config": "require",
+  "schema": 1,
+  "value_sources": {
+    "fiat": {
+      "alias": "prices.example",
+      "fallback": [
+        "AED",
+        "ALL",
+        "AMD",
+        "ARS",
+        "AUD",
+        "AZN",
+        "BAM",
+        "BDT",
+        "BGN",
+        "BHD",
+        "BMD",
+        "BOB",
+        "BRL",
+        "BYN",
+        "CAD",
+        "CHF",
+        "CLP",
+        "CNY",
+        "COP",
+        "CRC",
+        "CUP",
+        "CZK",
+        "DKK",
+        "DOP",
+        "DZD",
+        "EGP",
+        "EUR",
+        "GBP",
+        "GEL",
+        "GHS",
+        "GTQ",
+        "HKD",
+        "HNL",
+        "HRK",
+        "HUF",
+        "IDR",
+        "ILS",
+        "INR",
+        "IQD",
+        "IRR",
+        "ISK",
+        "JMD",
+        "JOD",
+        "JPY",
+        "KES",
+        "KGS",
+        "KHR",
+        "KRW",
+        "KWD",
+        "KZT",
+        "LBP",
+        "LKR",
+        "MAD",
+        "MDL",
+        "MKD",
+        "MMK",
+        "MNT",
+        "MUR",
+        "MXN",
+        "MYR",
+        "NAD",
+        "NGN",
+        "NIO",
+        "NOK",
+        "NPR",
+        "NZD",
+        "OMR",
+        "PAB",
+        "PEN",
+        "PHP",
+        "PKR",
+        "PLN",
+        "QAR",
+        "RON",
+        "RSD",
+        "RUB",
+        "SAR",
+        "SEK",
+        "SGD",
+        "SSP",
+        "THB",
+        "TND",
+        "TRY",
+        "TTD",
+        "TWD",
+        "UAH",
+        "UGX",
+        "USD",
+        "UYU",
+        "UZS",
+        "VES",
+        "VND",
+        "ZAR"
+      ],
+      "pointer": "/data/*/symbol",
+      "refresh_secs": 21600,
+      "route": "GET /v1/fiat/map"
+    }
+  }
+}

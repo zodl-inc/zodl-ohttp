@@ -18,6 +18,7 @@
 pub mod block_cache;
 pub mod cache;
 pub mod config;
+pub mod config_source;
 pub mod dynamic_hosts;
 pub mod enforcement;
 pub mod flexa;

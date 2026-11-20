@@ -12,6 +12,7 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 zodl-ohttp-gateway = { path = "../gateway", features = ["fuzzing"] }
+zodl-ohttp-integrations = { path = "../integrations" }
 zodl-ohttp-client = { path = "../client", default-features = false }
 tokio = { version = "1", features = ["rt"] }
 bytes = "1"
@@ -62,6 +63,13 @@ bench = false
 [[bin]]
 name = "gateway_dynamic_hosts"
 path = "fuzz_targets/gateway_dynamic_hosts.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "gateway_config_equivalence"
+path = "fuzz_targets/gateway_config_equivalence.rs"
 test = false
 doc = false
 bench = false

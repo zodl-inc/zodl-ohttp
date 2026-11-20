@@ -5,6 +5,25 @@ keeps its own log in [client/CHANGELOG.md](client/CHANGELOG.md).
 
 ## Unreleased
 
+### Configuration file
+
+- The routing policy can come from a TOML configuration file (`schema = 1`): the variables
+  `GATEWAY_HOSTS`, `BACKENDS`, `BACKENDS_POLICY(_DEFAULT)`, `BACKEND_HEADERS`, `FLEXA_ALIAS`,
+  `NEAR_ALIAS`, `THIRD_PARTY_*` (cache routes, rate limits, query rules, value sources, host
+  list), `REPLAY_READ_ROUTES`, `REPLAY_ONE_SIDED_WRITE_ROUTES`, `DYNAMIC_HOST_SOURCES`,
+  `DYNAMIC_HOSTS_DENY_CIDRS` and `RELAY_SECRET_ON_KEY_CONFIG`, grouped by alias, each entry in
+  its variable's grammar, header secrets named in `[secrets]` (a variable or a file). The file
+  is turned into those variables, which the same parsers read. `CONFIG_SOURCE=env|compare|file`
+  chooses the source; the default `env` is the behaviour so far (no file is read). New command
+  line actions `--check-config [--secrets=require|skip]`, `--print-effective-config` and
+  `--export-config` (with `--config <path>` or `GATEWAY_CONFIG_FILE`); without a flag the
+  binary serves as before, `backfill` (and whatever follows it) is unchanged. An unknown
+  option, or two actions, now exit with 2 (arguments that are no option are still ignored).
+  New metrics `ohttp_config_info{source,digest}`
+  (every process) and `ohttp_config_compare_match` (`compare` only). The image carries the label
+  `org.zodl.ohttp-gateway.check-config=1`. See `gateway/CONFIG.md` and
+  `gateway/config.example.toml`.
+
 ### Integrations crate
 
 - New library crate `zodl-ohttp-integrations` (`integrations/`, not published), linked into the

@@ -100,7 +100,6 @@
 //!   one network partition between two stores can run such a request once at each side.
 
 use std::collections::BTreeMap;
-use std::env;
 use std::fmt;
 
 pub const DEFAULT_REPLAY_PEER_TIMEOUT_MS: u64 = 150;
@@ -404,7 +403,7 @@ pub struct RawOriginEnv<'a> {
 
 impl OriginSettings {
     pub fn from_env() -> anyhow::Result<Self> {
-        let get = |k: &str| env::var(k).ok();
+        let get = |k: &str| crate::config_source::var(k).ok();
         let (
             origin_id,
             peer_urls,

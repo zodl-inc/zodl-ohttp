@@ -224,6 +224,23 @@ fn main() {
         ],
     );
 
+    // The fixture environments of the gateway's characterisation tests, and small ones.
+    let mut configs: Vec<Vec<u8>> = ["mainnet", "testnet"]
+        .iter()
+        .filter_map(|n| {
+            std::fs::read(format!(
+                "../gateway/tests/fixtures/characterisation/{n}.vars"
+            ))
+            .ok()
+        })
+        .collect();
+    configs.extend([
+        b"BACKENDS=a.example=https://a\nBACKENDS_POLICY=a.example=GET /x;gw.example=POST /*\nBACKEND_HEADERS=a.example=X-Key:k1,a.example=X-Key:k2\nFLEXA_ALIAS=a.example\n".to_vec(),
+        b"THIRD_PARTY_QUERY_VALUE_SOURCES=fiat=a.example GET /m#/data/*/s@300@fallback=USD|EUR\nTHIRD_PARTY_CACHE_ROUTES=a.example=GET /x@60\nTHIRD_PARTY_RATE_LIMITS=a.example=1/1s\n".to_vec(),
+        b"DYNAMIC_HOST_SOURCES=[{\"name\":\"n\",\"lists\":[{\"pointer\":\"/h\"}],\"max\":2.5}]\nDYNAMIC_HOSTS_DENY_CIDRS=192.0.2.0/28\nGATEWAY_HOSTS=G.example:443\n".to_vec(),
+    ]);
+    write(dir, "gateway_config_equivalence", &configs);
+
     let responses = responses();
     let mut wires: Vec<Vec<u8>> = responses
         .iter()
