@@ -12,11 +12,15 @@ publish = false
 anyhow = "1.0"
 # Value-source documents are JSON.
 serde_json = "1.0"
+# HTTP Basic credentials of the placeholder swap.
+base64 = "0.22"
 
 [features]
 # One feature per provider kind beyond the generic one; the gateway builds with all of them.
-default = ["cmc", "swapkit"]
+default = ["cmc", "flexa", "near", "swapkit"]
 cmc = []
+flexa = []
+near = []
 swapkit = []
 
 [lib]

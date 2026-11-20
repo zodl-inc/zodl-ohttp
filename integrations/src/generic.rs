@@ -19,6 +19,7 @@
 
 use std::time::SystemTime;
 
+use crate::core::auth::Header;
 use crate::core::provider::{Admitted, Denial, Provider, RequestView, ResponseAction};
 use crate::core::route;
 
@@ -53,7 +54,8 @@ pub struct Generic<'a> {
     pub policy: Option<&'a [(String, String)]>,
     /// `BACKENDS_POLICY_DEFAULT=allow`: an alias without a policy admits every operation.
     pub default_allow: bool,
-    /// The fixed upstream headers of the alias (`BACKEND_HEADERS`).
+    /// The fixed upstream headers of the alias (`BACKEND_HEADERS`), each sent as listed
+    /// ([`Header::literal`]).
     pub headers: &'a [(String, String)],
 }
 
@@ -76,7 +78,11 @@ impl Provider for Generic<'_> {
         _admitted: &Admitted,
         _now: SystemTime,
     ) -> Result<Vec<(String, String)>, Denial> {
-        Ok(self.headers.to_vec())
+        Ok(self
+            .headers
+            .iter()
+            .map(|(name, value)| Header::literal(name, value).header())
+            .collect())
     }
 
     fn response(&self, _admitted: &Admitted, _status: u16) -> ResponseAction {
