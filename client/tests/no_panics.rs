@@ -291,3 +291,27 @@ fn configuration_values_never_panic() {
         }
     }
 }
+
+#[test]
+fn relay_lists_never_panic() {
+    let mut rng = Rng(0x0c0f_1600_d00d_5eee);
+    let valid = "https://relay-a.example/relay,https://relay-b.example/x";
+    for _ in 0..ROUNDS {
+        let value = if rng.below(2) == 0 {
+            String::from_utf8_lossy(&rng.bytes(120)).into_owned()
+        } else {
+            String::from_utf8_lossy(&rng.mutate(valid.as_bytes())).into_owned()
+        };
+        if let Ok(config) = OhttpConfig::new(OhttpConfigParams {
+            gateway_host: "ohttp-gateway.example",
+            relay_url: &value,
+            keys_dns_name: "keys.ohttp-gateway.example",
+            signing_pubkey: "5866666666666666666666666666666666666666666666666666666666666666",
+        }) {
+            let chosen = config.choose_relay();
+            assert!(config.relays().iter().any(|r| r.url() == chosen));
+            zodl_ohttp_client::RelaySelector::global().note_failure(chosen);
+            zodl_ohttp_client::RelaySelector::global().note_success(chosen);
+        }
+    }
+}

@@ -30,8 +30,9 @@ use crate::chunked::{
 use crate::{
     check_size, encode_request, open_signed_config, retry_after_delay, signed_config_url, Error,
     HostListAnswer, HttpError, HttpErrorKind, KeyConfig, Limits, Network, NoHostList,
-    OhttpNetworks, OuterHeaders, RelayBackoff, Request, Response, SignedConfigUrlRule, SizeGuard,
-    GATEWAY_MAX_ENCAPSULATED_REQUEST_BYTES, MAX_THIRD_PARTY_HOSTS_BYTES,
+    OhttpNetworks, OuterHeaders, RelayBackoff, RelaySelector, Request, Response,
+    SignedConfigUrlRule, SizeGuard, GATEWAY_MAX_ENCAPSULATED_REQUEST_BYTES,
+    MAX_THIRD_PARTY_HOSTS_BYTES,
 };
 
 /// Where a gateway's key configuration is fetched, and how it is authenticated.
@@ -111,13 +112,81 @@ const MAX_TIMEOUT: Duration = Duration::from_secs(365 * 24 * 60 * 60);
 /// The gateway's key configuration is fetched on first use and kept: until a signed one
 /// expires (an unsigned one after its `Cache-Control: max-age`, or 5 minutes), or until the
 /// gateway refuses it (outer `400` or `422`, whatever the body says, as after a key rotation),
-/// when it is discarded and the request is sent once more under a fresh one. No redirect is
-/// followed, and only `https://` is spoken.
+/// when it is discarded: the refused request is returned as [`Error::Refused`] (never sent
+/// again, since an outer status does not prove that it did not run) and the next request
+/// fetches a fresh configuration. No redirect is followed, and only `https://` is spoken.
 pub struct Client {
-    relay_url: String,
+    relays: Relays,
     keys: KeyConfigSource,
+    /// Where else the signed envelope may be fetched, after `keys`' URL: the envelope URLs of
+    /// the other relays of a list, in list order (any of them is as good: the envelope is
+    /// signed).
+    other_key_urls: Vec<String>,
     http: reqwest::Client,
-    config: Mutex<Option<Fetched>>,
+    config: Mutex<KeyCache>,
+}
+
+/// A timeout of an attempt that had less than this to run is the caller's short deadline, not
+/// the relay's fault: it does not hold the relay out.
+const MIN_TIMEOUT_TO_BLAME: Duration = Duration::from_secs(5);
+
+/// How long a client with a relay list waits for a connection to a relay: a relay that does
+/// not answer at all fails as a connection failure, before anything is sent, so the request
+/// can move to another relay instead of spending its whole timeout.
+const LIST_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The most the first envelope source gets of the timeout when there are others: a source that
+/// does not answer leaves time for the next.
+const FIRST_KEY_SOURCE_TIMEOUT: Duration = Duration::from_secs(10);
+/// The least the first envelope source gets, when the timeout allows it.
+const MIN_FIRST_KEY_SOURCE_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Where a client posts: one relay URL, or the relays of a network's configuration, chosen per
+/// request ([`crate::OhttpConfig::choose_relay`]).
+enum Relays {
+    Fixed(String),
+    Configured(Box<crate::OhttpConfig>),
+}
+
+impl Relays {
+    /// The index of the relay the next request goes to.
+    fn choose(&self) -> usize {
+        match self {
+            Relays::Fixed(_) => 0,
+            Relays::Configured(config) => RelaySelector::global().choose(config.relays()),
+        }
+    }
+
+    /// The URL of the relay at `index`.
+    fn url(&self, index: usize) -> &str {
+        match self {
+            Relays::Fixed(url) => url,
+            Relays::Configured(config) => config.relays()[index].url(),
+        }
+    }
+
+    /// Whether outcomes are reported to [`RelaySelector::global`]: a list of relays.
+    fn is_list(&self) -> bool {
+        matches!(self, Relays::Configured(_))
+    }
+
+    /// The relay to take over from the one at `index`, if one is available.
+    fn alternative(&self, index: usize) -> Option<usize> {
+        match self {
+            Relays::Fixed(_) => None,
+            Relays::Configured(config) => {
+                RelaySelector::global().alternative(config.relays(), index)
+            }
+        }
+    }
+}
+
+/// The key configuration kept, and a generation that every change of it (an install or a
+/// drop) moves on, so that a fetch that began before a change does not undo it.
+#[derive(Default)]
+struct KeyCache {
+    kept: Option<Fetched>,
+    generation: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -165,6 +234,15 @@ impl Client {
     /// posting to the configured relay URL, sealing to the key of the gateway's signed envelope,
     /// checked against the signing key configured for `network`.
     ///
+    /// With a relay list, each request goes to [`crate::OhttpConfig::choose_relay`]'s choice,
+    /// and the outcome is reported to [`crate::RelaySelector::global`] (a success once the
+    /// answer is complete). A request goes through another relay instead, once, only when
+    /// nothing was sent: its relay is paused, or connecting to it failed (connecting is bounded
+    /// by 10 s). Any other failure, an outer error status included, is returned, and the next
+    /// request goes elsewhere. The envelope is fetched through
+    /// the first relay listed ([`crate::OhttpConfig::relay_url`]), and through the others in
+    /// list order when that fails.
+    ///
     /// The envelope must be served where `url_rule` derives it from the relay URL
     /// ([`signed_config_url`]): with [`SignedConfigUrlRule::ReplaceRelaySuffix`] (what
     /// [`crate::ClientProfile::LIBRARY`] uses) `https://relay.example/relay` gives
@@ -178,16 +256,42 @@ impl Client {
         network: Network,
         url_rule: SignedConfigUrlRule,
     ) -> Result<Self, Error> {
+        Self::for_network_with(networks, network, url_rule, reqwest::Client::builder())
+    }
+
+    /// [`Client::for_network`] with the HTTP stack `builder`.
+    fn for_network_with(
+        networks: &OhttpNetworks,
+        network: Network,
+        url_rule: SignedConfigUrlRule,
+        builder: reqwest::ClientBuilder,
+    ) -> Result<Self, Error> {
         let config = networks.require(network)?;
         let url = signed_config_url(config.relay_url(), url_rule)?;
-        Self::new(
-            config.relay_url(),
+        let builder = if config.relays().len() > 1 {
+            builder.connect_timeout(LIST_CONNECT_TIMEOUT)
+        } else {
+            builder
+        };
+        let mut client = Self::checked(
+            config.relay_url().to_owned(),
             KeyConfigSource::Signed {
                 url,
                 network,
                 signer: *config.signing_pubkey(),
             },
-        )
+            builder,
+        )?;
+        if config.relays().len() > 1 {
+            for relay in &config.relays()[1..] {
+                let other = signed_config_url(relay.url(), url_rule)?;
+                if !client.other_key_urls.contains(&other) && other != client.keys.url() {
+                    client.other_key_urls.push(other);
+                }
+            }
+            client.relays = Relays::Configured(Box::new(config.clone()));
+        }
+        Ok(client)
     }
 
     /// A client without the checks of [`Client::new`]: `http://` URLs and the unsigned source
@@ -239,6 +343,11 @@ impl Client {
     ) -> Result<Self, Error> {
         let http = builder
             .redirect(redirect::Policy::none())
+            // No retries inside the HTTP stack either (by default it sends a request again
+            // after an HTTP/2 refusal the peer asserts, such as REFUSED_STREAM): whether a
+            // request may be sent twice is decided here, and an assertion of the relay's proves
+            // nothing about what ran beyond it.
+            .retry(reqwest::retry::never())
             .https_only(https_only)
             .build()
             .map_err(|_| Error::Setup {
@@ -246,17 +355,17 @@ impl Client {
                 rule: "could not be initialized",
             })?;
         Ok(Client {
-            relay_url,
+            relays: Relays::Fixed(relay_url),
             keys,
+            other_key_urls: Vec::new(),
             http,
-            config: Mutex::new(None),
+            config: Mutex::new(KeyCache::default()),
         })
     }
 
     /// Sends `request` through the relay and returns the backend's answer, whatever its
-    /// status, all within `timeout` (a key-configuration fetch and a resend after a rotation
-    /// included). Fails when the relay, the gateway or the key-configuration URL cannot be
-    /// reached or refuses ([`Error::Http`], [`Error::Refused`]), or when the answer is not a
+    /// status, all within `timeout` (a key-configuration fetch included). Fails when the relay,
+    /// the gateway or the key-configuration URL cannot be reached or refuses ([`Error::Http`], [`Error::Refused`]), or when the answer is not a
     /// sealed response that opens. The inner trailers are appended to the headers.
     ///
     /// A `timeout` of more than a year (`Duration::MAX` for "no timeout") is a year; no
@@ -337,7 +446,7 @@ impl Client {
     /// Like [`send`](Self::send), but returns the inner response as it streams: the head, then
     /// every body chunk as the gateway sends it (a `GetBlockRange` block arrives before the
     /// next is fetched), then the trailers and [`ResponseEvent::End`]. The outer exchange
-    /// (key configuration, resend after a rotation, outer status and media type) is complete
+    /// (key configuration, outer status and media type) is complete
     /// when this returns; `timeout` then also bounds the whole body.
     ///
     /// A request the gateway refuses as stale (an inner `400` with `ohttp-freshness: rejected`,
@@ -369,7 +478,7 @@ impl Client {
         }
     }
 
-    /// One exchange: the outer loop (key configuration, resend after a rotation, outer status
+    /// One exchange: the outer loop (key configuration, outer status
     /// and media type), within `deadline`. Encoded here, so that every call carries a current
     /// `ohttp-freshness` stamp.
     async fn send_stream_once(
@@ -379,12 +488,23 @@ impl Client {
     ) -> Result<ResponseStream, Error> {
         let remaining = || deadline.saturating_duration_since(Instant::now());
         let encoded = encode_request(request)?;
-        let mut stale = false;
+        // Whether the request has moved to another relay already: at most once.
+        let mut moved = false;
+        let mut index = self.relays.choose();
         loop {
-            if let Some(wait) = RelayBackoff::global().remaining(&self.relay_url) {
-                return Err(Error::Backoff { wait });
+            let relay_url = self.relays.url(index);
+            if let Some(wait) = RelayBackoff::global().remaining(relay_url) {
+                // Nothing was sent: another relay may take it.
+                match self.relays.alternative(index).filter(|_| !moved) {
+                    Some(other) => {
+                        moved = true;
+                        index = other;
+                        continue;
+                    }
+                    None => return Err(Error::Backoff { wait }),
+                }
             }
-            let config = self.key_config(stale, remaining()).await?;
+            let config = self.key_config(remaining()).await?;
             // Sealed afresh on every attempt: the gateway answers a repeated nonce with 409.
             let (sealed, opener) = encapsulate_chunked_request(&config, &encoded)?;
             // Refused here as the relay would refuse it, before anything is uploaded.
@@ -393,14 +513,41 @@ impl Client {
             }
             // Checked again here: another request may have been answered 429 while this one
             // fetched the key configuration.
-            if let Some(wait) = RelayBackoff::global().remaining(&self.relay_url) {
-                return Err(Error::Backoff { wait });
+            if RelayBackoff::global().remaining(relay_url).is_some() {
+                continue;
             }
-            let mut post = self.http.post(&self.relay_url);
+            let mut post = self.http.post(relay_url);
             for (name, value) in OuterHeaders::LIBRARY.relay_post(None) {
                 post = post.header(name, value);
             }
-            let resp = post.body(sealed).timeout(remaining()).send().await?;
+            let budget = remaining();
+            let sent_at = Instant::now();
+            let resp = match post.body(sealed).timeout(budget).send().await {
+                Ok(resp) => resp,
+                Err(e) => {
+                    // Decided on the HTTP stack's own error: only a failure while connecting
+                    // (TCP or the TLS handshake) means that no byte of the request was sent.
+                    // Anything later may have reached the gateway, and is never sent again.
+                    let unsent = e.is_connect();
+                    let error = Error::from(e);
+                    if !self.relays.is_list() {
+                        return Err(error);
+                    }
+                    let callers_deadline = budget < MIN_TIMEOUT_TO_BLAME
+                        && matches!(&error, Error::Http(h) if h.kind() == HttpErrorKind::Timeout);
+                    if !callers_deadline {
+                        RelaySelector::global().note_failure_of(relay_url, sent_at);
+                    }
+                    if unsent && !moved {
+                        if let Some(other) = self.relays.alternative(index) {
+                            moved = true;
+                            index = other;
+                            continue;
+                        }
+                    }
+                    return Err(error);
+                }
+            };
             let status = resp.status();
             if status == StatusCode::TOO_MANY_REQUESTS {
                 let delay = retry_after_delay(
@@ -409,16 +556,27 @@ impl Client {
                         .and_then(|v| v.to_str().ok()),
                 );
                 if let Some(delay) = delay {
-                    RelayBackoff::global().note(&self.relay_url, delay);
+                    RelayBackoff::global().note(relay_url, delay);
                 }
             }
+            if self.relays.is_list() && crate::relay_status_fails_over(status.as_u16()) {
+                RelaySelector::global().note_failure_of(relay_url, sent_at);
+            }
+            // The gateway could not open the request (a key rotation, among others): the kept
+            // configuration is dropped, so that the next request fetches it afresh. This one is
+            // not sent again: an outer status, which anyone between the client and the gateway
+            // can write, proves nothing about whether the request ran.
             if matches!(
                 status,
                 StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY
-            ) && !stale
-            {
-                stale = true;
-                continue;
+            ) {
+                // Only if it is still the one this request was sealed to: another request may
+                // have fetched a newer one meanwhile.
+                let mut cache = self.config.lock().expect("never poisoned");
+                if cache.kept.is_some_and(|fetched| fetched.config == config) {
+                    cache.kept = None;
+                    cache.generation += 1;
+                }
             }
             if !status.is_success() {
                 return Err(Error::Refused {
@@ -432,47 +590,97 @@ impl Client {
                 .unwrap_or_default();
             let essence = media_type.split(';').next().unwrap_or_default().trim();
             if !essence.eq_ignore_ascii_case(CONTENT_TYPE_CHUNKED_RES) {
-                return Err(Error::MediaType(crate::sanitized(
-                    media_type,
-                    crate::MAX_MEDIA_TYPE_CHARS,
-                )));
+                // A success that is no sealed answer (an error page): the relay's fault.
+                if self.relays.is_list() {
+                    RelaySelector::global().note_failure_of(relay_url, sent_at);
+                }
+                return Err(Error::MediaType(crate::shown_media_type(media_type)));
             }
             let guard = Limits::LIBRARY.response_guard();
             if let Some(declared) = resp.content_length() {
                 guard.check_declared(declared)?;
             }
+            // Reported once the answer is complete (or breaks off), by the stream.
+            let reported_relay = self
+                .relays
+                .is_list()
+                .then(|| (relay_url.to_owned(), sent_at));
             return Ok(ResponseStream {
                 resp: Some(resp),
                 decoder: opener.decoder(),
                 guard,
                 pending: std::collections::VecDeque::new(),
+                relay: reported_relay,
             });
         }
     }
 
-    /// The key configuration to seal to: the one kept, or a fresh one when none is kept, it
-    /// expired, or it is `stale`.
-    async fn key_config(&self, stale: bool, timeout: Duration) -> Result<KeyConfig, Error> {
-        if stale {
-            // Discarded before the fetch that replaces it: a failed fetch leaves none.
-            *self.config.lock().expect("never poisoned") = None;
-        }
-        let kept = *self.config.lock().expect("never poisoned");
-        if let Some(fetched) = kept.filter(|f| f.usable(unix_now())) {
+    /// The key configuration to seal to: the one kept, or a fresh one when none is kept (the
+    /// gateway refused it, see `send_stream_once`) or it expired.
+    async fn key_config(&self, timeout: Duration) -> Result<KeyConfig, Error> {
+        let generation = {
+            let cache = self.config.lock().expect("never poisoned");
+            if let Some(fetched) = cache.kept.filter(|f| f.usable(unix_now())) {
+                return Ok(fetched.config);
+            }
+            cache.generation
+        };
+        let fetched = self.fetch(timeout).await?;
+        let mut cache = self.config.lock().expect("never poisoned");
+        if cache.generation != generation {
+            // The cache changed while this fetch ran: another request installed a
+            // configuration (kept: it is at least as new), or dropped the one the gateway
+            // refused (this fetch may have brought that one back). This request seals to what
+            // it fetched, but the cache is left as the newer change made it.
+            if let Some(other) = cache.kept.filter(|f| f.usable(unix_now())) {
+                return Ok(other.config);
+            }
             return Ok(fetched.config);
         }
-        let fetched = self.fetch(timeout).await?;
-        *self.config.lock().expect("never poisoned") = Some(fetched);
+        cache.kept = Some(fetched);
+        cache.generation += 1;
         Ok(fetched.config)
     }
 
+    /// The key configuration from `keys`' URL, or, when that cannot be had (no answer, an
+    /// error status, or a document that does not check out), from each of `other_key_urls` in
+    /// turn, all within `timeout`. The error is the first URL's.
     async fn fetch(&self, timeout: Duration) -> Result<Fetched, Error> {
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .unwrap_or_else(Instant::now);
+        if self.other_key_urls.is_empty() {
+            return self.fetch_from(self.keys.url(), timeout).await;
+        }
+        // The first source gets half the time (at least 3 s, at most 10 s), each other one an
+        // equal part of what is left, so that one that does not answer leaves time for the next.
+        let first_budget = (timeout / 2)
+            .max(timeout.min(MIN_FIRST_KEY_SOURCE_TIMEOUT))
+            .min(FIRST_KEY_SOURCE_TIMEOUT);
+        let first = self.fetch_from(self.keys.url(), first_budget).await;
+        if first.is_ok() {
+            return first;
+        }
+        for (i, url) in self.other_key_urls.iter().enumerate() {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            let sources_left = (self.other_key_urls.len() - i) as u32;
+            if let Ok(fetched) = self.fetch_from(url, left / sources_left).await {
+                return Ok(fetched);
+            }
+        }
+        first
+    }
+
+    async fn fetch_from(&self, url: &str, timeout: Duration) -> Result<Fetched, Error> {
         let headers = match &self.keys {
             #[cfg(feature = "insecure-plain-key-config")]
             KeyConfigSource::Plain { .. } => OuterHeaders::LIBRARY.key_fetch_plain(None),
             KeyConfigSource::Signed { .. } => OuterHeaders::LIBRARY.key_fetch_signed(None),
         };
-        let mut get = self.http.get(self.keys.url());
+        let mut get = self.http.get(url);
         for (name, value) in headers {
             get = get.header(name, value);
         }
@@ -519,6 +727,9 @@ pub struct ResponseStream {
     decoder: ChunkedResponseDecoder,
     guard: SizeGuard,
     pending: std::collections::VecDeque<ResponseEvent>,
+    /// The relay of a list the answer comes through and when the request was sent: a success
+    /// once the answer is complete, a failure should it break off.
+    relay: Option<(String, Instant)>,
 }
 
 impl ResponseStream {
@@ -537,13 +748,38 @@ impl ResponseStream {
                     .and_then(|()| self.decoder.push(&chunk)),
                 Ok(None) => {
                     self.resp = None;
-                    self.decoder.finish()
+                    let end = self.decoder.finish();
+                    if let Some((relay, sent_at)) = self.relay.take() {
+                        match &end {
+                            Ok(_) => RelaySelector::global().note_success_of(&relay, sent_at),
+                            // Cut short on its way: the relay's.
+                            Err(_) => RelaySelector::global().note_failure_of(&relay, sent_at),
+                        }
+                    }
+                    end
                 }
-                Err(e) => Err(Error::from(e)),
+                Err(e) => {
+                    // The answer broke off on its way through the relay (a timeout is the
+                    // caller's deadline on the whole body, and not held against it).
+                    if let Some((relay, sent_at)) = self.relay.take() {
+                        if !e.is_timeout() {
+                            RelaySelector::global().note_failure_of(&relay, sent_at);
+                        }
+                    }
+                    Err(Error::from(e))
+                }
             };
             match step {
                 Ok(events) => self.pending.extend(events),
                 Err(e) => {
+                    // An answer that does not open: the relay's (a transport failure was reported
+                    // above, or deliberately not, for a timeout). One too large says nothing
+                    // about the relay: the request asked for it.
+                    if let Some((relay, sent_at)) = self.relay.take() {
+                        if !matches!(e, Error::TooLarge { .. }) {
+                            RelaySelector::global().note_failure_of(&relay, sent_at);
+                        }
+                    }
                     self.resp = None;
                     return Some(Err(e));
                 }
@@ -679,7 +915,7 @@ mod tests {
                 SignedConfigUrlRule::RelayHostRoot,
             ] {
                 let client = Client::for_network(&networks, network, rule).unwrap();
-                assert_eq!(client.relay_url, relay);
+                assert_eq!(client.relays.url(client.relays.choose()), relay);
                 // Irrefutable without the feature `insecure-plain-key-config`.
                 #[allow(irrefutable_let_patterns)]
                 let KeyConfigSource::Signed {
@@ -795,7 +1031,7 @@ mod tests {
         // The relay URL is used in its canonical form.
         let client =
             Client::new("https://Relay.Example:443/a/../relay/", signed(good_keys)).unwrap();
-        assert_eq!(client.relay_url, "https://relay.example/relay");
+        assert_eq!(client.relays.url(0), "https://relay.example/relay");
     }
 
     #[cfg(feature = "insecure-plain-key-config")]
@@ -1023,6 +1259,48 @@ mod tests {
         assert_eq!(tls::count(&accepted), 2, "one fetch, one post");
     }
 
+    /// A relay's `Content-Type` that is no media type (here a URL) never reaches the error.
+    #[tokio::test]
+    async fn a_wrong_media_type_shows_no_relay_text() {
+        let (envelope, signer) = signed_envelope();
+        let (port, _) = tls::serve(
+            true,
+            std::sync::Arc::new(move |path: &str| {
+                Some(match path {
+                    "/ohttp-configs/signed" => {
+                        tls::response("200 OK", &[("content-type", "application/json")], &envelope)
+                    }
+                    _ => tls::response(
+                        "200 OK",
+                        &[("content-type", "https://relay.example/private-path")],
+                        b"",
+                    ),
+                })
+            }),
+        )
+        .await;
+        let base = format!("https://localhost:{port}");
+        let client = Client::checked(
+            format!("{base}/relay"),
+            signed_at(format!("{base}/ohttp-configs/signed"), signer),
+            tls::builder(),
+        )
+        .unwrap();
+        let request = Request::new("GET", "backend.example", "/v1/info");
+        let Err(error) = client.send(&request, Duration::from_secs(10)).await else {
+            panic!("a wrong media type was accepted");
+        };
+        let Error::MediaType(shown) = &error else {
+            panic!("{error}");
+        };
+        assert_eq!(shown, crate::NOT_A_MEDIA_TYPE);
+        let text = format!("{error} {error:?}");
+        assert!(
+            !text.contains("relay.example") && !text.contains("private"),
+            "{text}"
+        );
+    }
+
     /// An `http://` relay with an `https://` envelope: refused at construction, and a client
     /// that skipped the checks still never reaches the relay, its HTTP stack being https-only.
     #[tokio::test]
@@ -1132,6 +1410,316 @@ mod tests {
             client.send_stream(&request, Duration::MAX).await,
             Err(Error::Http(_))
         ));
+    }
+
+    /// A relay list: the post goes to the relay drawn (share 100), which cannot be reached, so
+    /// it is sent once more through the other relay, which also served the envelope (it is
+    /// listed first). Its refusal is returned, and the unreachable relay is held out.
+    #[tokio::test]
+    async fn a_relay_that_cannot_be_reached_hands_the_request_to_another() {
+        let (envelope, signer) = signed_envelope();
+        let (port, accepted) = tls::serve(
+            true,
+            std::sync::Arc::new(move |path: &str| {
+                Some(match path {
+                    "/ohttp-configs/signed" => {
+                        tls::response("200 OK", &[("content-type", "application/json")], &envelope)
+                    }
+                    _ => tls::response("413 Payload Too Large", &[], b""),
+                })
+            }),
+        )
+        .await;
+        // Reserved for this test (bound, never listening): refused, and not taken meanwhile.
+        let reserved = tokio::net::TcpSocket::new_v4().unwrap();
+        reserved.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let unreachable = format!(
+            "https://127.0.0.1:{}/relay",
+            reserved.local_addr().unwrap().port()
+        );
+        let reachable = format!("https://localhost:{port}/relay");
+        let mut config = crate::OhttpConfig::new(crate::OhttpConfigParams {
+            gateway_host: "ohttp-gateway-testnet.example",
+            relay_url: &format!("{reachable},{unreachable}"),
+            keys_dns_name: "testnet.ohttp-keys.example",
+            signing_pubkey: &hex::encode(signer.as_bytes()),
+        })
+        .unwrap();
+        // Every request draws the unreachable relay; the other is its fallback only.
+        config.set_shares_for_test(&[0, 100]);
+        let networks = OhttpNetworks::new(None, Some(config)).unwrap();
+        let client = Client::for_network_with(
+            &networks,
+            Network::Testnet,
+            SignedConfigUrlRule::ReplaceRelaySuffix,
+            tls::builder(),
+        )
+        .unwrap();
+        let request = Request::new("GET", "backend.example", "/v1/info");
+        let Err(Error::Refused { status: 413 }) =
+            client.send(&request, Duration::from_secs(10)).await
+        else {
+            panic!("the request did not reach the other relay");
+        };
+        assert_eq!(tls::count(&accepted), 2, "one fetch, one post");
+        // The unreachable relay is held out: the next request goes to the other at once.
+        assert_eq!(client.relays.url(client.relays.choose()), reachable);
+    }
+
+    /// Two relays on one local server, told apart by path: `/a` (share 0, listed first, so the
+    /// envelope is fetched through it first) and `/b` (share 100, so every request draws it).
+    /// `answer` gets the path; the counter counts the requests of each path.
+    async fn two_relays(
+        answer: impl Fn(&str) -> Option<Vec<u8>> + Send + Sync + 'static,
+    ) -> (
+        Client,
+        String,
+        String,
+        std::sync::Arc<Mutex<std::collections::HashMap<String, usize>>>,
+    ) {
+        let (client, base, seen) = relays_on("{base}/a,{base}/b", &[0, 100], answer).await;
+        (client, format!("{base}/a"), format!("{base}/b"), seen)
+    }
+
+    /// A client of the relay list `spec` (`{base}` standing for the local server's
+    /// `https://localhost:<port>`) with the relays' `shares` (so that the tests know which relay
+    /// a request draws), the base, and the requests the server saw by path.
+    async fn relays_on(
+        spec: &str,
+        shares: &[u32],
+        answer: impl Fn(&str) -> Option<Vec<u8>> + Send + Sync + 'static,
+    ) -> (
+        Client,
+        String,
+        std::sync::Arc<Mutex<std::collections::HashMap<String, usize>>>,
+    ) {
+        let (_, signer) = signed_envelope();
+        let seen = std::sync::Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let counter = seen.clone();
+        let (port, _) = tls::serve(
+            true,
+            std::sync::Arc::new(move |path: &str| {
+                *counter.lock().unwrap().entry(path.to_string()).or_insert(0) += 1;
+                answer(path)
+            }),
+        )
+        .await;
+        let base = format!("https://localhost:{port}");
+        let mut config = crate::OhttpConfig::new(crate::OhttpConfigParams {
+            gateway_host: "ohttp-gateway-testnet.example",
+            relay_url: &spec.replace("{base}", &base),
+            keys_dns_name: "testnet.ohttp-keys.example",
+            signing_pubkey: &hex::encode(signer.as_bytes()),
+        })
+        .unwrap();
+        config.set_shares_for_test(shares);
+        let networks = OhttpNetworks::new(None, Some(config)).unwrap();
+        let client = Client::for_network_with(
+            &networks,
+            Network::Testnet,
+            SignedConfigUrlRule::ReplaceRelaySuffix,
+            tls::builder(),
+        )
+        .unwrap();
+        (client, base, seen)
+    }
+
+    /// A port nothing listens on, held for the test.
+    fn refusing_port() -> (tokio::net::TcpSocket, u16) {
+        let reserved = tokio::net::TcpSocket::new_v4().unwrap();
+        reserved.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let port = reserved.local_addr().unwrap().port();
+        (reserved, port)
+    }
+
+    fn refused(status: &str) -> Vec<u8> {
+        tls::response(status, &[], b"")
+    }
+
+    /// An answer that does not open (a sealed body cut or corrupted on its way) holds the relay
+    /// out.
+    #[tokio::test]
+    async fn an_answer_that_does_not_open_holds_the_relay_out() {
+        let (client, a, b, _) = two_relays(|path| {
+            Some(match path {
+                "/a/ohttp-configs/signed" => envelope_answer(),
+                "/b" => tls::response(
+                    "200 OK",
+                    &[("content-type", CONTENT_TYPE_CHUNKED_RES)],
+                    b"\x00\x01not a sealed response",
+                ),
+                _ => refused("413 Payload Too Large"),
+            })
+        })
+        .await;
+        let request = Request::new("GET", "backend.example", "/v1/info");
+        assert!(client
+            .send(&request, Duration::from_secs(10))
+            .await
+            .is_err());
+        assert_eq!(client.relays.url(client.relays.choose()), a);
+        RelaySelector::global().note_success(&b);
+    }
+
+    /// A 429 is returned as it is (an outer status never proves that nothing ran, so the
+    /// request is not sent again), and the relay's pause sends the next request elsewhere.
+    #[tokio::test]
+    async fn a_429_is_returned_and_the_next_request_goes_elsewhere() {
+        let (client, _, b, seen) = two_relays(|path| {
+            Some(match path {
+                "/a/ohttp-configs/signed" => envelope_answer(),
+                "/b" => tls::response("429 Too Many Requests", &[("retry-after", "30")], b""),
+                _ => refused("413 Payload Too Large"),
+            })
+        })
+        .await;
+        let request = Request::new("GET", "backend.example", "/v1/info");
+        let Err(Error::Refused { status: 429 }) =
+            client.send(&request, Duration::from_secs(10)).await
+        else {
+            panic!("the 429 was not returned");
+        };
+        assert_eq!(seen.lock().unwrap().get("/a"), None, "sent again");
+        assert!(RelayBackoff::global().remaining(&b).is_some());
+        let Err(Error::Refused { status: 413 }) =
+            client.send(&request, Duration::from_secs(10)).await
+        else {
+            panic!("the next request did not go to the other relay");
+        };
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(
+            (seen.get("/b"), seen.get("/a")),
+            (Some(&1), Some(&1)),
+            "{seen:?}"
+        );
+    }
+
+    /// A relay paused by an earlier `Retry-After` is not sent to: the request goes through
+    /// another relay at once.
+    #[tokio::test]
+    async fn a_paused_relay_hands_the_request_over_before_anything_is_sent() {
+        let (client, _, b, seen) = two_relays(|path| {
+            Some(match path {
+                "/a/ohttp-configs/signed" => envelope_answer(),
+                _ => refused("413 Payload Too Large"),
+            })
+        })
+        .await;
+        RelayBackoff::global().note(&b, Duration::from_secs(30));
+        let request = Request::new("GET", "backend.example", "/v1/info");
+        let Err(Error::Refused { status: 413 }) =
+            client.send(&request, Duration::from_secs(10)).await
+        else {
+            panic!("the request did not go to the other relay");
+        };
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(
+            (seen.get("/b"), seen.get("/a")),
+            (None, Some(&1)),
+            "{seen:?}"
+        );
+    }
+
+    /// A request moves once at most: after a second relay it cannot reach, it fails.
+    #[tokio::test]
+    async fn a_request_moves_to_another_relay_once_at_most() {
+        let (_r1, p1) = refusing_port();
+        let (_r2, p2) = refusing_port();
+        let spec = format!("{{base}}/k,https://127.0.0.1:{p1}/relay,https://127.0.0.1:{p2}/relay");
+        let (client, _, seen) = relays_on(&spec, &[0, 100, 50], |path| {
+            Some(match path {
+                "/k/ohttp-configs/signed" => envelope_answer(),
+                _ => refused("413 Payload Too Large"),
+            })
+        })
+        .await;
+        let request = Request::new("POST", "backend.example", "/v1/write").body(vec![1; 8]);
+        let Err(Error::Http(error)) = client.send(&request, Duration::from_secs(10)).await else {
+            panic!("a request moved more than once");
+        };
+        assert_eq!(error.kind(), HttpErrorKind::Connect);
+        assert_eq!(seen.lock().unwrap().get("/k"), None, "moved a second time");
+    }
+
+    /// The first envelope source does not answer: it gets part of the timeout, and the
+    /// envelope comes through the next relay.
+    #[tokio::test]
+    async fn an_envelope_source_that_hangs_leaves_time_for_the_next() {
+        let (client, _, _, seen) = two_relays(|path| match path {
+            "/a/ohttp-configs/signed" => None,
+            "/b/ohttp-configs/signed" => Some(envelope_answer()),
+            _ => Some(refused("413 Payload Too Large")),
+        })
+        .await;
+        let request = Request::new("GET", "backend.example", "/v1/info");
+        let Err(Error::Refused { status: 413 }) =
+            client.send(&request, Duration::from_secs(6)).await
+        else {
+            panic!("the second envelope source was not used in time");
+        };
+        assert_eq!(seen.lock().unwrap().get("/b"), Some(&1));
+    }
+
+    fn envelope_answer() -> Vec<u8> {
+        let (envelope, _) = signed_envelope();
+        tls::response("200 OK", &[("content-type", "application/json")], &envelope)
+    }
+
+    /// A relay that takes the request and then drops the connection may have delivered it:
+    /// the request is not sent again, through it or any other relay.
+    #[tokio::test]
+    async fn a_request_that_may_have_been_delivered_is_never_sent_again() {
+        let (client, _, b, seen) = two_relays(|path| match path {
+            "/a/ohttp-configs/signed" => Some(envelope_answer()),
+            // Read the request, then close without a word.
+            _ => Some(Vec::new()),
+        })
+        .await;
+        let request = Request::new("POST", "backend.example", "/v1/write").body(vec![1; 64]);
+        let Err(Error::Http(error)) = client.send(&request, Duration::from_secs(10)).await else {
+            panic!("a dropped exchange was not reported");
+        };
+        assert_ne!(error.kind(), HttpErrorKind::Connect);
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(seen.get("/b"), Some(&1), "{seen:?}");
+        assert_eq!(
+            seen.get("/a"),
+            None,
+            "sent again through the other relay: {seen:?}"
+        );
+        // The relay that broke off is held out.
+        assert_ne!(client.relays.url(client.relays.choose()), b);
+        RelaySelector::global().note_success(&b);
+    }
+
+    /// A relay answering 503 is held out, and the envelope comes through the next relay when
+    /// the first listed cannot serve it.
+    #[tokio::test]
+    async fn a_failing_relay_is_held_out_and_the_envelope_has_a_second_source() {
+        let (client, a, b, seen) = two_relays(|path| {
+            Some(match path {
+                "/b/ohttp-configs/signed" => envelope_answer(),
+                "/a/ohttp-configs/signed" => tls::response("503 Service Unavailable", &[], b""),
+                _ => tls::response("503 Service Unavailable", &[], b""),
+            })
+        })
+        .await;
+        let request = Request::new("GET", "backend.example", "/v1/info");
+        let Err(Error::Refused { status: 503 }) =
+            client.send(&request, Duration::from_secs(10)).await
+        else {
+            panic!("the relay's refusal was not reported");
+        };
+        {
+            let seen = seen.lock().unwrap();
+            assert_eq!(seen.get("/a/ohttp-configs/signed"), Some(&1));
+            assert_eq!(seen.get("/b/ohttp-configs/signed"), Some(&1));
+            assert_eq!(seen.get("/b"), Some(&1));
+        }
+        // `/b` is held out: the next request goes to `/a` though its share is 0.
+        assert_eq!(client.relays.url(client.relays.choose()), a);
+        RelaySelector::global().note_success(&b);
+        assert_eq!(client.relays.url(client.relays.choose()), b);
     }
 
     /// Neither output of a transport error names the host, the address, the port or the path.

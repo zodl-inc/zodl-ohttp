@@ -685,7 +685,7 @@ fn the_outer_answer_is_classified_then_a_sealed_one_opened() {
         classify_outer_response(&profile.outer, &outer(503, b"down"), 0),
         OuterOutcome::Refused {
             status: 503,
-            detail: "down".into()
+            detail: "<4 bytes>".into()
         }
     );
     assert_eq!(

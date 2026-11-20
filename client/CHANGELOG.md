@@ -2,6 +2,78 @@
 
 [Keep a Changelog](https://keepachangelog.com).
 
+## 2.2.0
+
+Every configuration value accepted by 2.1.0 means what it did: a value is read as a relay list
+only where a `,` is followed by `https://`, which no valid 2.1.0 relay URL contains (its path
+would have an empty segment). Two behaviour changes apply to every client, single relay
+included, both for safety (see Changed): no request is sent again after an outer `400`/`422`,
+and errors no longer quote the relay's text.
+
+### Added
+
+- Several relays in front of one gateway. `OhttpConfigParams::relay_url` may list relay URLs
+  separated by `,` (each entry after the first starting `https://`): each under the relay URL
+  rules, at most 8 (`MAX_RELAYS`), no relay twice. Every relay of a list gets an equal share of
+  the requests. The mainnet/testnet and gateway-host rules apply to every relay of a list. The
+  order is significant: the first relay is the stable one and the envelope source, relays fail
+  over in list order, and `relays()` keeps it.
+  - `OhttpConfig::relay_url()` / `OhttpNetworks::relay_for(host)`: the first relay listed,
+    always the same, the one the signed key configuration is fetched through. An integration
+    that only bumps the crate keeps posting there.
+  - `OhttpConfig::choose_relay()` / `OhttpNetworks::choose_relay_for(host)`: the relay for the
+    next request, a fresh random choice on every call, each relay an equal share (operating
+    system RNG, with a non-cryptographic fallback should it fail; nothing derived from the wallet, no choice kept or stored), passed on down the
+    failover order while the relay drawn is held out or paused. With one relay, that relay.
+  - `OhttpConfig::relays()`: `Relay { url() }` in configuration order.
+  - `RelaySelector::global()`: `note_failure(relay_url)` holds a relay out of the choice for
+    60 s (`RELAY_FAILOVER_HOLD`), doubling while it keeps failing on requests sent after each
+    hold ended, up to 16 min (`MAX_RELAY_FAILOVER_HOLD`), where its list has another relay; a
+    running `RelayBackoff` pause also takes a relay out. Failures of several relays at once
+    (device offline, gateway down) are not doubled, and a success through a relay that failed
+    lately itself releases the holds of the others that failed meanwhile. `note_success(relay_url)` ends the hold.
+    `note_failure_of` / `note_success_of(relay_url, sent_at)` take the instant the request was
+    sent: a late report neither ends nor lengthens a hold that began after it. URLs are compared
+    canonically; at most 64 relays are held (`MAX_HELD_RELAYS`). Failover order: the others in
+    list order (while a relay is out its share goes to the next in that order); with every
+    relay out, a held relay before a paused one, else the relay drawn. Its `Debug` output shows a count only.
+  - `relay_status_fails_over(status)`: the outer statuses that hold a relay out (`429`, `5xx`,
+    `3xx`, `401`, `403`, `404`, `405`, `407`, `421`).
+  - `Client::for_network` with a list: each request goes to `choose_relay()`'s relay; the
+    outcome is reported (success once the answer is complete; failure on a transport failure, a
+    failing status, a success without a sealed answer, a body that breaks off or ends short; a
+    timeout only when the attempt had 5 s or more). A request moves to another relay once when
+    nothing was sent: its relay is paused, or the connection or TLS handshake failed
+    (`reqwest::Error::is_connect`; connecting is bounded by 10 s). Any outer error status and any
+    failure after connecting is returned: the request is never sent again. The envelope is
+    fetched through the first relay (half the timeout, at least 3 s and at most 10 s, while
+    there are others), then the others in list order, each an equal part of what is left; a
+    fetch failure does not hold a relay out.
+
+### Changed
+
+- `Client` no longer sends a request again after an outer `400`/`422`: it drops the kept key
+  configuration (the next request fetches it afresh) and returns `Error::Refused`. An outer
+  status, which anything between the client and the gateway can write, does not prove that the
+  request did not run, and a `WRITE` must not run twice. After a key rotation the requests
+  already sealed to the old configuration may be refused; the next ones fetch it afresh. `OuterOutcome::RefetchKeyConfig` documents the same rule for sans-IO
+  callers.
+- `reqwest` 0.12.28 or later (for `reqwest::retry`, used to turn the stack's retries off).
+- `Client` turns off the HTTP stack's own retries (reqwest's default resends a request after
+  an HTTP/2 refusal such as `REFUSED_STREAM`): whether a request may be sent twice is decided
+  by the client alone.
+- `OuterOutcome::Refused::detail` shows the size of the refusal's body (`<N bytes>`, empty for
+  none), never its text.
+- `Error::MediaType` and `OuterOutcome::WrongMediaType` show only the media type of the
+  relay's `Content-Type`: a registered top-level type and a common subtype (else `*`, as in
+  `text/*`), lower case, parameters dropped, or the new constant `NOT_A_MEDIA_TYPE`; never free
+  text of the relay's, which could carry a URL or a host into a log line.
+
+- `INTEGRATION.md` section 4: a request may be sent again only when nothing was sent (a
+  failure while connecting); after any later
+  failure a `WRITE` is not sent again (the old text called every transport error before an
+  answer "just another iteration").
+
 ## 2.1.0
 
 No breaking change. `Error` (non-exhaustive) gains the variant `NoHostList`.

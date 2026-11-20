@@ -32,6 +32,7 @@ use std::fmt;
 
 use ed25519_dalek::VerifyingKey;
 
+use crate::relays::{parse_relay_list, Relay, RelaySelector};
 use crate::signed::Network;
 
 /// One value of an [`OhttpConfig`], as a [`ConfigError`] names it.
@@ -130,6 +131,17 @@ pub struct OhttpConfigParams<'a> {
     /// fragment, backslash, whitespace, control characters, encoded `/` or `\` and empty path
     /// segments. Kept in its canonical form ([`OhttpConfig::relay_url`]), one trailing `/`
     /// removed.
+    ///
+    /// Or several relays: relay URLs under the rules above separated by `,`, each one after the
+    /// first starting `https://` (a value is read as a list only where a `,` is followed by
+    /// `https://`: any other `,` stays part of a URL's path, as before; an entry other than the last
+    /// must not end with `,`), at most 8, no relay twice. Each request then goes to one of them at random, each relay getting an equal
+    /// share, and to another while one fails (see [`crate::RelaySelector`]). The order is
+    /// significant: the first relay is the network's relay as [`OhttpConfig::relay_url`] gives
+    /// it (the signed key configuration is fetched through it first), relays fail over in list
+    /// order, and [`OhttpConfig::relays`] keeps it, so that a relay can be referred
+    /// to by its position. A client that splits its requests asks
+    /// [`OhttpConfig::choose_relay`] for each one.
     pub relay_url: &'a str,
     /// The DNS TXT name of the gateway's signed key configuration, the last-resort source of
     /// it; a lower-case bare DNS host name.
@@ -162,11 +174,10 @@ impl fmt::Debug for OhttpConfigParams<'_> {
 #[derive(Clone, PartialEq, Eq)]
 pub struct OhttpConfig {
     gateway_host: String,
-    relay_url: String,
+    /// The relays, in the order the configuration lists them; never empty.
+    relays: Vec<Relay>,
     keys_dns_name: String,
     signing_pubkey: VerifyingKey,
-    /// The relay URL's host, port and path, canonical, for comparisons.
-    relay: RelayTarget,
     /// The gateway host as the URL parser reads it, for comparisons with relay hosts.
     gateway_key: String,
 }
@@ -193,13 +204,13 @@ impl OhttpConfig {
         }
         let invalid = |field| move |rule| ConfigError::Invalid { field, rule };
         check_host_name(gateway_host).map_err(invalid(ConfigField::GatewayHost))?;
-        let relay = parse_relay_url(relay_url).map_err(invalid(ConfigField::RelayUrl))?;
+        let relays = parse_relay_list(relay_url).map_err(invalid(ConfigField::RelayUrl))?;
         // A relay on the gateway's own host would hand the gateway the client's address. Both
         // sides in the URL parser's form, so that a gateway host written as a numeric IPv4
         // alias (`0xc0000201`, `0300.0.2.1`, `192.0.513`) matches a relay on that address, and
         // an IPv6 literal that embeds an IPv4 address matches a gateway on that address.
         let gateway_key = host_key(gateway_host);
-        if relay.on_host(&gateway_key) {
+        if relays.iter().any(|r| r.target.on_host(&gateway_key)) {
             return Err(invalid(ConfigField::RelayUrl)(RELAY_ON_GATEWAY_HOST));
         }
         check_host_name(keys_dns_name).map_err(invalid(ConfigField::KeysDnsName))?;
@@ -207,10 +218,9 @@ impl OhttpConfig {
             parse_signing_pubkey(signing_pubkey).map_err(invalid(ConfigField::SigningPubkey))?;
         Ok(OhttpConfig {
             gateway_host: gateway_host.to_owned(),
-            relay_url: relay.url.clone(),
+            relays,
             keys_dns_name: keys_dns_name.to_owned(),
             signing_pubkey,
-            relay,
             gateway_key,
         })
     }
@@ -223,8 +233,39 @@ impl OhttpConfig {
     /// The relay URL, canonical: as given, but for a host in lower case and an IP address in its
     /// standard form, no `:443`, dot segments resolved, percent-encoding normalized and no
     /// trailing `/` (see [`OhttpConfigParams::relay_url`]).
+    ///
+    /// With a relay list, the first relay listed: the one the signed key configuration is
+    /// fetched through ([`crate::signed_config_url`]). Always the same value, so it can key
+    /// caches; the relay a request is posted to is [`choose_relay`](Self::choose_relay)'s.
     pub fn relay_url(&self) -> &str {
-        &self.relay_url
+        self.relays[0].url()
+    }
+
+    /// The relay to post the next request to. With one relay, always
+    /// [`relay_url`](Self::relay_url). With a list, a fresh random choice on every call (each
+    /// relay an equal share), passed on
+    /// down the failover order while the relay drawn is held out after a failure or paused by a
+    /// `Retry-After` ([`crate::RelaySelector::global`]). Call it for each request, and report
+    /// the outcome with [`crate::RelaySelector::note_failure`] /
+    /// [`crate::RelaySelector::note_success`].
+    pub fn choose_relay(&self) -> &str {
+        self.relays[RelaySelector::global().choose(&self.relays)].url()
+    }
+
+    /// Gives the relays these shares instead of equal ones, for the tests of `Client`.
+    #[cfg(all(test, feature = "client"))]
+    pub(crate) fn set_shares_for_test(&mut self, shares: &[u32]) {
+        self.relays = self
+            .relays
+            .iter()
+            .zip(shares)
+            .map(|(relay, &share)| crate::relays::Relay::weighted(relay.target.clone(), share))
+            .collect();
+    }
+
+    /// The relays, in the order the configuration lists them.
+    pub fn relays(&self) -> &[Relay] {
+        &self.relays
     }
 
     /// The DNS TXT name of the signed key configuration.
@@ -297,7 +338,10 @@ impl OhttpNetworks {
         testnet: Option<OhttpConfig>,
     ) -> Result<Self, ConfigError> {
         if let (Some(main), Some(test)) = (&mainnet, &testnet) {
-            if main.relay.on_host(&test.gateway_key) || test.relay.on_host(&main.gateway_key) {
+            let on = |config: &OhttpConfig, gateway_key: &str| {
+                config.relays.iter().any(|r| r.target.on_host(gateway_key))
+            };
+            if on(main, &test.gateway_key) || on(test, &main.gateway_key) {
                 return Err(ConfigError::Invalid {
                     field: ConfigField::RelayUrl,
                     rule: RELAY_ON_GATEWAY_HOST,
@@ -308,7 +352,12 @@ impl OhttpNetworks {
                     ConfigField::GatewayHost,
                     main.gateway_key.eq_ignore_ascii_case(&test.gateway_key),
                 ),
-                (ConfigField::RelayUrl, main.relay.same_relay(&test.relay)),
+                (
+                    ConfigField::RelayUrl,
+                    main.relays
+                        .iter()
+                        .any(|m| test.relays.iter().any(|t| m.target.same_relay(&t.target))),
+                ),
                 (
                     ConfigField::KeysDnsName,
                     main.keys_dns_name.eq_ignore_ascii_case(&test.keys_dns_name),
@@ -344,11 +393,20 @@ impl OhttpNetworks {
             })
     }
 
-    /// The relay URL for `gateway_host`, or `None` when it is not exactly the gateway host of a
-    /// configured network: `None` means OHTTP is off for that host.
+    /// The relay URL for `gateway_host` ([`OhttpConfig::relay_url`]: with a relay list, the
+    /// first relay listed), or `None` when it is not exactly the gateway host of a configured
+    /// network: `None` means OHTTP is off for that host.
     pub fn relay_for(&self, gateway_host: &str) -> Option<&str> {
         let network = self.network_of_host(gateway_host)?;
         self.get(network).map(OhttpConfig::relay_url)
+    }
+
+    /// The relay to post the next request to `gateway_host` through
+    /// ([`OhttpConfig::choose_relay`]: with a relay list, a fresh choice on every call), or
+    /// `None` as for [`relay_for`](Self::relay_for).
+    pub fn choose_relay_for(&self, gateway_host: &str) -> Option<&str> {
+        let network = self.network_of_host(gateway_host)?;
+        self.get(network).map(OhttpConfig::choose_relay)
     }
 
     /// The configuration of `network`, or [`crate::Error::KeyConfig`] naming the network when
@@ -442,20 +500,20 @@ pub(crate) struct RelayTarget {
 impl RelayTarget {
     /// Whether the relay is on the host `gateway_key` (a [`host_key`]): its host, or the IPv4
     /// address its IPv6 literal embeds.
-    fn on_host(&self, gateway_key: &str) -> bool {
+    pub(crate) fn on_host(&self, gateway_key: &str) -> bool {
         self.host == gateway_key || self.embedded_ipv4.as_deref() == Some(gateway_key)
     }
 
     /// The host as relays are told apart: the IPv4 address an IPv6 literal embeds, else
     /// [`RelayTarget::host`].
-    fn identity_host(&self) -> &str {
+    pub(crate) fn identity_host(&self) -> &str {
         self.embedded_ipv4.as_deref().unwrap_or(&self.host)
     }
 
     /// Whether `self` and `other` are the same relay: the same host (an IPv6 literal that
     /// embeds an IPv4 address as that address) and port and the same path ignoring ASCII case
     /// (conservative: two paths differing in case only count as one).
-    fn same_relay(&self, other: &RelayTarget) -> bool {
+    pub(crate) fn same_relay(&self, other: &RelayTarget) -> bool {
         self.identity_host() == other.identity_host()
             && self.port == other.port
             && self.path.eq_ignore_ascii_case(&other.path)
@@ -1016,5 +1074,84 @@ pub(crate) mod tests {
         }
         assert_eq!(off.relay_for("ohttp-gateway.example"), None);
         assert_eq!(off.network_of_host(""), None);
+    }
+
+    #[test]
+    fn a_relay_list_is_checked_like_a_relay_url() {
+        let list = "https://relay-a.example/relay,https://relay-b.example/gateway";
+        let main = config("ohttp-gateway.example", list, 1).unwrap();
+        assert_eq!(main.relays().len(), 2);
+        assert_eq!(main.relay_url(), "https://relay-a.example/relay");
+        let chosen = main.choose_relay();
+        assert!(main.relays().iter().any(|r| r.url() == chosen));
+        // No relay of the list on the gateway host.
+        assert_eq!(
+            config("relay-b.example", list, 1),
+            Err(ConfigError::Invalid {
+                field: ConfigField::RelayUrl,
+                rule: RELAY_ON_GATEWAY_HOST
+            })
+        );
+        assert!(matches!(
+            config(
+                "ohttp-gateway.example",
+                "https://relay-a.example/relay,https://relay-a.example/relay/",
+                1
+            ),
+            Err(ConfigError::Invalid {
+                field: ConfigField::RelayUrl,
+                ..
+            })
+        ));
+        // Mainnet and testnet share no relay of either list.
+        let test = config(
+            "ohttp-gateway-testnet.example",
+            "https://relay-c.example/relay,https://Relay-B.example/gateway/",
+            2,
+        )
+        .unwrap();
+        assert_eq!(
+            OhttpNetworks::new(Some(main.clone()), Some(test)),
+            Err(ConfigError::SharedAcrossNetworks {
+                field: ConfigField::RelayUrl
+            })
+        );
+        // Nor is one network's relay on the other's gateway host.
+        let test = config(
+            "ohttp-gateway-testnet.example",
+            "https://relay-c.example/relay,https://ohttp-gateway.example/relay",
+            2,
+        )
+        .unwrap();
+        assert_eq!(
+            OhttpNetworks::new(Some(main.clone()), Some(test)),
+            Err(ConfigError::Invalid {
+                field: ConfigField::RelayUrl,
+                rule: RELAY_ON_GATEWAY_HOST
+            })
+        );
+        let test = config(
+            "ohttp-gateway-testnet.example",
+            "https://relay-c.example/relay",
+            2,
+        )
+        .unwrap();
+        let networks = OhttpNetworks::new(Some(main), Some(test)).unwrap();
+        assert_eq!(
+            networks.relay_for("ohttp-gateway.example"),
+            Some("https://relay-a.example/relay")
+        );
+        assert_eq!(
+            networks.relay_for("ohttp-gateway-testnet.example"),
+            Some("https://relay-c.example/relay")
+        );
+        assert_eq!(networks.choose_relay_for("lightwalletd.example"), None);
+        let relay = networks.choose_relay_for("ohttp-gateway.example").unwrap();
+        assert!(
+            relay.starts_with("https://relay-a.example")
+                || relay.starts_with("https://relay-b.example")
+        );
+        // A list configuration shows no value either.
+        assert!(!format!("{networks:?}").contains("example"));
     }
 }

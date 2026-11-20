@@ -576,30 +576,32 @@ async fn a_signed_configuration_is_checked_against_the_pinned_key() {
     };
 }
 
+/// After a rotation the request under the old key is refused, and returned as such (an outer
+/// status does not prove that it did not run, so it is never sent again); the kept
+/// configuration is dropped and the next request goes out under the new key.
 #[tokio::test]
-async fn a_rotated_key_is_fetched_again_once() {
+async fn a_rotated_key_refuses_one_request_and_the_next_one_uses_the_new_key() {
     let (base, gw) = spawn().await;
     let client = plain_client(&base);
     client.send(&json_post(), TIMEOUT).await.unwrap();
     gw.rotate(2);
+    let Err(Error::Refused { status: 422 }) = client.send(&json_post(), TIMEOUT).await else {
+        panic!("the request under the old key was not reported");
+    };
+    assert_eq!(gw.posts.load(Ordering::SeqCst), 2, "not sent again");
+    assert_eq!(gw.config_fetches.load(Ordering::SeqCst), 1);
     let response = client.send(&json_post(), TIMEOUT).await.unwrap();
     assert_eq!(response.status, 200);
     assert_eq!(gw.config_fetches.load(Ordering::SeqCst), 2);
-    // The first, the refused one under the old key, the one under the new key.
     assert_eq!(gw.posts.load(Ordering::SeqCst), 3);
-
-    // A gateway that keeps refusing the key it advertises is refused once, not looped on.
-    *gw.opens_with.lock().unwrap() = Arc::new(key_state(3));
-    let Err(Error::Refused { status: 422 }) = client.send(&json_post(), TIMEOUT).await else {
-        panic!("a refused key was not reported");
-    };
-    assert_eq!(gw.posts.load(Ordering::SeqCst), 5);
 }
 
-/// ZIP, "Outer response contract": an outer 400 or 422 with any body refetches the key
-/// configuration and retries once, sealed afresh; a second one is permanent.
+/// An outer 400 or 422 with any body drops the kept key configuration. The request is not sent
+/// again (where the ZIP's "Outer response contract" retries once, this crate does not: an outer
+/// status proves nothing about what ran beyond the relay); the next one fetches the
+/// configuration afresh.
 #[tokio::test]
-async fn an_outer_400_or_422_with_any_body_is_refetched_once() {
+async fn an_outer_400_or_422_with_any_body_is_returned_and_drops_the_key() {
     for status in [StatusCode::BAD_REQUEST, StatusCode::UNPROCESSABLE_ENTITY] {
         for body in [&b""[..], b"anything at all", b"\xff\xfe"] {
             let (base, gw) = spawn().await;
@@ -607,21 +609,16 @@ async fn an_outer_400_or_422_with_any_body_is_refetched_once() {
             client.send(&json_post(), TIMEOUT).await.unwrap();
             assert_eq!(gw.config_fetches.load(Ordering::SeqCst), 1);
             *gw.refuse_once.lock().unwrap() = Some((status, body.to_vec()));
-            let response = client.send(&json_post(), TIMEOUT).await.unwrap();
-            assert_eq!(response.status, 200);
-            // The kept configuration was discarded and fetched again; the refused post and
-            // the retry are two posts beyond the first.
-            assert_eq!(gw.config_fetches.load(Ordering::SeqCst), 2, "{status}");
-            assert_eq!(gw.posts.load(Ordering::SeqCst), 3, "{status}");
-
-            // The second one in a row is permanent: no third post.
-            *gw.refuse_with.lock().unwrap() = Some(status);
             let Err(Error::Refused { status: got }) = client.send(&json_post(), TIMEOUT).await
             else {
-                panic!("a repeated {status} was not reported");
+                panic!("a {status} was sent again or not reported");
             };
             assert_eq!(got, status.as_u16());
-            assert_eq!(gw.posts.load(Ordering::SeqCst), 5, "{status}");
+            assert_eq!(gw.posts.load(Ordering::SeqCst), 2, "{status}");
+            let response = client.send(&json_post(), TIMEOUT).await.unwrap();
+            assert_eq!(response.status, 200);
+            assert_eq!(gw.config_fetches.load(Ordering::SeqCst), 2, "{status}");
+            assert_eq!(gw.posts.load(Ordering::SeqCst), 3, "{status}");
         }
     }
 }
