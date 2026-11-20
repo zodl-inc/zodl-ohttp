@@ -178,6 +178,10 @@ pub enum Kind {
     Near,
     Cmc,
     Swapkit,
+    /// The Coinbase Onramp provider ([`crate::coinbase`]): file only, its settings in
+    /// [`Integration::auth`], [`Integration::redirect_url`], [`Integration::enabled`] and
+    /// [`Integration::availability`].
+    Coinbase,
 }
 
 impl Kind {
@@ -188,9 +192,56 @@ impl Kind {
             Kind::Near => "near",
             Kind::Cmc => "cmc",
             Kind::Swapkit => "swapkit",
+            Kind::Coinbase => "coinbase",
         }
     }
 }
+
+/// `auth` of a `coinbase` integration: `{ type = "jwt_eddsa", secret = "<name>", ttl_secs = 120 }`.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Auth {
+    #[serde(rename = "type")]
+    pub kind: AuthKind,
+    /// The `[secrets]` name of the key document (JSON `{"id": ..., "privateKey": ...}`).
+    pub secret: String,
+    /// The lifetime of a token (default and maximum 120).
+    pub ttl_secs: Option<u64>,
+}
+
+/// The `type` of an [`Auth`].
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+pub enum AuthKind {
+    /// A JWT per request signed with an Ed25519 key ([`crate::core::auth::JwtEdDsa`]).
+    #[serde(rename = "jwt_eddsa")]
+    JwtEdDsa,
+}
+
+/// `[integrations.<label>.availability]` of a `coinbase` integration: the document
+/// `GET /v1/availability` answers.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Availability {
+    /// ISO 3166-1 alpha-2 country code (upper case) -> what is offered there.
+    #[serde(default)]
+    pub countries: BTreeMap<String, Country>,
+}
+
+/// One country of an [`Availability`].
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Country {
+    pub buy: bool,
+    pub sell: bool,
+}
+
+/// The policy entry that carries the settings of the `coinbase` integrations, in the map
+/// [`render`] returns: not an environment variable (no variable can configure them), read only
+/// from a rendered file. A JSON array, one object per integration
+/// ([`crate::coinbase::Settings`]): the key's `[secrets]` entry is named (its variable or
+/// file), never resolved, so the key document is never part of the rendered policy; the
+/// gateway reads it when it builds the provider.
+pub const COINBASE_RENDERED: &str = "integrations.coinbase";
 
 /// The rules of one authority, each list in the grammar of its variable's entries.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -229,6 +280,17 @@ pub struct Integration {
     pub read_routes: Vec<String>,
     #[serde(default)]
     pub one_sided_write_routes: Vec<String>,
+    /// Kind `coinbase` only: the credential.
+    pub auth: Option<Auth>,
+    /// Kind `coinbase` only: the `redirectUrl` of every hosted session.
+    pub redirect_url: Option<String>,
+    /// Kind `coinbase` only (required there): the kill switch.
+    pub enabled: Option<bool>,
+    /// Kind `coinbase` only: the availability document.
+    pub availability: Option<Availability>,
+    /// Kind `coinbase` only (required there): the cap of `POST /v1/sell/status`; `rate_limit`
+    /// is the cap of `POST /v1/session`.
+    pub status_rate_limit: Option<String>,
 }
 
 /// `[hosts."<authority>"]`: an authority that is no alias (a gateway host, the pseudo
@@ -325,10 +387,26 @@ pub struct PolicyFile {
 impl Integration {
     fn rules(&self) -> Rules {
         Rules {
-            routes: self.routes.clone(),
+            // A coinbase integration's routes are its module's ([`crate::coinbase::ROUTES`]);
+            // the file cannot set them.
+            routes: if self.kind == Some(Kind::Coinbase) {
+                Some(
+                    crate::coinbase::ROUTES
+                        .iter()
+                        .map(|(m, p)| format!("{m} {p}"))
+                        .collect(),
+                )
+            } else {
+                self.routes.clone()
+            },
             headers: self.headers.clone(),
             cache: self.cache.clone(),
-            rate_limit: self.rate_limit.clone(),
+            // A coinbase integration's caps are its own, per route (not THIRD_PARTY_RATE_LIMITS).
+            rate_limit: if self.kind == Some(Kind::Coinbase) {
+                None
+            } else {
+                self.rate_limit.clone()
+            },
             query_rules: self.query_rules.clone(),
             read_routes: self.read_routes.clone(),
             one_sided_write_routes: self.one_sided_write_routes.clone(),
@@ -413,6 +491,7 @@ pub fn parse(text: &str) -> Result<Loaded> {
     let file = file.normalized()?;
     file.check()?;
     file.check_kinds()?;
+    file.check_coinbase()?;
     Ok(Loaded { file, warnings })
 }
 
@@ -545,13 +624,23 @@ impl PolicyFile {
                         alias: i.alias.trim().to_ascii_lowercase(),
                         upstream: i.upstream.trim().to_string(),
                         kind: i.kind,
-                        routes: r.routes,
+                        // As written: a coinbase integration's own `routes` key is refused,
+                        // not replaced (`rules()` adds its fixed routes).
+                        routes: i.routes.as_ref().map(|v| trim_all(v)),
                         headers: r.headers,
                         cache: r.cache,
-                        rate_limit: r.rate_limit,
+                        rate_limit: i.rate_limit.as_ref().map(|s| s.trim().to_string()),
                         query_rules: r.query_rules,
                         read_routes: r.read_routes,
                         one_sided_write_routes: r.one_sided_write_routes,
+                        status_rate_limit: i
+                            .status_rate_limit
+                            .as_ref()
+                            .map(|s| s.trim().to_string()),
+                        auth: i.auth.clone(),
+                        redirect_url: i.redirect_url.as_ref().map(|u| u.trim().to_string()),
+                        enabled: i.enabled,
+                        availability: i.availability.clone(),
                     },
                 )
             })
@@ -852,6 +941,175 @@ impl PolicyFile {
     }
 }
 
+impl PolicyFile {
+    /// The `coinbase` integrations ([`crate::coinbase`]): `auth` (`jwt_eddsa`, a mapped secret,
+    /// `ttl_secs` 1..=120), `enabled`, `rate_limit` (`POST /v1/session`) and
+    /// `status_rate_limit` (`POST /v1/sell/status`) required, an https upstream,
+    /// `redirect_url` required when a country offers sell, `redirect_url` and
+    /// `availability` well-formed; their routes, headers, cache, query rules and replay routes
+    /// are the module's and cannot be set. The keys of a coinbase integration are refused on
+    /// any other kind. A build without the provider refuses the kind.
+    pub fn check_coinbase(&self) -> Result<()> {
+        for (label, i) in &self.integrations {
+            let place = format!("integrations.{label} ('{}')", i.alias);
+            if i.kind != Some(Kind::Coinbase) {
+                for (key, set) in [
+                    ("auth", i.auth.is_some()),
+                    ("redirect_url", i.redirect_url.is_some()),
+                    ("enabled", i.enabled.is_some()),
+                    ("availability", i.availability.is_some()),
+                    ("status_rate_limit", i.status_rate_limit.is_some()),
+                ] {
+                    if set {
+                        bail!("Invalid config file: {place} has '{key}', which only kind coinbase takes");
+                    }
+                }
+                continue;
+            }
+            if cfg!(not(feature = "coinbase")) {
+                bail!("Invalid config file: {place} has kind coinbase but this build has no coinbase provider (cargo feature 'coinbase')");
+            }
+            for (key, set) in [
+                ("routes", i.routes.is_some()),
+                ("headers", !i.headers.is_empty()),
+                ("cache", !i.cache.is_empty()),
+                ("query_rules", !i.query_rules.is_empty()),
+                ("read_routes", !i.read_routes.is_empty()),
+                (
+                    "one_sided_write_routes",
+                    !i.one_sided_write_routes.is_empty(),
+                ),
+            ] {
+                if set {
+                    bail!("Invalid config file: {place} has '{key}', which kind coinbase does not take (its routes and their handling are fixed)");
+                }
+            }
+            let Some(auth) = &i.auth else {
+                bail!("Invalid config file: {place} needs auth = {{ type = \"jwt_eddsa\", secret = \"<name>\" }}");
+            };
+            if !self.secrets.contains_key(&auth.secret) {
+                bail!(
+                    "Invalid config file: the auth of {place} names the secret '{}', which [secrets] does not map",
+                    auth.secret
+                );
+            }
+            if let Some(ttl) = auth.ttl_secs {
+                if !(1..=crate::core::auth::JwtEdDsa::MAX_TTL_SECS).contains(&ttl) {
+                    bail!(
+                        "Invalid config file: the auth ttl_secs of {place} must be 1 to {}",
+                        crate::core::auth::JwtEdDsa::MAX_TTL_SECS
+                    );
+                }
+            }
+            if i.enabled.is_none() {
+                bail!("Invalid config file: {place} needs 'enabled' (true, or false to switch it off)");
+            }
+            for (key, cap) in [
+                ("rate_limit", &i.rate_limit),
+                ("status_rate_limit", &i.status_rate_limit),
+            ] {
+                let Some(spec) = cap else {
+                    bail!("Invalid config file: {place} needs '{key}' (the cap of the upstream calls of {})", if key == "rate_limit" { "POST /v1/session" } else { "POST /v1/sell/status" });
+                };
+                crate::core::caps::parse_rate_spec(&format!("{key} of {place}"), spec)
+                    .map_err(|e| anyhow!("Invalid config file: {e}"))?;
+            }
+            if crate::coinbase::upstream_origin(&i.upstream).is_none() {
+                bail!("Invalid config file: the upstream of {place} must be https://host[:port] (http:// only for a loopback host), the host in lower case, without a path or the scheme's default port");
+            }
+            match &i.redirect_url {
+                Some(url) if !crate::coinbase::is_redirect_url(url) => {
+                    bail!("Invalid config file: the redirect_url of {place} must be a URL of at most {} visible ASCII characters with a scheme", crate::coinbase::MAX_REDIRECT_URL_LEN);
+                }
+                None if i
+                    .availability
+                    .iter()
+                    .any(|a| a.countries.values().any(|c| c.sell)) =>
+                {
+                    bail!("Invalid config file: {place} offers sell in a country, which needs a redirect_url (the wallet resumes a sell from it)");
+                }
+                _ => {}
+            }
+            for code in i.availability.iter().flat_map(|a| a.countries.keys()) {
+                if code.len() != 2 || !code.bytes().all(|b| b.is_ascii_uppercase()) {
+                    bail!("Invalid config file: the availability of {place} names a country that is no ISO 3166-1 alpha-2 code in upper case");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The `coinbase` integrations as [`render`] puts them under [`COINBASE_RENDERED`]: label,
+    /// alias, upstream, the key's `[secrets]` entry (named, never resolved; `read_key` true),
+    /// token lifetime, kill switch, redirect URL, availability and caps.
+    fn coinbase_rendered(&self) -> Result<Option<String>> {
+        let mut list = Vec::new();
+        for (label, i) in self
+            .integrations
+            .iter()
+            .filter(|(_, i)| i.kind == Some(Kind::Coinbase))
+        {
+            let Some(auth) = &i.auth else {
+                bail!("Invalid config file: '{}' has no auth", i.alias);
+            };
+            let Some(source) = self.secrets.get(&auth.secret) else {
+                bail!(
+                    "Invalid config file: the auth of '{}' names an unmapped secret",
+                    i.alias
+                );
+            };
+            let mut secret = Map::new();
+            secret.insert("name".into(), Value::String(auth.secret.clone()));
+            secret.insert(
+                "env".into(),
+                source.env.clone().map_or(Value::Null, Value::String),
+            );
+            secret.insert(
+                "file".into(),
+                source.file.clone().map_or(Value::Null, Value::String),
+            );
+            let countries: Map<String, Value> = i
+                .availability
+                .iter()
+                .flat_map(|a| a.countries.iter())
+                .map(|(code, c)| {
+                    let mut o = Map::new();
+                    o.insert("buy".into(), Value::Bool(c.buy));
+                    o.insert("sell".into(), Value::Bool(c.sell));
+                    (code.clone(), Value::Object(o))
+                })
+                .collect();
+            let mut o = Map::new();
+            o.insert("label".into(), Value::String(label.clone()));
+            o.insert("alias".into(), Value::String(i.alias.clone()));
+            o.insert("upstream".into(), Value::String(i.upstream.clone()));
+            o.insert("secret".into(), Value::Object(secret));
+            o.insert("read_key".into(), Value::Bool(true));
+            o.insert(
+                "ttl_secs".into(),
+                Value::from(
+                    auth.ttl_secs
+                        .unwrap_or(crate::core::auth::JwtEdDsa::DEFAULT_TTL_SECS),
+                ),
+            );
+            o.insert("enabled".into(), Value::Bool(i.enabled.unwrap_or(false)));
+            o.insert(
+                "redirect_url".into(),
+                i.redirect_url.clone().map_or(Value::Null, Value::String),
+            );
+            o.insert("countries".into(), Value::Object(countries));
+            for (key, cap) in [
+                ("rate_limit", &i.rate_limit),
+                ("status_rate_limit", &i.status_rate_limit),
+            ] {
+                o.insert(key.into(), cap.clone().map_or(Value::Null, Value::String));
+            }
+            list.push(Value::Object(o));
+        }
+        Ok((!list.is_empty()).then(|| Value::Array(list).to_string()))
+    }
+}
+
 /// `value` holds none of `seps`; the error names the place (`what`), never the value.
 fn no_sep(what: &str, value: &str, seps: &[char]) -> Result<()> {
     if let Some(c) = value.chars().find(|c| seps.contains(c)) {
@@ -1004,6 +1262,9 @@ pub fn render(
             "DYNAMIC_HOSTS_DENY_CIDRS",
             file.dynamic_hosts.deny_cidrs.join(","),
         );
+    }
+    if let Some(coinbase) = file.coinbase_rendered()? {
+        out.insert(COINBASE_RENDERED, coinbase);
     }
     Ok(out)
 }
@@ -1296,6 +1557,11 @@ pub fn export(env: &BTreeMap<String, String>) -> Result<Export> {
                         query_rules: rules.query_rules,
                         read_routes: rules.read_routes,
                         one_sided_write_routes: rules.one_sided_write_routes,
+                        auth: None,
+                        redirect_url: None,
+                        enabled: None,
+                        availability: None,
+                        status_rate_limit: None,
                     },
                 );
             }
@@ -1534,6 +1800,50 @@ pub fn canonical(
         if let Some(rl) = &r.rate_limit {
             o.insert("rate_limit".into(), Value::String(rl.clone()));
         }
+        // A coinbase integration's own settings (the secret's name is no part of the policy).
+        if let Some(i) = file
+            .integrations
+            .values()
+            .find(|i| i.alias == authority && i.kind == Some(Kind::Coinbase))
+        {
+            let mut c = Map::new();
+            if let Some(auth) = &i.auth {
+                let mut a = Map::new();
+                a.insert("type".into(), Value::String("jwt_eddsa".into()));
+                a.insert(
+                    "ttl_secs".into(),
+                    Value::from(
+                        auth.ttl_secs
+                            .unwrap_or(crate::core::auth::JwtEdDsa::DEFAULT_TTL_SECS),
+                    ),
+                );
+                c.insert("auth".into(), Value::Object(a));
+            }
+            c.insert("enabled".into(), i.enabled.map_or(Value::Null, Value::Bool));
+            c.insert(
+                "redirect_url".into(),
+                i.redirect_url.clone().map_or(Value::Null, Value::String),
+            );
+            let countries: Map<String, Value> = i
+                .availability
+                .iter()
+                .flat_map(|a| a.countries.iter())
+                .map(|(code, k)| {
+                    let mut o = Map::new();
+                    o.insert("buy".into(), Value::Bool(k.buy));
+                    o.insert("sell".into(), Value::Bool(k.sell));
+                    (code.clone(), Value::Object(o))
+                })
+                .collect();
+            c.insert("availability".into(), Value::Object(countries));
+            for (key, cap) in [
+                ("rate_limit", &i.rate_limit),
+                ("status_rate_limit", &i.status_rate_limit),
+            ] {
+                c.insert(key.into(), cap.clone().map_or(Value::Null, Value::String));
+            }
+            o.insert("coinbase".into(), Value::Object(c));
+        }
         // An authority with nothing configured is no part of the policy.
         if !o.is_empty() {
             auths.insert(authority, Value::Object(o));
@@ -1689,6 +1999,17 @@ pub fn differing_keys(a: &Value, b: &Value) -> Vec<String> {
 /// TOML text of `file` (the export): one table per integration, host and value source, lists
 /// one entry per line. `secrets` notes which secret variables are new names.
 pub fn to_toml(file: &PolicyFile, secrets: &[ExportedSecret]) -> Result<String> {
+    // An export never has one (no variable assigns the kind); its settings have no TOML form here.
+    if let Some(i) = file
+        .integrations
+        .values()
+        .find(|i| i.kind == Some(Kind::Coinbase))
+    {
+        bail!(
+            "'{}' has kind coinbase, which only a configuration file can express",
+            i.alias
+        );
+    }
     let mut s = String::new();
     s.push_str("schema = 1\n");
     if !file.gateway_hosts.is_empty() {
@@ -1937,5 +2258,7 @@ pub fn check_round_trip(env: &BTreeMap<String, String>) -> std::result::Result<b
     Ok(true)
 }
 
+#[cfg(test)]
+mod coinbase_tests;
 #[cfg(test)]
 mod tests;

@@ -87,6 +87,29 @@ keeps its own log in [client/CHANGELOG.md](client/CHANGELOG.md).
   transparent address), a body refusal (`Denial::InvalidBody`) and the response actions
   `Replace` (a fixed answer instead of the upstream's, which is neither forwarded nor logged)
   and `Rewrite`; every existing provider keeps `Pass`.
+- New provider kind `coinbase` (cargo feature `coinbase`, on by default), the Coinbase
+  Developer Platform Onramp: the gateway mints hosted buy and sell sessions for ZEC with its own
+  CDP key. Configuration file only and mainnet only (`[integrations.<label>] kind = "coinbase"`
+  with `alias`, an `https://` `upstream`, `auth = { type = "jwt_eddsa", secret, ttl_secs }`,
+  `enabled`, `rate_limit` (`POST /v1/session`), `status_rate_limit` (`POST /v1/sell/status`),
+  `redirect_url` (required when a country offers sell), `availability`; the key document a
+  `[secrets]` entry, read when the provider is built and never part of the rendered policy):
+  no environment variable can configure it, `CONFIG_SOURCE=compare` reports such a table as a
+  difference, so it is in force with `CONFIG_SOURCE=file` only; without a table nothing
+  changes. Routes `POST /v1/session`, `POST /v1/sell/status`, `GET /v1/availability` (WRITE
+  class, never cached, method and path matched exactly): the provider validates the body (a
+  mainnet P2PKH t-address by base58check, flow, ref, optional fiat preset), builds the
+  upstream request itself (asset and network constants, the configured redirect, never a
+  client IP or any client header), signs a JWT per request (5 s `nbf` leeway), and answers
+  fixed JSON codes (`invalid_address`, `invalid_request`, `unavailable`, `rate_limited` with a
+  bounded `retry-after`, `upstream`) instead of any upstream answer; a cap is spent only by a
+  call that is made. A key that is not usable fails `--check-config` but not the serving
+  process (its POST routes answer `unavailable`). `enabled = false` is the kill switch; the
+  availability document comes from the table. The generic forward refuses such an alias. New
+  metrics `ohttp_integration_denied_total{integration,reason}` and
+  `ohttp_integration_sign_failures_total{integration}`; a new fuzz target
+  `integrations_coinbase`. See `gateway/CONFIG.md` "Coinbase integration", which lists the
+  CDP names to verify against the live project before launch.
 
 ### Crate names
 

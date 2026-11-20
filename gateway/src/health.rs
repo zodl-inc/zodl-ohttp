@@ -613,6 +613,20 @@ lazy_static::lazy_static! {
     .unwrap();
 }
 
+// Providers of the integrations crate that answer some requests themselves (kind coinbase).
+lazy_static::lazy_static! {
+    static ref OHTTP_INTEGRATION_DENIED_TOTAL: IntCounterVec = IntCounterVec::new(
+        Opts::new("ohttp_integration_denied_total", "Requests to an integration answered without an upstream call because they were refused, by integration (the configuration file's table label) and reason (policy, disabled, invalid_request, invalid_address, unexpected_body, sell_unavailable, rate_limited)"),
+        &["integration", "reason"]
+    )
+    .unwrap();
+    static ref OHTTP_INTEGRATION_SIGN_FAILURES_TOTAL: IntCounterVec = IntCounterVec::new(
+        Opts::new("ohttp_integration_sign_failures_total", "Upstream calls of an integration not made because no credential could be signed (no usable key), answered 503"),
+        &["integration"]
+    )
+    .unwrap();
+}
+
 pub fn init_metrics() {
     for gauge in [
         &*OHTTP_DYNAMIC_HOSTS,
@@ -639,6 +653,12 @@ pub fn init_metrics() {
         .register(Box::new(OHTTP_QUERY_VALUE_SOURCE_SKIPPED_TOTAL.clone()))
         .ok();
     REGISTRY.register(Box::new(OHTTP_CONFIG_INFO.clone())).ok();
+    REGISTRY
+        .register(Box::new(OHTTP_INTEGRATION_DENIED_TOTAL.clone()))
+        .ok();
+    REGISTRY
+        .register(Box::new(OHTTP_INTEGRATION_SIGN_FAILURES_TOTAL.clone()))
+        .ok();
     REGISTRY
         .register(Box::new(OHTTP_REQUESTS_TOTAL.clone()))
         .ok();
@@ -1129,6 +1149,20 @@ pub fn record_lwd_permit_wait(network: &str, class: &str, wait_seconds: f64) {
 
 pub fn record_policy_denied(alias: &str) {
     OHTTP_POLICY_DENIED_TOTAL.with_label_values(&[alias]).inc();
+}
+
+/// A request to `integration` refused without an upstream call (bounded `reason`).
+pub fn record_integration_denied(integration: &str, reason: &str) {
+    OHTTP_INTEGRATION_DENIED_TOTAL
+        .with_label_values(&[integration, reason])
+        .inc();
+}
+
+/// An upstream call of `integration` not made: no credential could be signed.
+pub fn record_integration_sign_failure(integration: &str) {
+    OHTTP_INTEGRATION_SIGN_FAILURES_TOTAL
+        .with_label_values(&[integration])
+        .inc();
 }
 
 pub fn record_redis_connected(network: &str, connected: bool) {

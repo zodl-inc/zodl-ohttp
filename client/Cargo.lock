@@ -3414,6 +3414,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "zeroize",
  "zodl-ohttp-integrations",
 ]
 

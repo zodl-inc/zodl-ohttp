@@ -82,6 +82,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "integrations_coinbase"
+path = "fuzz_targets/integrations_coinbase.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "client_chunked_response"
 path = "fuzz_targets/client_chunked_response.rs"
 test = false

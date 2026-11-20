@@ -281,6 +281,10 @@ pub struct Config {
     /// `THIRD_PARTY_CACHE_ROUTES` (its other routes carry per-deposit state). `None` (unset or
     /// empty) = no such restriction.
     pub near_alias: Option<String>,
+    /// The `coinbase` integrations of the configuration file (`crate::coinbase`), by alias.
+    /// Only a configuration file in force sets them (no environment variable can). Default:
+    /// none.
+    pub coinbase: crate::coinbase::Integrations,
     /// `RELAY_SECRET_ON_KEY_CONFIG` (default `off`).
     pub relay_secret_on_key_config: RelaySecretOnKeyConfig,
     /// `DYNAMIC_HOST_SOURCES`: third-party hosts read from published documents and refreshed
@@ -373,6 +377,8 @@ impl Config {
             .map(|v| v.eq_ignore_ascii_case("allow"))
             .unwrap_or(false);
 
+        // Only a configuration file in force has any; mainnet only.
+        let coinbase = crate::coinbase::Integrations::from_policy(&network)?;
         let config = Self {
             port: crate::config_source::var("PORT")
                 .unwrap_or_else(|_| "8080".to_string())
@@ -537,6 +543,7 @@ impl Config {
                 .filter(|s| !s.is_empty()),
             flexa_alias: alias_env("FLEXA_ALIAS"),
             near_alias: alias_env("NEAR_ALIAS"),
+            coinbase,
             relay_secret_on_key_config: RelaySecretOnKeyConfig::parse(
                 &crate::config_source::var("RELAY_SECRET_ON_KEY_CONFIG").unwrap_or_default(),
             )?,
@@ -694,6 +701,7 @@ impl std::fmt::Debug for Config {
             .field("flexa_publishable_key", &"<REDACTED>")
             .field("flexa_alias", &self.flexa_alias)
             .field("near_alias", &self.near_alias)
+            .field("coinbase", &self.coinbase)
             .field("dynamic_hosts", &self.dynamic_hosts)
             .field("host_list", &self.host_list)
             .field("third_party_query_rules", &self.third_party_query_rules)
@@ -759,6 +767,7 @@ pub(crate) fn test_config() -> Config {
         flexa_publishable_key: None,
         flexa_alias: None,
         near_alias: None,
+        coinbase: Default::default(),
         relay_secret_on_key_config: RelaySecretOnKeyConfig::Off,
         dynamic_hosts: Default::default(),
         host_list: Default::default(),

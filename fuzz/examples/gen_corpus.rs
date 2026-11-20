@@ -252,6 +252,29 @@ fn main() {
     ]);
     write(dir, "gateway_settings_round_trip", &settings);
 
+    // Route selector, request body, 0xff, upstream body (synthetic address, made-up hash).
+    let seed = |selector: u8, body: &[u8], upstream: &[u8]| -> Vec<u8> {
+        let mut out = vec![selector];
+        out.extend_from_slice(body);
+        out.push(0xff);
+        out.extend_from_slice(upstream);
+        out
+    };
+    let session: &[u8] = br#"{"flow":"buy","address":"t1Hsc1LR8yKnbbe3twRp88p6vFfC5t7DLbs","ref":"ABCDEFGHIJKLMNOPQRSTUVWXYZ","fiat":"USD","amount":"50"}"#;
+    let status: &[u8] = br#"{"ref":"ABCDEFGHIJKLMNOPQRSTUVWXYZ"}"#;
+    let sell: &[u8] = br#"{"transactions":[{"status":"TRANSACTION_STATUS_STARTED","asset":"ZEC","network":"zcash","created_at":"2026-11-20T12:00:00Z","to_address":"t3JZcvsuaXE6ygokL4XUiZSTrQBUoPYFnXJ","sell_amount":{"value":"0.5","currency":"ZEC"}}]}"#;
+    write(
+        dir,
+        "integrations_coinbase",
+        &[
+            seed(0, session, br#"{"token":"abc"}"#),
+            seed(12, session, br#"{"message":"x"}"#),
+            seed(1, status, sell),
+            vec![2],
+            seed(0, br#"{"flow":"buy","flow":"sell"}"#, b""),
+        ],
+    );
+
     let responses = responses();
     let mut wires: Vec<Vec<u8>> = responses
         .iter()

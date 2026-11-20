@@ -48,6 +48,7 @@ mod block_cache;
 mod cache;
 mod chain;
 mod chunked_stream;
+mod coinbase;
 mod config;
 mod config_source;
 mod dynamic_hosts;
@@ -312,6 +313,24 @@ async fn main() -> anyhow::Result<()> {
     }
     if config.flexa_publishable_key.is_some() && config.flexa_alias.is_none() {
         warn!("FLEXA_PUBLISHABLE_KEY set without FLEXA_ALIAS: the key is never used");
+    }
+
+    for entry in config.coinbase.iter() {
+        let provider = &entry.provider;
+        info!(
+            integration = provider.label(),
+            alias = provider.alias(),
+            enabled = provider.enabled(),
+            key = provider.has_signer(),
+            "Coinbase integration configured (configuration file)"
+        );
+        if let Some(problem) = entry.key_problem() {
+            tracing::error!(
+                integration = provider.label(),
+                secret = %entry.secret,
+                "{problem}; its upstream routes answer 503 unavailable"
+            );
+        }
     }
 
     // Log backends policy status
@@ -2932,6 +2951,45 @@ async fn handle_ohttp(
     // A dynamic host has neither: THIRD_PARTY_CACHE_ROUTES and THIRD_PARTY_RATE_LIMITS belong to
     // BACKENDS aliases; its cap is its source's `rate_limit`, counted in the forwarder.
     let is_dynamic_host = route.dynamic().is_some();
+    // A coinbase alias (configuration file only): answered by its provider, which validates,
+    // builds, signs and scrubs; never the generic forward below. A WRITE like every route of it.
+    if let (false, false, Some(provider)) = (
+        cache_allowed,
+        is_dynamic_host,
+        state.config.coinbase.get(&inner_request.authority),
+    ) {
+        let started = Instant::now();
+        let resp = coinbase::answer(&state, &inner_request, &provider).await;
+        if route_class == origin::RouteClass::Write {
+            health::observe_write_stage(
+                &network,
+                "upstream_third_party",
+                if resp.status < 500 { "ok" } else { "error" },
+                started.elapsed(),
+            );
+        }
+        health::record_request_detailed(
+            coinbase::outcome_label(resp.status),
+            "ohttp",
+            &network,
+            "ohttp",
+            method_label,
+            resp.status,
+            "-",
+            &backend,
+            "mapped",
+        );
+        health::record_duration(
+            &network,
+            "ohttp",
+            &backend,
+            &backend_rpc,
+            start.elapsed().as_secs_f64(),
+            client_trace_id.is_some(),
+        );
+        log.served_third_party(resp.status, resp.body.len());
+        return responder.collected(resp);
+    }
     if !cache_allowed
         && !is_dynamic_host
         && !proxy::policy_denies_in(&state.config, &inner_request, &route)
@@ -3487,6 +3545,7 @@ mod handler_tests {
             flexa_publishable_key: None,
             flexa_alias: None,
             near_alias: None,
+            coinbase: Default::default(),
             dynamic_hosts: Default::default(),
             host_list: Default::default(),
             third_party_query_rules: Default::default(),
@@ -3984,6 +4043,141 @@ mod handler_tests {
 
         assert_eq!(tp_hits.load(Ordering::SeqCst), 0, "nothing forwarded");
         assert_eq!(lwd_hits.load(Ordering::SeqCst), 0, "nothing forwarded");
+    }
+
+    /// A coinbase alias through the OHTTP handler: answered by its provider (the upstream gets
+    /// the request it built, signed), after the replay check like every WRITE (the same sealed
+    /// request again is refused and nothing more goes upstream); its availability document
+    /// needs no upstream call.
+    #[tokio::test]
+    async fn a_coinbase_alias_is_answered_by_its_provider_after_the_replay_check() {
+        if !store_up("redis://127.0.0.1:6379", "the test Redis").await {
+            return;
+        }
+        health::init_metrics();
+        let (tp, tp_hits) = upstream(true).await;
+        let (lwd, _) = upstream(false).await;
+        let (cdp, seen) = coinbase::tests::stub_with(200, br#"{"token":"tok"}"#).await;
+        let alias = coinbase::tests::ALIAS;
+        let mut config = config(
+            &format!("mainnet-handler-coinbase-{}", Uuid::new_v4().simple()),
+            "redis://127.0.0.1:6379/1",
+            &lwd,
+            &tp,
+        );
+        config.backends_policy_default_allow = false;
+        config.backends.insert(alias.to_string(), cdp.clone());
+        config.backends_policy.insert(
+            alias.to_string(),
+            zodl_ohttp_integrations::coinbase::ROUTES
+                .iter()
+                .map(|(m, p)| (m.to_string(), p.to_string()))
+                .collect(),
+        );
+        config.coinbase = coinbase::Integrations::from_entries(vec![coinbase::tests::entry(
+            &cdp,
+            "onramp-handler",
+            true,
+            true,
+        )]);
+        let origin = origin::OriginSettings::default();
+        // Every route of the alias is a WRITE.
+        for (method, path) in zodl_ohttp_integrations::coinbase::ROUTES {
+            assert_eq!(
+                origin
+                    .replay_read_routes
+                    .classify(false, alias, method, path),
+                origin::RouteClass::Write,
+                "{method} {path}"
+            );
+        }
+        let cache = base_cache(&config, &origin, None).await;
+        let state = app_state(config, origin, cache);
+        let body = coinbase::tests::session("");
+        let session = bhttp(
+            "POST",
+            alias,
+            "/v1/session",
+            "application/json",
+            body.as_bytes(),
+        );
+
+        let key_config = state.hpke.as_ref().unwrap().public_config();
+        let (sealed, enc, secret) = seal(&key_config, &session);
+        let (status, wire) = post_sealed(&state, sealed.clone()).await;
+        assert_eq!(status, StatusCode::OK);
+        let (inner_status, fields, answer) = open(&enc, &secret, &wire);
+        assert_eq!(inner_status, 200, "{}", String::from_utf8_lossy(&answer));
+        assert!(fields.contains("application/json"), "{fields}");
+        let json: serde_json::Value = serde_json::from_slice(&answer).unwrap();
+        assert!(json["url"]
+            .as_str()
+            .unwrap()
+            .starts_with("https://pay.coinbase.com/buy/select-asset?sessionToken=tok&"));
+        {
+            let seen = seen.lock();
+            assert_eq!(seen.len(), 1);
+            assert_eq!(seen[0].target, "/onramp/v1/token");
+            let authorization = seen[0]
+                .headers
+                .iter()
+                .find(|(k, _)| k == "authorization")
+                .map(|(_, v)| v.clone())
+                .unwrap();
+            let host = cdp.strip_prefix("http://").unwrap();
+            assert_eq!(
+                coinbase::tests::claims(&authorization)["uri"],
+                format!("POST {host}/onramp/v1/token")
+            );
+        }
+        // The same sealed request again: a replay, refused before the provider.
+        let (status, _) = post_sealed(&state, sealed).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(seen.lock().len(), 1, "a replay mints nothing");
+
+        // An invalid address: the provider's fixed answer, nothing upstream.
+        let bad = body.replace(
+            "t1Hsc1LR8yKnbbe3twRp88p6vFfC5t7DLbs",
+            "t1Hsc1LR8yKnbbe3twRp88p6vFfC5t7DLbt",
+        );
+        let (inner_status, _, answer) = post(
+            &state,
+            bhttp(
+                "POST",
+                alias,
+                "/v1/session",
+                "application/json",
+                bad.as_bytes(),
+            ),
+        )
+        .await;
+        assert_eq!(
+            (inner_status, answer.as_slice()),
+            (400, &br#"{"error":"invalid_address"}"#[..])
+        );
+        // The availability document, from the configuration.
+        let (inner_status, _, answer) = post(
+            &state,
+            bhttp("GET", alias, "/v1/availability", "application/json", b""),
+        )
+        .await;
+        assert_eq!(inner_status, 200);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&answer).unwrap()["enabled"],
+            true
+        );
+        // Another route: the policy answer.
+        let (inner_status, _, answer) = post(
+            &state,
+            bhttp("POST", alias, "/onramp/v1/token", "application/json", b"{}"),
+        )
+        .await;
+        assert_eq!(
+            (inner_status, answer.as_slice()),
+            (403, &b"policy denied"[..])
+        );
+        assert_eq!(seen.lock().len(), 1);
+        assert_eq!(tp_hits.load(Ordering::SeqCst), 0);
     }
 
     /// A recording third-party backend: the path and query of every request it gets; it

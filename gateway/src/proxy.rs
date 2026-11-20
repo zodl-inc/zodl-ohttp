@@ -65,7 +65,7 @@ fn backend_pool_builder() -> hyper_util::client::legacy::Builder {
 /// `hyper_tls::HttpsConnector` (system roots, no ALPN, so HTTP/1.1). Headers, timeouts and
 /// credentials stay per request; a response body dropped before its end closes its connection
 /// instead of returning it to the pool.
-fn https_backend_client() -> &'static BackendClient {
+pub(crate) fn https_backend_client() -> &'static BackendClient {
     static CLIENT: OnceLock<BackendClient> = OnceLock::new();
     CLIENT.get_or_init(|| backend_pool_builder().build(HttpsConnector::new()))
 }
@@ -419,6 +419,11 @@ fn forward_admission(
         };
     }
     let authority_lower = inner_request.authority.to_ascii_lowercase();
+    // A coinbase alias is answered by its provider alone (`crate::coinbase::answer`), which
+    // builds and signs the upstream request itself: never forwarded as received.
+    if config.coinbase.contains(&authority_lower) {
+        return Err("alias answered by its provider only");
+    }
     let registry = integrations(config);
     let Some(provider) = registry.integration(&authority_lower) else {
         return Ok(config
@@ -921,7 +926,11 @@ impl BackendTarget {
 
 /// Build a validated URI from base URL and path, asserting that the result matches expected host.
 /// This prevents injection attacks where a malicious path could redirect to a different host.
-fn build_validated_uri(base_url: &str, path: &str, expected_host: &str) -> Result<String> {
+pub(crate) fn build_validated_uri(
+    base_url: &str,
+    path: &str,
+    expected_host: &str,
+) -> Result<String> {
     // Parse base URL to extract scheme and authority
     let base_uri: hyper::Uri = base_url
         .parse()
@@ -2605,6 +2614,7 @@ mod tests {
             flexa_publishable_key: None,
             flexa_alias: None,
             near_alias: None,
+            coinbase: Default::default(),
             dynamic_hosts: Default::default(),
             host_list: Default::default(),
             third_party_query_rules: Default::default(),
@@ -3046,6 +3056,7 @@ mod policy_enforcement_tests {
             flexa_publishable_key: None,
             flexa_alias: None,
             near_alias: None,
+            coinbase: Default::default(),
             dynamic_hosts: Default::default(),
             host_list: Default::default(),
             third_party_query_rules: Default::default(),
@@ -3281,6 +3292,7 @@ mod policy_tests {
             flexa_publishable_key: None,
             flexa_alias: None,
             near_alias: None,
+            coinbase: Default::default(),
             dynamic_hosts: Default::default(),
             host_list: Default::default(),
             third_party_query_rules: Default::default(),
@@ -3419,6 +3431,7 @@ mod method_wildcard_tests {
             flexa_publishable_key: None,
             flexa_alias: None,
             near_alias: None,
+            coinbase: Default::default(),
             dynamic_hosts: Default::default(),
             host_list: Default::default(),
             third_party_query_rules: Default::default(),
@@ -3496,6 +3509,7 @@ mod path_semantics_tests {
             flexa_publishable_key: None,
             flexa_alias: None,
             near_alias: None,
+            coinbase: Default::default(),
             dynamic_hosts: Default::default(),
             host_list: Default::default(),
             third_party_query_rules: Default::default(),
@@ -3577,6 +3591,7 @@ mod path_semantics_tests {
             flexa_publishable_key: None,
             flexa_alias: None,
             near_alias: None,
+            coinbase: Default::default(),
             dynamic_hosts: Default::default(),
             host_list: Default::default(),
             third_party_query_rules: Default::default(),
@@ -3666,6 +3681,7 @@ mod path_semantics_tests {
             flexa_publishable_key: None,
             flexa_alias: None,
             near_alias: None,
+            coinbase: Default::default(),
             dynamic_hosts: Default::default(),
             host_list: Default::default(),
             third_party_query_rules: Default::default(),
@@ -3884,6 +3900,7 @@ mod stream_tests {
             flexa_publishable_key: None,
             flexa_alias: None,
             near_alias: None,
+            coinbase: Default::default(),
             dynamic_hosts: Default::default(),
             host_list: Default::default(),
             third_party_query_rules: Default::default(),
@@ -4112,6 +4129,7 @@ mod stream_tests {
             flexa_publishable_key: None,
             flexa_alias: None,
             near_alias: None,
+            coinbase: Default::default(),
             dynamic_hosts: Default::default(),
             host_list: Default::default(),
             third_party_query_rules: Default::default(),

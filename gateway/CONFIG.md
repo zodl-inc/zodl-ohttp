@@ -53,6 +53,13 @@ warning for one release):
   (`THIRD_PARTY_RATE_LIMITS`), `query_rules`, `read_routes` (`REPLAY_READ_ROUTES`),
   `one_sided_write_routes`. Two integrations with one alias, or an alias that is a gateway host,
   are errors;
+- `[integrations.<label>]` with `kind = "coinbase"` (cargo feature `coinbase`, on by default):
+  the Coinbase Onramp provider, see "Coinbase integration" below. It takes `alias`, `upstream`,
+  `auth`, `enabled`, `rate_limit`, `status_rate_limit` (all required), `redirect_url` and
+  `availability`, and none
+  of `routes`, `headers`, `cache`, `query_rules`, `read_routes`, `one_sided_write_routes` (its
+  routes and their handling are fixed); `auth`, `enabled`, `redirect_url`, `availability` and
+  `status_rate_limit` are refused on any other kind;
 - `[hosts."<authority>"]`: the same rules for an authority that is no alias: a gateway host's
   `routes` and `headers`, the pseudo authority `lwd` of the replay routes;
 - `[value_sources.<name>]`: `alias`, `route` (`GET /path`), `pointer`, `refresh_secs`,
@@ -63,6 +70,113 @@ warning for one release):
 
 Every list entry keeps the grammar of its variable (a separator of that grammar inside an entry
 is an error). Every startup check of the variables applies to the file.
+
+### Coinbase integration
+
+A `kind = "coinbase"` table makes its alias a Coinbase Developer Platform (CDP) Onramp
+provider in the gateway: the gateway mints the hosted buy and sell sessions with its own CDP
+API key, so the wallet never holds the key, and the gateway's API calls to Coinbase carry no
+client IP and nothing of the client's request but the validated values. The browser or app
+that opens the hosted page talks to Coinbase directly (Coinbase sees that connection).
+
+Only a configuration file can configure it, and only on a mainnet gateway (`NETWORK=mainnet`;
+on any other network a table is a startup and `--check-config` error): no environment variable
+assigns the kind or carries its settings, so with `CONFIG_SOURCE=env` there is no such alias,
+and with `CONFIG_SOURCE=compare` the file's table is reported as a difference
+(`authorities.<alias>.kind` and `authorities.<alias>.coinbase`; `ohttp_config_compare_match`
+0). It can be in force with `CONFIG_SOURCE=file` only.
+
+```toml
+[secrets]
+cdp_key = { file = "/run/secrets/cdp_key" }   # one line: {"id": "<key id>", "privateKey": "<base64>"}
+
+[integrations.onramp]
+kind = "coinbase"
+alias = "onramp.example"
+upstream = "https://cdp-api.example"          # https://host[:port], lower case, no path, no default port
+auth = { type = "jwt_eddsa", secret = "cdp_key", ttl_secs = 120 }   # ttl_secs 1..=120, default 120
+redirect_url = "wallet://onramp/return"       # https or an app scheme; required when a country sells
+enabled = true                                # false: the kill switch
+rate_limit = "30/60s"                         # the cap of POST /v1/session
+status_rate_limit = "120/60s"                 # the cap of POST /v1/sell/status
+[integrations.onramp.availability]
+countries = { US = { buy = true, sell = true }, DE = { buy = true, sell = false } }   # ISO 3166-1 alpha-2
+```
+
+- The key document is CDP's Ed25519 API key, a `[secrets]` entry of the common file (a secret
+  declared only in a host file is refused: the table names an unmapped secret) (prefer `{ file = ... }` over `{ env = ... }`: a
+  file is read and wiped, a variable stays in the process environment), JSON `{"id": ..., "privateKey": ...}` on one line
+  (a secret holds no line break): `privateKey` is base64 of the 64-byte key pair as CDP issues
+  it (its public half must match the seed) or of the 32-byte seed. It is read once with every
+  other secret of the files (common or host file), never put into the policy the file renders,
+  and the provider's copy is wiped after the signer is made. A key that does not read as a key fails `--check-config` (with
+  `--secrets=require`, the default; `--secrets=skip` checks the table without reading it); a
+  serving process still starts, logs one error naming the secret (never the value), and
+  answers `503 unavailable` on the two POST routes (`ohttp_integration_sign_failures_total`);
+  the availability document is still served. A secret that does not resolve at all (no
+  variable, no file) is a startup error, as for every secret.
+- `upstream` must be `https://` (`http://` only for a loopback host: `127.0.0.1`, `localhost`,
+  `[::1]`, for a local stub).
+- The alias is a `BACKENDS` alias whose policy is its three routes; every route is a WRITE
+  for the replay check (none is in `REPLAY_READ_ROUTES`), nothing is cached. Its requests never
+  take the generic forward (which refuses the alias): the provider matches the method and path
+  exactly, validates the body (at most 1 KiB, a JSON object with exactly the listed members),
+  builds the upstream request itself, signs it with a fresh JWT (`Authorization: Bearer`,
+  header `alg` `EdDSA`, `kid`, `nonce`, `typ`; claims `iss` `cdp`, `sub`, `nbf` = now minus 5 s
+  of leeway for an upstream clock slightly behind, `exp` = `nbf` + `ttl_secs`, `uri` =
+  `METHOD host path`) and sends `accept`, `content-type` (with a body), `user-agent` and
+  `authorization` only. Asset (`ZEC`) and network (`zcash`) are constants.
+- Each upstream route has its cap (`rate_limit`, `status_rate_limit`, `REQUESTS/WINDOWs`),
+  spent only by a call that is made: after the body is valid, the key is usable and the
+  concurrency permits are held. The availability document has none. A cap is per process:
+  N replicas and hosts allow N times the cap in total.
+- `POST /v1/session` `{"flow": "buy"|"sell", "address": "t1...", "ref": "<26 to 40 base32>",
+  "fiat"?: "USD"|"CAD"|"GBP"|"EUR", "amount"?: "1" to "10000", 2 decimals, with fiat}`:
+  `POST /onramp/v1/token`, then `200 {"url": <hosted page>, "expires_at": <unix seconds, +300>}`.
+  The address must be a Zcash mainnet transparent P2PKH address (base58check). A sell without a
+  `redirect_url` is `503 unavailable` (never a URL).
+- `POST /v1/sell/status` `{"ref": ...}`: `GET /onramp/v1/sell/user/<ref>/transactions`, then
+  `200 {"status": "started"|"success"|"failed"|"unknown"|"not_found", "asset": "ZEC", "network":
+  "zcash", "to_address"?: "t1...|t3...", "sell_amount"?: "<ZEC>"}`: `not_found` only for the
+  documented empty `transactions` list; otherwise the newest transaction (by `created_at`) of
+  the ref (`partner_user_ref`, or of all when none names a ref), `created_at` read as RFC 3339
+  and compared in UTC (a candidate without one is `502 upstream`). A document without the list,
+  only other refs, a transaction without its status, asset (`ZEC`), network (`zcash`) or the
+  currency (`ZEC`) of its amount, or with a deposit address or amount that is not valid, is
+  `502 upstream`.
+- `GET /v1/availability`: `200 {"enabled": true, "countries": {...}}` from the table, no upstream
+  call; with `enabled = false`, `{"enabled": false, "countries": {}}`; with a body, `400
+  invalid_request`.
+- Fixed answers (`application/json`, `{"error": <code>}`): `400 invalid_address`, `400
+  invalid_request` (any other body problem), `503 unavailable` (`enabled = false` on the two
+  POST routes, a sell without a redirect, no usable key, or the gateway's concurrency limits),
+  `429 rate_limited` with `retry-after` (a cap, or the upstream's 429: its own `retry-after`
+  seconds within 1 to 300, else 60), `502 upstream` (any other upstream status, an answer that
+  is not the expected shape, or no answer in `LWD_TIMEOUT_SECS`). The body of an upstream
+  answer other than a 2xx is not read. Another route of the alias is the inner `403 policy
+  denied`. An upstream body is never forwarded or logged; logs carry the route, the upstream
+  status and the outcome, never a body, address, amount, ref, token or upstream path.
+
+To verify against the live CDP project before launch (the names the module uses, from CDP's
+documentation; a mismatch is a constant in `integrations/src/coinbase.rs`):
+
+- hosted buy page `https://pay.coinbase.com/buy/select-asset` with `sessionToken`,
+  `defaultAsset`, `defaultNetwork`, `partnerUserRef`, `redirectUrl`, `fiatCurrency`,
+  `presetFiatAmount`;
+- hosted sell page `https://pay.coinbase.com/v3/sell/input` with `sessionToken`,
+  `partnerUserRef` (older documentation: `partnerUserId`), `redirectUrl`, `defaultAsset`,
+  `defaultNetwork`, `fiatCurrency`, `presetFiatAmount` (or `presetCryptoAmount` for an amount
+  in ZEC);
+- session token API `POST /onramp/v1/token` with `addresses[].address`,
+  `addresses[].blockchains`, `assets`, answering `token`;
+- offramp transaction status API `GET /onramp/v1/sell/user/<partnerUserRef>/transactions`
+  answering `transactions[]` with `status` (`TRANSACTION_STATUS_STARTED`, `_SUCCESS`,
+  `_FAILED`), `partner_user_ref`, `created_at`, `asset`, `network`, `to_address`,
+  `sell_amount.value`, `sell_amount.currency`;
+- the transaction status API's paging and order (the module reads the first page only and
+  orders by `created_at` itself);
+- the JWT: `kid`/`sub` the key id, `iss` `cdp`, `uri` without a query, a 16-byte hex `nonce`,
+  a lifetime of at most 120 s, the 5 s `nbf` leeway accepted.
 
 Command line (`zodl-ohttp-gateway [--config <path>] [--host-config <path>] [ACTION]`; no action serves, as before;
 `backfill` is unchanged):

@@ -41,10 +41,14 @@
 //! - [`keyed`]: generic providers with a key header and a query rule on every route, refused at
 //!   construction otherwise; `cmc`, `swapkit` (cargo features of the same names, on by default)
 //!   are its kinds, assigned by the configuration file only.
+//! - [`coinbase`]: the Coinbase Onramp provider (cargo feature `coinbase`, on by default; kind
+//!   `coinbase`, configuration file only): body validation, the upstream request built by the
+//!   module, a JWT per request, scrubbed answers.
 //! - [`registry`]: the provider of an alias.
 
 #[cfg(feature = "cmc")]
 pub mod cmc;
+pub mod coinbase;
 pub mod core;
 pub mod flexa;
 pub mod generic;

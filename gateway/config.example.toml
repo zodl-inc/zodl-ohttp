@@ -23,6 +23,7 @@ quotes_key = { env = "QUOTES_API_KEY" }
 hpke_keys = { file = "/run/secrets/hpke_keys" }
 relay_secrets = { file = "/run/secrets/relay_secrets" }
 configs_signing_seed = { file = "/run/secrets/configs_signing_seed" }
+cdp_key = { file = "/run/secrets/cdp_key" }    # one line: {"id": ..., "privateKey": ...}
 
 # One BACKENDS alias per table.
 [integrations.prices]
@@ -72,6 +73,21 @@ query_rules = ["GET /tokens?provider=EXAMPLE", "POST /v1/quote?"]
 alias = "vote.example"
 upstream = "https://voting.example"
 routes = ["GET /*", "POST /*"]
+
+# kind = "coinbase": the Coinbase Onramp provider (configuration file only, CONFIG.md
+# "Coinbase integration"); its routes and their handling are fixed.
+[integrations.onramp]
+kind = "coinbase"
+alias = "onramp.example"
+upstream = "https://cdp-api.example"
+auth = { type = "jwt_eddsa", secret = "cdp_key", ttl_secs = 120 }
+redirect_url = "wallet://onramp/return"
+enabled = true                                 # the kill switch
+rate_limit = "30/60s"                          # the cap of POST /v1/session
+status_rate_limit = "120/60s"                  # the cap of POST /v1/sell/status
+
+[integrations.onramp.availability]
+countries = { US = { buy = true, sell = true } }
 
 # Authorities that are no alias: a gateway host, the pseudo authority `lwd` of the replay routes.
 [hosts."gateway.example"]

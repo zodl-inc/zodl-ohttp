@@ -83,6 +83,7 @@ fn gateway_config() -> Config {
         flexa_publishable_key: None,
         flexa_alias: None,
         near_alias: None,
+        coinbase: Default::default(),
         dynamic_hosts: Default::default(),
         host_list: Default::default(),
         third_party_query_rules: Default::default(),
