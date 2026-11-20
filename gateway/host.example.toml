@@ -1,0 +1,34 @@
+# An example host file of the gateway (--host-config or GATEWAY_HOST_CONFIG_FILE; see CONFIG.md
+# "Configuration file"): the settings of one host (or of every replica of one deployment),
+# merged after the common file (config.example.toml); a key set in both files is an error.
+# Placeholder names and values only. A host file holds `schema`, [secrets] and [settings]
+# only, never policy. `zodl-ohttp-gateway --export-config --host host.toml` writes the host
+# file of the current environment.
+
+schema = 1
+
+# Secrets of this host: never in the file, only where to read them.
+[secrets]
+cache_password = { file = "/run/secrets/cache_password" }
+peer_urls = { file = "/run/secrets/replay_peer_urls" }
+forward_secret = { file = "/run/secrets/replay_write_forward_secret" }
+
+[settings]
+network = "mainnet"                            # NETWORK
+port = 8080                                    # PORT
+internal_bind_addr = "0.0.0.0:9090"            # INTERNAL_BIND_ADDR
+origin_id = "origin-a"                         # ORIGIN_ID
+rust_log = "info"                              # RUST_LOG
+lwd_addr = "lwd.example:9067"                  # LWD_ADDR
+lwd_connection_pool = true                     # LWD_CONNECTION_POOL
+max_inflight_lwd = 64                          # MAX_INFLIGHT_LWD
+pinned_backfill_workers = 0                    # PINNED_BACKFILL_WORKERS
+# A store URL with a password: the URL as a template, the password from a secret.
+redis_url = { secret = "cache_password", value = "redis://:{secret}@cache.example:6379" }
+redis_security_url = "rediss://security.example:6380"
+# A whole value from a secret (several URLs with passwords).
+replay_peer_urls = { secret = "peer_urls" }    # REPLAY_PEER_URLS
+replay_peer_mode = "async-reads"               # REPLAY_PEER_MODE
+replay_standby_urls = ["rediss://standby.example:6380"]   # REPLAY_STANDBY_URLS
+replay_write_forward_url = "http://hub.example:9443"      # REPLAY_WRITE_FORWARD_URL
+replay_write_forward_secret = { secret = "forward_secret" }

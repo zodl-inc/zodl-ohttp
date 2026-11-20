@@ -169,7 +169,7 @@ pub struct ForwardConfig {
 
 impl ForwardConfig {
     pub fn from_env() -> anyhow::Result<Option<Self>> {
-        let get = |k: &str| std::env::var(k).ok();
+        let get = |k: &str| crate::config_source::var(k).ok();
         Self::parse(
             get("REPLAY_WRITE_FORWARD_URL").as_deref(),
             get("REPLAY_WRITE_FORWARD_SECRET").as_deref(),
@@ -450,8 +450,12 @@ impl std::fmt::Debug for ReceiverConfig {
 impl ReceiverConfig {
     pub fn from_env() -> anyhow::Result<Option<Self>> {
         Self::parse(
-            std::env::var("WRITE_FORWARD_BIND_ADDR").ok().as_deref(),
-            std::env::var("WRITE_FORWARD_SECRETS").ok().as_deref(),
+            crate::config_source::var("WRITE_FORWARD_BIND_ADDR")
+                .ok()
+                .as_deref(),
+            crate::config_source::var("WRITE_FORWARD_SECRETS")
+                .ok()
+                .as_deref(),
         )
     }
 

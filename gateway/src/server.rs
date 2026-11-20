@@ -75,7 +75,11 @@ pub const MAX_PROXY_IDLE_TIMEOUT: Duration = Duration::from_secs(130);
 /// `HEADER_READ_TIMEOUT_SECS` from the environment: unset = the default, `0` = disabled, a
 /// value at or below [`MAX_PROXY_IDLE_TIMEOUT`] is a configuration error.
 pub fn header_read_timeout_from_env() -> anyhow::Result<Option<Duration>> {
-    parse_header_read_timeout(std::env::var(HEADER_READ_TIMEOUT_ENV).ok().as_deref())
+    parse_header_read_timeout(
+        crate::config_source::var(HEADER_READ_TIMEOUT_ENV)
+            .ok()
+            .as_deref(),
+    )
 }
 
 /// The parser behind [`header_read_timeout_from_env`].
@@ -119,7 +123,11 @@ pub const DEFAULT_INTERNAL_BIND_ADDR: SocketAddr = SocketAddr::new(
 /// The internal server's bind address from [`INTERNAL_BIND_ADDR_ENV`] (unset or empty =
 /// [`DEFAULT_INTERNAL_BIND_ADDR`]).
 pub fn internal_bind_addr_from_env() -> anyhow::Result<SocketAddr> {
-    parse_internal_bind_addr(std::env::var(INTERNAL_BIND_ADDR_ENV).ok().as_deref())
+    parse_internal_bind_addr(
+        crate::config_source::var(INTERNAL_BIND_ADDR_ENV)
+            .ok()
+            .as_deref(),
+    )
 }
 
 /// The parser behind [`internal_bind_addr_from_env`]: `IP` (port 9090) or `IP:port`

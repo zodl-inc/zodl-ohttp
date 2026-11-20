@@ -47,6 +47,8 @@ prost = "0.13"
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+# The configuration files (`config_source.rs`, `settings.rs`); the version of the integrations crate.
+toml = "1"
 bincode = "1.3"
 base64 = "0.22"
 

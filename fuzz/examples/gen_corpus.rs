@@ -241,6 +241,17 @@ fn main() {
     ]);
     write(dir, "gateway_config_equivalence", &configs);
 
+    // The settings: the full settings fixture and small ones.
+    let mut settings: Vec<Vec<u8>> = std::fs::read("../gateway/tests/fixtures/settings/full.vars")
+        .into_iter()
+        .collect();
+    settings.extend([
+        b"LWD_TIMEOUT_SECS=80\nLWD_CONNECTION_POOL=on\nREPLAY_PEER_FAIL_CLOSED=maybe\nHEALTHZ_LWD_ERROR_RATIO=0.25\n".to_vec(),
+        b"REDIS_URL=redis://:pw@cache.example:6379\nREPLAY_PEER_URLS=redis://a.example,,b\nHPKE_KEYS=1:00\nRUST_LOG=info\n".to_vec(),
+        b"PREFETCH_TIP=yes\nLWD_TIMEOUT_SECS=+80\n".to_vec(),
+    ]);
+    write(dir, "gateway_settings_round_trip", &settings);
+
     let responses = responses();
     let mut wires: Vec<Vec<u8>> = responses
         .iter()

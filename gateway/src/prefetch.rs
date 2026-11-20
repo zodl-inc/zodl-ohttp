@@ -80,22 +80,32 @@ pub struct PrefetchConfig {
     pub tree_state: bool,
 }
 
+/// A prefetch switch `name` set to `raw`: `1`/`true` on, `0`/`false` off (trimmed), unset or
+/// blank `default`, anything else an error.
+pub fn parse_flag(name: &str, raw: Option<&str>, default: bool) -> anyhow::Result<bool> {
+    match raw {
+        Some(v) if !v.trim().is_empty() => match v.trim() {
+            "1" | "true" => Ok(true),
+            "0" | "false" => Ok(false),
+            _ => anyhow::bail!("{name} must be 0 or 1, got '{v}'"),
+        },
+        _ => Ok(default),
+    }
+}
+
 impl PrefetchConfig {
     /// From `PREFETCH_TIP` (default on; `0` turns it off), `PREFETCH_BLOCK_TXS` (default off;
     /// `1` turns it on), `PREFETCH_BLOCK_TXS_MAX` (default 100) and `PREFETCH_TREE_STATE`
     /// (default off; `1` turns it on).
     pub fn from_env() -> anyhow::Result<Self> {
         let flag = |name: &str, default: bool| -> anyhow::Result<bool> {
-            match std::env::var(name) {
-                Ok(v) if !v.trim().is_empty() => match v.trim() {
-                    "1" | "true" => Ok(true),
-                    "0" | "false" => Ok(false),
-                    _ => anyhow::bail!("{name} must be 0 or 1, got '{v}'"),
-                },
-                _ => Ok(default),
-            }
+            parse_flag(
+                name,
+                crate::config_source::var(name).ok().as_deref(),
+                default,
+            )
         };
-        let max = match std::env::var("PREFETCH_BLOCK_TXS_MAX") {
+        let max = match crate::config_source::var("PREFETCH_BLOCK_TXS_MAX") {
             Ok(v) if !v.trim().is_empty() => match v.trim().parse::<usize>() {
                 Ok(n) if n > 0 => n,
                 _ => anyhow::bail!("PREFETCH_BLOCK_TXS_MAX must be a positive integer, got '{v}'"),

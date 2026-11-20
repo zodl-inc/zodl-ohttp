@@ -296,10 +296,10 @@ impl FallbackHealth {
     /// `REPLAY_FALLBACK_HEALTH_FAILURES` / `REPLAY_FALLBACK_HEALTH_WINDOW_SECS`.
     pub fn from_env() -> anyhow::Result<Self> {
         Self::parse(
-            std::env::var("REPLAY_FALLBACK_HEALTH_FAILURES")
+            crate::config_source::var("REPLAY_FALLBACK_HEALTH_FAILURES")
                 .ok()
                 .as_deref(),
-            std::env::var("REPLAY_FALLBACK_HEALTH_WINDOW_SECS")
+            crate::config_source::var("REPLAY_FALLBACK_HEALTH_WINDOW_SECS")
                 .ok()
                 .as_deref(),
         )
@@ -619,7 +619,11 @@ pub const MAX_REPLAY_WAIT_CONNS: usize = 32;
 
 /// `REPLAY_WAIT_CONNS` (default `DEFAULT_REPLAY_WAIT_CONNS`, 1 to `MAX_REPLAY_WAIT_CONNS`).
 pub fn wait_conns_from_env() -> anyhow::Result<usize> {
-    parse_wait_conns(std::env::var("REPLAY_WAIT_CONNS").ok().as_deref())
+    parse_wait_conns(
+        crate::config_source::var("REPLAY_WAIT_CONNS")
+            .ok()
+            .as_deref(),
+    )
 }
 
 pub fn parse_wait_conns(raw: Option<&str>) -> anyhow::Result<usize> {
@@ -1220,8 +1224,12 @@ impl RecentTimeout {
 impl WriteWaitConfig {
     pub fn from_env() -> anyhow::Result<Option<Self>> {
         Self::parse(
-            std::env::var("REPLAY_WRITE_WAIT_REPLICAS").ok().as_deref(),
-            std::env::var("REPLAY_WRITE_WAIT_MS").ok().as_deref(),
+            crate::config_source::var("REPLAY_WRITE_WAIT_REPLICAS")
+                .ok()
+                .as_deref(),
+            crate::config_source::var("REPLAY_WRITE_WAIT_MS")
+                .ok()
+                .as_deref(),
         )
     }
 
@@ -1229,8 +1237,12 @@ impl WriteWaitConfig {
     /// nonce of a WRITE written synchronously to a peer origin's store (`ReplayPeers`).
     pub fn peer_from_env() -> anyhow::Result<Option<Self>> {
         Self::parse_named(
-            std::env::var("REPLAY_PEER_WAIT_REPLICAS").ok().as_deref(),
-            std::env::var("REPLAY_PEER_WAIT_MS").ok().as_deref(),
+            crate::config_source::var("REPLAY_PEER_WAIT_REPLICAS")
+                .ok()
+                .as_deref(),
+            crate::config_source::var("REPLAY_PEER_WAIT_MS")
+                .ok()
+                .as_deref(),
             DEFAULT_REPLAY_PEER_WAIT_REPLICAS,
             "REPLAY_PEER_WAIT",
         )
@@ -1286,7 +1298,11 @@ pub const DEFAULT_REPLAY_LOCAL_WAITAOF_MS: u64 = 2000;
 
 impl LocalAofConfig {
     pub fn from_env() -> anyhow::Result<Self> {
-        Self::parse(std::env::var("REPLAY_LOCAL_WAITAOF_MS").ok().as_deref())
+        Self::parse(
+            crate::config_source::var("REPLAY_LOCAL_WAITAOF_MS")
+                .ok()
+                .as_deref(),
+        )
     }
 
     pub fn parse(value: Option<&str>) -> anyhow::Result<Self> {
@@ -7343,7 +7359,7 @@ pub const DEFAULT_REPLAY_STARTUP_STORES_WAIT_SECS: u64 = 10;
 
 /// `REPLAY_STARTUP_STORES_WAIT_SECS` (default 10; 0 = do not wait).
 pub fn startup_stores_wait_from_env() -> anyhow::Result<Duration> {
-    match std::env::var("REPLAY_STARTUP_STORES_WAIT_SECS") {
+    match crate::config_source::var("REPLAY_STARTUP_STORES_WAIT_SECS") {
         Ok(v) if !v.trim().is_empty() => match v.trim().parse::<u64>() {
             Ok(n) => Ok(Duration::from_secs(n)),
             Err(_) => anyhow::bail!(

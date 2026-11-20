@@ -612,7 +612,7 @@ fn parse_positive_usize(name: &str, raw: Option<&str>, default: usize) -> anyhow
 
 /// `1`/`true` => true, `0`/`false` => false (case-insensitive); anything else, or unset, is the
 /// default. Unknown strings therefore never silently flip a safety default.
-fn parse_flag(raw: Option<&str>, default: bool) -> bool {
+pub fn parse_flag(raw: Option<&str>, default: bool) -> bool {
     match raw.map(str::trim) {
         Some(v) if v == "1" || v.eq_ignore_ascii_case("true") => true,
         Some(v) if v == "0" || v.eq_ignore_ascii_case("false") => false,

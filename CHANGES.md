@@ -23,6 +23,28 @@ keeps its own log in [client/CHANGELOG.md](client/CHANGELOG.md).
   (every process) and `ohttp_config_compare_match` (`compare` only). The image carries the label
   `org.zodl.ohttp-gateway.check-config=1`. See `gateway/CONFIG.md` and
   `gateway/config.example.toml`.
+- Every other setting can come from the configuration files too: a `[settings]` table (the
+  variable in lower case, typed values: integers, numbers, booleans, strings, arrays of strings)
+  in the common file for the settings common to a network, and a new host file
+  (`--host-config <path>` or `GATEWAY_HOST_CONFIG_FILE`: `schema`, `[settings]`, `[secrets]`)
+  for the per-host ones, merged after the common file (a key in both is an error). Secrets only
+  as `{ secret = "<name>" }` references to `[secrets]` (`{ file = ... }` or `{ env = ... }`); a
+  store URL with a password as a whole secret or a `value` template whose `{secret}` is the
+  whole password (percent-encoded into the URL). When the
+  files carry settings (a `[settings]` table, an empty one too, or a host file),
+  `CONFIG_SOURCE=file` reads every setting from them and ignores the environment's (one
+  warning naming them; `RUST_LOG` as `rust_log` too), so a process needs no variable but
+  `CONFIG_SOURCE` and the two paths; `compare` compares them as well (new
+  `ohttp_config_settings_compare_match`). A policy-only file without a host file keeps every
+  setting in the environment in every mode, as before; `CONFIG_SOURCE=env` (the default) is
+  unchanged, and so is `backfill`. `--check-config` checks both files and runs every startup
+  parser and the mandatory startup checks (shared with the serving process) on them, names the
+  settings of the environment the files leave out (`--strict`: an error); `--export-config --host <path>` writes the host file and prints the common
+  file with its settings (without `--host` the output is the policy file, as before).
+  `ohttp_config_info` gains the label `tuning_digest` (the digest of the tuning settings in
+  force; `digest` is unchanged). Every variable the gateway reads is classified (policy,
+  tuning, deployment, secret) in `gateway/CONFIG.md`. The image carries the label
+  `org.zodl.ohttp-gateway.host-config=1`. See `gateway/host.example.toml`.
 
 ### Integrations crate
 

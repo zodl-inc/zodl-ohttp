@@ -91,12 +91,12 @@ pub const POLICY_ENV_KEYS: &[&str] = &[
     "PROXY_ALLOW_SUFFIXES",
 ];
 
-/// The variables that stay in the environment whatever the source of the policy: the
-/// variables each host sets for itself (the deployment's per-host list: stores, addresses,
+/// The variables each host sets for itself (the deployment's per-host list: stores, addresses,
 /// identity, peers, WRITE forwarding), the identity of a process (`NETWORK`, `PORT`) and the
-/// secrets (keys, relay secrets, the signing seed, the Flexa key); the variables a `[secrets]`
-/// entry names are deployment keys too. Not used by the code yet: the tuning variables move
-/// into the file in a later stage, and this is the list that stays.
+/// secrets (keys, relay secrets, the signing seed, the Flexa key): none of them is policy. The
+/// gateway reads them, and every other setting, from its `[settings]` tables when its
+/// configuration files are in force (the gateway's `settings.rs` classifies each one); this
+/// list is not used by the code.
 pub const DEPLOYMENT_ENV_KEYS: &[&str] = &[
     "LWD_CONNECTION_POOL",
     "LWD_ENDPOINTS",
@@ -314,6 +314,12 @@ pub struct PolicyFile {
     pub dynamic_hosts: DynamicHostsSection,
     #[serde(default)]
     pub host_list: HostListSection,
+    /// `[settings]`: the gateway's settings other than the policy (tuning, deployment, secret
+    /// references), read and checked by the gateway, not by this crate; present (even empty),
+    /// the files carry every setting. Never part of the policy: not in [`canonical`],
+    /// [`render`] or the digest.
+    #[serde(default)]
+    pub settings: Option<toml::Table>,
 }
 
 impl Integration {
@@ -411,8 +417,9 @@ pub fn parse(text: &str) -> Result<Loaded> {
 }
 
 /// A TOML error without any of the file's content: its position and its kind, quoted values
-/// removed (a value may be a secret's neighbour, or one written in the wrong place).
-fn toml_error(text: &str, e: &toml::de::Error) -> anyhow::Error {
+/// removed (a value may be a secret's neighbour, or one written in the wrong place). Public for
+/// the gateway's other configuration file (the host file).
+pub fn toml_error(text: &str, e: &toml::de::Error) -> anyhow::Error {
     toml_error_in(text, e)
 }
 
@@ -1193,6 +1200,7 @@ pub fn export(env: &BTreeMap<String, String>) -> Result<Export> {
         hosts: BTreeMap::new(),
         value_sources: BTreeMap::new(),
         dynamic_hosts: DynamicHostsSection::default(),
+        settings: None,
         host_list: HostListSection {
             publish: get(env, "THIRD_PARTY_HOSTS_PUBLISH").map(|v| v.to_ascii_lowercase()),
             max_age_secs: get(env, "THIRD_PARTY_HOSTS_MAX_AGE_SECS")

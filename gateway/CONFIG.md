@@ -1,7 +1,8 @@
 # Gateway configuration
 
-Every setting of the gateway is an environment variable, read once at startup; the routing
-policy can come from a configuration file instead (see below). Defaults are the values in the
+Every setting of the gateway is an environment variable, read once at startup, or a key of its
+configuration files (see below): the routing policy in the common file, every other setting in
+the `[settings]` table of the common file or of the host file. Defaults are the values in the
 code; "unset" means the variable is absent or empty unless a row says otherwise. A malformed
 value is a startup error unless a row says it falls back to the default.
 
@@ -9,14 +10,16 @@ value is a startup error unless a row says it falls back to the default.
 
 The routing policy (the variables below) can be written as one TOML file instead, the same
 policy by construction: the file is turned into the values of the variables it stands for,
-which the same parsers read. Everything else (addresses and stores, identity, sizing, keys and
-other secrets) stays in the environment. [`config.example.toml`](config.example.toml) shows
-every key.
+which the same parsers read. Every other setting can be written in the files too
+([Settings in the files](#settings-in-the-files)); without them it stays in the environment.
+[`config.example.toml`](config.example.toml) and [`host.example.toml`](host.example.toml) show
+the keys.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `CONFIG_SOURCE` | `env` | `env`: the policy variables of the environment, no file is read. `compare`: the environment stays in force; the file is loaded and checked too, the two policies are compared (`ohttp_config_compare_match` 1 or 0, and one log line naming the differing keys, never a value); a file that does not load is logged and counts as 0, it never stops the gateway. `file`: the file is in force; the policy variables of the environment are ignored, with one warning naming those that are set; a file that does not load (or a secret it names that does not resolve) stops the gateway at startup. Any other value is a startup error. |
+| `CONFIG_SOURCE` | `env` | `env`: the policy variables of the environment, no file is read. `compare`: the environment stays in force; the file is loaded and checked too, the two policies are compared (`ohttp_config_compare_match` 1 or 0, and one log line naming the differing keys, never a value); a file that does not load is logged and counts as 0, it never stops the gateway. `file`: the file is in force; the policy variables of the environment are ignored, with one warning naming those that are set; a file that does not load (or a secret it names that does not resolve) stops the gateway at startup. Any other value is a startup error. For the settings in the files see [below](#settings-in-the-files). |
 | `GATEWAY_CONFIG_FILE` | unset | Path of the file (`--config <path>` wins). Read with `CONFIG_SOURCE=compare` or `file` and by `--check-config`. |
+| `GATEWAY_HOST_CONFIG_FILE` | unset | Path of the host file (`--host-config <path>` wins). Read with the common file: with `CONFIG_SOURCE=compare` or `file`, by `--check-config` and by `--print-effective-config` (`file`). |
 
 The policy variables are `GATEWAY_HOSTS`, `BACKENDS`, `BACKENDS_POLICY`,
 `BACKENDS_POLICY_DEFAULT`, `BACKEND_HEADERS`, `FLEXA_ALIAS`, `NEAR_ALIAS`,
@@ -55,30 +58,224 @@ warning for one release):
 - `[value_sources.<name>]`: `alias`, `route` (`GET /path`), `pointer`, `refresh_secs`,
   `fallback`;
 - `[dynamic_hosts]`: `deny_cidrs`, `sources` (the sources of `DYNAMIC_HOST_SOURCES` as tables);
-- `[host_list]`: `publish`, `max_age_secs`.
+- `[host_list]`: `publish`, `max_age_secs`;
+- `[settings]`: every other setting ([Settings in the files](#settings-in-the-files)).
 
 Every list entry keeps the grammar of its variable (a separator of that grammar inside an entry
 is an error). Every startup check of the variables applies to the file.
 
-Command line (`zodl-ohttp-gateway [--config <path>] [ACTION]`; no action serves, as before;
+Command line (`zodl-ohttp-gateway [--config <path>] [--host-config <path>] [ACTION]`; no action serves, as before;
 `backfill` is unchanged):
 
 | Action | Effect | Exit |
 |---|---|---|
-| `--check-config [--secrets=require\|skip]` | Load and check the file (`--config` or `GATEWAY_CONFIG_FILE`), resolve its secrets (`require`, the default) or not (`skip`), and run the startup checks on the policy it stands for. Prints `config OK: <path> (schema 1, digest <16 hex>, ...)` or the error on stderr. | 0 valid, 1 not |
+| `--check-config [--secrets=require\|skip]` | Load and check the file (`--config` or `GATEWAY_CONFIG_FILE`; with the host file, if given), resolve its secrets (`require`, the default) or not (`skip`), and run the startup checks on the policy it stands for. Prints `config OK: <path> (schema 1, digest <16 hex>, ...)` or the error on stderr. | 0 valid, 1 not |
 | `--print-effective-config` | The policy in force (`CONFIG_SOURCE`: the file for `file`, checked first as by `--check-config --secrets=skip`; else the environment, with a note on stderr when a file is given) as canonical JSON: sorted keys, header values `<redacted>`, no secret names, kinds as declared. | 0, 1 on error |
 | `--export-config` | The file equivalent to the environment's policy, checked before it is printed (it parses, passes `--check-config --secrets=skip` and is the environment's policy). A header value becomes a secret reference: to the variable it equals (or equals after `Bearer ` or `Basic `), else to a new variable for the whole value (named on stderr) that the operator sets. An environment no file can express is an error naming the key. | 0, 1 on error |
+| `--export-config --host <path>` | Both files of the whole environment: the common file (the policy as above, a `[settings]` table with the common settings) on stdout, the host file (the host settings) written to `<path>`, which must not exist. Each setting goes in the file of its class (table below); a secret, and a store URL with a password, becomes `{ secret = "<key>" }` with a `[secrets]` entry `{ env = "<VARIABLE>" }` (the variable that holds it today: one environment serves both sources during a move; point each at a file for the files-only setup). Checked before anything is written: both files parse, stand for exactly the environment's settings and pass the startup checks. A value the files cannot stand for exactly (an integer not written as plain digits, a boolean a strict parser refuses) is an error naming the variable. | 0, 1 on error |
 
 An unknown option, or two actions, exit with 2. `backfill` as the first argument ignores
 everything after it, as before, and reads the environment's policy whatever `CONFIG_SOURCE`
 says.
 
-`ohttp_config_info{source,digest}` is 1 on every serving process: the source (`env`, `compare`,
+`--check-config` with a host file (`--host-config` or `GATEWAY_HOST_CONFIG_FILE`) checks both
+files together; when the files carry settings it runs every startup parser of the serving
+process on them and its mandatory startup checks (the same function the serving process runs:
+relay secrets, keys, signing seed, both store URLs in `ohttp` mode (these with a host file
+only: a common file alone names no host's stores); the keys and the seed are
+decoded; `rust_log` must be a valid filter; nothing connects) and prints a second line
+`settings OK: <n> settings from <files> (tuning digest <16 hex>, ...)`. With `--secrets=skip`
+a setting that is a whole secret is left out of that check, with the checks that need it (the
+relay and forwarding secrets and the Flexa key get a placeholder of their form), and a template
+gets the placeholder `secret-not-read`. The settings the environment sets and the files leave
+out are named on stderr (names only: with `CONFIG_SOURCE=file` they would be unset);
+`--strict` makes that an error (exit 1). `--print-effective-config` with `CONFIG_SOURCE=file`
+and files that carry settings adds `settings`: each as written, a secret as `<secret:name>`.
+
+`ohttp_config_info{source,digest,tuning_digest}` is 1 on every serving process: the source (`env`, `compare`,
 `file`) and the first 16 hex digits of the SHA-256 of the canonical behaviour form of the policy
 in force (keyed kinds as `generic`, method tokens in upper case, gateway hosts and deny CIDRs
 as sorted sets, no dynamic sources as an empty list, defaults of unset keys written out), the
 same for a file and the environment it stands for; it is not the hash of the JSON
-`--print-effective-config` prints.
+`--print-effective-config` prints. `tuning_digest`: the same for the tuning settings in force
+(the class `tuning` below, as the files render them: no deployment setting, no secret; a value
+the files cannot stand for counts as written), the same for files and the environment they
+stand for, so one query shows whether all origins of a network run the same tuning.
+
+### Settings in the files
+
+Every setting that is not policy (the table below) can be a key of a `[settings]` table: its
+variable in lower case (`LWD_TIMEOUT_SECS` = `lwd_timeout_secs`), its value typed: an integer
+(non-negative), a number, `true`/`false`, a string, or an array of strings (a comma-separated
+variable, one entry per item, no `,` inside one). Each value stands for exactly one value of the
+variable, which the same parser reads: integers as their digits, booleans as `1`/`0`, arrays
+joined with `,`. A key left out is the variable unset, so every default is the parser's own. An
+unknown key, a policy variable, or a value of the wrong type is an error naming the key, never
+the value.
+
+Two files:
+
+- the **common file** (`--config`, `GATEWAY_CONFIG_FILE`): the policy and a `[settings]` table
+  for what is the same on every origin of a network (class `tuning`, and the references to the
+  shared secrets);
+- the **host file** (`--host-config`, `GATEWAY_HOST_CONFIG_FILE`): `schema = 1`, `[secrets]`
+  and `[settings]` only (no policy), for what each host sets for itself (class `deployment`:
+  addresses, stores, identity, per-host sizing, and its own secrets).
+
+The host file is merged after the common file; a key set in both, or a secret name declared in
+both, is an error. The class of a setting says which file `--export-config --host` writes it to;
+the gateway accepts every setting in either file.
+
+**When the files carry the settings**: when the common file has a `[settings]` table (an empty
+one too) or a host file is given. Then:
+
+- `CONFIG_SOURCE=file`: every setting comes from the files, the environment's are ignored, with
+  one warning naming those that are set (except the variables a `[secrets]` entry reads). A
+  key left out is unset (its default), whatever the environment says. `RUST_LOG` is read from
+  the files too (`rust_log`), before the first log line. The process needs no variable but
+  `CONFIG_SOURCE`, `GATEWAY_CONFIG_FILE` and `GATEWAY_HOST_CONFIG_FILE` (and those its
+  `[secrets]` entries name).
+- `CONFIG_SOURCE=compare`: the environment stays in force; the files' settings (secrets
+  resolved) are compared with the environment's, read as the files would render them:
+  `ohttp_config_settings_compare_match` 1 or 0 (0 also when the files do not load) and one log
+  line naming the differing keys (`settings.<key>`, never a value). `ohttp_config_compare_match`
+  stays the policy's.
+- `CONFIG_SOURCE=env`: the files are not read.
+
+Otherwise (a policy-only file and no host file) every setting comes from the environment in
+every mode, as before: a deployment moves its policy first and its settings later, and goes
+back by one variable (`CONFIG_SOURCE=env`) at each step.
+
+**Secrets** are never written in a file: a secret setting (class `secret`) must be
+`{ secret = "<name>" }`, naming a `[secrets]` entry (`{ env = "VAR" }` or `{ file = "/path" }`,
+as for the header secrets; exactly one of the two, checked in both files whether or not the
+secrets are read). A store URL with a password (`REDIS_URL` and the other URLs marked "or
+secret reference") is either the whole URL from a secret, `{ secret = "<name>" }` (the secret
+holds the URL as the store client reads it, password percent-encoded where needed), or, for a
+single-URL setting, a template whose `{secret}` is the whole password and appears nowhere else,
+`{ secret = "<name>", value = "redis://[user]:{secret}@cache.example:6379" }`: the secret holds
+the password itself, percent-encoded into the URL (every byte but `A-Z a-z 0-9 - . _ ~`). A
+literal URL with a password is refused: any entry whose part after the scheme holds an `@` with
+a `:` before the last one (white space removed first, so a tab, or a `/`, `?` or `#` in the
+password, hides nothing); `redis://user@host` without a password is a literal. Only store URL
+settings take a template. Every secret is read once at startup and must resolve where secrets
+are required; no secret value is logged, printed, compared in the open or part of a digest. A
+value from a secret that a parser refuses is reported by the setting's name only.
+
+**Blank values.** In the environment a variable can be set but blank (empty or white space).
+`--export-config --host` keeps a blank string or list as written, leaves a blank value out
+where the parser reads it as unset, and refuses it otherwise (`PORT`, `HPKE_KEY_ID`,
+`LWD_TIMEOUT_SECS`, `LONG_POLL_*`, `SSE_KEEPALIVE_SECS`, `HEADER_READ_TIMEOUT_SECS`,
+`RELAY_SECRET(S)`; white space in `HPKE_KEYS`, `HPKE_PRIVATE_KEY`, `CONFIGS_SIGNING_SEED_HEX`).
+
+`backfill` reads the environment only (its variables `BACKFILL_*` and the settings it uses),
+whatever `CONFIG_SOURCE` says.
+
+Every variable the gateway reads, by class (`policy`: the variables of the policy above;
+besides these: `CONFIG_SOURCE`, `GATEWAY_CONFIG_FILE` and `GATEWAY_HOST_CONFIG_FILE`, always from
+the environment; `BACKFILL_*`, `backfill` only; and switches of the test suite that the gateway
+itself never reads):
+
+| Variable | Key | Class | File | Value |
+|---|---|---|---|---|
+| `GATEWAY_MODE` | `gateway_mode` | tuning | common | string |
+| `HEADER_READ_TIMEOUT_SECS` | `header_read_timeout_secs` | tuning | common | integer |
+| `LOG_OUTER_HEADER_NAMES` | `log_outer_header_names` | tuning | common | boolean |
+| `ALLOW_UNAUTHENTICATED_RELAY` | `allow_unauthenticated_relay` | tuning | common | boolean |
+| `HPKE_KEY_ID` | `hpke_key_id` | tuning | common | integer |
+| `MAX_INFLIGHT_REQUESTS` | `max_inflight_requests` | tuning | common | integer |
+| `MAX_UPSTREAM_RESPONSE_BYTES` | `max_upstream_response_bytes` | tuning | common | integer |
+| `MAX_INFLIGHT_UPSTREAM` | `max_inflight_upstream` | tuning | common | integer |
+| `MAX_INFLIGHT_PER_BACKEND` | `max_inflight_per_backend` | tuning | common | integer |
+| `LWD_HEAVY_BLOCK_RANGE` | `lwd_heavy_block_range` | tuning | common | integer |
+| `LWD_PERMIT_WAIT_MS` | `lwd_permit_wait_ms` | tuning | common | integer |
+| `LWD_PERMIT_MAX_WAITERS` | `lwd_permit_max_waiters` | tuning | common | integer |
+| `MAX_BLOCK_RANGE` | `max_block_range` | tuning | common | integer |
+| `LWD_TIMEOUT_SECS` | `lwd_timeout_secs` | tuning | common | integer |
+| `LWD_UNARY_TIMEOUT_SECS` | `lwd_unary_timeout_secs` | tuning | common | integer |
+| `LWD_SEND_TIMEOUT_SECS` | `lwd_send_timeout_secs` | tuning | common | integer |
+| `LWD_STREAM_IDLE_SECS` | `lwd_stream_idle_secs` | tuning | common | integer |
+| `LWD_CONNECT_TIMEOUT_MS` | `lwd_connect_timeout_ms` | tuning | common | integer |
+| `LWD_HEDGE_DELAY_MS` | `lwd_hedge_delay_ms` | tuning | common | integer |
+| `LWD_HEDGE_MAX_INFLIGHT` | `lwd_hedge_max_inflight` | tuning | common | integer |
+| `LONG_POLL_MAX_INITIAL_SILENCE_SECS` | `long_poll_max_initial_silence_secs` | tuning | common | integer |
+| `LONG_POLL_IDLE_SECS` | `long_poll_idle_secs` | tuning | common | integer |
+| `SSE_KEEPALIVE_SECS` | `sse_keepalive_secs` | tuning | common | integer |
+| `MAX_CACHE_GET_CONCURRENCY` | `max_cache_get_concurrency` | tuning | common | integer |
+| `MAX_LARGE_RESPONSE_CONCURRENCY` | `max_large_response_concurrency` | tuning | common | integer |
+| `LARGE_RESPONSE_THRESHOLD` | `large_response_threshold` | tuning | common | integer |
+| `HEALTHZ_LWD_ERROR_RATIO` | `healthz_lwd_error_ratio` | tuning | common | number |
+| `HEALTHZ_LWD_ERROR_WINDOW_SECS` | `healthz_lwd_error_window_secs` | tuning | common | integer |
+| `HEALTHZ_LWD_MIN_ERRORS` | `healthz_lwd_min_errors` | tuning | common | integer |
+| `REDIS_OP_TIMEOUT_MS` | `redis_op_timeout_ms` | tuning | common | integer |
+| `CHUNK_SIZE` | `chunk_size` | tuning | common | integer |
+| `CHUNK_FLUSH_MS` | `chunk_flush_ms` | tuning | common | integer |
+| `RESPONSE_PADDING` | `response_padding` | tuning | common | string |
+| `REPLAY_FRESHNESS` | `replay_freshness` | tuning | common | string |
+| `REPLAY_FRESHNESS_WINDOW_SECS` | `replay_freshness_window_secs` | tuning | common | integer |
+| `REPLAY_WAIT_CONNS` | `replay_wait_conns` | tuning | common | integer |
+| `REPLAY_FALLBACK_HEALTH_FAILURES` | `replay_fallback_health_failures` | tuning | common | integer |
+| `REPLAY_FALLBACK_HEALTH_WINDOW_SECS` | `replay_fallback_health_window_secs` | tuning | common | integer |
+| `REPLAY_STARTUP_STORES_WAIT_SECS` | `replay_startup_stores_wait_secs` | tuning | common | integer |
+| `DYNAMIC_HOSTS_MAX_DOCUMENT_BYTES` | `dynamic_hosts_max_document_bytes` | tuning | common | integer |
+| `DYNAMIC_HOSTS_FETCH_TIMEOUT_SECS` | `dynamic_hosts_fetch_timeout_secs` | tuning | common | integer |
+| `LOCAL_CACHE_BYTES` | `local_cache_bytes` | tuning | common | integer |
+| `LOCAL_CACHE_MAX_ENTRY_BYTES` | `local_cache_max_entry_bytes` | tuning | common | integer |
+| `PERMANENT_MIN_HEIGHT` | `permanent_min_height` | tuning | common | integer |
+| `PERMANENT_OP_TIMEOUT_MS` | `permanent_op_timeout_ms` | tuning | common | integer |
+| `CHAIN_TIP_STALE_SECS` | `chain_tip_stale_secs` | tuning | common | integer |
+| `PREFETCH_TIP` | `prefetch_tip` | tuning | common | boolean |
+| `PREFETCH_BLOCK_TXS_MAX` | `prefetch_block_txs_max` | tuning | common | integer |
+| `PREFETCH_TREE_STATE` | `prefetch_tree_state` | tuning | common | boolean |
+| `PINNED_TREESTATE_RANGE` | `pinned_treestate_range` | tuning | common | string |
+| `HPKE_KEYS` | `hpke_keys` | secret | common | secret reference |
+| `HPKE_PRIVATE_KEY` | `hpke_private_key` | secret | common | secret reference |
+| `HPKE_ACCEPT_ONLY_KEYS` | `hpke_accept_only_keys` | secret | common | secret reference |
+| `RELAY_SECRET` | `relay_secret` | secret | common | secret reference |
+| `RELAY_SECRETS` | `relay_secrets` | secret | common | secret reference |
+| `CONFIGS_SIGNING_SEED_HEX` | `configs_signing_seed_hex` | secret | common | secret reference |
+| `FLEXA_PUBLISHABLE_KEY` | `flexa_publishable_key` | secret | common | secret reference |
+| `RUST_LOG` | `rust_log` | deployment | host | string |
+| `NETWORK` | `network` | deployment | host | string |
+| `PORT` | `port` | deployment | host | integer |
+| `INTERNAL_BIND_ADDR` | `internal_bind_addr` | deployment | host | string |
+| `ORIGIN_ID` | `origin_id` | deployment | host | string |
+| `LWD_ADDR` | `lwd_addr` | deployment | host | string |
+| `LWD_ENDPOINTS` | `lwd_endpoints` | deployment | host | string |
+| `LWD_CONNECTION_POOL` | `lwd_connection_pool` | deployment | host | boolean |
+| `CACHE_KEY_BACKEND` | `cache_key_backend` | deployment | host | string |
+| `MAX_INFLIGHT_LWD` | `max_inflight_lwd` | deployment | host | integer |
+| `MAX_INFLIGHT_LWD_HEAVY` | `max_inflight_lwd_heavy` | deployment | host | integer |
+| `PINNED_BACKFILL_WORKERS` | `pinned_backfill_workers` | deployment | host | integer |
+| `PREFETCH_BLOCK_TXS` | `prefetch_block_txs` | deployment | host | boolean |
+| `REDIS_URL` | `redis_url` | deployment | host | string or secret reference |
+| `REDIS_SECURITY_URL` | `redis_security_url` | deployment | host | string or secret reference |
+| `REDIS_PINNED_URL` | `redis_pinned_url` | deployment | host | string or secret reference |
+| `REDIS_PINNED_WRITE_URL` | `redis_pinned_write_url` | deployment | host | string or secret reference |
+| `PERMANENT_REDIS_URL` | `permanent_redis_url` | deployment | host | string or secret reference |
+| `REPLAY_PEER_URLS` | `replay_peer_urls` | deployment | host | array of strings or secret reference |
+| `REPLAY_STANDBY_URLS` | `replay_standby_urls` | deployment | host | array of strings or secret reference |
+| `REPLAY_PEER_MODE` | `replay_peer_mode` | deployment | host | string |
+| `REPLAY_PEER_TIMEOUT_MS` | `replay_peer_timeout_ms` | deployment | host | integer |
+| `REPLAY_PEER_FAIL_CLOSED` | `replay_peer_fail_closed` | deployment | host | boolean |
+| `REPLAY_PEER_FAIL_CLOSED_WRITES` | `replay_peer_fail_closed_writes` | deployment | host | boolean |
+| `REPLAY_PEER_WAIT_REPLICAS` | `replay_peer_wait_replicas` | deployment | host | integer |
+| `REPLAY_PEER_WAIT_MS` | `replay_peer_wait_ms` | deployment | host | integer |
+| `REPLAY_ASYNC_MAX_LAG_MS` | `replay_async_max_lag_ms` | deployment | host | integer |
+| `REPLAY_ASYNC_RECOVERY_SECS` | `replay_async_recovery_secs` | deployment | host | integer |
+| `REPLAY_ASYNC_FAILURES_BEFORE_STRICT` | `replay_async_failures_before_strict` | deployment | host | integer |
+| `REPLAY_WRITE_WAIT_REPLICAS` | `replay_write_wait_replicas` | deployment | host | integer |
+| `REPLAY_WRITE_WAIT_MS` | `replay_write_wait_ms` | deployment | host | integer |
+| `REPLAY_UNAVAILABLE_FALLBACK` | `replay_unavailable_fallback` | deployment | host | boolean |
+| `REPLAY_LOCAL_WAITAOF_MS` | `replay_local_waitaof_ms` | deployment | host | integer |
+| `REPLAY_WRITE_FORWARD_URL` | `replay_write_forward_url` | deployment | host | string |
+| `REPLAY_WRITE_FORWARD_CONNECT_TIMEOUT_MS` | `replay_write_forward_connect_timeout_ms` | deployment | host | integer |
+| `REPLAY_WRITE_FORWARD_TIMEOUT_SECS` | `replay_write_forward_timeout_secs` | deployment | host | integer |
+| `REPLAY_WRITE_FORWARD_BACKOFF_MS` | `replay_write_forward_backoff_ms` | deployment | host | integer |
+| `WRITE_FORWARD_BIND_ADDR` | `write_forward_bind_addr` | deployment | host | string |
+| `REPLAY_WRITE_FORWARD_SECRET` | `replay_write_forward_secret` | secret | host | secret reference |
+| `WRITE_FORWARD_SECRETS` | `write_forward_secrets` | secret | host | secret reference |
+
 
 ## Mode, network, listener
 

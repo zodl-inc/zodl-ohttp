@@ -11,7 +11,8 @@ not published on crates.io and is unrelated to the `ohttp-gateway` crate there; 
 the `ohttp-gateway` image only, whose name is unchanged. The image keeps `/app/ohttp-gateway` as
 a link to the binary.
 
-Every setting is an environment variable: see [CONFIG.md](CONFIG.md). The design, privacy model
+Every setting is an environment variable or a key of the configuration files: see
+[CONFIG.md](CONFIG.md). The design, privacy model
 and protocol details are in [../docs/architecture.md](../docs/architecture.md); logs and
 metrics in [../docs/observability.md](../docs/observability.md).
 
