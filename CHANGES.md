@@ -76,6 +76,17 @@ keeps its own log in [client/CHANGELOG.md](client/CHANGELOG.md).
   upstream headers (names, values, order), startup errors, log fields and metrics are
   unchanged; a new test pins the exact upstream header list of every kind of authority on both
   forward paths.
+- Building blocks for providers that sign and validate, used by none yet (no behaviour
+  change): the signer `JwtEdDsa` (a JWT per upstream request, signed with an Ed25519 key given
+  as a 32-byte seed or a 64-byte key pair whose public half must match; header `alg`, `kid`,
+  `nonce`, `typ`; claims `iss`, `sub`, `nbf` (an optional leeway), `exp`, `uri` = `METHOD host
+  path`, a lower-case host and a path without query; the time and the randomness are arguments;
+  key bytes wiped when dropped), body validation (`core::body`: a size cap, one JSON object with
+  exactly the listed members, string values checked by a value list, a character set and
+  length, a decimal range, or base58check with version bytes such as a Zcash mainnet
+  transparent address), a body refusal (`Denial::InvalidBody`) and the response actions
+  `Replace` (a fixed answer instead of the upstream's, which is neither forwarded nor logged)
+  and `Rewrite`; every existing provider keeps `Pass`.
 
 ### Crate names
 

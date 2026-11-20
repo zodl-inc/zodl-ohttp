@@ -17,6 +17,12 @@ base64 = "0.22"
 # The configuration file (TOML, typed with serde).
 serde = { version = "1.0", features = ["derive"] }
 toml = "1"
+# The Ed25519 key of a signed credential (JWT per request).
+ed25519-dalek = "2"
+# The double SHA-256 checksum of base58check values.
+sha2 = "0.10"
+# Key material wiped when dropped.
+zeroize = "1"
 
 [features]
 # One feature per provider kind beyond the generic one; the gateway builds with all of them.
