@@ -351,6 +351,8 @@ trace ids are never labels. `network` is `NETWORK`.
 | `ohttp_lwd_permit_wait_seconds` | `network, class` | Permit wait time (histogram). |
 | `ohttp_third_party_cache_total` | `network, authority, result` | Third-party cache `hit` / `miss`. |
 | `ohttp_third_party_limited_total` | `network, authority` | Third-party calls refused by `THIRD_PARTY_RATE_LIMITS`, or by the `rate_limit` of a dynamic host source (then `authority` is `dynamic:<source>`). |
+| `ohttp_integration_denied_total` | `integration, reason` | Requests to a `coinbase` integration (`integration`: its table label) answered without an upstream call because they were refused: `policy` (not one of its routes), `disabled` (`enabled = false`), `invalid_request`, `invalid_address`, `unexpected_body` (a body on `GET /v1/availability`), `sell_unavailable` (a sell without a `redirect_url`), `rate_limited` (its `rate_limit` or `status_rate_limit`). |
+| `ohttp_integration_sign_failures_total` | `integration` | Upstream calls of a `coinbase` integration not made because no request could be signed (no usable key: the startup log names its secret), answered `503 unavailable`. |
 | `ohttp_query_value_source_refresh_total` | `network, source, result` | Refreshes of a `THIRD_PARTY_QUERY_VALUE_SOURCES` source: `ok`, `transport`, `status`, `oversize`, `json`, `pointer`, `empty`, `too_many`, `too_few`. After any result but `ok` the current list stays. |
 | `ohttp_query_value_source_values` | `network, source` | Values in the current list of a source (its fallback before the first accepted refresh; 0 = `{from:}` admits nothing). |
 | `ohttp_query_value_source_last_success_timestamp_seconds` | `network, source` | Unix time of the last accepted refresh of a source; 0 until the first one. |

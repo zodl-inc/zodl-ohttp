@@ -26,8 +26,9 @@ zeroize = "1"
 
 [features]
 # One feature per provider kind beyond the generic one; the gateway builds with all of them.
-default = ["cmc", "flexa", "near", "swapkit"]
+default = ["cmc", "coinbase", "flexa", "near", "swapkit"]
 cmc = []
+coinbase = []
 flexa = []
 near = []
 swapkit = []

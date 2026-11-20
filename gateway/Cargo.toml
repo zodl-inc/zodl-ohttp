@@ -80,6 +80,8 @@ moka = { version = "0.12", features = ["sync"] }
 
 # Ed25519 signing for config attestation
 ed25519-dalek = { version = "2", features = ["rand_core"] }
+# Key material of the coinbase integrations wiped when dropped (already in the lock).
+zeroize = "1"
 
 [dev-dependencies]
 # Paused-clock tests of the streaming encoder and the block cache.

@@ -280,7 +280,7 @@ impl ThirdParty {
     }
 
     /// Consumes one upstream call of `authority`'s budget: `Some(429 answer)` when it is spent.
-    fn limited(&self, network: &str, authority: &str) -> Option<InnerResponse> {
+    pub(crate) fn limited(&self, network: &str, authority: &str) -> Option<InnerResponse> {
         let retry_after = self.limits.as_ref()?.check(authority).err()?;
         warn!(
             authority,

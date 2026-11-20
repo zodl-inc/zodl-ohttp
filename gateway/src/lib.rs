@@ -17,6 +17,7 @@
 // Re-export for tests and binary
 pub mod block_cache;
 pub mod cache;
+pub mod coinbase;
 pub mod config;
 pub mod config_source;
 pub mod dynamic_hosts;

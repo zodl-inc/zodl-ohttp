@@ -111,6 +111,81 @@ pub fn var(key: &str) -> Result<String, std::env::VarError> {
     std::env::var(key)
 }
 
+/// An entry of the policy in force that is no environment variable (the settings of the
+/// `coinbase` integrations, [`policy_file::COINBASE_RENDERED`]): only a configuration file in
+/// force (the process's, or a [`with_policy`] scope) has it, never the environment.
+pub fn file_value(key: &str) -> Option<String> {
+    let scoped = SCOPED.with(|s| s.borrow().clone());
+    scoped
+        .as_deref()
+        .map(|s| &s.policy)
+        .or_else(|| FILE_POLICY.get())
+        .and_then(|policy| policy.get(key).cloned())
+}
+
+/// The secret values a provider reads itself (the keys the `coinbase` integrations name), out
+/// of those the files read once; wiped when dropped.
+pub(crate) type ProviderSecrets = Arc<BTreeMap<String, zeroize::Zeroizing<String>>>;
+
+/// The [`ProviderSecrets`] of the files in force (`CONFIG_SOURCE=file`).
+static FILE_SECRETS: OnceLock<ProviderSecrets> = OnceLock::new();
+
+thread_local! {
+    /// The provider secrets of a [`with_secret_values`] scope on this thread.
+    static SCOPED_SECRETS: RefCell<Option<ProviderSecrets>> = const { RefCell::new(None) };
+}
+
+/// The secrets of `values` (all those the files read) that the coinbase integrations of
+/// `policy` name: only these are kept for a provider.
+fn provider_secrets(
+    policy: &BTreeMap<String, String>,
+    values: &BTreeMap<String, String>,
+) -> ProviderSecrets {
+    let names: Vec<String> = policy
+        .get(policy_file::COINBASE_RENDERED)
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+        .and_then(|v| v.as_array().cloned())
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|e| e["secret"]["name"].as_str().map(str::to_string))
+        .collect();
+    Arc::new(
+        names
+            .into_iter()
+            .filter_map(|n| {
+                let v = values.get(&n)?.clone();
+                Some((n, zeroize::Zeroizing::new(v)))
+            })
+            .collect(),
+    )
+}
+
+/// Run `f` with `values` as the provider secrets of this thread ([`secret_value`]): the checks
+/// of loaded files see the secrets they read, without making them the process's.
+pub(crate) fn with_secret_values<T>(values: ProviderSecrets, f: impl FnOnce() -> T) -> T {
+    struct Restore(Option<ProviderSecrets>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let previous = self.0.take();
+            SCOPED_SECRETS.with(|s| *s.borrow_mut() = previous);
+        }
+    }
+    let previous = SCOPED_SECRETS.with(|s| s.borrow_mut().replace(values));
+    let _restore = Restore(previous);
+    f()
+}
+
+/// The value of the secret `name` as the files read it ([`with_secret_values`], else the files
+/// in force), a copy wiped when dropped; `None` when no file read it for a provider.
+pub(crate) fn secret_value(name: &str) -> Option<zeroize::Zeroizing<String>> {
+    let scoped = SCOPED_SECRETS.with(|s| s.borrow().clone());
+    let from = |m: &ProviderSecrets| m.get(name).cloned();
+    match scoped {
+        Some(values) => from(&values),
+        None => FILE_SECRETS.get().and_then(from),
+    }
+}
+
 fn with_scope<T>(scope: Scope, f: impl FnOnce() -> T) -> T {
     struct Restore(Option<Arc<Scope>>);
     impl Drop for Restore {
@@ -220,16 +295,25 @@ pub fn resolve_secret_in(
     let r = secrets
         .get(name)
         .ok_or_else(|| anyhow!("secret '{name}' has no [secrets] entry"))?;
-    let (value, source) = match (&r.env, &r.file) {
+    read_secret(name, r.env.as_deref(), r.file.as_deref())
+}
+
+/// The value of the secret `name` read from its variable `env` or its file `file` (exactly one),
+/// with the rules of [`resolve_secret`]. The buffers it is read into are wiped (on error paths
+/// too); the value returned is the one the files keep ([`LoadedFile`]).
+fn read_secret(name: &str, env: Option<&str>, file: Option<&str>) -> Result<String> {
+    let (value, source) = match (env, file) {
         (Some(var), None) => (
-            std::env::var(var)
-                .map_err(|_| anyhow!("secret '{name}': variable {var} is not set"))?,
+            zeroize::Zeroizing::new(
+                std::env::var(var)
+                    .map_err(|_| anyhow!("secret '{name}': variable {var} is not set"))?,
+            ),
             format!("variable {var}"),
         ),
         (None, Some(path)) => (read_secret_file(name, path)?, format!("file {path}")),
         _ => bail!("secret '{name}' needs exactly one of env or file"),
     };
-    usable_secret(name, &source, value)
+    usable_secret(name, &source, String::clone(&value))
 }
 
 /// A secret's value as read from `source`, refused (by name and source only) when it is empty,
@@ -244,7 +328,7 @@ fn usable_secret(name: &str, source: &str, value: String) -> Result<String> {
     Ok(value)
 }
 
-fn read_secret_file(name: &str, path: &str) -> Result<String> {
+fn read_secret_file(name: &str, path: &str) -> Result<zeroize::Zeroizing<String>> {
     use std::io::Read;
     // Non-blocking, so that a FIFO without a writer cannot hold the open; the type is checked
     // on the opened handle.
@@ -264,19 +348,28 @@ fn read_secret_file(name: &str, path: &str) -> Result<String> {
     if !meta.is_file() {
         bail!("secret '{name}': {path} is not a regular file");
     }
-    let mut bytes = Vec::new();
+    let mut bytes = zeroize::Zeroizing::new(Vec::new());
     f.take(MAX_SECRET_FILE_BYTES + 1)
         .read_to_end(&mut bytes)
         .map_err(|e| anyhow!("secret '{name}': file {path}: {}", e.kind()))?;
     if bytes.len() as u64 > MAX_SECRET_FILE_BYTES {
         bail!("secret '{name}': file {path} is larger than {MAX_SECRET_FILE_BYTES} bytes");
     }
-    let text = String::from_utf8(bytes)
-        .map_err(|_| anyhow!("secret '{name}': file {path} is not UTF-8"))?;
-    let text = match text.strip_suffix("\r\n") {
-        Some(t) => t.to_string(),
-        None => text.strip_suffix('\n').unwrap_or(&text).to_string(),
+    let mut text = match String::from_utf8(std::mem::take(&mut *bytes)) {
+        Ok(text) => zeroize::Zeroizing::new(text),
+        Err(e) => {
+            drop(zeroize::Zeroizing::new(e.into_bytes()));
+            bail!("secret '{name}': file {path} is not UTF-8");
+        }
     };
+    // In place: no copy of the value is left behind.
+    if text.ends_with("\r\n") {
+        let len = text.len() - 2;
+        text.truncate(len);
+    } else if text.ends_with('\n') {
+        let len = text.len() - 1;
+        text.truncate(len);
+    }
     Ok(text)
 }
 
@@ -303,6 +396,8 @@ pub struct LoadedFile {
     pub settings: BTreeMap<String, String>,
     /// The value of every secret, read once (with [`Secrets::Require`]).
     pub(crate) secret_values: BTreeMap<String, String>,
+    /// Of those, the ones the coinbase integrations name ([`secret_value`]).
+    pub(crate) provider_secrets: ProviderSecrets,
 }
 
 impl std::fmt::Debug for LoadedFile {
@@ -319,6 +414,18 @@ impl std::fmt::Debug for LoadedFile {
 }
 
 impl LoadedFile {
+    /// Run `f` with these files as the configuration of this thread: their policy, their
+    /// settings when they carry them, and the secret values they read.
+    pub fn run_in<T>(&self, f: impl FnOnce() -> T) -> T {
+        with_secret_values(self.provider_secrets.clone(), || {
+            if self.carries_settings {
+                with_config(self.policy.clone(), self.settings.clone(), f)
+            } else {
+                with_policy(self.policy.clone(), f)
+            }
+        })
+    }
+
     /// The variables the `[secrets]` entries of the files read (they stay readable whatever
     /// the source).
     pub fn secret_variables(&self) -> Vec<String> {
@@ -405,10 +512,13 @@ fn load_files_with(
     };
     let rendered = policy_file::render(&loaded.file, &|name: &str| lookup(&secret_values, name))
         .with_context(|| format!("config file {path}"))?;
-    let policy: BTreeMap<String, String> = rendered
+    let mut policy: BTreeMap<String, String> = rendered
         .into_iter()
         .map(|(k, v)| (k.to_string(), v))
         .collect();
+    if secrets == Secrets::Skip {
+        skip_coinbase_keys(&mut policy)?;
+    }
 
     // The settings: the common file's, then the host file's.
     let mut setting_values = match &loaded.file.settings {
@@ -475,18 +585,22 @@ fn load_files_with(
         omitted.extend(["REDIS_URL", "REDIS_SECURITY_URL"]);
     }
     let carries_settings = loaded.file.settings.is_some() || host.is_some();
-    if carries_settings {
-        check_config_values(
-            &policy,
-            &rendered_settings,
-            &secret_settings,
-            &omitted,
-            quiet,
-        )
-        .with_context(|| files.clone())?;
-    } else {
-        check_policy(&policy, quiet).with_context(|| format!("config file {path}"))?;
-    }
+    // The checks see the secrets read above (a coinbase provider takes its key from them).
+    let provider_secrets = provider_secrets(&policy, &secret_values);
+    with_secret_values(provider_secrets.clone(), || -> Result<()> {
+        if carries_settings {
+            check_config_values(
+                &policy,
+                &rendered_settings,
+                &secret_settings,
+                &omitted,
+                quiet,
+            )
+            .with_context(|| files.clone())
+        } else {
+            check_policy(&policy, quiet).with_context(|| format!("config file {path}"))
+        }
+    })?;
     Ok(LoadedFile {
         path: path.to_string(),
         file: loaded.file,
@@ -498,6 +612,7 @@ fn load_files_with(
         secrets: all_secrets,
         settings: rendered_settings,
         secret_values,
+        provider_secrets,
     })
 }
 
@@ -508,6 +623,20 @@ fn quietly<T>(quiet: bool, f: impl FnOnce() -> T) -> T {
     } else {
         f()
     }
+}
+
+/// Mark the key of every coinbase integration of `policy` as not to be read (`read_key`
+/// false): the file was loaded without its secrets.
+fn skip_coinbase_keys(policy: &mut BTreeMap<String, String>) -> Result<()> {
+    let Some(raw) = policy.get_mut(policy_file::COINBASE_RENDERED) else {
+        return Ok(());
+    };
+    let mut list: serde_json::Value = serde_json::from_str(raw)?;
+    for entry in list.as_array_mut().into_iter().flatten() {
+        entry["read_key"] = serde_json::Value::Bool(false);
+    }
+    *raw = list.to_string();
+    Ok(())
 }
 
 /// The startup parsers of the policy variables, run on `policy` (the dynamic host sources
@@ -812,6 +941,9 @@ pub fn install_command(cmd: &Command) -> Result<Installed> {
             FILE_POLICY
                 .set(loaded.policy.clone())
                 .map_err(|_| anyhow!("the policy source was installed twice"))?;
+            FILE_SECRETS
+                .set(loaded.provider_secrets.clone())
+                .map_err(|_| anyhow!("the secrets were installed twice"))?;
             if loaded.carries_settings {
                 let ignored = ignored_env_settings(&process_env(), &loaded.secret_variables());
                 if !ignored.is_empty() {
@@ -1203,6 +1335,18 @@ fn check_config(cmd: &Command) -> Result<()> {
     let host = host_path(cmd);
     let loaded = load_files(&path, host.as_deref(), cli.secrets)
         .map_err(|e| anyhow!("config INVALID: {e:#}"))?;
+    // Strict where serving is lenient: a coinbase key that does not read as a key is an error
+    // here (a serving process answers `unavailable` on its routes instead of not starting).
+    if cli.secrets == Secrets::Require {
+        let config = loaded
+            .run_in(crate::config::Config::from_env)
+            .map_err(|e| anyhow!("config INVALID: {e:#}"))?;
+        for entry in config.coinbase.iter() {
+            if let Some(problem) = entry.key_problem() {
+                bail!("config INVALID: {path}: {problem}");
+            }
+        }
+    }
     for w in &loaded.warnings {
         eprintln!("warning: {w}");
     }
