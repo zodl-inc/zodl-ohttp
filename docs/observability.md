@@ -89,6 +89,17 @@ For the ids above to mean anything, a relay in front of the gateway:
 edge request-id header when the relay's network adds one (else `-`). It names a part of the
 relay's network, never a client, and is never logged per request.
 
+`relay` in `ohttp_requests_total` (every status, the non-success ones included) is the name of
+the `RELAY_SECRETS` entry that authenticated the request, the same value as in
+`ohttp_relay_requests_total{relay}`; for a forwarded WRITE on the receiving gateway it is the
+name of the `WRITE_FORWARD_SECRETS` entry. It is `-` when relay authentication is off and for a
+request refused before authentication (a missing, unknown or duplicated `X-Relay-Secret`, a
+forwarding secret that did not match). So errors can be told apart by relay, e.g.
+`sum by (relay, status) (rate(ohttp_requests_total{status!="success"}[5m]))`. Only configured
+names appear (plus `-`); a relay whose entry is named `-` cannot be told apart from an
+unauthenticated request there, so give relays other names. Queries that `sum` keep working; a
+query that matches an exact label set (or joins on all labels) needs `relay` added.
+
 ## Cardinality
 
 No log line carries an identifier of a user request's content: a replay refusal is logged with

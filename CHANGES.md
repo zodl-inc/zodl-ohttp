@@ -182,6 +182,14 @@ keeps its own log in [client/CHANGELOG.md](client/CHANGELOG.md).
 
 ### Gateway
 
+- `ohttp_requests_total` has a new label `relay`: the name of the `RELAY_SECRETS` entry that
+  authenticated the request (the value `ohttp_relay_requests_total{relay}` already has; for a
+  forwarded WRITE on the receiving gateway, the `WRITE_FORWARD_SECRETS` entry), `-` when relay
+  authentication is off or the request was refused before authentication. It is on every
+  status, the non-success ones included, so errors can be told apart by relay. Only configured
+  names (and `-`) appear; a relay entry named `-` is indistinguishable from the unauthenticated
+  `-`. Dashboards and alerts that `sum` the series keep working; a query
+  that matches an exact label set needs `relay`.
 - New, off by default: **WRITE forwarding** (`REPLAY_WRITE_FORWARD_URL`,
   `REPLAY_WRITE_FORWARD_SECRET`, `..._CONNECT_TIMEOUT_MS` 1000, `..._TIMEOUT_SECS` 90,
   `..._BACKOFF_MS` 5000 on a read origin, which must be `async-reads` with `REPLAY_PEER_URLS`

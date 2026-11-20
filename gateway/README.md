@@ -318,7 +318,7 @@ trace ids are never labels. `network` is `NETWORK`.
 
 | Metric | Labels | Meaning |
 |---|---|---|
-| `ohttp_requests_total` | `status, mode, network, hop, method, http_status, grpc_status, backend, route_class` | Requests by outcome. |
+| `ohttp_requests_total` | `status, mode, network, hop, method, http_status, grpc_status, backend, route_class, relay` | Requests by outcome. `relay`: the `RELAY_SECRETS` entry that authenticated the request (on the receiving gateway of a forwarded WRITE, the `WRITE_FORWARD_SECRETS` entry), `-` without relay authentication or before it ([docs/observability.md](../docs/observability.md)); a relay named `-` cannot be told apart from that `-`. |
 | `ohttp_request_duration_seconds` | `network, hop, backend, rpc` | Request duration (histogram). |
 | `ohttp_traced_request_duration_seconds` | `network, hop, backend, rpc` | The same histogram (same buckets), observed in addition for requests whose outer request carried a valid `X-Client-Trace-Id`, so it holds only synthetic checks, test tools and debug builds. Real-user latency is `ohttp_request_duration_seconds` minus this one, per bucket, aggregated to the same labels on both sides; a label set without traced traffic has no traced series, so in PromQL write `main - (traced or main * 0)`. Only answered requests are observed (refusals record no duration), and the split relies on relays forwarding `X-Client-Trace-Id`: synthetic traffic through a relay that strips it counts as real users. |
 | `ohttp_requests_in_flight` | `network` | Requests in flight. |

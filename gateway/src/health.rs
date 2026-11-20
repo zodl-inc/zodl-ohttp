@@ -140,8 +140,8 @@ lazy_static::lazy_static! {
     pub static ref REGISTRY: Registry = Registry::new();
 
     static ref OHTTP_REQUESTS_TOTAL: IntCounterVec = IntCounterVec::new(
-        Opts::new("ohttp_requests_total", "Total OHTTP requests by status and labels"),
-        &["status", "mode", "network", "hop", "method", "http_status", "grpc_status", "backend", "route_class"]
+        Opts::new("ohttp_requests_total", "Total OHTTP requests by status and labels; relay = the RELAY_SECRETS entry that authenticated the request (for a forwarded WRITE the WRITE_FORWARD_SECRETS entry), - when relay authentication is off or the request was refused before it"),
+        &["status", "mode", "network", "hop", "method", "http_status", "grpc_status", "backend", "route_class", "relay"]
     )
     .unwrap();
 
@@ -926,7 +926,7 @@ pub fn normalize_backend(
 // Legacy API for backward compatibility
 pub fn record_request(status: &str, mode: &str) {
     OHTTP_REQUESTS_TOTAL
-        .with_label_values(&[status, mode, "unknown", "-", "-", "-", "-", "-", "-"])
+        .with_label_values(&[status, mode, "unknown", "-", "-", "-", "-", "-", "-", "-"])
         .inc();
 }
 
@@ -966,6 +966,10 @@ pub fn record_replay_rejected_sealed(network: &str) {
     OHTTP_REPLAY_REJECTED.with_label_values(&[network]).inc();
 }
 
+/// Count a request in `ohttp_requests_total`. `relay`: the name of the `RELAY_SECRETS` entry that
+/// authenticated it (the `relay` label of `ohttp_relay_requests_total`; for a forwarded WRITE the
+/// `WRITE_FORWARD_SECRETS` entry), `-` when relay authentication is off or the request was
+/// refused before it. Only configured names: the label stays bounded.
 #[allow(clippy::too_many_arguments)]
 pub fn record_request_detailed(
     status: &str,
@@ -977,6 +981,7 @@ pub fn record_request_detailed(
     grpc_status: &str,
     backend: &str,
     route_class: &str,
+    relay: &str,
 ) {
     let mode = if forwarded() { "forwarded" } else { mode };
     OHTTP_REQUESTS_TOTAL
@@ -990,6 +995,7 @@ pub fn record_request_detailed(
             grpc_status,
             backend,
             route_class,
+            relay,
         ])
         .inc();
 }
@@ -2843,6 +2849,60 @@ mod multi_origin_tests {
         assert!(is_security_redis_connected(net));
         record_security_redis_connected(net, false);
         assert!(!is_security_redis_connected(net));
+    }
+
+    #[test]
+    fn requests_carry_the_relay_that_authenticated_them() {
+        init_metrics();
+        let net = "relay-label-test";
+        record_request_detailed(
+            "success", "ohttp", net, "ohttp", "POST", 200, "0", "lwd", "lwd", "edge-a",
+        );
+        record_request_detailed(
+            "unauthorized",
+            "ohttp",
+            net,
+            "ohttp",
+            "-",
+            401,
+            "-",
+            "-",
+            "other",
+            "-",
+        );
+        let family = REGISTRY
+            .gather()
+            .into_iter()
+            .find(|f| f.get_name() == "ohttp_requests_total")
+            .expect("ohttp_requests_total registered");
+        let series: Vec<(String, String)> = family
+            .get_metric()
+            .iter()
+            .filter(|m| m.get_label().iter().any(|l| l.get_value() == net))
+            .map(|m| {
+                let label = |name: &str| {
+                    m.get_label()
+                        .iter()
+                        .find(|l| l.get_name() == name)
+                        .map(|l| l.get_value().to_string())
+                        .unwrap_or_else(|| panic!("no {name} label"))
+                };
+                (label("status"), label("relay"))
+            })
+            .collect();
+        assert_eq!(series.len(), 2, "{series:?}");
+        assert!(series.contains(&("success".into(), "edge-a".into())));
+        assert!(series.contains(&("unauthorized".into(), "-".into())));
+        // Every series has the label, the legacy counter too.
+        record_request("rejected_plain", "ohttp");
+        for m in REGISTRY
+            .gather()
+            .into_iter()
+            .filter(|f| f.get_name() == "ohttp_requests_total")
+            .flat_map(|f| f.get_metric().to_vec())
+        {
+            assert!(m.get_label().iter().any(|l| l.get_name() == "relay"));
+        }
     }
 
     #[test]
