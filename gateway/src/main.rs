@@ -72,6 +72,7 @@ mod replication;
 mod request_id;
 mod rpc_cache;
 mod server;
+mod settings;
 mod singleflight;
 mod store;
 mod store_conn;
@@ -87,13 +88,14 @@ use config::Config;
 async fn main() -> anyhow::Result<()> {
     // The command line: no flag serves; `backfill`; the configuration file actions, which
     // print and exit (diagnostics on stderr).
-    let cli = match config_source::Cli::parse(std::env::args_os()) {
-        Ok(cli) => cli,
+    let command = match config_source::Command::parse(std::env::args_os()) {
+        Ok(command) => command,
         Err(usage) => {
             eprintln!("{usage}");
             std::process::exit(2);
         }
     };
+    let cli = command.cli.clone();
     if !matches!(
         cli.action,
         config_source::Action::Serve | config_source::Action::Backfill
@@ -105,14 +107,23 @@ async fn main() -> anyhow::Result<()> {
             )
             .with_writer(std::io::stderr)
             .init();
-        std::process::exit(config_source::run(&cli));
+        std::process::exit(config_source::run_command(&command));
     }
 
+    // RUST_LOG: the environment's, or the files' when they are in force and carry the
+    // settings (`backfill` reads the environment only).
+    let log_filter = match cli.action {
+        config_source::Action::Backfill => None,
+        _ => config_source::log_filter(&command),
+    };
     tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
+        .with_env_filter(match log_filter {
+            None => tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
+            Some(directives) => directives
+                .and_then(|d| tracing_subscriber::EnvFilter::try_new(d).ok())
+                .unwrap_or_else(|| tracing_subscriber::EnvFilter::new("info")),
+        })
         .json()
         .init();
 
@@ -125,7 +136,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // CONFIG_SOURCE: the environment (default), or the configuration file.
-    let policy_source = config_source::install(&cli)?;
+    let policy_source = config_source::install_command(&command)?;
 
     let config = Config::from_env()?;
     config_source::report(&policy_source);
@@ -170,24 +181,9 @@ async fn main() -> anyhow::Result<()> {
         "Request freshness (REPLAY_FRESHNESS)"
     );
 
-    // Fail-closed: require relay auth unless explicitly disabled
-    if config.mode == "ohttp"
-        && config.relay_secrets.is_empty()
-        && !config.allow_unauthenticated_relay
-    {
-        anyhow::bail!(
-            "RELAY_SECRET (or RELAY_SECRETS) is required in OHTTP mode unless ALLOW_UNAUTHENTICATED_RELAY=1. \
-             Configure a high-entropy secret to authenticate the relay."
-        );
-    }
-    if config.relay_secret_on_key_config == config::RelaySecretOnKeyConfig::Require
-        && config.relay_secrets.is_empty()
-    {
-        anyhow::bail!(
-            "RELAY_SECRET_ON_KEY_CONFIG=require needs RELAY_SECRET (or RELAY_SECRETS): without a relay \
-             secret no request could fetch the key configuration."
-        );
-    }
+    // The mandatory startup checks (relay secrets, keys and stores in OHTTP mode), shared with
+    // --check-config; the keys themselves are decoded where they are loaded below.
+    settings::startup_checks(&config, &[], false)?;
     info!(
         mode = ?config.relay_secret_on_key_config,
         "Relay secret on key configuration GETs (RELAY_SECRET_ON_KEY_CONFIG)"
@@ -338,13 +334,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let hpke_state = if config.mode == "ohttp" {
-        // Error if no HPKE key configured in OHTTP mode, instead of just warning and continuing
-        if config.hpke_keys.is_empty() && config.hpke_private_key.is_none() {
-            anyhow::bail!(
-                "HPKE_KEYS (or HPKE_PRIVATE_KEY) is required in OHTTP mode. \
-                 Generate a key: openssl rand -hex 32"
-            );
-        }
+        // HPKE_KEYS (or HPKE_PRIVATE_KEY) is required: settings::startup_checks.
         let ks = hpke::KeyState::new(&config)?;
         info!(
             network = %config.network,
@@ -359,16 +349,7 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
-    // OHTTP mode requires both Redis URLs: replay protection (the security Redis) lives in the
-    // response cache module, and without it every request would be refused with 503 for good.
-    if config.mode == "ohttp"
-        && (config.redis_security_url.is_empty() || config.redis_url.is_empty())
-    {
-        anyhow::bail!(
-            "REDIS_URL and REDIS_SECURITY_URL are required in OHTTP mode (replay protection fails \
-             closed without them). REDIS_SECURITY_URL: a Redis with maxmemory-policy noeviction."
-        );
-    }
+    // OHTTP mode requires both Redis URLs (settings::startup_checks).
 
     let cache_state = if config.redis_url.is_empty() {
         info!("Response cache disabled (REDIS_URL not set)");
@@ -379,7 +360,7 @@ async fn main() -> anyhow::Result<()> {
         // CACHE_KEY_BACKEND overrides the backend name in cache keys. Set it on a backfill-only
         // instance that fetches from its own lwd but must write the pinned keys the serving
         // gateways read (e.g. "lwd.example:9067").
-        let backend_host = std::env::var("CACHE_KEY_BACKEND")
+        let backend_host = crate::config_source::var("CACHE_KEY_BACKEND")
             .ok()
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| config.lwd_addr.clone());
@@ -423,11 +404,12 @@ async fn main() -> anyhow::Result<()> {
                 info!(network = %network, "Redis cache connected, starting tip poller");
 
                 // Pinned tier (optional): REDIS_PINNED_URL + PINNED_TREESTATE_RANGE.
-                let pinned_url = std::env::var("REDIS_PINNED_URL").unwrap_or_default();
-                let pinned_range = std::env::var("PINNED_TREESTATE_RANGE").unwrap_or_default();
+                let pinned_url = crate::config_source::var("REDIS_PINNED_URL").unwrap_or_default();
+                let pinned_range =
+                    crate::config_source::var("PINNED_TREESTATE_RANGE").unwrap_or_default();
                 // REDIS_PINNED_WRITE_URL (optional): where pinned entries are written when
                 // REDIS_PINNED_URL is a read replica (its primary).
-                let pinned_write_url = std::env::var("REDIS_PINNED_WRITE_URL")
+                let pinned_write_url = crate::config_source::var("REDIS_PINNED_WRITE_URL")
                     .ok()
                     .filter(|u| !u.trim().is_empty());
                 let c = if pinned_url.is_empty() || pinned_range.is_empty() {
@@ -704,11 +686,11 @@ async fn main() -> anyhow::Result<()> {
 
     // Per-process in-memory LRU in front of Redis (LOCAL_CACHE_BYTES, default 256 MiB, 0 = off;
     // values over LOCAL_CACHE_MAX_ENTRY_BYTES, default 64 KiB, are not admitted).
-    let local_cache_bytes: u64 = std::env::var("LOCAL_CACHE_BYTES")
+    let local_cache_bytes: u64 = crate::config_source::var("LOCAL_CACHE_BYTES")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(local::DEFAULT_LOCAL_CACHE_BYTES);
-    let local_cache_max_entry: usize = std::env::var("LOCAL_CACHE_MAX_ENTRY_BYTES")
+    let local_cache_max_entry: usize = crate::config_source::var("LOCAL_CACHE_MAX_ENTRY_BYTES")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(local::DEFAULT_LOCAL_CACHE_MAX_ENTRY_BYTES);
@@ -734,17 +716,17 @@ async fn main() -> anyhow::Result<()> {
     // PERMANENT_OP_TIMEOUT_MS (default 2000) is separate from REDIS_OP_TIMEOUT_MS: one MGET of
     // a batch of large blocks can be several MB read from disk, which the 250 ms cache budget
     // would turn into fail-open misses that go to lightwalletd instead.
-    let permanent_min_height: u64 = std::env::var("PERMANENT_MIN_HEIGHT")
+    let permanent_min_height: u64 = crate::config_source::var("PERMANENT_MIN_HEIGHT")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or_else(|| store::sapling_activation(&config.network));
-    let permanent_op_timeout_ms: u64 = std::env::var("PERMANENT_OP_TIMEOUT_MS")
+    let permanent_op_timeout_ms: u64 = crate::config_source::var("PERMANENT_OP_TIMEOUT_MS")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(2_000);
     let permanent_store: Option<Arc<cache::PermanentRedis>> = match (
         &cache_state,
-        std::env::var("PERMANENT_REDIS_URL").unwrap_or_default(),
+        crate::config_source::var("PERMANENT_REDIS_URL").unwrap_or_default(),
     ) {
         (Some(_), url) if !url.is_empty() => {
             match cache::PermanentRedis::connect(
@@ -801,13 +783,7 @@ async fn main() -> anyhow::Result<()> {
     });
     // CHAIN_TIP_STALE_SECS: a stored tip unmoved for longer makes the followers compare it with
     // their own lightwalletd (chain.rs, "Stale leader").
-    let chain_tip_stale_after = match std::env::var("CHAIN_TIP_STALE_SECS") {
-        Ok(v) if !v.trim().is_empty() => match v.trim().parse::<u64>() {
-            Ok(n) if n > 0 => Duration::from_secs(n),
-            _ => anyhow::bail!("CHAIN_TIP_STALE_SECS must be a positive integer, got '{v}'"),
-        },
-        _ => chain::DEFAULT_TIP_STALE_AFTER,
-    };
+    let chain_tip_stale_after = settings::chain_tip_stale_after()?;
     // PREFETCH_TIP / PREFETCH_BLOCK_TXS / PREFETCH_BLOCK_TXS_MAX (prefetch.rs).
     let prefetch_config = prefetch::PrefetchConfig::from_env()?;
     let follower = cache_state.as_ref().map(|c| {
@@ -840,13 +816,7 @@ async fn main() -> anyhow::Result<()> {
     });
 
     // Global in-flight limit on OHTTP requests, held until each response body ends.
-    let max_inflight_requests = match std::env::var("MAX_INFLIGHT_REQUESTS") {
-        Ok(v) if !v.trim().is_empty() => match v.trim().parse::<usize>() {
-            Ok(n) if n > 0 => n,
-            _ => anyhow::bail!("MAX_INFLIGHT_REQUESTS must be a positive integer, got '{v}'"),
-        },
-        _ => DEFAULT_MAX_INFLIGHT_REQUESTS,
-    };
+    let max_inflight_requests = settings::max_inflight_requests()?;
     info!(
         max_inflight_requests,
         "Global in-flight OHTTP request limit"
@@ -946,7 +916,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Pinned tier backfill: PINNED_BACKFILL_WORKERS per process (0/unset = write-through only).
-    let backfill_workers: usize = std::env::var("PINNED_BACKFILL_WORKERS")
+    let backfill_workers: usize = crate::config_source::var("PINNED_BACKFILL_WORKERS")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
@@ -1265,10 +1235,6 @@ pub struct AppState {
 
 /// Largest Encapsulated Request the gateway reads (ZIP: Gateways and Relays accept at least 10 MiB).
 const MAX_ENCAPSULATED_REQUEST_BYTES: usize = 10 * 1024 * 1024;
-
-/// MAX_INFLIGHT_REQUESTS default. Above the ZIP's reference (256) because every mempool long
-/// poll and block range stream holds a permit for its whole duration.
-const DEFAULT_MAX_INFLIGHT_REQUESTS: usize = 1024;
 
 /// Builds the one kind of answer the gateway gives once a request has been opened: a chunked
 /// OHTTP response (`message/ohttp-chunked-res`) sealed under the request's context, streamed

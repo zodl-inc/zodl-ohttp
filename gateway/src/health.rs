@@ -597,8 +597,13 @@ lazy_static::lazy_static! {
 // Where the routing policy comes from (CONFIG_SOURCE).
 lazy_static::lazy_static! {
     static ref OHTTP_CONFIG_INFO: IntGaugeVec = IntGaugeVec::new(
-        Opts::new("ohttp_config_info", "The routing policy in force, 1 on every serving process: its source (CONFIG_SOURCE: env, compare, file) and digest (the first 16 hex digits of the SHA-256 of the canonical behaviour form of the policy, the same for a file and the environment it stands for; not of the JSON --print-effective-config prints)"),
-        &["source", "digest"]
+        Opts::new("ohttp_config_info", "The routing policy in force, 1 on every serving process: its source (CONFIG_SOURCE: env, compare, file) and digest (the first 16 hex digits of the SHA-256 of the canonical behaviour form of the policy, the same for a file and the environment it stands for; not of the JSON --print-effective-config prints); tuning_digest: the same for the tuning settings in force (no deployment setting, no secret)"),
+        &["source", "digest", "tuning_digest"]
+    )
+    .unwrap();
+    static ref OHTTP_CONFIG_SETTINGS_COMPARE_MATCH: IntGauge = IntGauge::new(
+        "ohttp_config_settings_compare_match",
+        "CONFIG_SOURCE=compare, when the configuration files carry the settings (a [settings] table in the common file, or a host file): 1 when their settings equal the environment's, 0 when they differ or the files do not load"
     )
     .unwrap();
     static ref OHTTP_CONFIG_COMPARE_MATCH: IntGauge = IntGauge::new(
@@ -1425,11 +1430,15 @@ impl LwdErrorPolicy {
 
     pub fn from_env() -> anyhow::Result<Self> {
         Self::parse(
-            std::env::var("HEALTHZ_LWD_ERROR_RATIO").ok().as_deref(),
-            std::env::var("HEALTHZ_LWD_ERROR_WINDOW_SECS")
+            crate::config_source::var("HEALTHZ_LWD_ERROR_RATIO")
                 .ok()
                 .as_deref(),
-            std::env::var("HEALTHZ_LWD_MIN_ERRORS").ok().as_deref(),
+            crate::config_source::var("HEALTHZ_LWD_ERROR_WINDOW_SECS")
+                .ok()
+                .as_deref(),
+            crate::config_source::var("HEALTHZ_LWD_MIN_ERRORS")
+                .ok()
+                .as_deref(),
         )
     }
 
@@ -2119,12 +2128,22 @@ pub fn record_query_value_source_success(network: &str, source: &str) {
         .set(now);
 }
 
-/// The routing policy in force: `source` (`env`, `compare`, `file`) and its digest.
-pub fn set_config_info(source: &str, digest: &str) {
+/// The routing policy in force: `source` (`env`, `compare`, `file`), its digest and the digest
+/// of the tuning settings in force.
+pub fn set_config_info(source: &str, digest: &str, tuning_digest: &str) {
     OHTTP_CONFIG_INFO.reset();
     OHTTP_CONFIG_INFO
-        .with_label_values(&[source, digest])
+        .with_label_values(&[source, digest, tuning_digest])
         .set(1);
+}
+
+/// `CONFIG_SOURCE=compare` with files that carry the settings: whether their settings equal
+/// the environment's. The series exists in that case only.
+pub fn set_config_settings_compare_match(matches: bool) {
+    REGISTRY
+        .register(Box::new(OHTTP_CONFIG_SETTINGS_COMPARE_MATCH.clone()))
+        .ok();
+    OHTTP_CONFIG_SETTINGS_COMPARE_MATCH.set(i64::from(matches));
 }
 
 /// `CONFIG_SOURCE=compare`: whether the file's policy equals the environment's. The series

@@ -1,10 +1,14 @@
-# An example configuration file of the gateway (CONFIG_SOURCE=compare or file, --config or
-# GATEWAY_CONFIG_FILE; see CONFIG.md "Configuration file"). Placeholder names and values only.
+# An example common configuration file of the gateway (CONFIG_SOURCE=compare or file, --config
+# or GATEWAY_CONFIG_FILE; see CONFIG.md "Configuration file"). Placeholder names and values only.
 #
-# The file holds the routing policy; addresses, stores, keys and every other setting stay in
-# the environment. Every list entry is written in the grammar of the variable it stands for.
-# `zodl-ohttp-gateway --export-config` prints the file of the current environment;
-# `zodl-ohttp-gateway --config gateway.toml --check-config` checks one.
+# The file holds the routing policy and, in [settings], the settings that are the same on every
+# origin of a network (tuning, and references to the secrets they share). The per-host settings
+# (addresses, stores, identity, sizing) go in the host file (host.example.toml). Without a
+# [settings] table and without a host file, every setting stays in the environment. Every list
+# entry is written in the grammar of the variable it stands for.
+# `zodl-ohttp-gateway --export-config` prints the file of the current environment's policy,
+# `--export-config --host host.toml` the two files of all of it;
+# `zodl-ohttp-gateway --config gateway.toml --host-config host.toml --check-config` checks them.
 
 schema = 1
 gateway_hosts = ["gateway.example"]            # GATEWAY_HOSTS
@@ -16,6 +20,9 @@ relay_secret_on_key_config = "require"         # RELAY_SECRET_ON_KEY_CONFIG
 prices_key = { env = "PRICES_API_KEY" }
 swap_jwt = { file = "/run/secrets/swap_jwt" }  # the file's content, without its final line break
 quotes_key = { env = "QUOTES_API_KEY" }
+hpke_keys = { file = "/run/secrets/hpke_keys" }
+relay_secrets = { file = "/run/secrets/relay_secrets" }
+configs_signing_seed = { file = "/run/secrets/configs_signing_seed" }
 
 # One BACKENDS alias per table.
 [integrations.prices]
@@ -94,3 +101,20 @@ sources = [                                    # DYNAMIC_HOST_SOURCES, one table
 [host_list]
 publish = "all"                                # THIRD_PARTY_HOSTS_PUBLISH
 max_age_secs = 300                             # THIRD_PARTY_HOSTS_MAX_AGE_SECS
+
+# The settings common to every origin: each key is its variable in lower case, each value typed
+# (integers, numbers, true/false, strings, arrays of strings); a key left out is the variable's
+# default. A secret only as a reference to a [secrets] entry.
+[settings]
+lwd_timeout_secs = 80                          # LWD_TIMEOUT_SECS
+max_block_range = 10000                        # MAX_BLOCK_RANGE
+max_inflight_upstream = 256                    # MAX_INFLIGHT_UPSTREAM
+local_cache_bytes = 268435456                  # LOCAL_CACHE_BYTES
+healthz_lwd_error_ratio = 0.2                  # HEALTHZ_LWD_ERROR_RATIO
+prefetch_tree_state = true                     # PREFETCH_TREE_STATE
+response_padding = "on"                        # RESPONSE_PADDING
+replay_freshness = "enforce"                   # REPLAY_FRESHNESS
+pinned_treestate_range = "1-"                  # PINNED_TREESTATE_RANGE
+hpke_keys = { secret = "hpke_keys" }           # HPKE_KEYS
+relay_secrets = { secret = "relay_secrets" }   # RELAY_SECRETS
+configs_signing_seed_hex = { secret = "configs_signing_seed" }   # CONFIGS_SIGNING_SEED_HEX

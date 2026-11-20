@@ -61,6 +61,7 @@ pub mod prefetch;
 pub mod replication;
 pub mod rpc_cache;
 pub mod server;
+pub mod settings;
 pub mod singleflight;
 pub mod store;
 pub mod store_conn;

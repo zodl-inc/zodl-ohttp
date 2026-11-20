@@ -222,18 +222,24 @@ impl Settings {
 
     pub fn from_env(lwd_addr: &str) -> anyhow::Result<Self> {
         // The same value and default as `Config::max_inflight_lwd`.
-        let max_inflight_lwd = std::env::var("MAX_INFLIGHT_LWD")
+        let max_inflight_lwd = crate::config_source::var("MAX_INFLIGHT_LWD")
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(128);
         Self::parse(
             lwd_addr,
-            std::env::var("LWD_ENDPOINTS").ok().as_deref(),
-            std::env::var("LWD_CONNECT_TIMEOUT_MS").ok().as_deref(),
+            crate::config_source::var("LWD_ENDPOINTS").ok().as_deref(),
+            crate::config_source::var("LWD_CONNECT_TIMEOUT_MS")
+                .ok()
+                .as_deref(),
         )?
         .with_hedging(
-            std::env::var("LWD_HEDGE_DELAY_MS").ok().as_deref(),
-            std::env::var("LWD_HEDGE_MAX_INFLIGHT").ok().as_deref(),
+            crate::config_source::var("LWD_HEDGE_DELAY_MS")
+                .ok()
+                .as_deref(),
+            crate::config_source::var("LWD_HEDGE_MAX_INFLIGHT")
+                .ok()
+                .as_deref(),
             max_inflight_lwd,
         )
     }

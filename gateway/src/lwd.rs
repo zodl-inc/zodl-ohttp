@@ -59,11 +59,16 @@ type LwdClient = Client<HttpConnector, Full<axum::body::Bytes>>;
 fn pooled() -> &'static Option<arc_swap::ArcSwap<LwdClient>> {
     static POOLED: OnceLock<Option<arc_swap::ArcSwap<LwdClient>>> = OnceLock::new();
     POOLED.get_or_init(|| {
-        let on = std::env::var("LWD_CONNECTION_POOL")
-            .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "on"))
+        let on = crate::config_source::var("LWD_CONNECTION_POOL")
+            .map(|v| connection_pool_on(&v))
             .unwrap_or(false);
         on.then(|| arc_swap::ArcSwap::from_pointee(new_pooled_client()))
     })
+}
+
+/// `LWD_CONNECTION_POOL`: `1`, `true` or `on` (trimmed, any case) is on, anything else off.
+pub fn connection_pool_on(v: &str) -> bool {
+    matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "on")
 }
 
 fn new_pooled_client() -> LwdClient {
@@ -210,9 +215,15 @@ impl LwdDeadlines {
 
     pub fn from_env() -> Result<Self> {
         Self::parse_with_send(
-            std::env::var("LWD_UNARY_TIMEOUT_SECS").ok().as_deref(),
-            std::env::var("LWD_STREAM_IDLE_SECS").ok().as_deref(),
-            std::env::var("LWD_SEND_TIMEOUT_SECS").ok().as_deref(),
+            crate::config_source::var("LWD_UNARY_TIMEOUT_SECS")
+                .ok()
+                .as_deref(),
+            crate::config_source::var("LWD_STREAM_IDLE_SECS")
+                .ok()
+                .as_deref(),
+            crate::config_source::var("LWD_SEND_TIMEOUT_SECS")
+                .ok()
+                .as_deref(),
         )
     }
 }

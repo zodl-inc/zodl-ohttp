@@ -84,8 +84,10 @@ impl Default for Settings {
 impl Settings {
     pub fn from_env(replay_ttl_secs: u64) -> anyhow::Result<Self> {
         Self::parse(
-            std::env::var("REPLAY_FRESHNESS").ok().as_deref(),
-            std::env::var("REPLAY_FRESHNESS_WINDOW_SECS")
+            crate::config_source::var("REPLAY_FRESHNESS")
+                .ok()
+                .as_deref(),
+            crate::config_source::var("REPLAY_FRESHNESS_WINDOW_SECS")
                 .ok()
                 .as_deref(),
             replay_ttl_secs,

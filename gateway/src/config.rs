@@ -17,7 +17,6 @@
 // Configuration — Environment variables
 
 use std::collections::HashMap;
-use std::env;
 
 /// One accepted `X-Relay-Secret` and the relay it belongs to.
 ///
@@ -298,10 +297,11 @@ pub struct Config {
 
 impl Config {
     pub fn from_env() -> anyhow::Result<Self> {
-        let mode = env::var("GATEWAY_MODE").unwrap_or_else(|_| "ohttp".to_string());
+        let mode =
+            crate::config_source::var("GATEWAY_MODE").unwrap_or_else(|_| "ohttp".to_string());
         // Network detection: use NETWORK env var if set, otherwise derive from mode if it's
         // "mainnet" or "testnet", otherwise default to "mainnet"
-        let network = env::var("NETWORK")
+        let network = crate::config_source::var("NETWORK")
             .ok()
             .filter(|s| !s.is_empty())
             .or_else(|| {
@@ -330,8 +330,8 @@ impl Config {
 
         // Parse relay secrets (comma-separated for rotation support)
         // Error if both RELAY_SECRET and RELAY_SECRETS are set, instead of letting one silently shadow the other.
-        let relay_secret_set = env::var("RELAY_SECRET").is_ok();
-        let relay_secrets_set = env::var("RELAY_SECRETS").is_ok();
+        let relay_secret_set = crate::config_source::var("RELAY_SECRET").is_ok();
+        let relay_secrets_set = crate::config_source::var("RELAY_SECRETS").is_ok();
 
         if relay_secret_set && relay_secrets_set {
             anyhow::bail!(
@@ -340,8 +340,8 @@ impl Config {
             );
         }
 
-        let relay_secrets_raw = env::var("RELAY_SECRET")
-            .or_else(|_| env::var("RELAY_SECRETS"))
+        let relay_secrets_raw = crate::config_source::var("RELAY_SECRET")
+            .or_else(|_| crate::config_source::var("RELAY_SECRETS"))
             .ok()
             .filter(|s| !s.is_empty());
 
@@ -350,17 +350,19 @@ impl Config {
             None => Vec::new(),
         };
 
-        let allow_unauthenticated = env::var("ALLOW_UNAUTHENTICATED_RELAY")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        let allow_unauthenticated = crate::config_source::var("ALLOW_UNAUTHENTICATED_RELAY")
+            .map(|v| flag_on(&v))
             .unwrap_or(false);
 
         // Parse HPKE_KEYS: "key_id:hex_private_key,key_id:hex_private_key,..."
         // Strict parsing: reject malformed entries with a clear error instead of silently ignoring them.
-        let hpke_keys: Vec<(u8, String)> =
-            match env::var("HPKE_KEYS").ok().filter(|s| !s.is_empty()) {
-                Some(raw) => parse_hpke_keys("HPKE_KEYS", &raw)?,
-                None => Vec::new(),
-            };
+        let hpke_keys: Vec<(u8, String)> = match crate::config_source::var("HPKE_KEYS")
+            .ok()
+            .filter(|s| !s.is_empty())
+        {
+            Some(raw) => parse_hpke_keys("HPKE_KEYS", &raw)?,
+            None => Vec::new(),
+        };
 
         // Parse backends policy with strict validation
         let backends_policy = zodl_ohttp_integrations::core::policy::parse_backends_policy(
@@ -372,23 +374,26 @@ impl Config {
             .unwrap_or(false);
 
         let config = Self {
-            port: env::var("PORT")
+            port: crate::config_source::var("PORT")
                 .unwrap_or_else(|_| "8080".to_string())
                 .parse()?,
-            lwd_addr: env::var("LWD_ADDR").unwrap_or_else(|_| "localhost:9067".to_string()),
+            lwd_addr: crate::config_source::var("LWD_ADDR")
+                .unwrap_or_else(|_| "localhost:9067".to_string()),
             mode,
             relay_secrets,
             allow_unauthenticated_relay: allow_unauthenticated,
-            hpke_private_key: env::var("HPKE_PRIVATE_KEY").ok().filter(|s| !s.is_empty()),
-            hpke_key_id: env::var("HPKE_KEY_ID")
+            hpke_private_key: crate::config_source::var("HPKE_PRIVATE_KEY")
+                .ok()
+                .filter(|s| !s.is_empty()),
+            hpke_key_id: crate::config_source::var("HPKE_KEY_ID")
                 .unwrap_or_else(|_| "1".to_string())
                 .parse()?,
             hpke_keys,
-            lwd_timeout_secs: env::var("LWD_TIMEOUT_SECS")
+            lwd_timeout_secs: crate::config_source::var("LWD_TIMEOUT_SECS")
                 .unwrap_or_else(|_| "80".to_string())
                 .parse()?,
             long_poll_max_initial_silence_secs: {
-                let raw: u64 = env::var("LONG_POLL_MAX_INITIAL_SILENCE_SECS")
+                let raw: u64 = crate::config_source::var("LONG_POLL_MAX_INITIAL_SILENCE_SECS")
                     .unwrap_or_else(|_| "25".to_string())
                     .parse()?;
                 if raw > 25 {
@@ -402,7 +407,7 @@ impl Config {
                 }
             },
             long_poll_idle_secs: {
-                let raw: u64 = env::var("LONG_POLL_IDLE_SECS")
+                let raw: u64 = crate::config_source::var("LONG_POLL_IDLE_SECS")
                     .unwrap_or_else(|_| "3".to_string())
                     .parse()?;
                 if raw > 25 {
@@ -416,7 +421,7 @@ impl Config {
                 }
             },
             sse_keepalive_secs: {
-                let raw: u64 = env::var("SSE_KEEPALIVE_SECS")
+                let raw: u64 = crate::config_source::var("SSE_KEEPALIVE_SECS")
                     .unwrap_or_else(|_| "20".to_string())
                     .parse()?;
                 if raw == 0 {
@@ -434,8 +439,8 @@ impl Config {
                     raw
                 }
             },
-            redis_url: env::var("REDIS_URL").unwrap_or_default(),
-            redis_security_url: env::var("REDIS_SECURITY_URL").unwrap_or_default(),
+            redis_url: crate::config_source::var("REDIS_URL").unwrap_or_default(),
+            redis_security_url: crate::config_source::var("REDIS_SECURITY_URL").unwrap_or_default(),
             // Strict parsing: a malformed entry is an error, never skipped.
             backends: zodl_ohttp_integrations::core::policy::parse_backends(
                 &crate::config_source::var("BACKENDS").unwrap_or_default(),
@@ -450,81 +455,83 @@ impl Config {
                 .filter(|s| !s.is_empty())
                 .collect(),
             network,
-            log_outer_header_names: env::var("LOG_OUTER_HEADER_NAMES")
-                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            log_outer_header_names: crate::config_source::var("LOG_OUTER_HEADER_NAMES")
+                .map(|v| flag_on(&v))
                 .unwrap_or(false),
             gateway_hosts,
             backends_policy,
             backends_policy_default_allow,
-            max_upstream_response_bytes: env::var("MAX_UPSTREAM_RESPONSE_BYTES")
+            max_upstream_response_bytes: crate::config_source::var("MAX_UPSTREAM_RESPONSE_BYTES")
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(64 * 1024 * 1024),
-            max_inflight_upstream: env::var("MAX_INFLIGHT_UPSTREAM")
+            max_inflight_upstream: crate::config_source::var("MAX_INFLIGHT_UPSTREAM")
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(256),
-            max_inflight_per_backend: env::var("MAX_INFLIGHT_PER_BACKEND")
+            max_inflight_per_backend: crate::config_source::var("MAX_INFLIGHT_PER_BACKEND")
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(64),
-            max_inflight_lwd: env::var("MAX_INFLIGHT_LWD")
+            max_inflight_lwd: crate::config_source::var("MAX_INFLIGHT_LWD")
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(128),
-            max_inflight_lwd_heavy: env::var("MAX_INFLIGHT_LWD_HEAVY")
+            max_inflight_lwd_heavy: crate::config_source::var("MAX_INFLIGHT_LWD_HEAVY")
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or_else(|| {
-                    (env::var("MAX_INFLIGHT_LWD")
+                    (crate::config_source::var("MAX_INFLIGHT_LWD")
                         .ok()
                         .and_then(|s| s.parse::<usize>().ok())
                         .unwrap_or(128)
                         / 4)
                     .max(1)
                 }),
-            lwd_heavy_block_range: env::var("LWD_HEAVY_BLOCK_RANGE")
+            lwd_heavy_block_range: crate::config_source::var("LWD_HEAVY_BLOCK_RANGE")
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(100),
             // At least 10 000: the ZIP requires that floor unless coordinated with Clients.
-            max_block_range: env::var("MAX_BLOCK_RANGE")
+            max_block_range: crate::config_source::var("MAX_BLOCK_RANGE")
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(10_000),
-            lwd_permit_wait_ms: env::var("LWD_PERMIT_WAIT_MS")
+            lwd_permit_wait_ms: crate::config_source::var("LWD_PERMIT_WAIT_MS")
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(2000),
-            lwd_permit_max_waiters: env::var("LWD_PERMIT_MAX_WAITERS")
+            lwd_permit_max_waiters: crate::config_source::var("LWD_PERMIT_MAX_WAITERS")
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(0),
-            redis_op_timeout_ms: env::var("REDIS_OP_TIMEOUT_MS")
+            redis_op_timeout_ms: crate::config_source::var("REDIS_OP_TIMEOUT_MS")
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(250),
-            max_cache_get_concurrency: env::var("MAX_CACHE_GET_CONCURRENCY")
+            max_cache_get_concurrency: crate::config_source::var("MAX_CACHE_GET_CONCURRENCY")
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(64),
-            max_large_response_concurrency: env::var("MAX_LARGE_RESPONSE_CONCURRENCY")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(1),
-            large_response_threshold: env::var("LARGE_RESPONSE_THRESHOLD")
+            max_large_response_concurrency: crate::config_source::var(
+                "MAX_LARGE_RESPONSE_CONCURRENCY",
+            )
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1),
+            large_response_threshold: crate::config_source::var("LARGE_RESPONSE_THRESHOLD")
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(8 * 1024 * 1024),
-            configs_signing_seed: env::var("CONFIGS_SIGNING_SEED_HEX")
+            configs_signing_seed: crate::config_source::var("CONFIGS_SIGNING_SEED_HEX")
                 .ok()
                 .filter(|s| !s.is_empty()),
-            chunk_size: parse_chunk_size(env::var("CHUNK_SIZE").ok().as_deref())?,
-            chunk_flush_ms: env::var("CHUNK_FLUSH_MS")
+            chunk_size: parse_chunk_size(crate::config_source::var("CHUNK_SIZE").ok().as_deref())?,
+            chunk_flush_ms: crate::config_source::var("CHUNK_FLUSH_MS")
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(50),
-            flexa_publishable_key: env::var("FLEXA_PUBLISHABLE_KEY")
+            flexa_publishable_key: crate::config_source::var("FLEXA_PUBLISHABLE_KEY")
                 .ok()
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty()),
@@ -558,6 +565,12 @@ impl Config {
             ..config
         })
     }
+}
+
+/// `ALLOW_UNAUTHENTICATED_RELAY`, `LOG_OUTER_HEADER_NAMES`: `1` or `true` (any case, not
+/// trimmed) is on, anything else off.
+pub fn flag_on(v: &str) -> bool {
+    v == "1" || v.eq_ignore_ascii_case("true")
 }
 
 /// An alias host from `var` (trimmed, lowercase), `None` when unset or empty.
@@ -652,7 +665,7 @@ pub fn parse_hpke_keys(var: &str, raw: &str) -> anyhow::Result<Vec<(u8, String)>
 /// `/ohttp-configs` (key rotation: a key is accepted before it is advertised and after it is no
 /// longer advertised). Unset or empty: none.
 pub fn hpke_accept_only_keys_from_env() -> anyhow::Result<Vec<(u8, String)>> {
-    match env::var("HPKE_ACCEPT_ONLY_KEYS")
+    match crate::config_source::var("HPKE_ACCEPT_ONLY_KEYS")
         .ok()
         .filter(|s| !s.trim().is_empty())
     {

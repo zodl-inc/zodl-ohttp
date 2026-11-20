@@ -61,7 +61,11 @@ impl fmt::Display for Mode {
 
 impl Mode {
     pub fn from_env() -> anyhow::Result<Self> {
-        Self::parse(std::env::var("RESPONSE_PADDING").ok().as_deref())
+        Self::parse(
+            crate::config_source::var("RESPONSE_PADDING")
+                .ok()
+                .as_deref(),
+        )
     }
 
     pub fn parse(value: Option<&str>) -> anyhow::Result<Self> {
