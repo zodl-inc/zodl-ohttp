@@ -1,0 +1,160 @@
+schema = 1
+gateway_hosts = ["gateway-testnet.example"]
+relay_secret_on_key_config = "require"
+
+[secrets]
+# A new variable: set it to the header value this secret stands for.
+NEAR_EXAMPLE_AUTHORIZATION = { env = "NEAR_EXAMPLE_AUTHORIZATION" }
+# A new variable: set it to the header value this secret stands for.
+PRICES_EXAMPLE_X_PRICES_API_KEY = { env = "PRICES_EXAMPLE_X_PRICES_API_KEY" }
+
+[integrations."files.example"]
+alias = "files.example"
+upstream = "https://files.example"
+routes = [
+  "GET /example-org/voting-config/*",
+]
+
+[integrations."near.example"]
+alias = "near.example"
+upstream = "https://near-api.example"
+kind = "near"
+routes = [
+  "GET /v0/tokens",
+  "POST /v0/quote",
+  "GET /v0/status",
+  "POST /v0/deposit/submit",
+]
+headers = [
+  { name = "Authorization", value = "{secret}", secret = "NEAR_EXAMPLE_AUTHORIZATION" },
+]
+cache = [
+  "GET /v0/tokens@300",
+]
+read_routes = [
+  "GET /v0/tokens",
+  "GET /v0/status",
+]
+rate_limit = "120/60s"
+
+[integrations."prices.example"]
+alias = "prices.example"
+upstream = "https://prices-api.example"
+routes = [
+  "GET /v1/cryptocurrency/quotes/latest",
+  "GET /v1/fiat/map",
+  "GET /v1/key/info",
+]
+headers = [
+  { name = "X-PRICES_API_KEY", value = "{secret}", secret = "PRICES_EXAMPLE_X_PRICES_API_KEY" },
+]
+cache = [
+  "GET /v1/cryptocurrency/quotes/latest@120",
+  "GET /v1/fiat/map@21600",
+]
+query_rules = [
+  "GET /v1/cryptocurrency/quotes/latest?symbol=ZEC&convert={from:fiat}",
+  "GET /v1/fiat/map?",
+]
+read_routes = [
+  "GET /*",
+]
+rate_limit = "10/60s"
+
+[integrations."service.example"]
+alias = "service.example"
+upstream = "https://service.example"
+routes = [
+  "GET /v1/info",
+  "POST /v1/slots",
+  "GET /v1/slots/*",
+  "POST /v1/slots/*",
+]
+read_routes = [
+  "GET /v1/info",
+  "GET /v1/slots/*",
+]
+
+[integrations."vote.example"]
+alias = "vote.example"
+upstream = "https://voting.example"
+routes = [
+  "GET /*",
+  "POST /*",
+  "PUT /*",
+  "DELETE /*",
+  "HEAD /*",
+  "OPTIONS /*",
+]
+read_routes = [
+  "GET /*",
+]
+
+[integrations."voting.example"]
+alias = "voting.example"
+upstream = "https://voting.example"
+routes = [
+  "GET /*",
+  "POST /*",
+  "PUT /*",
+  "DELETE /*",
+  "HEAD /*",
+  "OPTIONS /*",
+]
+read_routes = [
+  "GET /*",
+]
+
+[hosts."flexa.example"]
+read_routes = [
+  "GET /*",
+]
+
+[hosts."gateway-testnet.example"]
+routes = [
+  "POST /cash.z.wallet.sdk.rpc.CompactTxStreamer/*",
+]
+
+[hosts.lwd]
+read_routes = [
+  "POST /cash.z.wallet.sdk.rpc.CompactTxStreamer/GetLatestBlock",
+  "POST /cash.z.wallet.sdk.rpc.CompactTxStreamer/GetBlock",
+  "POST /cash.z.wallet.sdk.rpc.CompactTxStreamer/GetBlockNullifiers",
+  "POST /cash.z.wallet.sdk.rpc.CompactTxStreamer/GetBlockRange",
+  "POST /cash.z.wallet.sdk.rpc.CompactTxStreamer/GetBlockRangeNullifiers",
+  "POST /cash.z.wallet.sdk.rpc.CompactTxStreamer/GetTransaction",
+  "POST /cash.z.wallet.sdk.rpc.CompactTxStreamer/GetTaddressTxids",
+  "POST /cash.z.wallet.sdk.rpc.CompactTxStreamer/GetTaddressBalance",
+  "POST /cash.z.wallet.sdk.rpc.CompactTxStreamer/GetTaddressBalanceStream",
+  "POST /cash.z.wallet.sdk.rpc.CompactTxStreamer/GetMempoolTx",
+  "POST /cash.z.wallet.sdk.rpc.CompactTxStreamer/GetMempoolStream",
+  "POST /cash.z.wallet.sdk.rpc.CompactTxStreamer/GetTreeState",
+  "POST /cash.z.wallet.sdk.rpc.CompactTxStreamer/GetLatestTreeState",
+  "POST /cash.z.wallet.sdk.rpc.CompactTxStreamer/GetSubtreeRoots",
+  "POST /cash.z.wallet.sdk.rpc.CompactTxStreamer/GetAddressUtxos",
+  "POST /cash.z.wallet.sdk.rpc.CompactTxStreamer/GetAddressUtxosStream",
+  "POST /cash.z.wallet.sdk.rpc.CompactTxStreamer/GetLightdInfo",
+  "POST /cash.z.wallet.sdk.rpc.CompactTxStreamer/Ping",
+]
+one_sided_write_routes = [
+  "POST /cash.z.wallet.sdk.rpc.CompactTxStreamer/SendTransaction",
+]
+
+[value_sources.fiat]
+alias = "prices.example"
+route = "GET /v1/fiat/map"
+pointer = "/data/*/symbol"
+refresh_secs = 21600
+fallback = ["AED", "ALL", "AMD", "ARS", "AUD", "AZN", "BAM", "BDT", "BGN", "BHD", "BMD", "BOB", "BRL", "BYN", "CAD", "CHF", "CLP", "CNY", "COP", "CRC", "CUP", "CZK", "DKK", "DOP", "DZD", "EGP", "EUR", "GBP", "GEL", "GHS", "GTQ", "HKD", "HNL", "HRK", "HUF", "IDR", "ILS", "INR", "IQD", "IRR", "ISK", "JMD", "JOD", "JPY", "KES", "KGS", "KHR", "KRW", "KWD", "KZT", "LBP", "LKR", "MAD", "MDL", "MKD", "MMK", "MNT", "MUR", "MXN", "MYR", "NAD", "NGN", "NIO", "NOK", "NPR", "NZD", "OMR", "PAB", "PEN", "PHP", "PKR", "PLN", "QAR", "RON", "RSD", "RUB", "SAR", "SEK", "SGD", "SSP", "THB", "TND", "TRY", "TTD", "TWD", "UAH", "UGX", "USD", "UYU", "UZS", "VES", "VND", "ZAR"]
+
+[dynamic_hosts]
+deny_cidrs = [
+  "192.0.2.0/28",
+  "2001:db8::/32",
+]
+sources = [
+  { lists = [{ pointer = "/hosts_a", read_routes = "GET /*", routes = "GET /*,POST /*,PUT /*,DELETE /*,HEAD /*,OPTIONS /*", url_field = "url" }, { pointer = "/hosts_b", read_routes = "GET /a,GET /b,GET /c/d,POST /d/query", routes = "GET /a,GET /b,GET /c/d,POST /d/query", url_field = "url" }], max_hosts = 40, name = "voting", url = "https://voting.example/prod/dynamic-voting-config.json" },
+]
+
+[host_list]
+publish = "all"

@@ -1,0 +1,96 @@
+# An example configuration file of the gateway (CONFIG_SOURCE=compare or file, --config or
+# GATEWAY_CONFIG_FILE; see CONFIG.md "Configuration file"). Placeholder names and values only.
+#
+# The file holds the routing policy; addresses, stores, keys and every other setting stay in
+# the environment. Every list entry is written in the grammar of the variable it stands for.
+# `zodl-ohttp-gateway --export-config` prints the file of the current environment;
+# `zodl-ohttp-gateway --config gateway.toml --check-config` checks one.
+
+schema = 1
+gateway_hosts = ["gateway.example"]            # GATEWAY_HOSTS
+backends_policy_default = "deny"               # BACKENDS_POLICY_DEFAULT
+relay_secret_on_key_config = "require"         # RELAY_SECRET_ON_KEY_CONFIG
+
+# Secrets: never in the file, only where to read them.
+[secrets]
+prices_key = { env = "PRICES_API_KEY" }
+swap_jwt = { file = "/run/secrets/swap_jwt" }  # the file's content, without its final line break
+quotes_key = { env = "QUOTES_API_KEY" }
+
+# One BACKENDS alias per table.
+[integrations.prices]
+alias = "prices.example"
+upstream = "https://prices-api.example"
+routes = [                                     # BACKENDS_POLICY
+  "GET /v1/quotes/latest",
+  "GET /v1/fiat/map",
+]
+headers = [                                    # BACKEND_HEADERS
+  { name = "X-Api-Key", value = "{secret}", secret = "prices_key" },
+]
+cache = [                                      # THIRD_PARTY_CACHE_ROUTES
+  "GET /v1/quotes/latest@120",
+  "GET /v1/fiat/map@21600",
+]
+rate_limit = "10/60s"                          # THIRD_PARTY_RATE_LIMITS
+query_rules = [                                # THIRD_PARTY_QUERY_RULES
+  "GET /v1/quotes/latest?symbol=ZEC&convert={from:fiat}",
+  "GET /v1/fiat/map?",
+]
+read_routes = ["GET /*"]                       # REPLAY_READ_ROUTES
+
+[integrations.swap]
+alias = "swap.example"
+upstream = "https://swap-api.example"
+kind = "near"                                  # NEAR_ALIAS (kind = "flexa": FLEXA_ALIAS)
+routes = ["GET /v0/tokens", "POST /v0/quote", "GET /v0/status"]
+headers = [
+  { name = "Authorization", value = "Bearer {secret}", secret = "swap_jwt" },
+]
+cache = ["GET /v0/tokens@300"]
+read_routes = ["GET /v0/tokens", "GET /v0/status"]
+rate_limit = "120/60s"
+
+# kind = "cmc" or "swapkit": a generic alias that must carry a header credential and have a
+# query rule on every route.
+[integrations.quotes]
+alias = "quotes.example"
+upstream = "https://quotes-api.example"
+kind = "swapkit"
+routes = ["GET /tokens", "POST /v1/quote"]
+headers = [{ name = "x-api-key", value = "{secret}", secret = "quotes_key" }]
+query_rules = ["GET /tokens?provider=EXAMPLE", "POST /v1/quote?"]
+
+[integrations.vote]
+alias = "vote.example"
+upstream = "https://voting.example"
+routes = ["GET /*", "POST /*"]
+
+# Authorities that are no alias: a gateway host, the pseudo authority `lwd` of the replay routes.
+[hosts."gateway.example"]
+routes = ["POST /cash.z.wallet.sdk.rpc.CompactTxStreamer/*"]
+
+[hosts.lwd]
+read_routes = [
+  "POST /cash.z.wallet.sdk.rpc.CompactTxStreamer/GetLatestBlock",
+  "POST /cash.z.wallet.sdk.rpc.CompactTxStreamer/GetBlock",
+]
+one_sided_write_routes = ["POST /cash.z.wallet.sdk.rpc.CompactTxStreamer/SendTransaction"]
+
+# THIRD_PARTY_QUERY_VALUE_SOURCES
+[value_sources.fiat]
+alias = "prices.example"
+route = "GET /v1/fiat/map"
+pointer = "/data/*/symbol"
+refresh_secs = 21600
+fallback = ["EUR", "USD"]
+
+[dynamic_hosts]
+deny_cidrs = ["192.0.2.0/24", "2001:db8::/32"]   # DYNAMIC_HOSTS_DENY_CIDRS
+sources = [                                    # DYNAMIC_HOST_SOURCES, one table per source
+  { name = "voting", url = "https://voting.example/hosts.json", max_hosts = 40, lists = [{ pointer = "/servers", url_field = "url", routes = "GET /*,POST /*", read_routes = "GET /*" }] },
+]
+
+[host_list]
+publish = "all"                                # THIRD_PARTY_HOSTS_PUBLISH
+max_age_secs = 300                             # THIRD_PARTY_HOSTS_MAX_AGE_SECS

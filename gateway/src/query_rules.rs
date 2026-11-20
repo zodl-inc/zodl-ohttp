@@ -58,7 +58,7 @@ impl QueryRules {
     /// environment. Unset or blank: no rule (no source); a value that is not UTF-8 is an error.
     pub fn from_env() -> anyhow::Result<Self> {
         let sources = QueryValueSources::from_env()?;
-        match std::env::var(ENV) {
+        match crate::config_source::var(ENV) {
             Ok(raw) if raw.trim().is_empty() => Self::parse_with_sources("", sources),
             Ok(raw) => Self::parse_with_sources(&raw, sources),
             Err(std::env::VarError::NotPresent) => Self::parse_with_sources("", sources),

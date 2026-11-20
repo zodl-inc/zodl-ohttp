@@ -1,8 +1,84 @@
 # Gateway configuration
 
-Every setting of the gateway is an environment variable, read once at startup. Defaults are
-the values in the code; "unset" means the variable is absent or empty unless a row says
-otherwise. A malformed value is a startup error unless a row says it falls back to the default.
+Every setting of the gateway is an environment variable, read once at startup; the routing
+policy can come from a configuration file instead (see below). Defaults are the values in the
+code; "unset" means the variable is absent or empty unless a row says otherwise. A malformed
+value is a startup error unless a row says it falls back to the default.
+
+## Configuration file
+
+The routing policy (the variables below) can be written as one TOML file instead, the same
+policy by construction: the file is turned into the values of the variables it stands for,
+which the same parsers read. Everything else (addresses and stores, identity, sizing, keys and
+other secrets) stays in the environment. [`config.example.toml`](config.example.toml) shows
+every key.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `CONFIG_SOURCE` | `env` | `env`: the policy variables of the environment, no file is read. `compare`: the environment stays in force; the file is loaded and checked too, the two policies are compared (`ohttp_config_compare_match` 1 or 0, and one log line naming the differing keys, never a value); a file that does not load is logged and counts as 0, it never stops the gateway. `file`: the file is in force; the policy variables of the environment are ignored, with one warning naming those that are set; a file that does not load (or a secret it names that does not resolve) stops the gateway at startup. Any other value is a startup error. |
+| `GATEWAY_CONFIG_FILE` | unset | Path of the file (`--config <path>` wins). Read with `CONFIG_SOURCE=compare` or `file` and by `--check-config`. |
+
+The policy variables are `GATEWAY_HOSTS`, `BACKENDS`, `BACKENDS_POLICY`,
+`BACKENDS_POLICY_DEFAULT`, `BACKEND_HEADERS`, `FLEXA_ALIAS`, `NEAR_ALIAS`,
+`THIRD_PARTY_CACHE_ROUTES`, `THIRD_PARTY_RATE_LIMITS`, `THIRD_PARTY_QUERY_RULES`,
+`THIRD_PARTY_QUERY_VALUE_SOURCES`, `THIRD_PARTY_HOSTS_PUBLISH`, `THIRD_PARTY_HOSTS_MAX_AGE_SECS`,
+`REPLAY_READ_ROUTES`, `REPLAY_ONE_SIDED_WRITE_ROUTES`, `DYNAMIC_HOST_SOURCES`,
+`DYNAMIC_HOSTS_DENY_CIDRS`, `RELAY_SECRET_ON_KEY_CONFIG` and `PROXY_ALLOW_SUFFIXES` (read by no
+code; the file has no key for it, `proxy_allow_suffixes` is accepted with a warning for one
+release).
+
+The file (`schema = 1`; an unknown key is an error; a key a release removed is accepted with a
+warning for one release):
+
+- top level: `gateway_hosts` (`GATEWAY_HOSTS`), `backends_policy_default` (`allow` or `deny`),
+  `relay_secret_on_key_config`;
+- `[secrets]`: `name = { env = "VAR" }` or `name = { file = "/path" }`: a regular file of at
+  most 64 KiB, its content without one final `\n` or `\r\n` (no permission of the file is
+  checked). A value that is empty, blank, or holds a line break or another control character
+  does not resolve. A secret file is opened without blocking and must be a regular file (a
+  FIFO, a directory or a device is refused). A header names a secret; every declared secret
+  must resolve (used or not) where secrets are required. Secret values and header values are
+  never logged or printed, not even in an error; an error about the file gives the position
+  and kind of the problem with quoted values removed, and may name keys, aliases, hosts and
+  route patterns of the policy;
+- `[integrations.<label>]`: one `BACKENDS` alias: `alias`, `upstream`, `kind` (`generic`, the
+  default; `flexa` for `FLEXA_ALIAS`; `near` for `NEAR_ALIAS`; `cmc` and `swapkit`: generic
+  providers that must have a header credential and a query rule on every route), and its rules:
+  `routes` (`BACKENDS_POLICY`; leave it out for no entry), `headers` (`BACKEND_HEADERS`:
+  `{ name, value, secret }`, `{secret}` in `value` replaced by the secret), `cache`
+  (`THIRD_PARTY_CACHE_ROUTES`, `METHOD /path@TTL`; each must be within `routes`), `rate_limit`
+  (`THIRD_PARTY_RATE_LIMITS`), `query_rules`, `read_routes` (`REPLAY_READ_ROUTES`),
+  `one_sided_write_routes`. Two integrations with one alias, or an alias that is a gateway host,
+  are errors;
+- `[hosts."<authority>"]`: the same rules for an authority that is no alias: a gateway host's
+  `routes` and `headers`, the pseudo authority `lwd` of the replay routes;
+- `[value_sources.<name>]`: `alias`, `route` (`GET /path`), `pointer`, `refresh_secs`,
+  `fallback`;
+- `[dynamic_hosts]`: `deny_cidrs`, `sources` (the sources of `DYNAMIC_HOST_SOURCES` as tables);
+- `[host_list]`: `publish`, `max_age_secs`.
+
+Every list entry keeps the grammar of its variable (a separator of that grammar inside an entry
+is an error). Every startup check of the variables applies to the file.
+
+Command line (`zodl-ohttp-gateway [--config <path>] [ACTION]`; no action serves, as before;
+`backfill` is unchanged):
+
+| Action | Effect | Exit |
+|---|---|---|
+| `--check-config [--secrets=require\|skip]` | Load and check the file (`--config` or `GATEWAY_CONFIG_FILE`), resolve its secrets (`require`, the default) or not (`skip`), and run the startup checks on the policy it stands for. Prints `config OK: <path> (schema 1, digest <16 hex>, ...)` or the error on stderr. | 0 valid, 1 not |
+| `--print-effective-config` | The policy in force (`CONFIG_SOURCE`: the file for `file`, checked first as by `--check-config --secrets=skip`; else the environment, with a note on stderr when a file is given) as canonical JSON: sorted keys, header values `<redacted>`, no secret names, kinds as declared. | 0, 1 on error |
+| `--export-config` | The file equivalent to the environment's policy, checked before it is printed (it parses, passes `--check-config --secrets=skip` and is the environment's policy). A header value becomes a secret reference: to the variable it equals (or equals after `Bearer ` or `Basic `), else to a new variable for the whole value (named on stderr) that the operator sets. An environment no file can express is an error naming the key. | 0, 1 on error |
+
+An unknown option, or two actions, exit with 2. `backfill` as the first argument ignores
+everything after it, as before, and reads the environment's policy whatever `CONFIG_SOURCE`
+says.
+
+`ohttp_config_info{source,digest}` is 1 on every serving process: the source (`env`, `compare`,
+`file`) and the first 16 hex digits of the SHA-256 of the canonical behaviour form of the policy
+in force (keyed kinds as `generic`, method tokens in upper case, gateway hosts and deny CIDRs
+as sorted sets, no dynamic sources as an empty list, defaults of unset keys written out), the
+same for a file and the environment it stands for; it is not the hash of the JSON
+`--print-effective-config` prints.
 
 ## Mode, network, listener
 

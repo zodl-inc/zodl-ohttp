@@ -73,7 +73,7 @@ impl QueryValueSources {
     /// `THIRD_PARTY_QUERY_VALUE_SOURCES` from the environment. Unset or blank: no source; a
     /// value that is not UTF-8 is an error.
     pub fn from_env() -> anyhow::Result<Self> {
-        match std::env::var(ENV) {
+        match crate::config_source::var(ENV) {
             Ok(raw) if raw.trim().is_empty() => Ok(Self::default()),
             Ok(raw) => Self::parse(&raw),
             Err(std::env::VarError::NotPresent) => Ok(Self::default()),

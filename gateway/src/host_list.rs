@@ -62,7 +62,8 @@ pub const HOST_LIST_VERSION: u32 = 1;
 /// bounds produce in practice (a host with its routes is on the order of 100 bytes).
 pub const MAX_HOST_LIST_BYTES: usize = 256 * 1024;
 /// `THIRD_PARTY_HOSTS_MAX_AGE_SECS`: default and bounds.
-const DEFAULT_MAX_AGE_SECS: u64 = 300;
+const DEFAULT_MAX_AGE_SECS: u64 =
+    zodl_ohttp_integrations::core::config::HOST_LIST_DEFAULT_MAX_AGE_SECS;
 const MIN_MAX_AGE_SECS: u64 = 30;
 const MAX_MAX_AGE_SECS: u64 = 86_400;
 
@@ -99,8 +100,10 @@ impl HostListSettings {
     /// `THIRD_PARTY_HOSTS_PUBLISH` and `THIRD_PARTY_HOSTS_MAX_AGE_SECS` from the environment.
     pub fn from_env() -> anyhow::Result<Self> {
         Self::parse(
-            std::env::var("THIRD_PARTY_HOSTS_PUBLISH").ok().as_deref(),
-            std::env::var("THIRD_PARTY_HOSTS_MAX_AGE_SECS")
+            crate::config_source::var("THIRD_PARTY_HOSTS_PUBLISH")
+                .ok()
+                .as_deref(),
+            crate::config_source::var("THIRD_PARTY_HOSTS_MAX_AGE_SECS")
                 .ok()
                 .as_deref(),
         )

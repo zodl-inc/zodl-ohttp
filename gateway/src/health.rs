@@ -17,7 +17,7 @@
 // Health checks and metrics
 
 use prometheus::Histogram;
-use prometheus::{HistogramVec, IntCounter, IntCounterVec, IntGaugeVec, Opts, Registry};
+use prometheus::{HistogramVec, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, Opts, Registry};
 
 /// Buckets of `ohttp_request_duration_seconds` and `ohttp_upstream_request_duration_seconds`.
 /// Fine enough between 25 ms and 1.5 s that a quantile of a call crossing a long network path
@@ -594,6 +594,20 @@ lazy_static::lazy_static! {
     .unwrap();
 }
 
+// Where the routing policy comes from (CONFIG_SOURCE).
+lazy_static::lazy_static! {
+    static ref OHTTP_CONFIG_INFO: IntGaugeVec = IntGaugeVec::new(
+        Opts::new("ohttp_config_info", "The routing policy in force, 1 on every serving process: its source (CONFIG_SOURCE: env, compare, file) and digest (the first 16 hex digits of the SHA-256 of the canonical behaviour form of the policy, the same for a file and the environment it stands for; not of the JSON --print-effective-config prints)"),
+        &["source", "digest"]
+    )
+    .unwrap();
+    static ref OHTTP_CONFIG_COMPARE_MATCH: IntGauge = IntGauge::new(
+        "ohttp_config_compare_match",
+        "CONFIG_SOURCE=compare only: 1 when the configuration file's policy equals the environment's, 0 when it differs or the file does not load"
+    )
+    .unwrap();
+}
+
 pub fn init_metrics() {
     for gauge in [
         &*OHTTP_DYNAMIC_HOSTS,
@@ -619,6 +633,7 @@ pub fn init_metrics() {
     REGISTRY
         .register(Box::new(OHTTP_QUERY_VALUE_SOURCE_SKIPPED_TOTAL.clone()))
         .ok();
+    REGISTRY.register(Box::new(OHTTP_CONFIG_INFO.clone())).ok();
     REGISTRY
         .register(Box::new(OHTTP_REQUESTS_TOTAL.clone()))
         .ok();
@@ -2102,6 +2117,23 @@ pub fn record_query_value_source_success(network: &str, source: &str) {
     OHTTP_QUERY_VALUE_SOURCE_LAST_SUCCESS
         .with_label_values(&[network, source])
         .set(now);
+}
+
+/// The routing policy in force: `source` (`env`, `compare`, `file`) and its digest.
+pub fn set_config_info(source: &str, digest: &str) {
+    OHTTP_CONFIG_INFO.reset();
+    OHTTP_CONFIG_INFO
+        .with_label_values(&[source, digest])
+        .set(1);
+}
+
+/// `CONFIG_SOURCE=compare`: whether the file's policy equals the environment's. The series
+/// exists in that mode only.
+pub fn set_config_compare_match(matches: bool) {
+    REGISTRY
+        .register(Box::new(OHTTP_CONFIG_COMPARE_MATCH.clone()))
+        .ok();
+    OHTTP_CONFIG_COMPARE_MATCH.set(i64::from(matches));
 }
 
 /// `skipped` selected items of query value source `source` were not valid values.

@@ -819,7 +819,7 @@ impl Settings {
 }
 
 fn env_value(var: &str) -> Option<String> {
-    std::env::var(var)
+    crate::config_source::var(var)
         .ok()
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty())
@@ -868,6 +868,14 @@ impl DynamicHosts {
         if let Some(raw) = env_value("DYNAMIC_HOSTS_DENY_CIDRS") {
             // Read once per process; the resolver of the dynamic hosts' client consults it.
             let blocks = parse_deny_cidrs(&raw)?;
+            // A validation of a configuration file (--check-config, CONFIG_SOURCE=compare) only
+            // parses the list: the process's own startup puts its list in force.
+            if crate::config_source::in_scope() {
+                return match env_value("DYNAMIC_HOST_SOURCES") {
+                    Some(raw) => Self::parse(&raw, reserved, settings),
+                    None => Ok(Self::build(Vec::new(), reserved, settings)),
+                };
+            }
             let in_force = DENY_CIDRS.get_or_init(|| blocks.clone());
             let same = blocks.iter().all(|b| in_force.contains(b))
                 && in_force.iter().all(|b| blocks.contains(b));

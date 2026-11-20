@@ -313,7 +313,7 @@ impl Config {
             })
             .unwrap_or_else(|| "mainnet".to_string());
 
-        let gateway_hosts: Vec<String> = env::var("GATEWAY_HOSTS")
+        let gateway_hosts: Vec<String> = crate::config_source::var("GATEWAY_HOSTS")
             .unwrap_or_default()
             .split(',')
             .map(|s| {
@@ -364,10 +364,10 @@ impl Config {
 
         // Parse backends policy with strict validation
         let backends_policy = zodl_ohttp_integrations::core::policy::parse_backends_policy(
-            &env::var("BACKENDS_POLICY").unwrap_or_default(),
+            &crate::config_source::var("BACKENDS_POLICY").unwrap_or_default(),
         )?;
 
-        let backends_policy_default_allow = env::var("BACKENDS_POLICY_DEFAULT")
+        let backends_policy_default_allow = crate::config_source::var("BACKENDS_POLICY_DEFAULT")
             .map(|v| v.eq_ignore_ascii_case("allow"))
             .unwrap_or(false);
 
@@ -438,12 +438,12 @@ impl Config {
             redis_security_url: env::var("REDIS_SECURITY_URL").unwrap_or_default(),
             // Strict parsing: a malformed entry is an error, never skipped.
             backends: zodl_ohttp_integrations::core::policy::parse_backends(
-                &env::var("BACKENDS").unwrap_or_default(),
+                &crate::config_source::var("BACKENDS").unwrap_or_default(),
             )?,
             backend_headers: zodl_ohttp_integrations::core::policy::parse_backend_headers(
-                &env::var("BACKEND_HEADERS").unwrap_or_default(),
+                &crate::config_source::var("BACKEND_HEADERS").unwrap_or_default(),
             )?,
-            proxy_allow_suffixes: env::var("PROXY_ALLOW_SUFFIXES")
+            proxy_allow_suffixes: crate::config_source::var("PROXY_ALLOW_SUFFIXES")
                 .unwrap_or_default()
                 .split(',')
                 .map(|s| s.trim().to_ascii_lowercase())
@@ -531,7 +531,7 @@ impl Config {
             flexa_alias: alias_env("FLEXA_ALIAS"),
             near_alias: alias_env("NEAR_ALIAS"),
             relay_secret_on_key_config: RelaySecretOnKeyConfig::parse(
-                &env::var("RELAY_SECRET_ON_KEY_CONFIG").unwrap_or_default(),
+                &crate::config_source::var("RELAY_SECRET_ON_KEY_CONFIG").unwrap_or_default(),
             )?,
             dynamic_hosts: crate::dynamic_hosts::DynamicHosts::default(),
             host_list: crate::host_list::HostListSettings::from_env()?,
@@ -562,7 +562,7 @@ impl Config {
 
 /// An alias host from `var` (trimmed, lowercase), `None` when unset or empty.
 fn alias_env(var: &str) -> Option<String> {
-    env::var(var)
+    crate::config_source::var(var)
         .ok()
         .map(|s| s.trim().to_ascii_lowercase())
         .filter(|s| !s.is_empty())

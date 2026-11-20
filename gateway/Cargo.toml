@@ -65,6 +65,8 @@ redis = { version = "0.25", features = ["tokio-comp", "connection-manager", "tok
 
 # Secrets
 hex = "0.4"
+# O_NONBLOCK for secret files (already in the lock through tokio).
+libc = "0.2"
 
 # UUID for request correlation
 uuid = { version = "1.0", features = ["v4", "serde"] }

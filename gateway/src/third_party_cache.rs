@@ -82,7 +82,7 @@ impl CacheRoutes {
     /// aliases (`FLEXA_ALIAS`, `NEAR_ALIAS`, lowercase).
     /// Format: `authority=METHOD /path@TTL,...;authority2=...`
     pub fn from_env(aliases: Aliases<'_>) -> Result<Option<Self>> {
-        let s = match std::env::var("THIRD_PARTY_CACHE_ROUTES")
+        let s = match crate::config_source::var("THIRD_PARTY_CACHE_ROUTES")
             .ok()
             .filter(|s| !s.trim().is_empty())
         {
@@ -143,7 +143,7 @@ impl RateLimiters {
     /// Format: `authority=REQUESTS/WINDOW,...`
     /// Example: `prices.example=120/60s,swap.example=600/60s`
     pub fn from_env() -> Result<Option<Self>> {
-        let s = match std::env::var("THIRD_PARTY_RATE_LIMITS")
+        let s = match crate::config_source::var("THIRD_PARTY_RATE_LIMITS")
             .ok()
             .filter(|s| !s.trim().is_empty())
         {
