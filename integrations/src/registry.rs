@@ -308,6 +308,41 @@ mod tests {
         );
     }
 
+    /// The generic forward never consults `response`: every provider it uses passes every
+    /// status, so ignoring it changes nothing.
+    #[test]
+    fn every_provider_of_the_generic_forward_passes_every_answer() {
+        let backends =
+            parse_backends("pay.example=https://p,swap.example=https://s,a.example=https://a")
+                .unwrap();
+        let policy = parse_backends_policy("a.example=GET /x").unwrap();
+        let headers = parse_backend_headers("").unwrap();
+        let registry = Registry {
+            backends: &backends,
+            policy: &policy,
+            default_allow: true,
+            headers: &headers,
+            aliases: Aliases {
+                flexa: Some("pay.example"),
+                near: Some("swap.example"),
+            },
+            flexa_key: None,
+        };
+        let admitted = Admitted { rule: None };
+        for alias in ["pay.example", "swap.example", "a.example"] {
+            let provider = registry.integration(alias).unwrap();
+            for status in [
+                100, 200, 204, 301, 400, 401, 403, 404, 429, 500, 502, 503, 599,
+            ] {
+                assert_eq!(
+                    provider.response(&admitted, status),
+                    ResponseAction::Pass,
+                    "{alias} {status}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn cache_restrictions_of_the_kinds() {
         let aliases = Aliases {

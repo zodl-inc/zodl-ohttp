@@ -26,7 +26,9 @@
 //! - [`core::policy`]: the parsers of the static alias tables (`BACKENDS`, `BACKENDS_POLICY`,
 //!   `BACKEND_HEADERS`).
 //! - [`core::provider`]: the [`core::provider::Provider`] interface and its verdict types.
-//! - [`core::auth`]: the credentials a provider adds (a header, a placeholder swap).
+//! - [`core::auth`]: the credentials a provider adds (a header, a placeholder swap, a signed
+//!   JWT per request).
+//! - [`core::body`]: the validation of a JSON request body against a fixed schema.
 //! - [`core::caps`]: the upstream caps (`THIRD_PARTY_RATE_LIMITS`) and their fixed window.
 //! - [`core::cache`]: the cacheable routes (`THIRD_PARTY_CACHE_ROUTES`).
 //! - [`core::query`]: the per-route query rules (`THIRD_PARTY_QUERY_RULES`).

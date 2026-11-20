@@ -17,6 +17,7 @@
 //! Shared building blocks of the providers.
 
 pub mod auth;
+pub mod body;
 pub mod cache;
 pub mod caps;
 pub mod config;

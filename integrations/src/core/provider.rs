@@ -59,6 +59,8 @@ pub enum Denial {
     NotInPolicy,
     /// The alias has no policy and the default is to deny.
     NoPolicy,
+    /// The body fails the route's body schema ([`crate::core::body`]).
+    InvalidBody(crate::core::body::BodyError),
 }
 
 impl Denial {
@@ -68,16 +70,29 @@ impl Denial {
             Denial::PathTrick(reason) => reason,
             Denial::NotInPolicy => "operation not in alias policy",
             Denial::NoPolicy => "alias has no operation policy",
+            Denial::InvalidBody(error) => error.reason(),
         }
     }
 }
 
 /// What the gateway does with an upstream answer.
+///
+/// The gateway's generic forward (every alias of the registry) does not consult
+/// [`Provider::response`]: each provider it uses answers [`ResponseAction::Pass`] for every
+/// status (a test of the registry pins it). `Replace` and `Rewrite` are for providers that
+/// answer outside it (the `coinbase` kind), which apply them themselves.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ResponseAction {
     /// Return it as received (through the gateway's response header filter).
     Pass,
+    /// Answer `status` with the fixed JSON `body` instead: the upstream body is never
+    /// forwarded (it may echo the request, e.g. an address) and never logged (error
+    /// scrubbing).
+    Replace { status: u16, body: &'static [u8] },
+    /// The provider builds the answer from the upstream body itself (a success it turns into
+    /// its own shape); the upstream body is never passed as received.
+    Rewrite,
 }
 
 /// A third-party provider: one alias and its rules.
