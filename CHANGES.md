@@ -148,7 +148,7 @@ keeps its own log in [client/CHANGELOG.md](client/CHANGELOG.md).
 - The gateway crate is renamed `zodl-ohttp-gateway` (library `zodl_ohttp_gateway`, binary
   `zodl-ohttp-gateway`) and marked `publish = false`: the name `ohttp-gateway` on crates.io belongs
   to an unrelated crate. The image is still `ohttp-gateway`, its entrypoint is
-  `/app/zodl-ohttp-gateway`, and `/app/ohttp-gateway` stays as a link to it. Nothing on the wire
+  `/app/zodl-ohttp-gateway`. Nothing on the wire
   changes: the upstream `User-Agent`, the `/ohttp-gateway/...` paths, the metric names and the
   environment are the same. Two things a log or process reader sees change: the `target` of every
   log line is now `zodl_ohttp_gateway[::module]` (a per-module `RUST_LOG` directive must use that
@@ -156,6 +156,8 @@ keeps its own log in [client/CHANGELOG.md](client/CHANGELOG.md).
   (truncated to `zodl-ohttp-gate` by the kernel). The relay simulator and the e2e client are
   marked `publish = false` too. A release tag now looks for `zodl-ohttp-gateway` in the lock
   files; a commit from before the rename cannot be tagged with this check.
+- **Breaking:** the image no longer has `/app/ohttp-gateway`; use `/app/zodl-ohttp-gateway` or
+  the entrypoint.
 
 ### Images and releases
 

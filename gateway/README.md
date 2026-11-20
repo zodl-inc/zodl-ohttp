@@ -8,8 +8,8 @@ streams.
 
 The crate is `zodl-ohttp-gateway` (library `zodl_ohttp_gateway`, binary `zodl-ohttp-gateway`). It is
 not published on crates.io and is unrelated to the `ohttp-gateway` crate there; it is built into
-the `ohttp-gateway` image only, whose name is unchanged. The image keeps `/app/ohttp-gateway` as
-a link to the binary.
+the `ohttp-gateway` image only, whose name is unchanged; its binary is
+`/app/zodl-ohttp-gateway`, the image's entrypoint.
 
 Every setting is a key of the configuration files (named after the environment variable it
 replaces, which only `backfill` still reads): see [CONFIG.md](CONFIG.md). The design, privacy model
