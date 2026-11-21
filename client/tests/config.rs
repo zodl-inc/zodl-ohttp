@@ -748,3 +748,37 @@ fn the_shipped_shapes_are_unchanged() {
         }
     }
 }
+
+#[test]
+fn a_relay_list_keeps_the_first_relay_as_the_relay_url() {
+    let list = "https://relay-a.example/relay,https://relay-b.example/x";
+    let config = build(&with(mainnet(), 1, list)).unwrap();
+    assert_eq!(config.relay_url(), "https://relay-a.example/relay");
+    assert_eq!(config.relays().len(), 2);
+    let networks = OhttpNetworks::new(Some(config), None).unwrap();
+    // Stable: the first relay, whatever the choice.
+    for _ in 0..50 {
+        assert_eq!(
+            networks.relay_for("ohttp-gateway.example"),
+            Some("https://relay-a.example/relay")
+        );
+    }
+    // The envelope URL derives from it, as with one relay.
+    assert_eq!(
+        signed_config_url(
+            networks.relay_for("ohttp-gateway.example").unwrap(),
+            SignedConfigUrlRule::ReplaceRelaySuffix
+        )
+        .unwrap(),
+        "https://relay-a.example/ohttp-configs/signed"
+    );
+    let mut seen = std::collections::HashSet::new();
+    for _ in 0..500 {
+        seen.insert(networks.choose_relay_for("ohttp-gateway.example").unwrap());
+    }
+    assert_eq!(seen.len(), 2);
+    let twice = "https://relay-a.example/relay,https://RELAY-A.example/relay/";
+    let error = build(&with(mainnet(), 1, twice)).unwrap_err();
+    assert_eq!(error.field(), ConfigField::RelayUrl);
+    assert_no_value(&error, &["relay-a.example", "RELAY-A"]);
+}

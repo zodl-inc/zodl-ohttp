@@ -73,10 +73,9 @@ impl SuccessStatus {
 pub struct OuterPolicy {
     /// Which statuses are success.
     pub success: SuccessStatus,
-    /// How many bytes of a non-success answer's body are read for the quote in
-    /// [`OuterOutcome::Refused`]; `None` for all of it. The quote itself is at most
-    /// [`MAX_REFUSED_DETAIL_CHARS`] characters of printable ASCII, whatever the window. (An outer
-    /// `400` or `422` is retried whatever its body says: see [`classify_outer_response`].)
+    /// How many bytes of a non-success answer's body are counted for the size
+    /// [`OuterOutcome::Refused`] shows; `None` for all of it. (An outer `400` or `422` is a
+    /// [`OuterOutcome::RefetchKeyConfig`] whatever its body says.)
     pub body_window: Option<usize>,
     /// Whether a success answer must be labelled `message/ohttp-chunked-res`.
     pub require_response_media_type: bool,
@@ -128,11 +127,12 @@ pub struct OuterResponse<'a> {
     pub body: &'a [u8],
 }
 
-/// The most characters of a `Content-Type` [`OuterOutcome::WrongMediaType`] (and
-/// `Error::MediaType`) quotes.
+/// The most characters of the media type [`OuterOutcome::WrongMediaType`] (and
+/// `Error::MediaType`) shows; every one shown, from a fixed set, is shorter.
 pub const MAX_MEDIA_TYPE_CHARS: usize = 64;
 
-/// The most characters of an outer error body [`OuterOutcome::Refused`] quotes.
+/// The most characters [`OuterOutcome::Refused`] shows of a refusal (its body's size; no text
+/// of the body is shown).
 pub const MAX_REFUSED_DETAIL_CHARS: usize = 120;
 
 /// What an outer answer means.
@@ -141,38 +141,40 @@ pub enum OuterOutcome {
     /// The body is a sealed response: open it with the request's
     /// [`crate::ChunkedResponseOpener`] (or its [`crate::ChunkedResponseDecoder`]).
     Sealed,
-    /// The gateway does not know the key configuration: fetch it again (dropping the kept
-    /// one), encapsulate the request afresh, and post once more. Never returned on a retry.
+    /// The gateway could not open the request (a key rotation, among others): drop the kept key
+    /// configuration, so that the next request fetches it afresh, and report this one as
+    /// refused. Do not send it again: an outer status, which anything between the client and
+    /// the gateway can write, does not prove that the request did not run, and a `WRITE` must
+    /// not run twice. Only for `attempt` 0.
     RefetchKeyConfig,
     /// The relay or the gateway refused the request.
     Refused {
         /// The outer status.
         status: u16,
-        /// The body, up to the policy's window, as at most [`MAX_REFUSED_DETAIL_CHARS`]
-        /// characters of printable ASCII: anything else (invalid UTF-8, any non-ASCII character,
-        /// newlines and other controls) replaced by `?`. Safe to log in format only (one short
-        /// line, which cannot inject log lines): the content is whatever the relay sent and may
-        /// itself name an address or an identifier, so a privacy-sensitive log records the
-        /// status and drops this.
+        /// The size of the body, `"<N bytes>"`, or empty for none: never its text, which is
+        /// whatever the relay sent and may name an address, a URL or an identifier. Safe to
+        /// log.
         detail: String,
     },
     /// A success status, but not labelled `message/ohttp-chunked-res`.
     WrongMediaType {
-        /// The `Content-Type` received, as at most [`MAX_MEDIA_TYPE_CHARS`] characters of
-        /// printable ASCII, anything else replaced by `?`: one short line, whose content is the
-        /// relay's choice.
+        /// The media type of the `Content-Type` received: a registered top-level type and a
+        /// common subtype (else `*`), lower case, parameters dropped; or
+        /// [`crate::NOT_A_MEDIA_TYPE`]. No free text of the relay's.
         content_type: String,
     },
 }
 
 /// What the outer answer `response` means, under `policy`. `attempt` is 0 for the first post
-/// of a request and 1 for the post after a [`OuterOutcome::RefetchKeyConfig`]; a request is
-/// retried once at most.
+/// of a request; a caller that still posts once more after an outer `400`/`422` (no longer
+/// advised, see [`OuterOutcome::RefetchKeyConfig`]) passes 1 for that post.
 ///
 /// An outer `400` (the gateway could not open the request) or `422` (key configuration
 /// problem) on the first attempt is [`OuterOutcome::RefetchKeyConfig`] for every client,
-/// whatever the body says; on the second it is refused for good (ZIP, "Outer response
-/// contract and decapsulation failure handling"). A `409` is never a refetch: the sealing is
+/// whatever the body says; on a later one it is refused. The ZIP ("Outer response contract and
+/// decapsulation failure handling") has the client refetch and retry once; this crate refetches
+/// for the next request but never retries the refused one, since an outer status does not
+/// prove that it did not run. A `409` is never a refetch: the sealing is
 /// fresh on every attempt, so a repeat of the same ciphertext cannot happen here. `413`,
 /// `401`, `426`, `500`, `502`, `503` are refused, and the wrapper surfaces them as transient.
 pub fn classify_outer_response(
@@ -189,7 +191,7 @@ pub fn classify_outer_response(
     if !policy.success.accepts(response.status) {
         return OuterOutcome::Refused {
             status: response.status,
-            detail: crate::sanitized(&String::from_utf8_lossy(window), MAX_REFUSED_DETAIL_CHARS),
+            detail: refused_detail(window),
         };
     }
     if policy.require_response_media_type {
@@ -197,11 +199,21 @@ pub fn classify_outer_response(
         let essence = content_type.split(';').next().unwrap_or_default().trim();
         if !essence.eq_ignore_ascii_case(RESPONSE_MEDIA_TYPE) {
             return OuterOutcome::WrongMediaType {
-                content_type: crate::sanitized(content_type, MAX_MEDIA_TYPE_CHARS),
+                content_type: crate::shown_media_type(content_type),
             };
         }
     }
     OuterOutcome::Sealed
+}
+
+/// What [`OuterOutcome::Refused`] shows of a refusal's body (the part `policy.body_window`
+/// lets through): its size, never its text.
+fn refused_detail(window: &[u8]) -> String {
+    if window.is_empty() {
+        String::new()
+    } else {
+        format!("<{} bytes>", window.len())
+    }
 }
 
 /// The `User-Agent` every [`OuterHeaders`] preset sends to the relay, on the post and on the
@@ -695,10 +707,11 @@ mod tests {
         OuterPolicy::SLIPSTREAM,
     ];
 
-    /// ZIP, "Outer response contract": outer 400 and 422 refetch the key configuration and
-    /// retry exactly once, for every client, whatever the body says.
+    /// An outer 400 or 422 is a key refetch for every client, whatever the body says, on the
+    /// first post (the request itself is not sent again, see `RefetchKeyConfig`); on a later
+    /// one it is refused.
     #[test]
-    fn a_400_or_422_is_retried_once_by_every_client_whatever_the_body() {
+    fn a_400_or_422_is_a_key_refetch_for_every_client_whatever_the_body() {
         let bodies: [&[u8]; 6] = [
             PROBLEM,
             b"",
@@ -743,80 +756,86 @@ mod tests {
     }
 
     #[test]
-    fn the_body_window_bounds_what_is_quoted() {
+    fn the_body_window_bounds_what_is_counted() {
         let body = vec![b'x'; 300];
         for (policy, window) in [
             (OuterPolicy::ANDROID, 200),
             (OuterPolicy::IOS, 200),
             (OuterPolicy::SLIPSTREAM, 300),
+            (OuterPolicy::LIBRARY, 300),
         ] {
             let OuterOutcome::Refused { detail, .. } =
                 classify_outer_response(&policy, &outer(503, None, &body), 0)
             else {
                 panic!("a 503 was not refused");
             };
-            assert_eq!(detail.len(), window.min(MAX_REFUSED_DETAIL_CHARS));
+            assert_eq!(detail, format!("<{window} bytes>"));
         }
-        // A narrower window than the quote cap bounds it.
-        let narrow = OuterPolicy {
-            body_window: Some(10),
-            ..OuterPolicy::LIBRARY
-        };
         let OuterOutcome::Refused { detail, .. } =
-            classify_outer_response(&narrow, &outer(503, None, &body), 0)
+            classify_outer_response(&OuterPolicy::LIBRARY, &outer(503, None, b""), 0)
         else {
             panic!("a 503 was not refused");
         };
-        assert_eq!(detail, "x".repeat(10));
+        assert_eq!(detail, "");
     }
 
-    /// The relay's `Content-Type` is quoted as one short line of printable ASCII.
+    /// No text of the relay's body reaches the refusal: it could name an address or a URL.
     #[test]
-    fn a_wrong_media_type_is_quoted_short_and_printable() {
-        let policy = OuterPolicy {
-            require_response_media_type: true,
-            ..OuterPolicy::LIBRARY
-        };
-        let long = format!("text/html\r\nX-Injected: 1; {}", "a".repeat(200));
-        let OuterOutcome::WrongMediaType { content_type } =
-            classify_outer_response(&policy, &outer(200, Some(&long), &[]), 0)
-        else {
-            panic!("a wrong label was accepted");
-        };
-        assert_eq!(content_type.chars().count(), MAX_MEDIA_TYPE_CHARS);
-        assert!(content_type.starts_with("text/html??X-Injected: 1; "));
-        assert!(content_type
-            .chars()
-            .all(|c| c.is_ascii_graphic() || c == ' '));
-    }
-
-    /// The relay's error body is quoted as one short line of printable ASCII.
-    #[test]
-    fn a_quoted_body_is_one_short_printable_line() {
-        let mut body = b"bad\r\nInjected: header\x00\x1b[31m".to_vec();
-        body.extend_from_slice("é€".as_bytes());
-        body.extend_from_slice(&[0xff, 0xfe]);
-        body.extend_from_slice(&[b'y'; 500]);
+    fn a_refusal_shows_no_body_text() {
+        let body = b"see https://relay.example/private-path from 192.0.2.1\r\nInjected: x";
         for policy in [
             OuterPolicy::LIBRARY,
             OuterPolicy::ANDROID,
             OuterPolicy::IOS,
             OuterPolicy::SLIPSTREAM,
         ] {
-            let OuterOutcome::Refused { detail, .. } =
-                classify_outer_response(&policy, &outer(502, None, &body), 0)
+            let outcome = classify_outer_response(&policy, &outer(502, None, body), 0);
+            let shown = format!("{outcome:?}");
+            for part in ["relay.example", "192.0.2.1", "Injected", "see"] {
+                assert!(!shown.contains(part), "{shown}");
+            }
+        }
+    }
+
+    /// Of the relay's `Content-Type` only a fixed media type is shown, never other text.
+    #[test]
+    fn a_wrong_media_type_shows_the_media_type_only() {
+        let policy = OuterPolicy {
+            require_response_media_type: true,
+            ..OuterPolicy::LIBRARY
+        };
+        let shown = |value: &str| {
+            let OuterOutcome::WrongMediaType { content_type } =
+                classify_outer_response(&policy, &outer(200, Some(value), &[]), 0)
             else {
-                panic!("a 502 was not refused");
+                panic!("a wrong label was accepted");
             };
-            assert!(detail.chars().count() <= MAX_REFUSED_DETAIL_CHARS);
-            assert!(
-                detail.chars().all(|c| c.is_ascii_graphic() || c == ' '),
-                "{detail:?}"
-            );
-            assert!(
-                detail.starts_with("bad??Injected: header??[31m??"),
-                "{detail:?}"
-            );
+            content_type
+        };
+        assert_eq!(shown("Text/HTML; charset=utf-8"), "text/html");
+        assert_eq!(
+            shown("text/plain; relay=https://relay.example/x"),
+            "text/plain"
+        );
+        assert_eq!(shown("message/ohttp-res"), "message/ohttp-res");
+        // A subtype that is not a common one is not shown: it could be any text.
+        for value in ["text/relay-a.example", &format!("text/{}", "a".repeat(80))] {
+            assert_eq!(shown(value), "text/*", "{value:?}");
+        }
+        assert_eq!(shown("application/vnd.relay.example+json"), "application/*");
+        for value in [
+            "https://relay.example/private-path",
+            "relay.example/private-path",
+            "relay-a.example/relay",
+            "relay.example",
+            "",
+            "/html",
+            "text/",
+            "text/a/b",
+            "text/invalid subtype",
+            "text/html\r\nX-Injected: 1",
+        ] {
+            assert_eq!(shown(value), crate::NOT_A_MEDIA_TYPE, "{value:?}");
         }
     }
 
@@ -857,10 +876,7 @@ mod tests {
                     let OuterOutcome::Refused { detail, .. } = outcome else {
                         panic!("not refused");
                     };
-                    if let Some(window) = policy.body_window {
-                        assert!(detail.len() <= window + 3 * 2, "{}", detail.len());
-                    }
-                    assert!(std::str::from_utf8(detail.as_bytes()).is_ok());
+                    assert!(detail.ends_with(" bytes>"), "{detail}");
                     // And on the first attempt, where a 400 or 422 is decided by its status alone.
                     let _ = classify_outer_response(&policy, &outer(status, None, &body), 0);
                 }

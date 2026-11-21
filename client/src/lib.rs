@@ -109,6 +109,7 @@ mod http_error;
 mod message;
 mod outer;
 mod profile;
+mod relays;
 mod signed;
 mod third_party_hosts;
 mod trace;
@@ -143,6 +144,10 @@ pub use outer::{
     RELAY_ACCEPT_LANGUAGE, RELAY_USER_AGENT, SIGNED_CONFIG_MEDIA_TYPE, UNSIGNED_DEFAULT_CACHE_SECS,
 };
 pub use profile::ClientProfile;
+pub use relays::{
+    relay_status_fails_over, Relay, RelaySelector, MAX_HELD_RELAYS, MAX_RELAYS,
+    MAX_RELAY_FAILOVER_HOLD, RELAY_FAILOVER_HOLD,
+};
 pub use signed::{
     open_signed_config, verify_signed_config, verify_signed_config_with, Base64Decoding,
     DuplicateKeys, Network, NetworkRule, SignatureCheck, SignedConfigPolicy, SignedKeys,
@@ -192,9 +197,9 @@ pub enum Error {
         /// The rule it breaks.
         rule: &'static str,
     },
-    /// The relay answered something other than a sealed response. The `Content-Type` received,
-    /// as `Client` reports it: at most 64 characters, anything but printable ASCII replaced by
-    /// `?`.
+    /// The relay answered something other than a sealed response. The media type of the
+    /// `Content-Type` received: a registered top-level type and a common subtype (else `*`),
+    /// lower case, parameters dropped; or [`NOT_A_MEDIA_TYPE`]. No free text of the relay's.
     #[error("the relay answered {0:?}, not {RESPONSE_MEDIA_TYPE}")]
     MediaType(String),
     /// A key configuration or a sealed response was larger than `max` bytes.
@@ -245,18 +250,84 @@ impl From<reqwest::Error> for Error {
     }
 }
 
-/// At most `max` characters of untrusted `text` (a peer's header or field), every character
-/// that is not printable ASCII replaced by `?`, so an error or a log line quoting it stays one
-/// short line.
-pub(crate) fn sanitized(text: &str, max: usize) -> String {
-    text.chars()
-        .take(max)
-        .map(|c| {
-            if c.is_ascii_graphic() || c == ' ' {
-                c
-            } else {
-                '?'
-            }
-        })
-        .collect()
+/// What an error shows of a peer's `Content-Type`: a registered top-level type and, when it is
+/// one of a few common ones, its subtype (`text/html`, `message/ohttp-res`, ...), else `*`
+/// (`text/*`); in lower case, parameters dropped. A value that is no media type of a registered
+/// top-level type is [`NOT_A_MEDIA_TYPE`]. So no free text of the peer's (a URL, a host, a
+/// parameter) can reach an error or a log line through it.
+pub(crate) fn shown_media_type(value: &str) -> String {
+    const TYPES: [&str; 10] = [
+        "application",
+        "audio",
+        "font",
+        "haptics",
+        "image",
+        "message",
+        "model",
+        "multipart",
+        "text",
+        "video",
+    ];
+    const SUBTYPES: [&str; 13] = [
+        "html",
+        "plain",
+        "json",
+        "xml",
+        "octet-stream",
+        "problem+json",
+        "grpc",
+        "ohttp-keys",
+        "ohttp-req",
+        "ohttp-res",
+        "ohttp-chunked-req",
+        "ohttp-chunked-res",
+        "http",
+    ];
+    let essence = value
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    // RFC 9110 `token "/" token` first: anything else is no media type at all.
+    let token = |part: &str| {
+        !part.is_empty()
+            && part.bytes().all(|b| {
+                b.is_ascii_alphanumeric()
+                    || matches!(
+                        b,
+                        b'!' | b'#'
+                            | b'$'
+                            | b'%'
+                            | b'&'
+                            | b'\''
+                            | b'*'
+                            | b'+'
+                            | b'-'
+                            | b'.'
+                            | b'^'
+                            | b'_'
+                            | b'`'
+                            | b'|'
+                            | b'~'
+                    )
+            })
+    };
+    let Some((kind, sub)) = essence
+        .split_once('/')
+        .filter(|(kind, sub)| token(kind) && token(sub))
+    else {
+        return NOT_A_MEDIA_TYPE.to_owned();
+    };
+    let Some(kind) = TYPES.iter().find(|&&t| t == kind) else {
+        return NOT_A_MEDIA_TYPE.to_owned();
+    };
+    match SUBTYPES.iter().find(|&&t| t == sub) {
+        Some(sub) => format!("{kind}/{sub}"),
+        None => format!("{kind}/*"),
+    }
 }
+
+/// What an error shows for a `Content-Type` that is no media type (absent, malformed, or
+/// carrying anything else).
+pub const NOT_A_MEDIA_TYPE: &str = "<not a media type>";

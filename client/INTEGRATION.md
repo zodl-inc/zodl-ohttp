@@ -34,7 +34,9 @@ pub struct OhttpConfig { /* private */ }
 impl OhttpConfig {
     pub fn new(params: OhttpConfigParams<'_>) -> Result<OhttpConfig, ConfigError>;
     pub fn gateway_host(&self) -> &str;
-    pub fn relay_url(&self) -> &str;
+    pub fn relay_url(&self) -> &str;          // the (first) relay; stable
+    pub fn choose_relay(&self) -> &str;       // the relay for the next request
+    pub fn relays(&self) -> &[Relay];         // every relay listed, in order
     pub fn keys_dns_name(&self) -> &str;
     pub fn signing_pubkey(&self) -> &VerifyingKey;
 }
@@ -46,13 +48,14 @@ impl OhttpNetworks {
     pub fn get(&self, network: Network) -> Option<&OhttpConfig>;
     pub fn network_of_host(&self, gateway_host: &str) -> Option<Network>;
     pub fn relay_for(&self, gateway_host: &str) -> Option<&str>;
+    pub fn choose_relay_for(&self, gateway_host: &str) -> Option<&str>;
 }
 ```
 
 | Value | Rule |
 |---|---|
 | `gateway_host` | the gateway host name, which is also the inner `:authority` of light client server requests; a lower-case bare DNS host name (no scheme, port, path or trailing dot) |
-| `relay_url` | the relay URL sealed requests are posted to; `https://`, a host (DNS name or IP address, not a gateway host), an optional numeric port and an optional path; ASCII, no userinfo, query, fragment, backslash, whitespace, control characters, encoded `/` or `\\` (`%2F`, `%5C`) or empty path segment (`//`). Kept canonical: one trailing `/` removed, host in lower case, IP addresses in standard form, no `:443`, dot segments resolved, percent-encoding normalized |
+| `relay_url` | the relay URL sealed requests are posted to; `https://`, a host (DNS name or IP address, not a gateway host), an optional numeric port and an optional path; ASCII, no userinfo, query, fragment, backslash, whitespace, control characters, encoded `/` or `\\` (`%2F`, `%5C`) or empty path segment (`//`). Kept canonical: one trailing `/` removed, host in lower case, IP addresses in standard form, no `:443`, dot segments resolved, percent-encoding normalized. Or a list of relays ("Several relays" below) |
 | `keys_dns_name` | the DNS TXT name of the signed key configuration, a last-resort source (section 2); a lower-case bare DNS host name |
 | `signing_pubkey` | the gateway's key-configuration signing key, raw Ed25519 as 64 hex digits, a valid point not of small order |
 
@@ -78,7 +81,8 @@ set (for `OhttpConfigParams`, which are set and which empty); both can be logged
 A network without a configuration has OHTTP off, and so does every network of
 `OhttpNetworks::default()`: `relay_for(host)` returns `None`, `NetworkRule::KnownHosts` refuses
 the host, `verify_signed_config` and `envelope_from_doh_json` return `Error::KeyConfig` and
-`doh_query_url` returns `None`. The crate keeps no global configuration: build one
+`doh_query_url` returns `None`. The crate keeps no global configuration (only the
+process-wide relay state of `RelayBackoff::global()` and `RelaySelector::global()`): build one
 `OhttpNetworks` at startup and pass it where it is needed.
 
 `relay_for(gateway_host)` maps exactly the configured gateway host of a network to its relay
@@ -103,9 +107,56 @@ assert_eq!(networks.relay_for("lightwalletd.example"), None);
 assert!(networks.get(Network::Mainnet).is_none());
 ```
 
+### Several relays
+
+`relay_url` may also list relays: relay URLs separated by `,`, each entry after the first
+starting `https://`, for example `https://relay-a.example/relay,https://relay-b.example/gateway`.
+A value is a list only where a `,` is followed by `https://`; any other value is one relay URL,
+exactly as before. Each URL follows the rules above, a list has at most 8 relays and no relay
+twice, every relay gets an equal share of the requests, and the mainnet/testnet and
+gateway-host rules apply to every relay.
+
+- **Stable values stay stable.** `relay_url()` and `relay_for(host)` return the first relay
+  listed, always: use them for "is this a gateway" checks, cache keys and the signed key
+  configuration (`signed_config_url(networks.relay_for(host)?, rule)`), as before; when that
+  fetch fails, try the other relays in list order, then the DNS fallback. An integration that
+  only bumps the crate keeps posting to that first relay.
+- **Per request.** To split the requests, call `choose_relay_for(host)` (or
+  `config.choose_relay()`) once per request and use that one string for the post, the
+  `RelayBackoff` checks and the report below; never key a cache or connection pool on it (key
+  pools on `relays()`, at most 8 stable URLs). Each call is a fresh random choice from
+  the operating system's RNG (should it fail, a non-cryptographic draw from the standard
+  library's per-process hash keys, still spread evenly: the choice protects nothing secret),
+  so the relays share the traffic equally.
+  Nothing about the choice depends on the wallet; no choice is kept or stored (in memory, the
+  selector keeps only which relays are held out).
+- **Failover.** Report a request whose relay failed with
+  `RelaySelector::global().note_failure(url)`: no connection, a TLS failure, a broken exchange,
+  a timeout that is the relay's (not a short deadline of the caller), a success that is no
+  sealed answer (wrong media type), or an outer status for which `relay_status_fails_over(status)`
+  holds (`429`, any `5xx`, a redirect, and `401`/`403`/`404`/`405`/`407`/`421`, a relay that
+  cannot deliver). Report one whose sealed answer completed with `note_success(url)`. Prefer
+  `note_failure_of` / `note_success_of(url, sent_at)` with the instant the request was sent, so
+  that a late report neither ends nor lengthens a newer hold. A relay that failed is held out
+  of the choice for `RELAY_FAILOVER_HOLD` (60 s, doubling while it keeps failing on requests
+  sent after each hold, up to `MAX_RELAY_FAILOVER_HOLD`; not doubled while other relays fail
+  too, and released by a success through a relay that failed with it), and one paused by a `Retry-After` (`RelayBackoff::global()`) until the pause ends:
+  a request that draws it goes to the next relay in list order, which gets the whole share
+  meanwhile. With every relay out, the first relay in that order that
+  is only held (not paused) is used, and with every relay paused, the relay drawn. The selector
+  never resends anything. A request may be sent again through another relay only when nothing
+  was sent: the connection or TLS handshake failed, or the relay is paused before the post.
+  Never after an outer error status (a relay or front end may answer one in place of an answer
+  it got), a `5xx` or any later failure (section 4).
+- **Order matters.** The first relay is the network's stable relay and the envelope source,
+  relays fail over in list order, and the list's order is how its relays are referred to: keep
+  it when the list changes otherwise.
+
 ## 2. Obtaining the key configuration
 
-1. Fetch the signed envelope through the relay: `signed_config_url(relay_url, rule)` derives its
+1. Fetch the signed envelope through the relay (with a relay list, the first one,
+   `relay_for(host)`, and the others in turn when it fails):
+   `signed_config_url(relay_url, rule)` derives its
    URL from the relay URL (`.../relay` becomes `.../ohttp-configs/signed` under the default
    rules), with exactly the headers `profile.headers.key_fetch_signed(None)` lists. Do not follow
    redirects. Read at most `MAX_KEY_CONFIG_BYTES` (64 KiB, enforce it while reading with
@@ -207,7 +258,8 @@ loop {
        no redirects, reading the answer through profile.limits.response_guard()
   match classify_outer_response(&profile.outer, &OuterResponse { status, content_type, body }, attempt) {
     Sealed           => feed the body to opener.decoder() as it arrives (or opener.open_response)
-    RefetchKeyConfig => drop the cached key, run section 2 again, attempt = 1, continue
+    RefetchKeyConfig => drop the cached key (the next request runs section 2 again), error:
+                        never resend this one
     Refused { .. } | WrongMediaType { .. } => error
   }
 }
@@ -232,9 +284,18 @@ Rules that matter for privacy and correctness:
   (`../docs/architecture.md`, "Request padding").
 - **Seal every attempt afresh.** Never resend a sealed body: the gateway refuses a repeated
   ciphertext as a replay (409). Each sealing returns its own `ChunkedResponseOpener` (neither
-  `Clone` nor `Copy`); keep one sealing per post, the type does not enforce it. A transport error before an answer is just another iteration.
-- **Retry once at most** after `RefetchKeyConfig`; 409, 413, 401, 426 and 5xx are not retried by
-  the core.
+  `Clone` nor `Copy`); keep one sealing per post, the type does not enforce it. Only a request
+  that was not sent (a failure while connecting, TCP or the TLS handshake) may be sealed again
+  and sent. After any later failure (a reset, a timeout, a broken answer, an
+  outer error status) the request may have reached the gateway, and a `WRITE`
+  (`SendTransaction`) must not be sent again, through the same relay or another.
+- **No retry on an outer status.** `RefetchKeyConfig` (an outer `400`/`422`) drops the cached
+  key configuration so that the next request fetches it afresh, and the request is reported as
+  refused: an outer status, which anything between the client and the gateway can write, does
+  not prove that the request did not run. 409, 413, 401, 426 and 5xx are not retried either.
+- **Errors show no peer text.** `OuterOutcome::WrongMediaType` and `Error::MediaType` carry
+  only a registered type and a common subtype (`text/*` otherwise, or `NOT_A_MEDIA_TYPE`), and
+  `OuterOutcome::Refused` only the size of the body; log nothing else of the relay's answer.
 - **Freshness.** Feed every inner response's headers to `freshness::observe_response_headers`
   so later stamps follow the gateway clock; `freshness::is_rejection` recognises a stale-request
   refusal, which may be retried once, sealed afresh.

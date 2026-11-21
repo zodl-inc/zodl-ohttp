@@ -1,0 +1,1145 @@
+// Copyright © 2026 Znewco, Inc. (d/b/a Zcash Open Development Lab)
+// SPDX-License-Identifier: AGPL-3.0-only
+//
+// This file is part of ZODL OHTTP.
+//
+// ZODL OHTTP is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License,
+// version 3 only, as published by the Free Software Foundation.
+//
+// ZODL OHTTP is distributed in the hope that it will be useful, but
+// WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
+// Affero General Public License for more details.
+//
+// Commercial licensing: see COMMERCIAL-LICENSE.md.
+
+//! Several relays in front of one gateway: a random choice per request (equal shares), and a
+//! failover to another relay while one fails.
+//!
+//! A network's `relay_url` may list several relays, separated by `,` (see
+//! [`crate::OhttpConfigParams::relay_url`]). Every request draws a fresh random number from the
+//! operating system and goes to the relay it falls on, so the relays share the traffic equally. Nothing about the choice is
+//! derived from the wallet, and no choice is kept or stored: the only state, in memory, is
+//! which relays are held out after a failure (below).
+//!
+//! [`RelaySelector::note_failure`] takes a relay out of the choice for [`RELAY_FAILOVER_HOLD`]
+//! (a transport failure, a success that is no sealed answer, or an outer status
+//! [`relay_status_fails_over`]), doubling while it keeps failing right after each hold up to
+//! [`MAX_RELAY_FAILOVER_HOLD`], as does a running `Retry-After` pause of
+//! [`crate::RelayBackoff::global`]; a request that drew it then goes to another relay of the
+//! list (the others in list order), so while a relay is out its share goes to the next one in
+//! that order, not spread over the rest. A relay comes back when
+//! its hold ends or a request through it succeeds ([`RelaySelector::note_success`]). With every
+//! relay out, the first relay in the failover order that is only held (not paused) is used,
+//! else the relay drawn; failures while every relay is out (the device offline, the gateway
+//! down) do not double a hold, and the first success releases the holds of the relays that
+//! failed with it (a hold doubled before, on that relay's own, stays). A list of one relay behaves as a single relay URL always did.
+//! Nothing here sends or resends a request: which relay the next request goes to is all it
+//! decides.
+
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
+
+use crate::config::{parse_relay_url, RelayTarget};
+use crate::RelayBackoff;
+
+/// The most relays a list may have.
+pub const MAX_RELAYS: usize = 8;
+/// How long a relay that failed stays out of the choice when the list has another relay. A
+/// relay that fails again soon after its hold ends is held twice as long each time, up to
+/// [`MAX_RELAY_FAILOVER_HOLD`]; a success ends the hold and the doubling.
+pub const RELAY_FAILOVER_HOLD: Duration = Duration::from_secs(60);
+/// The longest hold of a relay that keeps failing.
+pub const MAX_RELAY_FAILOVER_HOLD: Duration = Duration::from_secs(16 * 60);
+
+/// Where a relay list's next entry begins: a `,` followed by the next URL's scheme.
+pub(crate) const LIST_SEPARATOR: &str = ",https://";
+
+/// Whether an outer answer with `status` holds its relay out of the choice
+/// ([`RelaySelector::note_failure`]): `429`, any `5xx`, a redirect (never followed), and the
+/// refusals that say the relay cannot deliver to the gateway at all (`401`, `403`, `404`,
+/// `405`, `407`, `421`), where
+/// another relay may. Not `400`, `409`, `413`, `415` or `422`, which concern the request or its
+/// key configuration, the same through any relay.
+pub const fn relay_status_fails_over(status: u16) -> bool {
+    matches!(status, 300..=399 | 401 | 403 | 404 | 405 | 407 | 421 | 429 | 500..=599)
+}
+
+/// One relay of a network's configuration.
+///
+/// Its `Debug` output never shows the URL.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Relay {
+    pub(crate) target: RelayTarget,
+    /// The selector's key for it ([`relay_key`]).
+    key: String,
+    /// Its share of the requests, against the other relays' (every relay of a configured
+    /// list has the same).
+    weight: u32,
+}
+
+impl Relay {
+    /// The relay URL, canonical (see [`crate::OhttpConfig::relay_url`]).
+    pub fn url(&self) -> &str {
+        &self.target.url
+    }
+
+    pub(crate) fn weight(&self) -> u32 {
+        self.weight
+    }
+
+    fn new(target: RelayTarget, weight: u32) -> Self {
+        let key = relay_key(&target);
+        Relay {
+            target,
+            key,
+            weight,
+        }
+    }
+
+    /// `target` with the share `weight`.
+    #[cfg(test)]
+    pub(crate) fn weighted(target: RelayTarget, weight: u32) -> Self {
+        Relay::new(target, weight)
+    }
+}
+
+impl std::fmt::Debug for Relay {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Relay")
+            .field("url", &format_args!("<set>"))
+            .finish()
+    }
+}
+
+/// Reads a `relay_url` value: one relay URL, or a list of relay URLs separated by `,`, each
+/// entry after the first beginning `https://` (so a value is a list only where a `,` is followed
+/// by `https://`, which no single relay URL holds; any other `,` stays part of a URL's path).
+/// Every relay of a list gets the same share. The error completes "`relay_url` ...".
+pub(crate) fn parse_relay_list(value: &str) -> Result<Vec<Relay>, &'static str> {
+    let mut relays: Vec<Relay> = Vec::new();
+    let mut rest = value;
+    loop {
+        let (entry, next) = match rest.find(LIST_SEPARATOR) {
+            Some(at) => (&rest[..at], Some(&rest[at + 1..])),
+            None => (rest, None),
+        };
+        if relays.len() == MAX_RELAYS {
+            return Err("must not list more than 8 relays");
+        }
+        // `URL,,https://...`: a stray comma would otherwise end the first URL's path.
+        if next.is_some() && entry.ends_with(',') {
+            return Err("must not contain an empty list entry");
+        }
+        let target = parse_relay_url(entry)?;
+        if relays.iter().any(|r| r.target.same_relay(&target)) {
+            return Err("must not list the same relay twice");
+        }
+        relays.push(Relay::new(target, 1));
+        match next {
+            Some(next) => rest = next,
+            None => return Ok(relays),
+        }
+    }
+}
+
+/// The relay `draw` (a uniform 64-bit number) picks under `weights`: the one whose share of
+/// the total the draw falls into (each share exact to within one part in 2^64). A relay of
+/// weight 0 is never picked; `None` when every weight is 0.
+pub(crate) fn pick(weights: &[u32], draw: u64) -> Option<usize> {
+    let total: u64 = weights.iter().map(|&w| u64::from(w)).sum();
+    if total == 0 {
+        return None;
+    }
+    // `draw / 2^64 * total`, exactly: a point in `0..total`.
+    let point = ((u128::from(draw) * u128::from(total)) >> 64) as u64;
+    let mut end = 0u64;
+    for (i, &w) in weights.iter().enumerate() {
+        end += u64::from(w);
+        if point < end {
+            return Some(i);
+        }
+    }
+    None
+}
+
+/// The order relays are tried in: `primary`, then the others by weight (highest first, list
+/// order among equals), those of weight 0 last.
+fn failover_order(weights: &[u32], primary: usize) -> Vec<usize> {
+    let mut rest: Vec<usize> = (0..weights.len()).filter(|&i| i != primary).collect();
+    rest.sort_by_key(|&i| std::cmp::Reverse(weights[i]));
+    std::iter::once(primary).chain(rest).collect()
+}
+
+/// The relays a process holds out of the choice after a failure.
+///
+/// [`RelaySelector::global`] is the one a process shares, and the one
+/// [`crate::OhttpConfig::choose_relay`] and [`crate::OhttpNetworks::choose_relay_for`] ask.
+/// Its `Debug` output gives the number of relays held out only, never a relay URL.
+#[derive(Default)]
+pub struct RelaySelector {
+    /// Everything under one lock, so that a failure and a success are each one atomic step.
+    state: Mutex<SelectorState>,
+}
+
+/// The state of a [`RelaySelector`], by relay key ([`relay_key`]). Each table has at most
+/// [`MAX_HELD_RELAYS`] entries.
+#[derive(Default)]
+struct SelectorState {
+    /// Relays held out, and relays whose hold ended no longer ago than it lasted (remembered,
+    /// for the doubling and to tell one relay's failure from a failure of them all).
+    held: HashMap<String, Hold>,
+    /// When the latest request was sent that got its answer through each relay: a failure of a
+    /// request sent before it is older news and holds nothing.
+    cleared: HashMap<String, Instant>,
+    /// The list each relay was last chosen from (a digest of its keys), so that failures and
+    /// successes are compared within one list only: the lists of a process's networks share
+    /// no relay ([`crate::OhttpNetworks::new`]).
+    lists: HashMap<String, u64>,
+    /// When the latest failure that counted was reported, kept after its hold is forgotten: a
+    /// failure of a request sent before it (a long request reporting late) is older news.
+    failed: HashMap<String, Instant>,
+}
+
+/// A relay held out of the choice.
+#[derive(Clone, Copy, Debug)]
+struct Hold {
+    /// When the hold ends.
+    until: Instant,
+    /// How long it was last held, for the doubling.
+    hold: Duration,
+    /// When the hold began: a report of a request sent before it does not change it.
+    since: Instant,
+    /// When the latest request was sent whose failure counted: an older report (a success or
+    /// a failure of a request sent before it) changes nothing.
+    last: Instant,
+    /// The list the relay was last chosen from, if it was.
+    list: Option<u64>,
+}
+
+impl Hold {
+    /// Whether the entry is still kept at `now`: held, or ended no longer ago than it lasted.
+    fn remembered(&self, now: Instant) -> bool {
+        self.until
+            .checked_add(self.hold)
+            .is_none_or(|end| end > now)
+    }
+}
+
+impl std::fmt::Debug for RelaySelector {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let held = match self.state.try_lock() {
+            Ok(state) => Some(state.held.len()),
+            Err(std::sync::TryLockError::Poisoned(p)) => Some(p.into_inner().held.len()),
+            Err(std::sync::TryLockError::WouldBlock) => None,
+        };
+        let mut s = f.debug_struct("RelaySelector");
+        match held {
+            Some(n) => s.field("held", &n),
+            None => s.field("held", &format_args!("<locked>")),
+        };
+        s.finish_non_exhaustive()
+    }
+}
+
+/// Inserts into `map` and keeps it at [`MAX_HELD_RELAYS`] entries by clearing it first when
+/// it is full (a table of advice: losing it only forgets old holds).
+fn bounded_insert<V>(map: &mut HashMap<String, V>, key: String, value: V) {
+    if !map.contains_key(&key) && map.len() >= MAX_HELD_RELAYS {
+        map.clear();
+    }
+    map.insert(key, value);
+}
+
+impl RelaySelector {
+    /// An empty selector: no relay held out.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The process-wide selector.
+    pub fn global() -> &'static RelaySelector {
+        static GLOBAL: OnceLock<RelaySelector> = OnceLock::new();
+        GLOBAL.get_or_init(RelaySelector::new)
+    }
+
+    fn state(&self) -> std::sync::MutexGuard<'_, SelectorState> {
+        self.state.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// A request through the relay at `relay_url` failed in a way another relay may not: no
+    /// connection, a TLS failure, a broken exchange, an answer that does not open, a success
+    /// that is no sealed answer, or an outer status [`relay_status_fails_over`]. The relay
+    /// stays out of the choice for [`RELAY_FAILOVER_HOLD`] where its list has another relay.
+    /// When it fails again on a request sent after that hold ended, while no other relay of its
+    /// list has failed lately, it is held twice as long, up to [`MAX_RELAY_FAILOVER_HOLD`];
+    /// failures of several relays of a list at once (the device offline, the gateway down) are
+    /// not doubled. Nothing is resent here.
+    ///
+    /// `relay_url` is compared as the configuration compares relays (host, port and path as
+    /// [`crate::OhttpNetworks::new`] tells relays apart), so any spelling of a configured relay
+    /// holds it. At most [`MAX_HELD_RELAYS`] relays are kept at once. This form takes the
+    /// request as sent now; [`note_failure_of`](Self::note_failure_of) takes the instant it was
+    /// sent.
+    pub fn note_failure(&self, relay_url: &str) {
+        let now = Instant::now();
+        self.note_failure_with(relay_url, now, now);
+    }
+
+    /// [`note_failure`](Self::note_failure) for a request sent at `sent_at`: the report of a
+    /// request sent before a later request through the relay got its answer, before the
+    /// relay's current hold began, or during a hold that has ended since, changes nothing (one
+    /// sent during a hold that still runs, when every relay was out, failed anew and extends
+    /// it).
+    pub fn note_failure_of(&self, relay_url: &str, sent_at: Instant) {
+        self.note_failure_with(relay_url, sent_at, Instant::now());
+    }
+
+    /// [`note_failure`](Self::note_failure) at `now`, for a request sent then.
+    pub fn note_failure_at(&self, relay_url: &str, now: Instant) {
+        self.note_failure_with(relay_url, now, now);
+    }
+
+    fn note_failure_with(&self, relay_url: &str, sent_at: Instant, now: Instant) {
+        let key = held_key(relay_url);
+        let mut state = self.state();
+        if state.cleared.get(&key).is_some_and(|&ok| sent_at < ok)
+            || state.failed.get(&key).is_some_and(|&last| sent_at < last)
+        {
+            return;
+        }
+        let list = state.lists.get(&key).copied();
+        state.held.retain(|_, h| h.remembered(now));
+        let others_failing =
+            list.is_some() && state.held.iter().any(|(k, h)| *k != key && h.list == list);
+        let (hold, since) = match state.held.get(&key) {
+            // Sent before the latest failure that counted, before the hold began (a late
+            // report), or while a hold that has ended since was running: no change.
+            Some(h)
+                if sent_at < h.last
+                    || sent_at < h.since
+                    || (h.until <= now && sent_at < h.until) =>
+            {
+                return
+            }
+            // Held now and failing again: the hold runs on from now, as long as it is.
+            Some(h) if h.until > now => (h.hold, h.since),
+            // Failing again after its hold: twice as long, unless others fail too.
+            Some(h) if !others_failing => ((h.hold * 2).min(MAX_RELAY_FAILOVER_HOLD), now),
+            Some(h) => (h.hold, now),
+            None => (RELAY_FAILOVER_HOLD, now),
+        };
+        let until = now.checked_add(hold).unwrap_or(now);
+        if !state.held.contains_key(&key) && state.held.len() >= MAX_HELD_RELAYS {
+            if let Some(first) = state
+                .held
+                .iter()
+                .min_by_key(|(_, h)| h.until)
+                .map(|(k, _)| k.clone())
+            {
+                state.held.remove(&first);
+            }
+        }
+        // From now on, a failure of a request sent before this one counted is older news, even
+        // once the hold is forgotten.
+        bounded_insert(&mut state.failed, key.clone(), now);
+        let entry = state.held.entry(key).or_insert(Hold {
+            until,
+            hold,
+            since,
+            last: sent_at,
+            list,
+        });
+        entry.hold = hold;
+        entry.since = since;
+        entry.last = sent_at;
+        entry.list = list;
+        if entry.until < until {
+            entry.until = until;
+        }
+    }
+
+    /// A request through the relay at `relay_url` got its sealed answer, complete: its failure
+    /// hold ends at once, and a failure of a request sent before this one is ignored from now
+    /// on. If it had failed lately itself, the holds of the other relays of its list that
+    /// failed with it end too (the device offline, the gateway down: the way is clear again).
+    /// A running `Retry-After` pause of [`RelayBackoff`] is not touched. This form takes the
+    /// request as sent now; [`note_success_of`](Self::note_success_of) takes the instant it was
+    /// sent.
+    pub fn note_success(&self, relay_url: &str) {
+        self.note_success_of(relay_url, Instant::now());
+    }
+
+    /// [`note_success`](Self::note_success) for a request sent at `sent_at`: a hold that began
+    /// after the request was sent (another request failed meanwhile) is left as it is.
+    pub fn note_success_of(&self, relay_url: &str, sent_at: Instant) {
+        let key = held_key(relay_url);
+        let mut state = self.state();
+        // Recorded for every success (the table is bounded): a request sent earlier may still
+        // report a failure, which is older news.
+        let newest = state
+            .cleared
+            .get(&key)
+            .map_or(sent_at, |&ok| ok.max(sent_at));
+        bounded_insert(&mut state.cleared, key.clone(), newest);
+        let Some(mine) = state.held.get(&key).copied() else {
+            return;
+        };
+        // A failure of a request sent after this one is newer news.
+        if mine.since > sent_at || mine.last > sent_at {
+            return;
+        }
+        state.held.remove(&key);
+        // Others of the list that failed with it (not one held longer, down on its own).
+        if mine.list.is_some() {
+            let mut released = Vec::new();
+            state.held.retain(|k, h| {
+                let keep = h.list != mine.list
+                    || h.since > sent_at
+                    || h.last > sent_at
+                    || h.hold > RELAY_FAILOVER_HOLD;
+                if !keep {
+                    released.push(k.clone());
+                }
+                keep
+            });
+            for other in released {
+                let at = state
+                    .cleared
+                    .get(&other)
+                    .map_or(sent_at, |&ok| ok.max(sent_at));
+                bounded_insert(&mut state.cleared, other, at);
+            }
+        }
+    }
+
+    /// Records `relays` as the list each of them was chosen from.
+    fn remember(&self, relays: &[Relay]) {
+        use std::hash::{Hash as _, Hasher as _};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        for relay in relays {
+            relay.key.hash(&mut hasher);
+        }
+        let id = hasher.finish();
+        let mut state = self.state();
+        if relays.iter().all(|r| state.lists.get(&r.key) == Some(&id)) {
+            return;
+        }
+        if state.lists.len() + relays.len() > MAX_HELD_RELAYS {
+            state.lists.clear();
+        }
+        for relay in relays {
+            state.lists.insert(relay.key.clone(), id);
+        }
+    }
+
+    /// Whether the relay of key `key` is held out after a failure at `now`.
+    fn is_held(&self, key: &str, now: Instant) -> bool {
+        self.state().held.get(key).is_some_and(|h| h.until > now)
+    }
+
+    /// Whether the relay at index `i` of `relays` may take a request at `now`.
+    fn available(&self, relays: &[Relay], i: usize, now: Instant, backoff: &RelayBackoff) -> bool {
+        !self.is_held(&relays[i].key, now) && backoff.remaining_at(relays[i].url(), now).is_none()
+    }
+
+    /// Whether the relay at index `i` of `relays` may be sent to at `now` at all: not paused
+    /// (a hold is advice, a `Retry-After` pause is the relay's own refusal).
+    fn unpaused(relays: &[Relay], i: usize, now: Instant, backoff: &RelayBackoff) -> bool {
+        backoff.remaining_at(relays[i].url(), now).is_none()
+    }
+
+    /// The hold of the relay at `relay_url`, for tests.
+    #[cfg(test)]
+    fn hold_of(&self, relay_url: &str) -> Option<Hold> {
+        self.state().held.get(&held_key(relay_url)).copied()
+    }
+
+    /// The index of the relay of `relays` a request goes to: a fresh random choice by share,
+    /// passed on down the failover order while the relay drawn is held out or paused. With
+    /// every relay out, the first one in that order that is only held, not paused; with every
+    /// relay paused, the relay drawn.
+    pub(crate) fn choose(&self, relays: &[Relay]) -> usize {
+        if relays.len() < 2 {
+            return 0;
+        }
+        self.choose_with(
+            relays,
+            random_draw(),
+            Instant::now(),
+            RelayBackoff::global(),
+        )
+    }
+
+    /// [`choose`](Self::choose) with the draw `draw`, at `now`, against the pauses of
+    /// `backoff`.
+    pub(crate) fn choose_with(
+        &self,
+        relays: &[Relay],
+        draw: u64,
+        now: Instant,
+        backoff: &RelayBackoff,
+    ) -> usize {
+        if relays.len() < 2 {
+            return 0;
+        }
+        self.remember(relays);
+        let weights: Vec<u32> = relays.iter().map(Relay::weight).collect();
+        let drawn = pick(&weights, draw).unwrap_or(0);
+        let order = failover_order(&weights, drawn);
+        order
+            .iter()
+            .copied()
+            .find(|&i| self.available(relays, i, now, backoff))
+            .or_else(|| {
+                order
+                    .iter()
+                    .copied()
+                    .find(|&i| Self::unpaused(relays, i, now, backoff))
+            })
+            .unwrap_or(drawn)
+    }
+
+    /// The relay of `relays` to take over a request that could not go through the one at
+    /// index `failed`: the next one in its failover order that is neither held out nor paused,
+    /// or `None`.
+    #[cfg_attr(not(feature = "client"), allow(dead_code))]
+    pub(crate) fn alternative(&self, relays: &[Relay], failed: usize) -> Option<usize> {
+        self.alternative_with(relays, failed, Instant::now(), RelayBackoff::global())
+    }
+
+    /// [`alternative`](Self::alternative) at `now`, against the pauses of `backoff`.
+    #[cfg_attr(not(any(feature = "client", test)), allow(dead_code))]
+    pub(crate) fn alternative_with(
+        &self,
+        relays: &[Relay],
+        failed: usize,
+        now: Instant,
+        backoff: &RelayBackoff,
+    ) -> Option<usize> {
+        let weights: Vec<u32> = relays.iter().map(Relay::weight).collect();
+        let order: Vec<usize> = failover_order(&weights, failed)
+            .into_iter()
+            .skip(1)
+            .collect();
+        // One that is neither held nor paused; else one only held (a hold is advice, and
+        // nothing was sent yet), as for the first choice.
+        order
+            .iter()
+            .copied()
+            .find(|&i| self.available(relays, i, now, backoff))
+            .or_else(|| {
+                order
+                    .iter()
+                    .copied()
+                    .find(|&i| Self::unpaused(relays, i, now, backoff))
+            })
+    }
+}
+
+/// The most relays [`RelaySelector`] holds out at once.
+pub const MAX_HELD_RELAYS: usize = 64;
+
+/// The key the selector knows a relay by: host, port and path as
+/// [`crate::OhttpNetworks::new`] tells relays apart (an IPv6 literal that embeds an IPv4
+/// address as that address, the path in lower case), so that any spelling of one relay is one
+/// key.
+fn relay_key(target: &RelayTarget) -> String {
+    format!(
+        "{}:{}{}",
+        target.identity_host(),
+        target.port,
+        target.path.to_ascii_lowercase()
+    )
+}
+
+/// [`relay_key`] of `relay_url`, or the value as given when it is no relay URL.
+fn held_key(relay_url: &str) -> String {
+    parse_relay_url(relay_url)
+        .map(|target| relay_key(&target))
+        .unwrap_or_else(|_| relay_url.to_owned())
+}
+
+/// A uniform 64-bit number from the operating system. Should the operating system fail to
+/// give one, a number from the standard library's per-process random hash keys and a counter:
+/// still spread over the relays, though not of cryptographic quality (the choice
+/// guards nothing secret, it only spreads the load).
+fn random_draw() -> u64 {
+    use rand_core::{OsRng, TryRngCore as _};
+    OsRng.try_next_u64().unwrap_or_else(|_| fallback_draw())
+}
+
+fn fallback_draw() -> u64 {
+    use std::hash::{BuildHasher as _, Hasher as _};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+    hasher.write_u64(COUNTER.fetch_add(1, Ordering::Relaxed));
+    hasher.finish()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const A: &str = "https://relay-a.example/relay";
+    const B: &str = "https://relay-b.example/gateway-path";
+
+    fn list(value: &str) -> Vec<Relay> {
+        parse_relay_list(value).unwrap()
+    }
+
+    /// Relays with the given shares (a configured list has equal ones).
+    fn weighted(relays: &[(&str, u32)]) -> Vec<Relay> {
+        relays
+            .iter()
+            .map(|&(url, w)| Relay::weighted(parse_relay_url(url).unwrap(), w))
+            .collect()
+    }
+
+    /// SplitMix64: a seeded, reproducible stream of uniform 64-bit numbers.
+    struct SplitMix64(u64);
+
+    impl SplitMix64 {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            z ^ (z >> 31)
+        }
+    }
+
+    #[test]
+    fn a_single_url_is_one_relay() {
+        let relays = list("https://Relay-A.example/relay/");
+        assert_eq!(relays.len(), 1);
+        assert_eq!(relays[0].url(), A);
+        // A comma not followed by `https://` is part of the path, as in 2.1.0; so is a `|`.
+        for single in ["https://relay.example/a,b", "https://relay.example/a|70"] {
+            let relays = list(single);
+            assert_eq!(relays.len(), 1, "{single}");
+            assert_eq!(relays[0].url(), single);
+        }
+    }
+
+    #[test]
+    fn a_list_names_relays_in_order_with_equal_shares() {
+        let relays = list(&format!("{A},{B}/,https://relay-c.example/relay"));
+        let got: Vec<&str> = relays.iter().map(Relay::url).collect();
+        assert_eq!(got, [A, B, "https://relay-c.example/relay"]);
+        assert!(relays.iter().all(|r| r.weight() == relays[0].weight()));
+    }
+
+    #[test]
+    fn a_malformed_list_is_refused_naming_the_rule() {
+        for (value, rule) in [
+            (
+                format!("{A},https://RELAY-A.example:443/relay/"),
+                "must not list the same relay twice",
+            ),
+            (format!(",{A}"), "must be an https:// URL"),
+            (format!("{A},https://"), "must have a non-empty host"),
+            (
+                format!("{A},https://relay-b.example/a b"),
+                "must not contain whitespace or control characters",
+            ),
+            (format!("{A},,{B}"), "must not contain an empty list entry"),
+        ] {
+            assert_eq!(parse_relay_list(&value).err(), Some(rule), "{value}");
+        }
+        let nine: Vec<String> = (0..9)
+            .map(|i| format!("https://relay-{i}.example/relay"))
+            .collect();
+        assert_eq!(
+            parse_relay_list(&nine.join(",")).err(),
+            Some("must not list more than 8 relays")
+        );
+        assert!(parse_relay_list(&nine[..8].join(",")).is_ok());
+    }
+
+    #[test]
+    fn the_draw_splits_by_weight() {
+        assert_eq!(pick(&[70, 30], 0), Some(0));
+        assert_eq!(pick(&[70, 30], u64::MAX), Some(1));
+        assert_eq!(pick(&[0, 30], 0), Some(1));
+        assert_eq!(pick(&[30, 0], u64::MAX), Some(0));
+        assert_eq!(pick(&[0, 0], 7), None);
+        // The boundary: 70 % of the range picks the first relay, the rest the second.
+        let boundary = ((70u128 << 64) / 100) as u64;
+        assert_eq!(pick(&[70, 30], boundary - 1), Some(0));
+        assert_eq!(pick(&[70, 30], boundary + 1), Some(1));
+    }
+
+    /// Over many draws the relays get their share of the weights.
+    #[test]
+    fn draws_spread_over_the_relays_in_proportion_to_the_weights() {
+        let mut rng = SplitMix64(0x5eed_0001);
+        for weights in [[70u32, 30, 0], [50, 50, 0], [10, 60, 30]] {
+            let mut counts = [0u32; 3];
+            let n = 200_000;
+            for _ in 0..n {
+                counts[pick(&weights, rng.next()).unwrap()] += 1;
+            }
+            for (i, &w) in weights.iter().enumerate() {
+                let share = f64::from(counts[i]) / f64::from(n);
+                let expected = f64::from(w) / 100.0;
+                assert!(
+                    (share - expected).abs() < 0.005,
+                    "{weights:?}: relay {i} got {share}"
+                );
+            }
+        }
+    }
+
+    /// Every request draws afresh: over many requests through one selector the relays get
+    /// their share of the weights.
+    #[test]
+    fn requests_spread_over_the_relays_in_proportion_to_the_weights() {
+        let relays = weighted(&[(A, 70), (B, 30)]);
+        let selector = RelaySelector::new();
+        let backoff = RelayBackoff::new();
+        let now = Instant::now();
+        let mut rng = SplitMix64(0x5eed_0003);
+        let n = 100_000;
+        let to_b = (0..n)
+            .filter(|_| selector.choose_with(&relays, rng.next(), now, &backoff) == 1)
+            .count();
+        let share = to_b as f64 / f64::from(n);
+        assert!((share - 0.30).abs() < 0.005, "{share}");
+        // The operating system's draws too (loose bound: not seeded).
+        let to_b = (0..20_000)
+            .filter(|_| selector.choose(&relays) == 1)
+            .count();
+        let share = to_b as f64 / 20_000.0;
+        assert!((share - 0.30).abs() < 0.03, "{share}");
+    }
+
+    #[test]
+    fn a_failed_relay_hands_over_to_the_next_until_its_hold_ends() {
+        let relays = weighted(&[(A, 70), (B, 30)]);
+        let selector = RelaySelector::new();
+        let backoff = RelayBackoff::new();
+        let now = Instant::now();
+        // Draw 0 picks the first relay.
+        assert_eq!(selector.choose_with(&relays, 0, now, &backoff), 0);
+        selector.note_failure_at(A, now);
+        assert_eq!(selector.choose_with(&relays, 0, now, &backoff), 1);
+        let later = now + RELAY_FAILOVER_HOLD - Duration::from_millis(1);
+        assert_eq!(selector.choose_with(&relays, 0, later, &backoff), 1);
+        let after = now + RELAY_FAILOVER_HOLD;
+        assert_eq!(selector.choose_with(&relays, 0, after, &backoff), 0);
+        // A success brings it back at once.
+        selector.note_failure_at(A, now);
+        selector.note_success(A);
+        assert_eq!(selector.choose_with(&relays, 0, now, &backoff), 0);
+        // Holding a relay out does not touch requests that drew the other one.
+        selector.note_failure_at(A, now);
+        assert_eq!(selector.choose_with(&relays, u64::MAX, now, &backoff), 1);
+    }
+
+    #[test]
+    fn a_relay_pause_hands_over_too() {
+        let relays = weighted(&[(A, 70), (B, 30)]);
+        let selector = RelaySelector::new();
+        let backoff = RelayBackoff::new();
+        let now = Instant::now();
+        backoff.note_at(B, Duration::from_secs(10), now);
+        assert_eq!(selector.choose_with(&relays, u64::MAX, now, &backoff), 0);
+        let after = now + Duration::from_secs(10);
+        assert_eq!(selector.choose_with(&relays, u64::MAX, after, &backoff), 1);
+    }
+
+    #[test]
+    fn with_every_relay_out_the_drawn_relay_is_used() {
+        let relays = weighted(&[(A, 70), (B, 30)]);
+        let selector = RelaySelector::new();
+        let backoff = RelayBackoff::new();
+        let now = Instant::now();
+        selector.note_failure_at(A, now);
+        selector.note_failure_at(B, now);
+        assert_eq!(selector.choose_with(&relays, u64::MAX, now, &backoff), 1);
+        assert_eq!(selector.choose_with(&relays, 0, now, &backoff), 0);
+    }
+
+    #[test]
+    fn a_relay_of_weight_zero_is_only_a_fallback() {
+        let relays = weighted(&[(A, 0), (B, 100)]);
+        let selector = RelaySelector::new();
+        let backoff = RelayBackoff::new();
+        let now = Instant::now();
+        for draw in [0, 1 << 63, u64::MAX] {
+            assert_eq!(selector.choose_with(&relays, draw, now, &backoff), 1);
+        }
+        selector.note_failure_at(B, now);
+        assert_eq!(selector.choose_with(&relays, 0, now, &backoff), 0);
+    }
+
+    #[test]
+    fn the_statuses_that_hold_a_relay_out() {
+        for status in [
+            301, 302, 307, 401, 403, 404, 405, 407, 421, 429, 500, 502, 503, 599,
+        ] {
+            assert!(relay_status_fails_over(status), "{status}");
+        }
+        for status in [200, 204, 400, 409, 413, 415, 422, 426] {
+            assert!(!relay_status_fails_over(status), "{status}");
+        }
+    }
+
+    #[test]
+    fn the_failover_order_follows_the_weights() {
+        assert_eq!(failover_order(&[10, 0, 60, 30], 0), [0, 2, 3, 1]);
+        assert_eq!(failover_order(&[10, 0, 60, 30], 1), [1, 2, 3, 0]);
+        assert_eq!(failover_order(&[50, 50], 1), [1, 0]);
+    }
+
+    #[test]
+    fn a_hold_matches_any_spelling_of_the_relay_and_is_never_shortened() {
+        let relays = weighted(&[(A, 70), (B, 30)]);
+        let selector = RelaySelector::new();
+        let backoff = RelayBackoff::new();
+        let now = Instant::now();
+        selector.note_failure_at("https://RELAY-A.example:443/relay/", now);
+        assert_eq!(selector.choose_with(&relays, 0, now, &backoff), 1);
+        let later = now + Duration::from_secs(30);
+        selector.note_failure_at(A, later);
+        selector.note_failure_at(A, now);
+        let end = later + RELAY_FAILOVER_HOLD - Duration::from_millis(1);
+        assert_eq!(selector.choose_with(&relays, 0, end, &backoff), 1);
+        selector.note_success_of("https://relay-a.EXAMPLE/relay", later);
+        assert_eq!(selector.choose_with(&relays, 0, now, &backoff), 0);
+    }
+
+    #[test]
+    fn the_hold_table_is_bounded() {
+        let selector = RelaySelector::new();
+        let now = Instant::now();
+        for i in 0..(MAX_HELD_RELAYS + 10) {
+            let at = now + Duration::from_millis(i as u64);
+            selector.note_failure_at(&format!("https://relay-{i}.example/relay"), at);
+        }
+        assert_eq!(selector.state().held.len(), MAX_HELD_RELAYS);
+        // The holds that end first were let go.
+        assert!(selector.hold_of("https://relay-0.example/relay").is_none());
+        assert!(selector
+            .hold_of(&format!(
+                "https://relay-{}.example/relay",
+                MAX_HELD_RELAYS + 9
+            ))
+            .is_some());
+    }
+
+    #[test]
+    fn an_alternative_is_the_next_available_relay_in_failover_order() {
+        let relays = weighted(&[(A, 0), (B, 100), ("https://relay-c.example/relay", 50)]);
+        let selector = RelaySelector::new();
+        let backoff = RelayBackoff::new();
+        let now = Instant::now();
+        assert_eq!(
+            selector.alternative_with(&relays, 1, now, &backoff),
+            Some(2)
+        );
+        selector.note_failure_at("https://relay-c.example/relay", now);
+        assert_eq!(
+            selector.alternative_with(&relays, 1, now, &backoff),
+            Some(0)
+        );
+        backoff.note_at(A, Duration::from_secs(5), now);
+        // C is only held: still offered, nothing having been sent.
+        assert_eq!(
+            selector.alternative_with(&relays, 1, now, &backoff),
+            Some(2)
+        );
+        backoff.note_at("https://relay-c.example/relay", Duration::from_secs(5), now);
+        assert_eq!(selector.alternative_with(&relays, 1, now, &backoff), None);
+        assert_eq!(selector.alternative_with(&list(A), 0, now, &backoff), None);
+    }
+
+    #[test]
+    fn the_fallback_draws_spread_too() {
+        let n = 20_000;
+        let high = (0..n).filter(|_| fallback_draw() >= 1 << 63).count();
+        let share = high as f64 / f64::from(n);
+        assert!((share - 0.5).abs() < 0.03, "{share}");
+    }
+
+    #[test]
+    fn a_relay_that_keeps_failing_is_held_longer_each_time() {
+        let relays = weighted(&[(A, 70), (B, 30)]);
+        let selector = RelaySelector::new();
+        let backoff = RelayBackoff::new();
+        let mut now = Instant::now();
+        let mut hold = RELAY_FAILOVER_HOLD;
+        for _ in 0..8 {
+            selector.note_failure_at(A, now);
+            let just_before = now + hold - Duration::from_millis(1);
+            assert_eq!(selector.choose_with(&relays, 0, just_before, &backoff), 1);
+            assert_eq!(selector.choose_with(&relays, 0, now + hold, &backoff), 0);
+            // It fails again on its first request after the hold.
+            now += hold;
+            hold = (hold * 2).min(MAX_RELAY_FAILOVER_HOLD);
+        }
+        assert_eq!(hold, MAX_RELAY_FAILOVER_HOLD);
+        // A success ends the doubling.
+        selector.note_success_of(A, now);
+        selector.note_failure_at(A, now);
+        let after = now + RELAY_FAILOVER_HOLD;
+        assert_eq!(selector.choose_with(&relays, 0, after, &backoff), 0);
+        // So does a long quiet spell.
+        let selector = RelaySelector::new();
+        selector.note_failure_at(A, now);
+        let quiet = now + 2 * RELAY_FAILOVER_HOLD;
+        selector.note_failure_at(A, quiet);
+        assert_eq!(
+            selector.choose_with(&relays, 0, quiet + RELAY_FAILOVER_HOLD, &backoff),
+            0
+        );
+    }
+
+    #[test]
+    fn with_every_relay_out_a_held_relay_goes_before_a_paused_one() {
+        let relays = weighted(&[(A, 70), (B, 30)]);
+        let selector = RelaySelector::new();
+        let backoff = RelayBackoff::new();
+        let now = Instant::now();
+        backoff.note_at(A, Duration::from_secs(10), now);
+        selector.note_failure_at(B, now);
+        assert_eq!(selector.choose_with(&relays, 0, now, &backoff), 1);
+        // Both paused: the relay drawn.
+        backoff.note_at(B, Duration::from_secs(10), now);
+        assert_eq!(selector.choose_with(&relays, 0, now, &backoff), 0);
+    }
+
+    /// A configured list splits evenly.
+    #[test]
+    fn a_configured_list_splits_evenly() {
+        let relays = list(&format!("{A},{B},https://relay-c.example/relay"));
+        let selector = RelaySelector::new();
+        let backoff = RelayBackoff::new();
+        let now = Instant::now();
+        let mut rng = SplitMix64(0x5eed_0005);
+        let mut counts = [0u32; 3];
+        let n = 90_000;
+        for _ in 0..n {
+            counts[selector.choose_with(&relays, rng.next(), now, &backoff)] += 1;
+        }
+        for count in counts {
+            let share = f64::from(count) / f64::from(n);
+            assert!((share - 1.0 / 3.0).abs() < 0.005, "{counts:?}");
+        }
+    }
+
+    /// The client's sequence while the device is offline: each request draws a relay, fails
+    /// to connect, moves to the other and fails again, every 90 s.
+    #[test]
+    fn a_failure_of_every_relay_is_not_held_against_one() {
+        let relays = weighted(&[(A, 70), (B, 30)]);
+        let selector = RelaySelector::new();
+        let backoff = RelayBackoff::new();
+        let mut now = Instant::now();
+        let mut rng = SplitMix64(0x5eed_0004);
+        for _ in 0..20 {
+            let first = selector.choose_with(&relays, rng.next(), now, &backoff);
+            selector.note_failure_at(relays[first].url(), now);
+            let other = selector.alternative_with(&relays, first, now, &backoff);
+            selector.note_failure_at(relays[other.unwrap_or(1 - first)].url(), now);
+            now += Duration::from_secs(90);
+        }
+        {
+            for url in [A, B] {
+                assert_eq!(
+                    selector.hold_of(url).unwrap().hold,
+                    RELAY_FAILOVER_HOLD,
+                    "{url}"
+                );
+            }
+        }
+        // Back online: the first request fails on its relay (held, say A) and succeeds
+        // through the other; that success clears every hold of the outage.
+        selector.note_failure_at(A, now);
+        let sent = now + Duration::from_millis(1);
+        selector.note_success_of(B, sent);
+        let to_a = (0..100)
+            .filter(|i| selector.choose_with(&relays, i * (u64::MAX / 100), sent, &backoff) == 0)
+            .count();
+        assert!((69..=71).contains(&to_a), "{to_a}");
+    }
+
+    #[test]
+    fn late_reports_change_nothing() {
+        let relays = weighted(&[(A, 70), (B, 30)]);
+        let selector = RelaySelector::new();
+        let backoff = RelayBackoff::new();
+        let start = Instant::now();
+        let failed = start + Duration::from_secs(1);
+        selector.note_failure_at(A, failed);
+        let until = selector.hold_of(A).unwrap().until;
+        // A request sent before the failure succeeds late: the hold stays.
+        selector.note_success_of(A, start);
+        assert_eq!(selector.choose_with(&relays, 0, failed, &backoff), 1);
+        // One sent before the failure fails late, inside the hold: the hold does not grow.
+        selector.note_failure_with(A, start, failed + Duration::from_secs(50));
+        assert_eq!(selector.hold_of(A).unwrap().until, until);
+        // One sent while A was held fails after the hold: no new hold, no doubling.
+        let after = until + Duration::from_secs(1);
+        selector.note_failure_with(A, failed + Duration::from_secs(2), after);
+        assert_eq!(selector.hold_of(A).unwrap().until, until);
+        assert_eq!(selector.choose_with(&relays, 0, after, &backoff), 0);
+        // A success through B, which never failed, releases nothing else.
+        selector.note_failure_at(A, after);
+        selector.note_success_of(B, after);
+        assert_eq!(selector.choose_with(&relays, 0, after, &backoff), 1);
+    }
+
+    #[test]
+    fn another_list_neither_releases_nor_shares_a_hold() {
+        let main = weighted(&[(A, 70), (B, 30)]);
+        let test = list("https://relay-c.example/relay,https://relay-d.example/relay");
+        let selector = RelaySelector::new();
+        let backoff = RelayBackoff::new();
+        let now = Instant::now();
+        selector.choose_with(&main, 0, now, &backoff);
+        selector.choose_with(&test, 0, now, &backoff);
+        selector.note_failure_at(A, now);
+        selector.note_failure_at("https://relay-c.example/relay", now);
+        selector.note_success_of("https://relay-c.example/relay", now);
+        // A is still held: C belongs to another list.
+        assert_eq!(selector.choose_with(&main, 0, now, &backoff), 1);
+        // And A doubles when it fails again alone in its list.
+        let again = now + RELAY_FAILOVER_HOLD;
+        selector.note_failure_at("https://relay-c.example/relay", again);
+        selector.note_failure_at(A, again);
+        assert_eq!(selector.hold_of(A).unwrap().hold, RELAY_FAILOVER_HOLD * 2);
+    }
+
+    /// A failure of a request sent before the success that ended a hold is older news.
+    #[test]
+    fn a_late_failure_does_not_bring_back_a_hold_a_newer_success_ended() {
+        let relays = weighted(&[(A, 70), (B, 30)]);
+        let selector = RelaySelector::new();
+        let backoff = RelayBackoff::new();
+        let start = Instant::now();
+        selector.note_failure_at(A, start);
+        let old = start + RELAY_FAILOVER_HOLD + Duration::from_secs(1);
+        let newer = old + Duration::from_secs(1);
+        selector.note_success_of(A, newer);
+        // The request sent at `old` fails only now.
+        selector.note_failure_with(A, old, newer + Duration::from_secs(10));
+        assert_eq!(
+            selector.choose_with(&relays, 0, newer + Duration::from_secs(10), &backoff),
+            0
+        );
+        // A failure of a request sent after the success holds it again.
+        let later = newer + Duration::from_secs(20);
+        selector.note_failure_at(A, later);
+        assert_eq!(selector.choose_with(&relays, 0, later, &backoff), 1);
+    }
+
+    /// A success of a request sent before a later failure that extended the hold does not end
+    /// it, and an older failure does not extend it again.
+    #[test]
+    fn reports_older_than_the_latest_failure_change_nothing() {
+        let relays = weighted(&[(A, 70), (B, 30)]);
+        let selector = RelaySelector::new();
+        let backoff = RelayBackoff::new();
+        let t0 = Instant::now();
+        let s = |secs| t0 + Duration::from_secs(secs);
+        selector.note_failure_at(A, t0);
+        // Sent at 20 (every relay out, say), failing at 30: the hold runs from 30.
+        selector.note_failure_with(A, s(20), s(30));
+        let until = selector.hold_of(A).unwrap().until;
+        assert_eq!(until, s(30) + RELAY_FAILOVER_HOLD);
+        // A success of a request sent at 10 arrives at 40: older than the failure at 20.
+        selector.note_success_of(A, s(10));
+        assert_eq!(selector.choose_with(&relays, 0, s(40), &backoff), 1);
+        // A failure of a request sent at 15 arrives at 50: older too, no extension.
+        selector.note_failure_with(A, s(15), s(50));
+        assert_eq!(selector.hold_of(A).unwrap().until, until);
+    }
+
+    /// When every relay is held, a request that could not reach the one it drew may still
+    /// move to another that is only held (nothing was sent, a hold is advice).
+    #[test]
+    fn with_every_relay_held_an_alternative_is_still_offered() {
+        let relays = weighted(&[(A, 50), (B, 50)]);
+        let selector = RelaySelector::new();
+        let backoff = RelayBackoff::new();
+        let now = Instant::now();
+        selector.note_failure_at(A, now);
+        selector.note_failure_at(B, now);
+        assert_eq!(
+            selector.alternative_with(&relays, 0, now, &backoff),
+            Some(1)
+        );
+        backoff.note_at(B, Duration::from_secs(5), now);
+        assert_eq!(selector.alternative_with(&relays, 0, now, &backoff), None);
+    }
+
+    /// On a relay that never failed, a success of a newer request makes a late failure of an
+    /// older one older news.
+    #[test]
+    fn a_late_failure_after_a_newer_success_holds_nothing() {
+        let relays = weighted(&[(A, 70), (B, 30)]);
+        let selector = RelaySelector::new();
+        let backoff = RelayBackoff::new();
+        let t0 = Instant::now();
+        selector.note_success_of(A, t0 + Duration::from_secs(2));
+        selector.note_failure_with(A, t0 + Duration::from_secs(1), t0 + Duration::from_secs(3));
+        assert_eq!(
+            selector.choose_with(&relays, 0, t0 + Duration::from_secs(3), &backoff),
+            0
+        );
+    }
+
+    /// A request sent before a failure that counted and reporting long after its hold was
+    /// forgotten holds nothing.
+    #[test]
+    fn a_very_late_failure_after_a_forgotten_hold_holds_nothing() {
+        let relays = weighted(&[(A, 70), (B, 30)]);
+        let selector = RelaySelector::new();
+        let backoff = RelayBackoff::new();
+        let t0 = Instant::now();
+        selector.note_failure_at(A, t0 + Duration::from_secs(10));
+        let much_later = t0 + Duration::from_secs(600);
+        selector.note_failure_with(A, t0, much_later);
+        assert_eq!(selector.choose_with(&relays, 0, much_later, &backoff), 0);
+    }
+
+    /// A request sent before a hold began and reporting after the hold was forgotten holds
+    /// nothing either.
+    #[test]
+    fn a_failure_sent_before_a_forgotten_hold_began_holds_nothing() {
+        let relays = weighted(&[(A, 70), (B, 30)]);
+        let selector = RelaySelector::new();
+        let backoff = RelayBackoff::new();
+        let t0 = Instant::now();
+        // Sent at 0, failing at 10: the hold begins at 10.
+        selector.note_failure_with(A, t0, t0 + Duration::from_secs(10));
+        // Sent at 5, reporting at 200, long after the hold was forgotten.
+        let late = t0 + Duration::from_secs(200);
+        selector.note_failure_with(A, t0 + Duration::from_secs(5), late);
+        assert_eq!(selector.choose_with(&relays, 0, late, &backoff), 0);
+    }
+
+    #[test]
+    fn a_single_relay_is_always_chosen() {
+        let relays = list(A);
+        let selector = RelaySelector::new();
+        selector.note_failure(A);
+        assert_eq!(selector.choose(&relays), 0);
+    }
+
+    #[test]
+    fn the_debug_output_shows_no_url() {
+        let relays = weighted(&[(A, 70), (B, 30)]);
+        let shown = format!("{relays:?}");
+        assert!(!shown.contains("example"), "{shown}");
+        let selector = RelaySelector::new();
+        selector.note_failure(A);
+        let shown = format!("{selector:?}");
+        assert!(!shown.contains("example"), "{shown}");
+    }
+}
