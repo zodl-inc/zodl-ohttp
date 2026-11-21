@@ -130,10 +130,12 @@ pub struct Client {
 /// the relay's fault: it does not hold the relay out.
 const MIN_TIMEOUT_TO_BLAME: Duration = Duration::from_secs(5);
 
-/// How long a client with a relay list waits for a connection to a relay: a relay that does
-/// not answer at all fails as a connection failure, before anything is sent, so the request
-/// can move to another relay instead of spending its whole timeout.
-const LIST_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long a client with a relay list waits for a connection to a relay, unless
+/// [`Client::for_network_with_connect_timeout`] sets another: a relay that does not answer at
+/// all fails as a connection failure, before anything is sent, so the request can move to
+/// another relay instead of spending its whole timeout. Long enough for a slow mobile link
+/// (several lost SYNs, a slow TLS handshake); a client on links slower still sets more.
+pub const DEFAULT_LIST_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The most the first envelope source gets of the timeout when there are others: a source that
 /// does not answer leaves time for the next.
@@ -189,6 +191,35 @@ struct KeyCache {
     generation: u64,
 }
 
+impl KeyCache {
+    /// Installs `fetched`, from a fetch that began at `generation`, and returns the
+    /// configuration to seal to. If the cache changed while the fetch ran, another request
+    /// installed a configuration (kept: it is at least as new) or dropped the one the gateway
+    /// refused (the fetch may have brought that one back): the cache is left as that change
+    /// made it, and the request seals to the kept configuration if usable, else to what it
+    /// fetched.
+    fn install(&mut self, generation: u64, fetched: Fetched, now: u64) -> KeyConfig {
+        if self.generation != generation {
+            if let Some(other) = self.kept.filter(|f| f.usable(now)) {
+                return other.config;
+            }
+            return fetched.config;
+        }
+        self.kept = Some(fetched);
+        self.generation += 1;
+        fetched.config
+    }
+
+    /// Drops the kept configuration after the gateway refused `sealed_to`, only if it is still
+    /// the one kept (another request may have installed a newer one meanwhile).
+    fn drop_refused(&mut self, sealed_to: &KeyConfig) {
+        if self.kept.is_some_and(|f| f.config == *sealed_to) {
+            self.kept = None;
+            self.generation += 1;
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 struct Fetched {
     config: KeyConfig,
@@ -238,7 +269,7 @@ impl Client {
     /// and the outcome is reported to [`crate::RelaySelector::global`] (a success once the
     /// answer is complete). A request goes through another relay instead, once, only when
     /// nothing was sent: its relay is paused, or connecting to it failed (connecting is bounded
-    /// by 10 s). Any other failure, an outer error status included, is returned, and the next
+    /// by [`DEFAULT_LIST_CONNECT_TIMEOUT`]). Any other failure, an outer error status included, is returned, and the next
     /// request goes elsewhere. The envelope is fetched through
     /// the first relay listed ([`crate::OhttpConfig::relay_url`]), and through the others in
     /// list order when that fails.
@@ -256,7 +287,39 @@ impl Client {
         network: Network,
         url_rule: SignedConfigUrlRule,
     ) -> Result<Self, Error> {
-        Self::for_network_with(networks, network, url_rule, reqwest::Client::builder())
+        Self::for_network_with(
+            networks,
+            network,
+            url_rule,
+            reqwest::Client::builder(),
+            DEFAULT_LIST_CONNECT_TIMEOUT,
+        )
+    }
+
+    /// [`Client::for_network`] with another bound on connecting to a relay of a list than
+    /// [`DEFAULT_LIST_CONNECT_TIMEOUT`] (a relay that does not answer within it is a connection
+    /// failure: the request moves to another relay, nothing having been sent). Without a relay
+    /// list there is no such bound, as with [`Client::for_network`]. A timeout over a year is a
+    /// year; a zero timeout is refused with [`Error::Setup`] (no connection could ever be made).
+    pub fn for_network_with_connect_timeout(
+        networks: &OhttpNetworks,
+        network: Network,
+        url_rule: SignedConfigUrlRule,
+        connect_timeout: Duration,
+    ) -> Result<Self, Error> {
+        if connect_timeout.is_zero() {
+            return Err(Error::Setup {
+                what: "connect timeout",
+                rule: "must be longer than zero",
+            });
+        }
+        Self::for_network_with(
+            networks,
+            network,
+            url_rule,
+            reqwest::Client::builder(),
+            connect_timeout,
+        )
     }
 
     /// [`Client::for_network`] with the HTTP stack `builder`.
@@ -265,11 +328,12 @@ impl Client {
         network: Network,
         url_rule: SignedConfigUrlRule,
         builder: reqwest::ClientBuilder,
+        connect_timeout: Duration,
     ) -> Result<Self, Error> {
         let config = networks.require(network)?;
         let url = signed_config_url(config.relay_url(), url_rule)?;
         let builder = if config.relays().len() > 1 {
-            builder.connect_timeout(LIST_CONNECT_TIMEOUT)
+            builder.connect_timeout(connect_timeout.min(MAX_TIMEOUT))
         } else {
             builder
         };
@@ -572,11 +636,10 @@ impl Client {
             ) {
                 // Only if it is still the one this request was sealed to: another request may
                 // have fetched a newer one meanwhile.
-                let mut cache = self.config.lock().expect("never poisoned");
-                if cache.kept.is_some_and(|fetched| fetched.config == config) {
-                    cache.kept = None;
-                    cache.generation += 1;
-                }
+                self.config
+                    .lock()
+                    .expect("never poisoned")
+                    .drop_refused(&config);
             }
             if !status.is_success() {
                 return Err(Error::Refused {
@@ -626,20 +689,11 @@ impl Client {
             cache.generation
         };
         let fetched = self.fetch(timeout).await?;
-        let mut cache = self.config.lock().expect("never poisoned");
-        if cache.generation != generation {
-            // The cache changed while this fetch ran: another request installed a
-            // configuration (kept: it is at least as new), or dropped the one the gateway
-            // refused (this fetch may have brought that one back). This request seals to what
-            // it fetched, but the cache is left as the newer change made it.
-            if let Some(other) = cache.kept.filter(|f| f.usable(unix_now())) {
-                return Ok(other.config);
-            }
-            return Ok(fetched.config);
-        }
-        cache.kept = Some(fetched);
-        cache.generation += 1;
-        Ok(fetched.config)
+        Ok(self
+            .config
+            .lock()
+            .expect("never poisoned")
+            .install(generation, fetched, unix_now()))
     }
 
     /// The key configuration from `keys`' URL, or, when that cannot be had (no answer, an
@@ -1059,13 +1113,13 @@ mod tests {
         use tokio::net::TcpListener;
 
         /// The root (DER), the leaf (DER) and the leaf's key (PKCS #8 DER).
-        struct Material {
-            root: Vec<u8>,
-            leaf: Vec<u8>,
-            key: Vec<u8>,
+        pub(crate) struct Material {
+            pub(crate) root: Vec<u8>,
+            pub(crate) leaf: Vec<u8>,
+            pub(crate) key: Vec<u8>,
         }
 
-        fn material() -> &'static Material {
+        pub(crate) fn material() -> &'static Material {
             static MATERIAL: OnceLock<Material> = OnceLock::new();
             MATERIAL.get_or_init(|| {
                 let mut root = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
@@ -1453,6 +1507,7 @@ mod tests {
             Network::Testnet,
             SignedConfigUrlRule::ReplaceRelaySuffix,
             tls::builder(),
+            DEFAULT_LIST_CONNECT_TIMEOUT,
         )
         .unwrap();
         let request = Request::new("GET", "backend.example", "/v1/info");
@@ -1519,6 +1574,7 @@ mod tests {
             Network::Testnet,
             SignedConfigUrlRule::ReplaceRelaySuffix,
             tls::builder(),
+            DEFAULT_LIST_CONNECT_TIMEOUT,
         )
         .unwrap();
         (client, base, seen)
@@ -1720,6 +1776,161 @@ mod tests {
         assert_eq!(client.relays.url(client.relays.choose()), a);
         RelaySelector::global().note_success(&b);
         assert_eq!(client.relays.url(client.relays.choose()), b);
+    }
+
+    fn fetched(seed: u8, not_after: u64) -> Fetched {
+        let mut document = crate::encapsulation::tests::usable_document();
+        // Another key: the public key bytes follow the key id and the KEM id.
+        for byte in &mut document[5..37] {
+            *byte = seed;
+        }
+        Fetched {
+            config: KeyConfig::select(&document).unwrap(),
+            not_after: Some(not_after),
+        }
+    }
+
+    /// A fetch installs what it brought only if nothing changed the cache while it ran.
+    #[test]
+    fn a_fetch_installs_only_if_the_cache_did_not_change_meanwhile() {
+        let (k1, k2, k3) = (fetched(1, 1_000), fetched(2, 1_000), fetched(3, 1_000));
+        // Two fetches begin at generation 0; the first to finish installs.
+        let mut cache = KeyCache::default();
+        assert_eq!(cache.install(0, k1, 10), k1.config);
+        assert_eq!(cache.generation, 1);
+        // The slower one, with an older key, does not overwrite it, and seals to the kept one.
+        assert_eq!(cache.install(0, k2, 10), k1.config);
+        assert_eq!(cache.kept.unwrap().config, k1.config);
+        // A refusal of k1 drops it; a fetch that began before the drop and brings k1 back does
+        // not cache it (it seals to what it fetched, nothing usable being kept).
+        let generation = cache.generation;
+        cache.drop_refused(&k1.config);
+        assert!(cache.kept.is_none());
+        assert_eq!(cache.install(generation, k1, 10), k1.config);
+        assert!(cache.kept.is_none(), "a dropped key came back");
+        // A fetch that began after the drop installs.
+        let generation = cache.generation;
+        assert_eq!(cache.install(generation, k3, 10), k3.config);
+        assert_eq!(cache.kept.unwrap().config, k3.config);
+        // A late refusal of a key no longer kept drops nothing.
+        cache.drop_refused(&k1.config);
+        assert_eq!(cache.kept.unwrap().config, k3.config);
+    }
+
+    /// An HTTP/2 relay that takes a request and then refuses its stream (`REFUSED_STREAM`)
+    /// may have delivered it: the HTTP stack must not send it again on its own. The crate's own
+    /// build speaks HTTP/1.1 only, but an application whose other dependencies turn on
+    /// reqwest's `http2` gets HTTP/2 to relays (cargo merges features), so the test runs with
+    /// it on (a dev-dependency): keep it.
+    #[tokio::test]
+    async fn an_http2_refused_stream_is_not_sent_again() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (envelope, signer) = signed_envelope();
+        let posts = std::sync::Arc::new(AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let material = tls::material();
+        let certs = vec![rustls::pki_types::CertificateDer::from(
+            material.leaf.clone(),
+        )];
+        let key = rustls::pki_types::PrivateKeyDer::Pkcs8(
+            rustls::pki_types::PrivatePkcs8KeyDer::from(material.key.clone()),
+        );
+        let mut config = rustls::ServerConfig::builder_with_provider(std::sync::Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .unwrap();
+        config.alpn_protocols = vec![b"h2".to_vec()];
+        let acceptor = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(config));
+        let counter = posts.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((tcp, _)) = listener.accept().await else {
+                    return;
+                };
+                let acceptor = acceptor.clone();
+                let counter = counter.clone();
+                let envelope = envelope.clone();
+                tokio::spawn(async move {
+                    let Ok(tls) = acceptor.accept(tcp).await else {
+                        return;
+                    };
+                    let Ok(mut connection) = h2::server::handshake(tls).await else {
+                        return;
+                    };
+                    // Every stream in a task of its own, so that the connection keeps being
+                    // driven (frames of a request body arrive through it) while one is read.
+                    while let Some(Ok((request, mut respond))) = connection.accept().await {
+                        let counter = counter.clone();
+                        let envelope = envelope.clone();
+                        tokio::spawn(async move {
+                            if request.method() == http::Method::GET {
+                                let response = http::Response::builder()
+                                    .status(200)
+                                    .header("content-type", "application/json")
+                                    .body(())
+                                    .unwrap();
+                                let mut send = respond.send_response(response, false).unwrap();
+                                let _ = send.send_data(bytes::Bytes::from(envelope.clone()), true);
+                            } else {
+                                // Read the whole request, as a relay that forwarded it would.
+                                let mut body = request.into_body();
+                                while let Some(Ok(chunk)) = body.data().await {
+                                    let _ = body.flow_control().release_capacity(chunk.len());
+                                }
+                                counter.fetch_add(1, Ordering::SeqCst);
+                                respond.send_reset(h2::Reason::REFUSED_STREAM);
+                            }
+                        });
+                    }
+                });
+            }
+        });
+        let base = format!("https://localhost:{port}");
+        let client = Client::checked(
+            format!("{base}/relay"),
+            signed_at(format!("{base}/ohttp-configs/signed"), signer),
+            tls::builder(),
+        )
+        .unwrap();
+        let request = Request::new("POST", "backend.example", "/v1/write").body(vec![1; 64]);
+        assert!(client
+            .send(&request, Duration::from_secs(10))
+            .await
+            .is_err());
+        assert_eq!(
+            posts.load(Ordering::SeqCst),
+            1,
+            "sent again after REFUSED_STREAM"
+        );
+    }
+
+    #[test]
+    fn a_zero_connect_timeout_is_refused() {
+        let networks = crate::config::tests::example();
+        let Err(Error::Setup { what, .. }) = Client::for_network_with_connect_timeout(
+            &networks,
+            Network::Mainnet,
+            SignedConfigUrlRule::ReplaceRelaySuffix,
+            Duration::ZERO,
+        ) else {
+            panic!("a zero connect timeout was accepted");
+        };
+        assert_eq!(what, "connect timeout");
+        // Any other one builds, a year and over included.
+        for timeout in [Duration::from_millis(1), Duration::MAX] {
+            Client::for_network_with_connect_timeout(
+                &networks,
+                Network::Mainnet,
+                SignedConfigUrlRule::ReplaceRelaySuffix,
+                timeout,
+            )
+            .unwrap();
+        }
     }
 
     /// Neither output of a transport error names the host, the address, the port or the path.

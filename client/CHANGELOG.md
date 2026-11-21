@@ -2,6 +2,38 @@
 
 [Keep a Changelog](https://keepachangelog.com).
 
+## 2.3.0
+
+No breaking change (a minor release: new public items).
+
+### Added
+
+- `Client::for_network_with_connect_timeout` and `DEFAULT_LIST_CONNECT_TIMEOUT` (10 s): the
+  bound on connecting to a relay of a list can be set for links slower than a slow mobile one
+  (zero is refused, over a year is a year).
+- `RELAY_PROBE_WINDOW`, `MASKED_FAILURES_TO_HOLD`, `MASKED_FAILURE_WINDOW` (see Changed).
+
+### Changed
+
+- After a relay's hold ends, one request at a time goes to it as a probe; the others keep
+  going to the other relays until the probe reports (or `RELAY_PROBE_WINDOW`, 30 s, passes),
+  instead of every request that draws it at once. The fallback that ignores holds (every relay
+  out) leaves a relay with a probe out alone too (a paused relay is chosen instead: the request
+  then fails locally, nothing posted); a probe outlives the memory of its hold. Each `choose_relay()` call may make its
+  request the probe: call it only for a request that will be sent.
+- A relay that answers some requests and hangs others is held: a failure set aside because a
+  request sent later through it succeeded counts after all once `MASKED_FAILURES_TO_HOLD` (3)
+  such failures fall within a rolling `MASKED_FAILURE_WINDOW` (5 min). Any failure reported to
+  the selector counts (a caller's whole-body deadline is never reported); a hold only moves
+  load.
+
+### Tests
+
+- An HTTP/2 relay that refuses a stream (`REFUSED_STREAM`) after reading the request: the
+  request is not sent again by the HTTP stack.
+- The key-configuration cache under concurrent fetches and a refusal: a slower fetch neither
+  replaces a newer configuration nor brings back a dropped one.
+
 ## 2.2.0
 
 Every configuration value accepted by 2.1.0 means what it did: a value is read as a relay list
