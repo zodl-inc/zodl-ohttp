@@ -30,7 +30,7 @@ use crate::chunked::{
 use crate::{
     check_size, encode_request, open_signed_config, retry_after_delay, signed_config_url, Error,
     HostListAnswer, HttpError, HttpErrorKind, KeyConfig, Limits, Network, NoHostList,
-    OhttpNetworks, OuterHeaders, RelayBackoff, RelaySelector, Request, Response,
+    OhttpNetworks, OuterHeaders, RelayBackoff, RelayProbe, RelaySelector, Request, Response,
     SignedConfigUrlRule, SizeGuard, GATEWAY_MAX_ENCAPSULATED_REQUEST_BYTES,
     MAX_THIRD_PARTY_HOSTS_BYTES,
 };
@@ -151,11 +151,11 @@ enum Relays {
 }
 
 impl Relays {
-    /// The index of the relay the next request goes to.
-    fn choose(&self) -> usize {
+    /// The index of the relay the next request goes to, and the probe the choice let through.
+    fn choose(&self) -> (usize, RelayProbe) {
         match self {
-            Relays::Fixed(_) => 0,
-            Relays::Configured(config) => RelaySelector::global().choose(config.relays()),
+            Relays::Fixed(_) => (0, RelayProbe::NONE),
+            Relays::Configured(config) => RelaySelector::global().choose_probe(config.relays()),
         }
     }
 
@@ -172,8 +172,9 @@ impl Relays {
         matches!(self, Relays::Configured(_))
     }
 
-    /// The relay to take over from the one at `index`, if one is available.
-    fn alternative(&self, index: usize) -> Option<usize> {
+    /// The relay to take over from the one at `index`, if one is available, and the probe the
+    /// choice let through.
+    fn alternative(&self, index: usize) -> Option<(usize, RelayProbe)> {
         match self {
             Relays::Fixed(_) => None,
             Relays::Configured(config) => {
@@ -267,7 +268,12 @@ impl Client {
     ///
     /// With a relay list, each request goes to [`crate::OhttpConfig::choose_relay`]'s choice,
     /// and the outcome is reported to [`crate::RelaySelector::global`] (a success once the
-    /// answer is complete). A request goes through another relay instead, once, only when
+    /// answer is complete) with the choice's [`crate::RelayProbe`]. When every relay of the
+    /// list has its probe out at once (all came off their holds within
+    /// [`crate::RELAY_PROBE_WINDOW`], after the device was offline, say), a request still goes,
+    /// to the relay drawn, as no probe: its success ends that relay's hold, and with it the
+    /// probe, whose own report then counts as a stale one. That is the one case where a request
+    /// that is no probe goes to a relay while its probe is out. A request goes through another relay instead, once, only when
     /// nothing was sent: its relay is paused, or connecting to it failed (connecting is bounded
     /// by [`DEFAULT_LIST_CONNECT_TIMEOUT`]). Any other failure, an outer error status included, is returned, and the next
     /// request goes elsewhere. The envelope is fetched through
@@ -554,15 +560,16 @@ impl Client {
         let encoded = encode_request(request)?;
         // Whether the request has moved to another relay already: at most once.
         let mut moved = false;
-        let mut index = self.relays.choose();
+        let (mut index, mut probe) = self.relays.choose();
         loop {
             let relay_url = self.relays.url(index);
             if let Some(wait) = RelayBackoff::global().remaining(relay_url) {
                 // Nothing was sent: another relay may take it.
-                match self.relays.alternative(index).filter(|_| !moved) {
+                // At most one move, decided before choosing (a choice may claim a probe).
+                match (!moved).then(|| self.relays.alternative(index)).flatten() {
                     Some(other) => {
                         moved = true;
-                        index = other;
+                        (index, probe) = other;
                         continue;
                     }
                     None => return Err(Error::Backoff { wait }),
@@ -600,12 +607,12 @@ impl Client {
                     let callers_deadline = budget < MIN_TIMEOUT_TO_BLAME
                         && matches!(&error, Error::Http(h) if h.kind() == HttpErrorKind::Timeout);
                     if !callers_deadline {
-                        RelaySelector::global().note_failure_of(relay_url, sent_at);
+                        RelaySelector::global().note_failure_of_probe(relay_url, sent_at, probe);
                     }
                     if unsent && !moved {
                         if let Some(other) = self.relays.alternative(index) {
                             moved = true;
-                            index = other;
+                            (index, probe) = other;
                             continue;
                         }
                     }
@@ -624,7 +631,12 @@ impl Client {
                 }
             }
             if self.relays.is_list() && crate::relay_status_fails_over(status.as_u16()) {
-                RelaySelector::global().note_failure_of(relay_url, sent_at);
+                RelaySelector::global().note_failure_of_probe(relay_url, sent_at, probe);
+            }
+            // A refusal about the request itself: the relay answered, which ends its probe
+            // after a hold (neither a success nor a failure).
+            if self.relays.is_list() && crate::relay_status_answered(status.as_u16()) {
+                RelaySelector::global().note_answered_of(relay_url, probe);
             }
             // The gateway could not open the request (a key rotation, among others): the kept
             // configuration is dropped, so that the next request fetches it afresh. This one is
@@ -655,7 +667,7 @@ impl Client {
             if !essence.eq_ignore_ascii_case(CONTENT_TYPE_CHUNKED_RES) {
                 // A success that is no sealed answer (an error page): the relay's fault.
                 if self.relays.is_list() {
-                    RelaySelector::global().note_failure_of(relay_url, sent_at);
+                    RelaySelector::global().note_failure_of_probe(relay_url, sent_at, probe);
                 }
                 return Err(Error::MediaType(crate::shown_media_type(media_type)));
             }
@@ -667,7 +679,7 @@ impl Client {
             let reported_relay = self
                 .relays
                 .is_list()
-                .then(|| (relay_url.to_owned(), sent_at));
+                .then(|| (relay_url.to_owned(), sent_at, probe));
             return Ok(ResponseStream {
                 resp: Some(resp),
                 decoder: opener.decoder(),
@@ -781,9 +793,10 @@ pub struct ResponseStream {
     decoder: ChunkedResponseDecoder,
     guard: SizeGuard,
     pending: std::collections::VecDeque<ResponseEvent>,
-    /// The relay of a list the answer comes through and when the request was sent: a success
+    /// The relay of a list the answer comes through, when the request was sent and the probe
+    /// its choice let through: a success
     /// once the answer is complete, a failure should it break off.
-    relay: Option<(String, Instant)>,
+    relay: Option<(String, Instant, RelayProbe)>,
 }
 
 impl ResponseStream {
@@ -803,11 +816,13 @@ impl ResponseStream {
                 Ok(None) => {
                     self.resp = None;
                     let end = self.decoder.finish();
-                    if let Some((relay, sent_at)) = self.relay.take() {
+                    if let Some((relay, sent_at, probe)) = self.relay.take() {
                         match &end {
-                            Ok(_) => RelaySelector::global().note_success_of(&relay, sent_at),
+                            Ok(_) => RelaySelector::global()
+                                .note_success_of_probe(&relay, sent_at, probe),
                             // Cut short on its way: the relay's.
-                            Err(_) => RelaySelector::global().note_failure_of(&relay, sent_at),
+                            Err(_) => RelaySelector::global()
+                                .note_failure_of_probe(&relay, sent_at, probe),
                         }
                     }
                     end
@@ -815,9 +830,9 @@ impl ResponseStream {
                 Err(e) => {
                     // The answer broke off on its way through the relay (a timeout is the
                     // caller's deadline on the whole body, and not held against it).
-                    if let Some((relay, sent_at)) = self.relay.take() {
+                    if let Some((relay, sent_at, probe)) = self.relay.take() {
                         if !e.is_timeout() {
-                            RelaySelector::global().note_failure_of(&relay, sent_at);
+                            RelaySelector::global().note_failure_of_probe(&relay, sent_at, probe);
                         }
                     }
                     Err(Error::from(e))
@@ -829,9 +844,9 @@ impl ResponseStream {
                     // An answer that does not open: the relay's (a transport failure was reported
                     // above, or deliberately not, for a timeout). One too large says nothing
                     // about the relay: the request asked for it.
-                    if let Some((relay, sent_at)) = self.relay.take() {
+                    if let Some((relay, sent_at, probe)) = self.relay.take() {
                         if !matches!(e, Error::TooLarge { .. }) {
-                            RelaySelector::global().note_failure_of(&relay, sent_at);
+                            RelaySelector::global().note_failure_of_probe(&relay, sent_at, probe);
                         }
                     }
                     self.resp = None;
@@ -969,7 +984,7 @@ mod tests {
                 SignedConfigUrlRule::RelayHostRoot,
             ] {
                 let client = Client::for_network(&networks, network, rule).unwrap();
-                assert_eq!(client.relays.url(client.relays.choose()), relay);
+                assert_eq!(client.relays.url(client.relays.choose().0), relay);
                 // Irrefutable without the feature `insecure-plain-key-config`.
                 #[allow(irrefutable_let_patterns)]
                 let KeyConfigSource::Signed {
@@ -1518,7 +1533,7 @@ mod tests {
         };
         assert_eq!(tls::count(&accepted), 2, "one fetch, one post");
         // The unreachable relay is held out: the next request goes to the other at once.
-        assert_eq!(client.relays.url(client.relays.choose()), reachable);
+        assert_eq!(client.relays.url(client.relays.choose().0), reachable);
     }
 
     /// Two relays on one local server, told apart by path: `/a` (share 0, listed first, so the
@@ -1613,7 +1628,7 @@ mod tests {
             .send(&request, Duration::from_secs(10))
             .await
             .is_err());
-        assert_eq!(client.relays.url(client.relays.choose()), a);
+        assert_eq!(client.relays.url(client.relays.choose().0), a);
         RelaySelector::global().note_success(&b);
     }
 
@@ -1744,7 +1759,7 @@ mod tests {
             "sent again through the other relay: {seen:?}"
         );
         // The relay that broke off is held out.
-        assert_ne!(client.relays.url(client.relays.choose()), b);
+        assert_ne!(client.relays.url(client.relays.choose().0), b);
         RelaySelector::global().note_success(&b);
     }
 
@@ -1773,9 +1788,9 @@ mod tests {
             assert_eq!(seen.get("/b"), Some(&1));
         }
         // `/b` is held out: the next request goes to `/a` though its share is 0.
-        assert_eq!(client.relays.url(client.relays.choose()), a);
+        assert_eq!(client.relays.url(client.relays.choose().0), a);
         RelaySelector::global().note_success(&b);
-        assert_eq!(client.relays.url(client.relays.choose()), b);
+        assert_eq!(client.relays.url(client.relays.choose().0), b);
     }
 
     fn fetched(seed: u8, not_after: u64) -> Fetched {
