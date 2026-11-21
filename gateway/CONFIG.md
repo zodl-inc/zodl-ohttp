@@ -137,8 +137,8 @@ countries = { US = { buy = true, sell = true }, DE = { buy = true, sell = false 
   readable file) is a startup error, as for every secret.
 - `upstream` must be `https://` (`http://` only for a loopback host: `127.0.0.1`, `localhost`,
   `[::1]`, for a local stub).
-- The alias is a `BACKENDS` alias whose policy is its three routes; every route is a WRITE
-  for the replay check (none is in `REPLAY_READ_ROUTES`), nothing is cached. Its requests never
+- The alias is an integration alias whose policy is its three routes; every route is a WRITE
+  for the replay check (the table takes no `read_routes`), nothing is cached. Its requests never
   take the generic forward (which refuses the alias): the provider matches the method and path
   exactly, validates the body (at most 1 KiB, a JSON object with exactly the listed members),
   builds the upstream request itself, signs it with a fresh JWT (`Authorization: Bearer`,
@@ -151,10 +151,12 @@ countries = { US = { buy = true, sell = true }, DE = { buy = true, sell = false 
   concurrency permits are held. The availability document has none. A cap is per process:
   N replicas and hosts allow N times the cap in total.
 - `POST /v1/session` `{"flow": "buy"|"sell", "address": "t1...", "ref": "<26 to 40 base32>",
-  "fiat"?: "USD"|"CAD"|"GBP"|"EUR", "amount"?: "1" to "10000", 2 decimals, with fiat}`:
-  `POST /onramp/v1/token`, then `200 {"url": <hosted page>, "expires_at": <unix seconds, +300>}`.
-  The address must be a Zcash mainnet transparent P2PKH address (base58check). A sell without a
-  `redirect_url` is `503 unavailable` (never a URL).
+  "fiat"?: "USD"|"CAD"|"GBP"|"EUR", "amount"?: "1" to "10000", 2 decimals, with fiat,
+  "timestamp": "<unix seconds>", "signature": "<base64>"}`: `POST /onramp/v1/token`, then
+  `200 {"url": <hosted page>, "expires_at": <unix seconds, +300>}`. The address must be a Zcash
+  mainnet transparent P2PKH address (base58check), and the request signed by that address's
+  key (see "Session signature" below): checked after the body and before anything is signed or
+  called. A sell without a `redirect_url` is `503 unavailable` (never a URL).
 - `POST /v1/sell/status` `{"ref": ...}`: `GET /onramp/v1/sell/user/<ref>/transactions`, then
   `200 {"status": "started"|"success"|"failed"|"unknown"|"not_found", "asset": "ZEC", "network":
   "zcash", "to_address"?: "t1...|t3...", "sell_amount"?: "<ZEC>"}`: `not_found` only for the
@@ -168,14 +170,98 @@ countries = { US = { buy = true, sell = true }, DE = { buy = true, sell = false 
   call; with `enabled = false`, `{"enabled": false, "countries": {}}`; with a body, `400
   invalid_request`.
 - Fixed answers (`application/json`, `{"error": <code>}`): `400 invalid_address`, `400
-  invalid_request` (any other body problem), `503 unavailable` (`enabled = false` on the two
+  invalid_request` (any other body problem), `401 invalid_signature` (a session request whose
+  timestamp is outside the window or whose signature is not the address's; no
+  `www-authenticate` header), `503 unavailable` (`enabled = false` on the two
   POST routes, a sell without a redirect, no usable key, or the gateway's concurrency limits),
   `429 rate_limited` with `retry-after` (a cap, or the upstream's 429: its own `retry-after`
   seconds within 1 to 300, else 60), `502 upstream` (any other upstream status, an answer that
-  is not the expected shape, or no answer in `LWD_TIMEOUT_SECS`). The body of an upstream
+  is not the expected shape, or no answer in `lwd_timeout_secs`). The body of an upstream
   answer other than a 2xx is not read. Another route of the alias is the inner `403 policy
   denied`. An upstream body is never forwarded or logged; logs carry the route, the upstream
-  status and the outcome, never a body, address, amount, ref, token or upstream path.
+  status and the outcome, never a body, address, amount, ref, timestamp, signature, token or
+  upstream path.
+
+#### Session signature
+
+A session request proves that the wallet holds the key of the address it asks a session for:
+`timestamp` and `signature` are required members of the `POST /v1/session` body (strings
+both, like every member).
+
+- `timestamp`: the wallet's clock in decimal Unix seconds: digits only, no sign, no leading
+  zero, no fraction, at most 10 digits (`"1700000000"`; `"01700000000"`, `"+1700000000"`,
+  `"1700000000.0"` and the number `1700000000` are `400 invalid_request`).
+- The message is the UTF-8 text `zodl-onramp-session-v1` LF `<address>` LF `<timestamp>`
+  (LF = `0x0a`; no trailing LF). The address and the timestamp are the decoded JSON string
+  values of the body, exactly as sent. Both are ASCII-restricted (base58 characters, digits),
+  so a wallet writes them without JSON escapes and none are expected; the gateway checks
+  the decoded value either way.
+- It is signed as a Zcash signed message (the `signmessage` convention): the hash is
+  SHA-256(SHA-256(`0x16` `"Zcash Signed Message:\n"` `len(message)` `message`)), each length a
+  compact size (one byte below 253, which every message here is).
+- `signature`: base64 (standard alphabet, padded: 88 characters) of 65 bytes, a header byte,
+  then `r` and `s` (32 bytes each, big endian). The header is `31 + recovery id` (0 to 3) when
+  the address is the HASH160 of the 33-byte compressed public key (what Zcash wallets use),
+  `27 + recovery id` when it is the HASH160 of the 65-byte uncompressed key. `s` must be in the
+  lower half of the group order (as every RFC 6979 signer that normalises produces it).
+
+The gateway, in this order: the body as above (else `400`); the timestamp within 300 s of its
+clock either way (exactly 300 s is accepted, 301 s is not); the signature decodes to 65 bytes
+with a header in 27 to 34 and valid `r`, `s` (both non-zero, below the order, `s` low); the
+public key recovered from it and the hash, encoded as the header says, hashes (RIPEMD-160 of
+SHA-256) to the address's 20 bytes. Any failure after the body is `401
+{"error":"invalid_signature"}`, with no JWT made and no upstream call (reason
+`stale_timestamp` or `invalid_signature` of `ohttp_integration_denied_total`). The signature is
+checked before the route's cap: an invalid request costs one public-key recovery (of the order
+of the request's own HPKE decryption) and does not spend the cap. A gateway clock that reads
+before the Unix epoch answers every request to a coinbase alias `503 unavailable` (reason
+`clock_unavailable`), the availability document too, without checking anything.
+
+What the signature does and does not cover:
+
+- It covers the address and the timestamp only. `flow`, `ref`, `fiat` and `amount` are not
+  signed: whoever holds a signed request can change them. That is bounded: a session is only
+  ever for the signer's own address, and each upstream call spends the route's cap.
+- A signature is not single use: it can be sent again for as long as its timestamp is in the
+  window, up to 600 s in all (from 300 s before to 300 s after the gateway's clock).
+- Wallets must produce it internally, for this request only, never through a user-facing
+  "sign message" prompt (a user asked to sign arbitrary text for a site could be phished into
+  signing this one).
+- A `401 invalid_signature` may also mean that the device clock is wrong by more than 300 s:
+  the answer is the same for every cause, so a wallet may suggest checking the clock.
+
+Test vector (a key made for this vector only; it must never hold funds):
+
+| | |
+|---|---|
+| private key | `0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20` |
+| public key (compressed) | `0284bf7562262bbd6940085748f3be6afa52ae317155181ece31b66351ccffa4b0` |
+| address | `t1RwUkDxFKCydymAzBtTwHtVyH9Tvf6CiiL` |
+| timestamp | `1700000000` |
+| message (hex) | `7a6f646c2d6f6e72616d702d73657373696f6e2d76310a74315277556b4478464b437964796d417a42745477487456794839547666364369694c0a31373030303030303030` |
+| hashed bytes (hex) | `165a63617368205369676e6564204d6573736167653a0a457a6f646c2d6f6e72616d702d73657373696f6e2d76310a74315277556b4478464b437964796d417a42745477487456794839547666364369694c0a31373030303030303030` |
+| message hash (hex) | `3e0f90d09a41b6cc3a720cf740dbfc68abe90013111494f05aa170cd4143c7fa` |
+| signature (RFC 6979, header 32) | `IJdQ6f64QRlbvvFp2dTb33IU8GeRNmRVE1/re+l6yGVkeTv0Lvbid7DGQ3JxOVXZZ4GpXl24i75ZzDQe1Z5jZAs=` |
+| signature (hex) | `209750e9feb841195bbef169d9d4dbdf7214f06791366455135feb7be97ac86564793bf42ef6e277b0c64372713955d96781a95e5db88bbe59cc341ed59e63640b` |
+
+The body of that request at that time:
+
+```json
+{"flow":"buy","address":"t1RwUkDxFKCydymAzBtTwHtVyH9Tvf6CiiL","ref":"ABCDEFGHIJKLMNOPQRSTUVWXYZ","timestamp":"1700000000","signature":"IJdQ6f64QRlbvvFp2dTb33IU8GeRNmRVE1/re+l6yGVkeTv0Lvbid7DGQ3JxOVXZZ4GpXl24i75ZzDQe1Z5jZAs="}
+```
+
+The same key's uncompressed encoding has the address `t1cJfqUTpZiKZ2r7vLUgQFhuj1yAmtcoDhE`; its
+signature at the same timestamp (header 28) is
+`HFuzIoquD5CClZMiyd9iWfEJvtBXDyfjy0Wd6TYDz7wqX6MwseZHt1iAQy5YWb0zv4+vgYAZNUqe9u36L7jPuMs=`. The
+unit test `coinbase::signature::tests::the_published_vector` (integrations crate) checks every
+value above, and that the signer of the tests produces these signatures byte for byte.
+
+`scripts/coinbase-signature-vector.py` is an independent reference for wallet developers,
+Python 3 standard library only (its own secp256k1 arithmetic, RFC 6979, RIPEMD-160 and
+base58check): `check` reproduces every value above, `vector <key hex> <timestamp>
+[uncompressed]` prints them for another key, `verify <address> <timestamp> <signature>` checks
+a signature as the gateway does (the clock aside). The integrations tests run it (required
+under `CI`).
 
 To verify against the live CDP project before launch (the names the module uses, from CDP's
 documentation; a mismatch is a constant in `integrations/src/coinbase.rs`):

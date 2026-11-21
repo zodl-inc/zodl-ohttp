@@ -88,6 +88,8 @@ zeroize = "1"
 tokio = { version = "1.42", features = ["full", "test-util"] }
 # The client half of the chunked HPKE exchange in tests/streaming.rs (hpke 0.13's RNG trait).
 rand_core = { version = "0.9", features = ["os_rng"] }
+# The wallet's signature of a coinbase session request in the tests (the integrations' k256).
+k256 = { version = "0.13", default-features = false, features = ["ecdsa"] }
 
 [features]
 ## Private parsers exposed to the fuzz targets in `fuzz/`.

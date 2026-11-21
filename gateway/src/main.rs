@@ -4269,9 +4269,10 @@ mod handler_tests {
 
         // An invalid address: the provider's fixed answer, nothing upstream.
         let bad = body.replace(
-            "t1Hsc1LR8yKnbbe3twRp88p6vFfC5t7DLbs",
-            "t1Hsc1LR8yKnbbe3twRp88p6vFfC5t7DLbt",
+            "t1RwUkDxFKCydymAzBtTwHtVyH9Tvf6CiiL",
+            "t1RwUkDxFKCydymAzBtTwHtVyH9Tvf6CiiM",
         );
+        assert_ne!(bad, body);
         let (inner_status, _, answer) = post(
             &state,
             bhttp(

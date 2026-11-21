@@ -17,15 +17,18 @@
 //! The coinbase provider on an arbitrary request body and upstream answer: the first byte picks
 //! the route and the upstream status, the rest up to the first `0xff` is the request body, what
 //! follows is the upstream body. Nothing panics; a request goes upstream only with a body that
-//! passed its schema (the session body names exactly one valid mainnet P2PKH address, the
-//! constant asset and network, nothing else); every answer is one of the fixed statuses and JSON.
+//! passed its schema and, for a session, the wallet's signature at the fuzzer's fixed clock (the
+//! session body names exactly one valid mainnet P2PKH address, the constant asset and network,
+//! nothing else); every answer is one of the fixed statuses and JSON.
 
 #![no_main]
 
 use std::sync::Arc;
 
 use libfuzzer_sys::fuzz_target;
-use zodl_ohttp_integrations::coinbase::{Coinbase, Country, Plan, Route, SecretSource, Settings};
+use zodl_ohttp_integrations::coinbase::{
+    signature, Coinbase, Country, Plan, Route, SecretSource, Settings,
+};
 use zodl_ohttp_integrations::core::auth::{JwtEdDsa, NonceSource};
 use zodl_ohttp_integrations::core::body::{self, Check};
 use zodl_ohttp_integrations::core::provider::RequestView;
@@ -72,6 +75,11 @@ fn provider() -> Coinbase {
     Coinbase::new(&settings, Some(signer), Arc::new(Fixed)).expect("the provider")
 }
 
+/// The clock of the fuzzer: the published test vector's timestamp (a seed carries its body).
+const NOW: u64 = 1_700_000_000;
+/// The published test vector's address.
+const VECTOR_ADDRESS: &str = "t1RwUkDxFKCydymAzBtTwHtVyH9Tvf6CiiL";
+
 const ADDRESS: Check = Check::Base58Check {
     versions: &[body::ZCASH_MAINNET_P2PKH],
     payload_len: body::TRANSPARENT_HASH_BYTES,
@@ -99,10 +107,10 @@ fuzz_target!(|data: &[u8]| {
         headers: &[],
         body: request_body,
     };
-    match p.plan(&req) {
+    match p.plan(&req, NOW) {
         Plan::Denied(_) => assert_eq!(path, "/v1/other"),
         Plan::Local { answer, .. } => {
-            assert!(matches!(answer.status, 200 | 400 | 503));
+            assert!(matches!(answer.status, 200 | 400 | 401 | 503));
             serde_json::from_slice::<serde_json::Value>(&answer.body).expect("JSON");
         }
         Plan::Upstream(call) => {
@@ -116,6 +124,16 @@ fuzz_target!(|data: &[u8]| {
                     assert_eq!(addresses[0]["blockchains"], serde_json::json!(["zcash"]));
                     assert_eq!(sent["assets"], serde_json::json!(["ZEC"]));
                     assert_eq!(sent.as_object().unwrap().len(), 2);
+                    // Only a request the wallet signed, fresh at the fuzzer's clock.
+                    let got: serde_json::Value = serde_json::from_slice(request_body).unwrap();
+                    let member = |name: &str| got[name].as_str().unwrap();
+                    let timestamp: u64 = member("timestamp").parse().unwrap();
+                    assert!(signature::is_fresh(timestamp, NOW));
+                    assert!(
+                        signature::verify(member("address"), timestamp, member("signature"))
+                            .is_ok()
+                    );
+                    assert_eq!(member("address"), addresses[0]["address"].as_str().unwrap());
                 }
                 Route::SellStatus => {
                     assert!(call.body.is_none());
@@ -133,6 +151,8 @@ fuzz_target!(|data: &[u8]| {
     if let Ok(text) = std::str::from_utf8(request_body) {
         let _ = ADDRESS.accepts(text);
         let _ = body::base58check(text);
+        let _ = signature::verify(VECTOR_ADDRESS, NOW, text);
+        let _ = signature::verify(text, NOW, "IJdQ6f64QRlbvvFp2dTb33IU8GeRNmRVE1/re+l6yGVkeTv0Lvbid7DGQ3JxOVXZZ4GpXl24i75ZzDQe1Z5jZAs=");
         let _ = Check::Decimal {
             max_fraction: 8,
             min: "0",

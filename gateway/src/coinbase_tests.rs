@@ -26,8 +26,15 @@ use zodl_ohttp_integrations::coinbase::{Country, SecretSource, Settings};
 
 use super::*;
 
-/// A synthetic address (a made-up hash).
-const T1: &str = "t1Hsc1LR8yKnbbe3twRp88p6vFfC5t7DLbs";
+/// The address of the test key [`T1_KEY`] (made for the tests, no real funds; the published
+/// test vector's key), compressed.
+const T1: &str = "t1RwUkDxFKCydymAzBtTwHtVyH9Tvf6CiiL";
+const T1_KEY: [u8; 32] = [
+    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
+    27, 28, 29, 30, 31, 32,
+];
+/// Another test key.
+const OTHER_KEY: [u8; 32] = [0x22; 32];
 const REF: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
 const KEY_ID: &str = "00000000-0000-4000-8000-0000000000aa";
 
@@ -202,8 +209,30 @@ fn request(method: &str, path: &str, body: &str) -> InnerRequest {
     }
 }
 
+/// The base64 signature of `key` for `address` at `timestamp` (compressed key header).
+fn sign(key: &[u8; 32], address: &str, timestamp: u64) -> String {
+    use zodl_ohttp_integrations::coinbase::signature;
+    let key = k256::ecdsa::SigningKey::from_slice(key).unwrap();
+    let digest = signature::message_hash(signature::message(address, timestamp).as_bytes());
+    let (sig, recovery) = key.sign_prehash_recoverable(&digest).unwrap();
+    let mut bytes = vec![31 + recovery.to_byte()];
+    bytes.extend_from_slice(&sig.to_bytes());
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+/// A buy session body for [`T1`] with `fields`, claiming `timestamp`, signed by `key` at
+/// `signed_at`.
+fn session_signed(fields: &str, key: &[u8; 32], signed_at: u64, timestamp: u64) -> String {
+    let sig = sign(key, T1, signed_at);
+    format!(
+        r#"{{"flow":"buy","address":"{T1}","ref":"{REF}"{fields},"timestamp":"{timestamp}","signature":"{sig}"}}"#
+    )
+}
+
+/// A buy session body for [`T1`] with `fields`, signed by its key now.
 pub(crate) fn session(fields: &str) -> String {
-    format!(r#"{{"flow":"buy","address":"{T1}","ref":"{REF}"{fields}}}"#)
+    let now = unix_now().unwrap();
+    session_signed(fields, &T1_KEY, now, now)
 }
 
 async fn ask(state: &Arc<AppState>, req: &InnerRequest) -> (u16, Value, Vec<(String, String)>) {
@@ -503,6 +532,122 @@ async fn refusals_and_local_answers_never_reach_the_upstream() {
 }
 
 #[tokio::test]
+async fn a_session_without_the_wallets_signature_never_reaches_the_upstream() {
+    crate::health::init_metrics();
+    let (url, log) = stub_with(200, br#"{"token":"t"}"#).await;
+    let label = "onramp-signature";
+    let state = gateway_state(&url, entry(&url, label, true, true), 256);
+    let denied = |reason: &str| {
+        counter(
+            "ohttp_integration_denied_total",
+            &[("integration", label), ("reason", reason)],
+        )
+    };
+    let now = unix_now().unwrap();
+    let good = sign(&T1_KEY, T1, now);
+    let mut bytes = base64::engine::general_purpose::STANDARD
+        .decode(&good)
+        .unwrap();
+    // The malleated (high-S) copy of the valid signature.
+    let sig = k256::ecdsa::Signature::from_slice(&bytes[1..]).unwrap();
+    let s: k256::Scalar = *sig.s().as_ref();
+    let mut high = bytes.clone();
+    high[0] = 27 + ((high[0] - 27) ^ 1);
+    high[33..].copy_from_slice(&(-s).to_bytes());
+    let b64 = |b: &[u8]| base64::engine::general_purpose::STANDARD.encode(b);
+    let with_signature = |sig: &str| {
+        format!(
+            r#"{{"flow":"buy","address":"{T1}","ref":"{REF}","timestamp":"{now}","signature":"{sig}"}}"#
+        )
+    };
+    let mut refused_signature = vec![
+        // Another key's signature, a tampered timestamp.
+        session_signed("", &OTHER_KEY, now, now),
+        session_signed("", &T1_KEY, now, now - 1),
+        // Malleated, unpadded, not 65 bytes.
+        with_signature(&b64(&high)),
+        with_signature(good.trim_end_matches('=')),
+        with_signature(&b64(&bytes[..64])),
+    ];
+    // The uncompressed key encoding's header (another address), a header byte out of range.
+    bytes[0] -= 4;
+    refused_signature.push(with_signature(&b64(&bytes)));
+    bytes[0] = 35;
+    refused_signature.push(with_signature(&b64(&bytes)));
+    for body in &refused_signature {
+        let (status, json, headers) = ask(&state, &request("POST", "/v1/session", body)).await;
+        assert_eq!(
+            (status, json),
+            (401, json!({"error": "invalid_signature"})),
+            "{body}"
+        );
+        // A fixed answer: its content type only (no CORS header, nothing of the request).
+        assert_eq!(
+            headers,
+            vec![("content-type".to_string(), "application/json".to_string())]
+        );
+    }
+    // Expired and ahead (signed correctly at that time; well past the window, so a second
+    // boundary during the test cannot make one fresh: the exact edges are the provider's tests).
+    for at in [now - 400, now + 400, now - 3600, 0] {
+        let (status, json, _) = ask(
+            &state,
+            &request("POST", "/v1/session", &session_signed("", &T1_KEY, at, at)),
+        )
+        .await;
+        assert_eq!((status, json), (401, json!({"error": "invalid_signature"})));
+    }
+    // Missing, extra, repeated or malformed members are body problems.
+    let invalid_request = [
+        format!(r#"{{"flow":"buy","address":"{T1}","ref":"{REF}","timestamp":"{now}"}}"#),
+        format!(r#"{{"flow":"buy","address":"{T1}","ref":"{REF}","signature":"{good}"}}"#),
+        session(r#","nonce":"1""#),
+        session(r#","timestamp":"1""#),
+        format!(
+            r#"{{"flow":"buy","address":"{T1}","ref":"{REF}","timestamp":{now},"signature":"{good}"}}"#
+        ),
+        format!(
+            r#"{{"flow":"buy","address":"{T1}","ref":"{REF}","timestamp":"0{now}","signature":"{good}"}}"#
+        ),
+    ];
+    for body in &invalid_request {
+        let (status, json, _) = ask(&state, &request("POST", "/v1/session", body)).await;
+        assert_eq!(
+            (status, json),
+            (400, json!({"error": "invalid_request"})),
+            "{body}"
+        );
+    }
+    assert_eq!(denied("invalid_signature"), refused_signature.len() as f64);
+    assert_eq!(denied("stale_timestamp"), 4.0);
+    assert_eq!(denied("invalid_request"), invalid_request.len() as f64);
+    assert!(log.lock().is_empty(), "nothing went upstream");
+    // The same request signed correctly goes upstream once, with nothing of the signature.
+    let (status, _, _) = ask(&state, &request("POST", "/v1/session", &session(""))).await;
+    assert_eq!(status, 200);
+    let seen = log.lock().clone();
+    assert_eq!(seen.len(), 1);
+    let sent = String::from_utf8_lossy(&seen[0].body).to_string();
+    assert!(
+        !sent.contains("signature") && !sent.contains("timestamp"),
+        "{sent}"
+    );
+    assert_eq!(outcome_label(401), "invalid_signature");
+}
+
+#[test]
+fn a_clock_before_the_epoch_reads_as_none() {
+    let epoch = SystemTime::UNIX_EPOCH;
+    assert_eq!(unix_seconds(epoch), Some(0));
+    assert_eq!(
+        unix_seconds(epoch + Duration::from_secs(1_700_000_000)),
+        Some(1_700_000_000)
+    );
+    assert_eq!(unix_seconds(epoch - Duration::from_secs(1)), None);
+    assert!(unix_now().is_some());
+}
+
+#[tokio::test]
 async fn switched_off_or_without_a_key_it_answers_unavailable() {
     crate::health::init_metrics();
     let (url, log) = stub_with(200, br#"{"token":"t"}"#).await;
@@ -538,7 +683,7 @@ async fn switched_off_or_without_a_key_it_answers_unavailable() {
 async fn upstream_errors_are_scrubbed() {
     // CDP's 400 echoes the address.
     let echo: &'static [u8] =
-        br#"{"message":"address [t1Hsc1LR8yKnbbe3twRp88p6vFfC5t7DLbs] is not valid for blockchain [zcash]"}"#;
+        br#"{"message":"address [t1RwUkDxFKCydymAzBtTwHtVyH9Tvf6CiiL] is not valid for blockchain [zcash]"}"#;
     for (status, expected_status, code) in [
         (400, 502, "upstream"),
         (401, 502, "upstream"),

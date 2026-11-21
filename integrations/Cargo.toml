@@ -23,12 +23,16 @@ ed25519-dalek = "2"
 sha2 = "0.10"
 # Key material wiped when dropped.
 zeroize = "1"
+# The wallet's signature of a coinbase session request: secp256k1 ECDSA public key recovery
+# (k256) and the HASH160 of the recovered key (RIPEMD-160 of its SHA-256).
+k256 = { version = "0.13", default-features = false, features = ["ecdsa"], optional = true }
+ripemd = { version = "0.1", optional = true }
 
 [features]
 # One feature per provider kind beyond the generic one; the gateway builds with all of them.
 default = ["cmc", "coinbase", "flexa", "near", "swapkit"]
 cmc = []
-coinbase = []
+coinbase = ["dep:k256", "dep:ripemd"]
 flexa = []
 near = []
 swapkit = []

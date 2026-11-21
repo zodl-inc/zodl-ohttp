@@ -24,11 +24,14 @@
 //! body, builds the upstream request itself and scrubs every upstream answer:
 //!
 //! - `POST /v1/session` `{"flow": "buy"|"sell", "address": "t1...", "ref": "<base32>", "fiat"?:
-//!   "USD"|"CAD"|"GBP"|"EUR", "amount"?: "50"}` (`amount` needs `fiat`): `POST
-//!   /onramp/v1/token` with the address for the `zcash` network and the asset `ZEC` (constants,
-//!   never inputs; no client IP is ever sent), then `{"url": <hosted page URL>, "expires_at":
-//!   <unix seconds>}` ([`buy_url`], [`sell_url`]). The address must be a Zcash mainnet
-//!   transparent P2PKH address (base58check). A sell needs the configured `redirect_url`.
+//!   "USD"|"CAD"|"GBP"|"EUR", "amount"?: "50", "timestamp": "<unix seconds>", "signature":
+//!   "<base64>"}` (`amount` needs `fiat`): `POST /onramp/v1/token` with the address for the
+//!   `zcash` network and the asset `ZEC` (constants, never inputs; no client IP is ever sent),
+//!   then `{"url": <hosted page URL>, "expires_at": <unix seconds>}` ([`buy_url`],
+//!   [`sell_url`]). The address must be a Zcash mainnet transparent P2PKH address
+//!   (base58check), the timestamp within [`signature::MAX_SKEW_SECS`] of the gateway's clock,
+//!   and the signature the wallet's, by that address's key, over the address and the timestamp
+//!   ([`signature`]). A sell needs the configured `redirect_url`.
 //! - `POST /v1/sell/status` `{"ref": ...}`: `GET /onramp/v1/sell/user/<ref>/transactions`, then
 //!   `{"status": "started"|"success"|"failed"|"unknown"|"not_found", "asset": "ZEC", "network":
 //!   "zcash", "to_address"?: "t1...|t3...", "sell_amount"?: "<ZEC>"}` from the newest
@@ -38,15 +41,20 @@
 //!
 //! Every upstream call carries a fresh JWT ([`crate::core::auth::JwtEdDsa`]). Errors are fixed
 //! JSON answers `{"error": <code>}`: `400 invalid_address`, `400 invalid_request` (any other
-//! body problem), `503 unavailable` (switched off with `enabled = false`, a sell without a
-//! redirect, no usable key), `429 rate_limited` (the upstream's 429, or a cap), `502 upstream`
-//! (any other upstream answer, an answer that is not the expected shape, or no answer). With
+//! body problem), `401 invalid_signature` (a session request whose timestamp is out of the
+//! window or whose signature is not the address's), `503 unavailable` (switched off with
+//! `enabled = false`, a sell without a redirect, no usable key), `429 rate_limited` (the
+//! upstream's 429, or a cap), `502 upstream` (any other upstream answer, an answer that is not
+//! the expected shape, or no answer). With
 //! `enabled = false` the availability document is `{"enabled": false, "countries": {}}`, so the
 //! wallets hide the feature. An upstream body is never forwarded and never logged: CDP's errors
 //! echo the address.
 //!
 //! The provider answers outside the gateway's generic forward and implements no
 //! [`crate::core::provider::Provider`]: nothing can forward a request to its alias as received.
+
+#[cfg(feature = "coinbase")]
+pub mod signature;
 
 #[cfg(feature = "coinbase")]
 use std::collections::BTreeMap;
@@ -192,6 +200,7 @@ pub const RETRY_AFTER_DEFAULT: u64 = 60;
 pub mod answers {
     pub const INVALID_REQUEST: &[u8] = br#"{"error":"invalid_request"}"#;
     pub const INVALID_ADDRESS: &[u8] = br#"{"error":"invalid_address"}"#;
+    pub const INVALID_SIGNATURE: &[u8] = br#"{"error":"invalid_signature"}"#;
     pub const UNAVAILABLE: &[u8] = br#"{"error":"unavailable"}"#;
     pub const RATE_LIMITED: &[u8] = br#"{"error":"rate_limited"}"#;
     pub const UPSTREAM: &[u8] = br#"{"error":"upstream"}"#;
@@ -234,6 +243,22 @@ const TOKEN: Check = Check::Chars {
     max: 2048,
 };
 
+/// The wallet's timestamp of a session request: decimal Unix seconds, no sign, no leading zero.
+#[cfg(feature = "coinbase")]
+const TIMESTAMP: Check = Check::Decimal {
+    max_fraction: 0,
+    min: "0",
+    max: "9999999999",
+};
+/// The wallet's signature of a session request: base64 characters, bounded (decoded and
+/// verified after the body is valid: [`signature::verify`]).
+#[cfg(feature = "coinbase")]
+const SIGNATURE: Check = Check::Chars {
+    charset: b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=",
+    min: 1,
+    max: 128,
+};
+
 #[cfg(feature = "coinbase")]
 const SESSION: Schema = Schema {
     max_bytes: MAX_BODY_BYTES,
@@ -262,6 +287,16 @@ const SESSION: Schema = Schema {
             name: "amount",
             required: false,
             check: AMOUNT,
+        },
+        Field {
+            name: "timestamp",
+            required: true,
+            check: TIMESTAMP,
+        },
+        Field {
+            name: "signature",
+            required: true,
+            check: SIGNATURE,
         },
     ],
 };
@@ -416,7 +451,8 @@ pub enum Plan {
     Denied(Denial),
     /// Answered here, without an upstream call: `refusal` is the bounded reason of a refusal
     /// (`disabled`, `invalid_request`, `invalid_address`, `unexpected_body`,
-    /// `sell_unavailable`), `None` for the availability document.
+    /// `stale_timestamp`, `invalid_signature`, `sell_unavailable`), `None` for the
+    /// availability document.
     Local {
         answer: Answer,
         refusal: Option<&'static str>,
@@ -711,9 +747,10 @@ impl Coinbase {
         }
     }
 
-    /// What to do with `req`: the policy refusal, a local answer (switched off, an invalid body,
-    /// the availability document), or the upstream call.
-    pub fn plan(&self, req: &RequestView<'_>) -> Plan {
+    /// What to do with `req` at `now` (seconds since the Unix epoch, the gateway's clock): the
+    /// policy refusal, a local answer (switched off, an invalid body, a session request whose
+    /// timestamp or signature is refused, the availability document), or the upstream call.
+    pub fn plan(&self, req: &RequestView<'_>, now: u64) -> Plan {
         // The route first: anything else is the gateway's policy refusal, whatever the switch.
         if let Some(reason) = crate::core::route::path_trick(req.path) {
             return Plan::Denied(Denial::PathTrick(reason));
@@ -754,6 +791,18 @@ impl Coinbase {
             Route::Session => {
                 if values.get("amount").is_some() && values.get("fiat").is_none() {
                     return local(400, answers::INVALID_REQUEST, Some("invalid_request"));
+                }
+                // The wallet's signature, before anything is signed or called: a fresh
+                // timestamp, then the key of exactly this address. Both refusals are the
+                // same answer; neither echoes anything of the request.
+                let address = values.get("address").unwrap_or_default();
+                let timestamp = values.get("timestamp").and_then(|t| t.parse::<u64>().ok());
+                let Some(timestamp) = timestamp.filter(|&t| signature::is_fresh(t, now)) else {
+                    return local(401, answers::INVALID_SIGNATURE, Some("stale_timestamp"));
+                };
+                let signed = values.get("signature").unwrap_or_default();
+                if signature::verify(address, timestamp, signed).is_err() {
+                    return local(401, answers::INVALID_SIGNATURE, Some("invalid_signature"));
                 }
                 let sell = values.get("flow") == Some("sell");
                 if sell && self.redirect_url.is_none() {
