@@ -145,8 +145,9 @@ pub use outer::{
 };
 pub use profile::ClientProfile;
 pub use relays::{
-    relay_status_fails_over, Relay, RelaySelector, MASKED_FAILURES_TO_HOLD, MASKED_FAILURE_WINDOW,
-    MAX_HELD_RELAYS, MAX_RELAYS, MAX_RELAY_FAILOVER_HOLD, RELAY_FAILOVER_HOLD, RELAY_PROBE_WINDOW,
+    relay_status_answered, relay_status_fails_over, Relay, RelayProbe, RelaySelector,
+    MASKED_FAILURES_TO_HOLD, MASKED_FAILURE_WINDOW, MAX_HELD_RELAYS, MAX_RELAYS,
+    MAX_RELAY_FAILOVER_HOLD, RELAY_FAILOVER_HOLD, RELAY_PROBE_WINDOW,
 };
 pub use signed::{
     open_signed_config, verify_signed_config, verify_signed_config_with, Base64Decoding,

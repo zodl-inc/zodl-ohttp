@@ -1735,7 +1735,7 @@ checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
 
 [[package]]
 name = "zodl-ohttp-client"
-version = "2.3.0"
+version = "2.4.0"
 dependencies = [
  "aes-gcm",
  "base64",

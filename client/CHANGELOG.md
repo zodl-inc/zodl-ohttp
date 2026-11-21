@@ -2,6 +2,50 @@
 
 [Keep a Changelog](https://keepachangelog.com).
 
+## 2.4.0
+
+No breaking change (a minor release: new public items).
+
+### Added
+
+- `RelayProbe`: which probe a relay choice let through after the relay's hold, if any. An
+  opaque value (a counter, no URL, no time; `to_raw` / `from_raw` for a foreign-function
+  interface) the caller keeps with the request and passes back with its report, so that only
+  the report of the relay's current probe ends that probe. A request chosen as a probe but sent
+  late, after a newer probe replaced it, reports for a probe no longer current: its report
+  never ends the newer probe (its answer changes nothing, its success only makes older failures
+  older news, its failure counts as any failure, so that a relay whose probes hang past the
+  window is still held). `RelayProbe::NONE` for a request that was no probe. `choose_relay` /
+  `choose_relay_for` return none: their reports count as in 2.3.0; prefer the `_where` forms.
+- `OhttpConfig::choose_relay_where(eligible)` / `OhttpNetworks::choose_relay_for_where(host,
+  eligible)`: the relay choice with the caller's own criterion, returning the relay and its
+  `RelayProbe`. A relay for which `eligible` is false (a pause the caller keeps per transport,
+  for example) is passed over as if paused, never let through as the probe after its hold
+  (a choice the caller cannot use spends no probe), and never returned. `eligible` is asked
+  once per relay and choice. `None` when no eligible relay can take the request (none is
+  eligible, or every eligible one has its probe out); an eligible relay paused by
+  `Retry-After` may still be returned, as by `choose_relay`.
+- `RelaySelector::note_failure_of_probe(relay_url, sent_at, probe)` /
+  `note_success_of_probe(relay_url, sent_at, probe)`: `note_failure_of` / `note_success_of`
+  for a request with the `RelayProbe` of its choice. With `RelayProbe::NONE`, exactly the
+  forms without it.
+- `relay_status_answered(status)` and `RelaySelector::note_answered_of(relay_url, probe)`: an
+  outer refusal about the request itself (`400`, `409`, `413`, `415`, `422`, `426`) shows the
+  relay answered but not that it delivered; reported this way it ends the relay's current
+  probe after a hold, neither a success nor a failure, so the next request probes again instead
+  of the relay staying at one request per `RELAY_PROBE_WINDOW`.
+
+### Changed
+
+- `Client` keeps the `RelayProbe` of each choice and reports with it. When every relay of
+  a list has its probe out at once, a request still goes, to the relay drawn, as no probe;
+  its success ends that relay's hold and the probe with it (the one case where a request that
+  is no probe goes during a probe; the `_where` choices return `None` instead). A relay whose
+  probe is out is no longer released by another relay's success in a shared outage: its own
+  probe's report decides. `Client` also reports those refusals through a relay of a list
+  with `note_answered_of`. The request itself is still
+  refused and never resent.
+
 ## 2.3.0
 
 No breaking change (a minor release: new public items).

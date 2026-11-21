@@ -32,7 +32,7 @@ use std::fmt;
 
 use ed25519_dalek::VerifyingKey;
 
-use crate::relays::{parse_relay_list, Relay, RelaySelector};
+use crate::relays::{parse_relay_list, Relay, RelayProbe, RelaySelector};
 use crate::signed::Network;
 
 /// One value of an [`OhttpConfig`], as a [`ConfigError`] names it.
@@ -248,8 +248,41 @@ impl OhttpConfig {
     /// `Retry-After` ([`crate::RelaySelector::global`]). Call it for each request, and report
     /// the outcome with [`crate::RelaySelector::note_failure`] /
     /// [`crate::RelaySelector::note_success`].
+    ///
+    /// This choice may make the request a relay's probe after its hold without saying so:
+    /// its reports, without a [`RelayProbe`], count as they did in 2.3.0, so a late one may end
+    /// a newer probe, and a refusal cannot end the probe (it lasts its
+    /// [`crate::RELAY_PROBE_WINDOW`]). Prefer [`choose_relay_where`](Self::choose_relay_where)
+    /// (`|_| true` with no criterion) and report with its [`RelayProbe`].
     pub fn choose_relay(&self) -> &str {
         self.relays[RelaySelector::global().choose(&self.relays)].url()
+    }
+
+    /// [`choose_relay`](Self::choose_relay), passing over a relay for which `eligible` is false
+    /// as if it were paused: one the caller cannot send to (a pause of its own, kept per
+    /// transport, that the selector does not see). Such a relay is never let through as the
+    /// probe after its hold, so a choice the caller then cannot use spends no probe, and never
+    /// returned. `eligible` is asked once per relay, before the choice. `None` when no eligible
+    /// relay can take the request (none is eligible, or every eligible one has its probe out):
+    /// fail the request locally, nothing sent. An eligible relay paused by `Retry-After` may
+    /// still be returned, as by [`choose_relay`](Self::choose_relay): check the pause before
+    /// sending. A relay passed over fails nothing, so it takes no part in its list's outage; a
+    /// hold it had from an outage of the whole list is still cleared by a success of another.
+    /// A network of one relay gets it whenever it is eligible (with no other relay to take its
+    /// share it is never held out), with [`RelayProbe::NONE`].
+    ///
+    /// With the relay, the [`RelayProbe`] the choice let through, if it made the request the
+    /// relay's probe after a hold: keep it with the request and pass it back with its report
+    /// ([`crate::RelaySelector::note_failure_of_probe`],
+    /// [`crate::RelaySelector::note_success_of_probe`], [`crate::RelaySelector::note_answered_of`]),
+    /// so that a request sent late never ends a newer probe.
+    pub fn choose_relay_where(
+        &self,
+        eligible: impl Fn(&str) -> bool,
+    ) -> Option<(&str, RelayProbe)> {
+        RelaySelector::global()
+            .choose_where(&self.relays, &eligible)
+            .map(|(i, probe)| (self.relays[i].url(), probe))
     }
 
     /// Gives the relays these shares instead of equal ones, for the tests of `Client`.
@@ -403,10 +436,23 @@ impl OhttpNetworks {
 
     /// The relay to post the next request to `gateway_host` through
     /// ([`OhttpConfig::choose_relay`]: with a relay list, a fresh choice on every call), or
-    /// `None` as for [`relay_for`](Self::relay_for).
+    /// `None` as for [`relay_for`](Self::relay_for). Prefer
+    /// [`choose_relay_for_where`](Self::choose_relay_for_where), for its [`RelayProbe`]
+    /// ([`OhttpConfig::choose_relay`] says why).
     pub fn choose_relay_for(&self, gateway_host: &str) -> Option<&str> {
         let network = self.network_of_host(gateway_host)?;
         self.get(network).map(OhttpConfig::choose_relay)
+    }
+
+    /// [`choose_relay_for`](Self::choose_relay_for) with the caller's criterion
+    /// ([`OhttpConfig::choose_relay_where`]); `None` also for a host of no network.
+    pub fn choose_relay_for_where(
+        &self,
+        gateway_host: &str,
+        eligible: impl Fn(&str) -> bool,
+    ) -> Option<(&str, RelayProbe)> {
+        let network = self.network_of_host(gateway_host)?;
+        self.get(network)?.choose_relay_where(&eligible)
     }
 
     /// The configuration of `network`, or [`crate::Error::KeyConfig`] naming the network when
@@ -1153,5 +1199,29 @@ pub(crate) mod tests {
         );
         // A list configuration shows no value either.
         assert!(!format!("{networks:?}").contains("example"));
+    }
+
+    #[test]
+    fn a_choice_with_the_callers_criterion_returns_only_an_eligible_relay() {
+        let list = "https://relay-a.example/relay,https://relay-b.example/gateway";
+        let main = config("ohttp-gateway.example", list, 1).unwrap();
+        for _ in 0..50 {
+            assert_eq!(
+                main.choose_relay_where(|url| url.contains("relay-b"))
+                    .map(|(url, _)| url),
+                Some("https://relay-b.example/gateway")
+            );
+        }
+        assert_eq!(main.choose_relay_where(|_| false), None);
+        let single = config("ohttp-gateway.example", "https://relay-a.example/relay", 1).unwrap();
+        assert_eq!(single.choose_relay_where(|_| false), None);
+        assert_eq!(
+            single.choose_relay_where(|_| true),
+            Some(("https://relay-a.example/relay", RelayProbe::NONE))
+        );
+        assert_eq!(
+            single.choose_relay_where(|_| true).map(|(url, _)| url),
+            Some("https://relay-a.example/relay")
+        );
     }
 }
