@@ -606,7 +606,7 @@ lazy_static::lazy_static! {
 // Providers of the integrations crate that answer some requests themselves (kind coinbase).
 lazy_static::lazy_static! {
     static ref OHTTP_INTEGRATION_DENIED_TOTAL: IntCounterVec = IntCounterVec::new(
-        Opts::new("ohttp_integration_denied_total", "Requests to an integration answered without an upstream call because they were refused, by integration (the configuration file's table label) and reason (policy, disabled, invalid_request, invalid_address, unexpected_body, sell_unavailable, rate_limited)"),
+        Opts::new("ohttp_integration_denied_total", "Requests to an integration answered without an upstream call because they were refused, by integration (the configuration file's table label) and reason (policy, disabled, invalid_request, invalid_address, stale_timestamp, invalid_signature, unexpected_body, sell_unavailable, rate_limited, clock_unavailable)"),
         &["integration", "reason"]
     )
     .unwrap();

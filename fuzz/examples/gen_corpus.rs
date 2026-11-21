@@ -252,7 +252,7 @@ fn main() {
     ]);
     write(dir, "gateway_settings_round_trip", &settings);
 
-    // Route selector, request body, 0xff, upstream body (synthetic address, made-up hash).
+    // Route selector, request body, 0xff, upstream body.
     let seed = |selector: u8, body: &[u8], upstream: &[u8]| -> Vec<u8> {
         let mut out = vec![selector];
         out.extend_from_slice(body);
@@ -260,7 +260,8 @@ fn main() {
         out.extend_from_slice(upstream);
         out
     };
-    let session: &[u8] = br#"{"flow":"buy","address":"t1Hsc1LR8yKnbbe3twRp88p6vFfC5t7DLbs","ref":"ABCDEFGHIJKLMNOPQRSTUVWXYZ","fiat":"USD","amount":"50"}"#;
+    // The session body is signed by the published test vector's key at the fuzzer's clock.
+    let session: &[u8] = br#"{"flow":"buy","address":"t1RwUkDxFKCydymAzBtTwHtVyH9Tvf6CiiL","ref":"ABCDEFGHIJKLMNOPQRSTUVWXYZ","fiat":"USD","amount":"50","timestamp":"1700000000","signature":"IJdQ6f64QRlbvvFp2dTb33IU8GeRNmRVE1/re+l6yGVkeTv0Lvbid7DGQ3JxOVXZZ4GpXl24i75ZzDQe1Z5jZAs="}"#;
     let status: &[u8] = br#"{"ref":"ABCDEFGHIJKLMNOPQRSTUVWXYZ"}"#;
     let sell: &[u8] = br#"{"transactions":[{"status":"TRANSACTION_STATUS_STARTED","asset":"ZEC","network":"zcash","created_at":"2026-11-20T12:00:00Z","to_address":"t3JZcvsuaXE6ygokL4XUiZSTrQBUoPYFnXJ","sell_amount":{"value":"0.5","currency":"ZEC"}}]}"#;
     write(

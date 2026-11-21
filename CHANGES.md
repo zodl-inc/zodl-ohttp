@@ -142,6 +142,25 @@ keeps its own log in [client/CHANGELOG.md](client/CHANGELOG.md).
   `ohttp_integration_sign_failures_total{integration}`; a new fuzz target
   `integrations_coinbase`. See `gateway/CONFIG.md` "Coinbase integration", which lists the
   CDP names to verify against the live project before launch.
+- **Breaking change of the `coinbase` session request** (not a refactor): every wallet must
+  sign it. An unsigned `POST /v1/session` (no `timestamp` or `signature`) is now
+  `400 invalid_request`, a bad or stale signature `401 invalid_signature`; in the integrations
+  crate `Coinbase::plan` takes the gateway's clock (`plan(&req, now)`). A gateway clock before
+  the Unix epoch answers `503 unavailable` (reason `clock_unavailable`).
+  The request is signed by the wallet: `POST /v1/session` takes two more
+  required members, `timestamp` (decimal Unix seconds, a string) and `signature` (base64 of a
+  65-byte compact recoverable secp256k1 signature, the Zcash signed-message convention) over
+  `zodl-onramp-session-v1\n<address>\n<timestamp>` by the key of the session's t-address.
+  The gateway recovers the key, hashes it in the encoding the header byte names (compressed or
+  not) and compares it with the address; it refuses a high `s`, and a timestamp more than
+  300 s from its clock either way. Either refusal is `401 {"error":"invalid_signature"}`
+  without an upstream call or a JWT (reasons `stale_timestamp` and `invalid_signature` of
+  `ohttp_integration_denied_total`; `ohttp_requests_total` status label `invalid_signature`);
+  a missing, repeated or malformed member, or any other, stays `400 invalid_request`. Neither
+  value is logged or sent upstream. A wallet without the signature can no longer start a
+  session. See `gateway/CONFIG.md` "Session signature" for the format, what the signature does
+  not cover (`flow`, `ref`, `fiat`, `amount`; reuse within 600 s), a test vector and the
+  standard-library Python reference `scripts/coinbase-signature-vector.py`.
 
 ### Crate names
 

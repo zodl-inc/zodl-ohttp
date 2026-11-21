@@ -18,13 +18,15 @@
 //! from the configuration file in force, and the answer to a request to one of their aliases.
 //!
 //! Only a configuration file sets them (`[integrations.<label>] kind = "coinbase"`), and only
-//! on a mainnet gateway (`NETWORK=mainnet`): no environment variable can (the export of an
-//! environment has none). The alias is a `BACKENDS` alias like any
-//! other (routing, replay class: every route a WRITE, labels), but its requests never take the
+//! on a mainnet gateway (the setting `network = "mainnet"`): no environment variable can (the
+//! export of an environment has none). The alias is an integration alias like any other
+//! (routing, replay class: every route a WRITE, labels), but its requests never take the
 //! generic forward: the provider validates the body, builds the upstream request, signs it,
 //! and scrubs the answer, all here, with a cap per route. Nothing of the client's request but
-//! the validated values reaches the upstream; no body, address, amount, ref, token or upstream
-//! path is logged.
+//! the validated values reaches the upstream; no body, address, amount, ref, timestamp,
+//! signature, token or upstream path is logged. A session request carries the wallet's
+//! signature over its address and a timestamp (`zodl_ohttp_integrations::coinbase::signature`):
+//! verified against the gateway's clock before anything is signed or called.
 //!
 //! The key document is read once with every other secret of the files
 //! ([`crate::config_source::secret_value`]; it is never part of the rendered policy); the
@@ -199,7 +201,7 @@ impl Integrations {
         for settings in Settings::parse_rendered(&rendered)? {
             if network != NETWORK {
                 bail!(
-                    "Invalid coinbase integration '{}': kind coinbase runs on a mainnet gateway only (NETWORK is '{network}')",
+                    "Invalid coinbase integration '{}': kind coinbase runs on a mainnet gateway only (the network setting is '{network}')",
                     settings.alias
                 );
             }
@@ -254,10 +256,17 @@ fn json(answer: Answer, extra: Vec<(String, String)>) -> InnerResponse {
     }
 }
 
-fn unix_now() -> u64 {
-    SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs())
+/// `time` in seconds since the Unix epoch; `None` before it (a clock that cannot be read as
+/// one: no timestamp window and no JWT can be made from it).
+fn unix_seconds(time: SystemTime) -> Option<u64> {
+    time.duration_since(SystemTime::UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_secs())
+}
+
+/// The gateway's clock in Unix seconds, if it reads as such.
+fn unix_now() -> Option<u64> {
+    unix_seconds(SystemTime::now())
 }
 
 /// The label of an answer of the provider for `ohttp_requests_total`'s status label.
@@ -265,6 +274,7 @@ pub fn outcome_label(status: u16) -> &'static str {
     match status {
         200..=299 => "success",
         400 => "invalid_request",
+        401 => "invalid_signature",
         403 => "policy_denied",
         429 => "third_party_limited",
         502 => "upstream_error",
@@ -275,7 +285,8 @@ pub fn outcome_label(status: u16) -> &'static str {
 
 /// The answer to `inner_request` for the alias of `entry`: the policy refusal (the gateway's
 /// inner 403), an answer of the provider without an upstream call (switched off, an invalid
-/// body, the availability document), `unavailable` without a key or a concurrency permit, the
+/// body, a session request without a fresh timestamp or the address's signature, the
+/// availability document), `unavailable` without a key or a concurrency permit, the
 /// route's cap (`rate_limited`), or the upstream call (signed, built by the provider) and its
 /// scrubbed answer. Never an error: every failure is one of the provider's fixed answers.
 pub async fn answer(
@@ -293,7 +304,17 @@ pub async fn answer(
         headers: &inner_request.headers,
         body: &inner_request.body,
     };
-    let call = match provider.plan(&view) {
+    // The gateway's clock: the window of the wallet's timestamp, then the JWT's claims. A clock
+    // before the epoch checks no timestamp and signs nothing: `unavailable`.
+    let Some(now) = unix_now() else {
+        warn!(
+            integration = label,
+            network, "The clock is before the Unix epoch (integration answered 503)"
+        );
+        crate::health::record_integration_denied(label, "clock_unavailable");
+        return json(Answer::unavailable(), Vec::new());
+    };
+    let call = match provider.plan(&view, now) {
         Plan::Denied(denial) => {
             warn!(
                 policy = "deny",
@@ -335,7 +356,6 @@ pub async fn answer(
     let route = call.route.label();
 
     // A signer first: without one nothing is spent.
-    let now = unix_now();
     let Some(authorization) = provider.authorization(&call, now) else {
         crate::health::record_integration_sign_failure(label);
         return json(Answer::unavailable(), Vec::new());

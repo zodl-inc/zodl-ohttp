@@ -21,9 +21,18 @@ use ed25519_dalek::Verifier;
 // RFC 8032 section 7.1 test 1 (a published test key, no real credential).
 const SEED_B64: &str = "nWGxne/9WmC6hEr0kuwsxERJxWl7MmkZcDusAxyuf2A=";
 const KEY_ID: &str = "00000000-0000-4000-8000-000000000001";
+// The addresses of two test keys (made for the tests, no real funds): the published vector's
+// key `01 02 .. 20` and the key `22 .. 22`, both compressed.
+const T1: &str = "t1RwUkDxFKCydymAzBtTwHtVyH9Tvf6CiiL";
+const T1_KEY: [u8; 32] = [
+    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
+    27, 28, 29, 30, 31, 32,
+];
+const T1_OTHER: &str = "t1RSr79xfHYE8LALif4h9Puuft9pGgydJv3";
+const T1_OTHER_KEY: [u8; 32] = [0x22; 32];
+// The gateway's clock in these tests.
+const NOW: u64 = 1_700_000_000;
 // Synthetic addresses (made-up hashes).
-const T1: &str = "t1Hsc1LR8yKnbbe3twRp88p6vFfC5t7DLbs";
-const T1_OTHER: &str = "t1Hxw6JqWMnhDK5jRCieg5bFHM2qt7UtQvu";
 const T3: &str = "t3JZcvsuaXE6ygokL4XUiZSTrQBUoPYFnXJ";
 const TESTNET: &str = "tm9iMLAuYMzJ6jtFLcA7rzUmfreGuKvr7Ma";
 const REF: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
@@ -93,12 +102,40 @@ fn req<'a>(method: &'a str, path: &'a str, body: &'a [u8]) -> RequestView<'a> {
     }
 }
 
-fn session_body(fields: &str) -> Vec<u8> {
+/// The base64 signature of `key` for `address` at `timestamp` (compressed key header).
+fn sign(key: &[u8; 32], address: &str, timestamp: u64) -> String {
+    let key = k256::ecdsa::SigningKey::from_slice(key).unwrap();
+    let digest = signature::message_hash(signature::message(address, timestamp).as_bytes());
+    let (sig, recovery) = key.sign_prehash_recoverable(&digest).unwrap();
+    let mut bytes = vec![31 + recovery.to_byte()];
+    bytes.extend_from_slice(&sig.to_bytes());
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+/// The body `{fields}` without a timestamp or a signature.
+fn unsigned_body(fields: &str) -> Vec<u8> {
     format!("{{{fields}}}").into_bytes()
 }
 
+/// The body `{fields}` with `"timestamp"` [`NOW`] and the `"signature"` of the key of its
+/// address (one of the test keys; for any other address, or none, a well-formed signature of
+/// the first key, so a body refused for another reason is not refused for its signature).
+fn session_body(fields: &str) -> Vec<u8> {
+    let address = serde_json::from_slice::<Value>(&unsigned_body(fields))
+        .ok()
+        .and_then(|v| v.get("address").and_then(Value::as_str).map(str::to_string))
+        .unwrap_or_default();
+    let key = if address == T1_OTHER {
+        &T1_OTHER_KEY
+    } else {
+        &T1_KEY
+    };
+    let sig = sign(key, &address, NOW);
+    format!(r#"{{{fields},"timestamp":"{NOW}","signature":"{sig}"}}"#).into_bytes()
+}
+
 fn plan(p: &Coinbase, method: &str, path: &str, body: &[u8]) -> Plan {
-    p.plan(&req(method, path, body))
+    p.plan(&req(method, path, body), NOW)
 }
 
 fn local(plan: Plan) -> (u16, String, Option<&'static str>) {
@@ -471,6 +508,228 @@ fn every_call_gets_a_token_for_itself() {
     let keyless = Coinbase::new(&settings(true), None, Arc::new(Fixed)).unwrap();
     assert!(!keyless.has_signer());
     assert_eq!(keyless.authorization(&session, 5), None);
+}
+
+/// The session body for `address` with `timestamp` and `signature` as given (raw JSON text).
+fn signed_raw(address: &str, timestamp: &str, signature: &str) -> Vec<u8> {
+    unsigned_body(&format!(
+        r#""flow":"buy","address":"{address}","ref":"{REF}","timestamp":{timestamp},"signature":"{signature}""#
+    ))
+}
+
+/// The session body for `address` signed by `key` at `signed_at`, the body claiming
+/// `timestamp`.
+fn signed(key: &[u8; 32], address: &str, signed_at: u64, timestamp: u64) -> Vec<u8> {
+    signed_raw(
+        address,
+        &format!(r#""{timestamp}""#),
+        &sign(key, address, signed_at),
+    )
+}
+
+#[test]
+fn a_session_request_is_signed_by_the_key_of_its_address() {
+    let p = provider(true);
+    let session = |body: &[u8]| plan(&p, "POST", "/v1/session", body);
+    let refused = |reason| {
+        (
+            401,
+            r#"{"error":"invalid_signature"}"#.to_string(),
+            Some(reason),
+        )
+    };
+    // Valid: each key for its own address; the address goes upstream unchanged.
+    for (key, address) in [(&T1_KEY, T1), (&T1_OTHER_KEY, T1_OTHER)] {
+        let call = upstream(session(&signed(key, address, NOW, NOW)));
+        assert_eq!(
+            json_of(call.body.as_deref().unwrap())["addresses"][0]["address"],
+            address
+        );
+        // Neither the timestamp nor the signature goes upstream.
+        let sent = String::from_utf8(call.body.unwrap()).unwrap();
+        assert!(!sent.contains(&NOW.to_string()) && !sent.contains("signature"));
+    }
+    // The published vector at its own time.
+    let vector = signed_raw(
+        T1,
+        r#""1700000000""#,
+        "IJdQ6f64QRlbvvFp2dTb33IU8GeRNmRVE1/re+l6yGVkeTv0Lvbid7DGQ3JxOVXZZ4GpXl24i75ZzDQe1Z5jZAs=",
+    );
+    assert!(matches!(
+        p.plan(&req("POST", "/v1/session", &vector), 1_700_000_000),
+        Plan::Upstream(_)
+    ));
+    // A valid signature by another key, for this address.
+    assert_eq!(
+        local(session(&signed(&T1_OTHER_KEY, T1, NOW, NOW))),
+        refused("invalid_signature")
+    );
+    // A signature for another address, under this one.
+    let sig = sign(&T1_KEY, T1, NOW);
+    assert_eq!(
+        local(session(&signed_raw(T1_OTHER, &format!(r#""{NOW}""#), &sig))),
+        refused("invalid_signature")
+    );
+    // A tampered timestamp (still within the window).
+    assert_eq!(
+        local(session(&signed(&T1_KEY, T1, NOW, NOW - 1))),
+        refused("invalid_signature")
+    );
+    assert_eq!(
+        local(session(&signed(&T1_KEY, T1, NOW - 10, NOW))),
+        refused("invalid_signature")
+    );
+    // The window: exactly 300 s either way is fresh, 301 s is not (signed correctly).
+    for (offset, fresh) in [(-300i64, true), (300, true), (-301, false), (301, false)] {
+        let at = NOW.checked_add_signed(offset).unwrap();
+        let plan = session(&signed(&T1_KEY, T1, at, at));
+        if fresh {
+            assert!(matches!(plan, Plan::Upstream(_)), "{offset}");
+        } else {
+            assert_eq!(local(plan), refused("stale_timestamp"), "{offset}");
+        }
+    }
+    // Long expired, far in the future.
+    for at in [0, NOW - 86_400, NOW + 86_400, 9_999_999_999] {
+        assert_eq!(
+            local(session(&signed(&T1_KEY, T1, at, at))),
+            refused("stale_timestamp"),
+            "{at}"
+        );
+    }
+    // A malleated (high-S) copy of a valid signature.
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(sign(&T1_KEY, T1, NOW))
+        .unwrap();
+    let sig = k256::ecdsa::Signature::from_slice(&bytes[1..]).unwrap();
+    let s: k256::Scalar = *sig.s().as_ref();
+    let mut high = bytes.clone();
+    high[0] = 27 + ((high[0] - 27) ^ 1);
+    high[33..].copy_from_slice(&(-s).to_bytes());
+    let high = base64::engine::general_purpose::STANDARD.encode(high);
+    assert_eq!(
+        local(session(&signed_raw(T1, &format!(r#""{NOW}""#), &high))),
+        refused("invalid_signature")
+    );
+    // The header's key encoding must be the one the address hashes: the compressed key's
+    // address with an uncompressed header (and the uncompressed key's address, its own
+    // signature, then the compressed header).
+    let mut uncompressed_header = bytes.clone();
+    uncompressed_header[0] -= 4;
+    let flipped = base64::engine::general_purpose::STANDARD.encode(&uncompressed_header);
+    assert_eq!(
+        local(session(&signed_raw(T1, &format!(r#""{NOW}""#), &flipped))),
+        refused("invalid_signature")
+    );
+    const T1_UNCOMPRESSED: &str = "t1cJfqUTpZiKZ2r7vLUgQFhuj1yAmtcoDhE";
+    let key = k256::ecdsa::SigningKey::from_slice(&T1_KEY).unwrap();
+    let digest = signature::message_hash(signature::message(T1_UNCOMPRESSED, NOW).as_bytes());
+    let (sig, recovery) = key.sign_prehash_recoverable(&digest).unwrap();
+    let mut own = vec![27 + recovery.to_byte()];
+    own.extend_from_slice(&sig.to_bytes());
+    let b64 = |b: &[u8]| base64::engine::general_purpose::STANDARD.encode(b);
+    assert!(matches!(
+        session(&signed_raw(
+            T1_UNCOMPRESSED,
+            &format!(r#""{NOW}""#),
+            &b64(&own)
+        )),
+        Plan::Upstream(_)
+    ));
+    own[0] += 4;
+    assert_eq!(
+        local(session(&signed_raw(
+            T1_UNCOMPRESSED,
+            &format!(r#""{NOW}""#),
+            &b64(&own)
+        ))),
+        refused("invalid_signature")
+    );
+    // Not 65 bytes of padded base64, or a header byte outside 27..=34.
+    let good = sign(&T1_KEY, T1, NOW);
+    let mut bad_header = bytes.clone();
+    bad_header[0] = 35;
+    let mut zero_header = bytes.clone();
+    zero_header[0] = 0;
+    for bad in [
+        good.trim_end_matches('=').to_string(),
+        good[4..].to_string(),
+        format!("{good}AAAA"),
+        b64(&bytes[..64]),
+        b64(&[bytes.as_slice(), &[0]].concat()),
+        b64(&bad_header),
+        b64(&zero_header),
+        "A".to_string(),
+        "====".to_string(),
+    ] {
+        assert_eq!(
+            local(session(&signed_raw(T1, &format!(r#""{NOW}""#), &bad))),
+            refused("invalid_signature"),
+            "{bad}"
+        );
+    }
+    // Every refusal above is the same fixed answer: nothing of the request in it.
+    let invalid_request = (
+        400,
+        r#"{"error":"invalid_request"}"#.to_string(),
+        Some("invalid_request"),
+    );
+    let now = format!(r#""{NOW}""#);
+    for body in [
+        // Missing, as another type, or in another form.
+        unsigned_body(&format!(
+            r#""flow":"buy","address":"{T1}","ref":"{REF}","signature":"{good}""#
+        )),
+        unsigned_body(&format!(
+            r#""flow":"buy","address":"{T1}","ref":"{REF}","timestamp":"{NOW}""#
+        )),
+        signed_raw(T1, &NOW.to_string(), &good),
+        signed_raw(T1, "null", &good),
+        signed_raw(T1, &format!(r#""0{NOW}""#), &good),
+        signed_raw(T1, &format!(r#""+{NOW}""#), &good),
+        signed_raw(T1, &format!(r#""-{NOW}""#), &good),
+        signed_raw(T1, &format!(r#""{NOW}.0""#), &good),
+        signed_raw(T1, &format!(r#"" {NOW}""#), &good),
+        signed_raw(T1, r#""""#, &good),
+        signed_raw(T1, r#""17000000000""#, &good),
+        signed_raw(T1, &now, ""),
+        signed_raw(T1, &now, &format!("-{}", &good[1..])),
+        signed_raw(T1, &now, &format!("{good} ")),
+        signed_raw(T1, &now, &"A".repeat(129)),
+        // An extra member, or one twice.
+        unsigned_body(&format!(
+            r#""flow":"buy","address":"{T1}","ref":"{REF}","timestamp":"{NOW}","signature":"{good}","nonce":"1""#
+        )),
+        unsigned_body(&format!(
+            r#""flow":"buy","address":"{T1}","ref":"{REF}","timestamp":"{NOW}","signature":"{good}","signature":"{good}""#
+        )),
+        unsigned_body(&format!(
+            r#""flow":"buy","address":"{T1}","ref":"{REF}","timestamp":"{NOW}","timestamp":"{NOW}","signature":"{good}""#
+        )),
+        unsigned_body(&format!(
+            r#""flow":"buy","address":"{T1}","ref":"{REF}","timestamp":"{NOW}","signature":"{good}","publicKey":"02""#
+        )),
+    ] {
+        let b = String::from_utf8_lossy(&body).to_string();
+        let (status, answer, reason) = local(session(&body));
+        assert_eq!(
+            (status, answer.as_str(), reason),
+            (
+                invalid_request.0,
+                invalid_request.1.as_str(),
+                invalid_request.2
+            ),
+            "{b}"
+        );
+    }
+    // The address is checked first: a bad one is `invalid_address`, whatever the signature.
+    assert_eq!(local(session(&signed_raw(T3, &now, &good))).0, 400);
+    // A refusal of the signature shows no input in the plan's debug form either.
+    let debug = format!("{:?}", session(&signed(&T1_OTHER_KEY, T1, NOW, NOW)));
+    assert!(
+        !debug.contains(T1) && !debug.contains(&NOW.to_string()),
+        "{debug}"
+    );
 }
 
 fn session_call(p: &Coinbase, extra: &str, flow: &str) -> Call {
