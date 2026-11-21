@@ -20,8 +20,9 @@
 //! - `<network>.toml` is the export (`--export-config`) of the fixture environment and
 //!   `<network>.effective.json` its canonical effective policy (`--print-effective-config`);
 //!   the environment, the file and the committed snapshot are the same policy;
-//! - the gateway's parsers read the same tables from the file as from the environment;
-//! - `--check-config` refusals, `CONFIG_SOURCE=compare` and `file`.
+//! - the gateway's parsers read the same tables from the file (its secrets pointed at files) as
+//!   from the environment's policy;
+//! - `--check-config` refusals, the command line, and that the environment is never read.
 //!
 //! `CONFIG_FILE_BLESS=1 cargo test --test config_file` rewrites the two files per network from
 //! the current code (refused when `CI` is set); review the diff before committing it.
@@ -258,12 +259,12 @@ fn the_parsers_read_the_same_policy_from_the_file_as_from_the_environment() {
         let vars = read_env(network);
         apply_env(&vars);
         let env = process_env();
-        let from_env = views(&env);
+        // The parsers on the environment's policy (the gateway itself never reads it).
+        let from_env = config_source::with_policy(config_source::env_policy(), || views(&env));
         let export = export_of(&vars);
         let path = fixtures().join(format!("{network}.toml"));
-        let file = policy_file::parse(&std::fs::read_to_string(&path).unwrap())
-            .unwrap()
-            .file;
+        let text = std::fs::read_to_string(&path).unwrap();
+        let file = policy_file::parse(&text).unwrap().file;
         let rendered: BTreeMap<String, String> =
             policy_file::render(&file, &|n: &str| export.resolve(n))
                 .unwrap()
@@ -277,20 +278,24 @@ fn the_parsers_read_the_same_policy_from_the_file_as_from_the_environment() {
         assert_eq!(rendered_keys, set, "{network}");
         let from_file = config_source::with_policy(rendered.clone(), || views(&env));
         assert_eq!(from_file, from_env, "{network}");
-        // The comparison of CONFIG_SOURCE=compare agrees.
+        // The comparison of the export's check agrees.
         let c = config_source::compare(&config_source::env_policy(), &file, &|n: &str| {
             export.resolve(n)
         })
         .unwrap();
         assert!(c.matches, "{network}: {:?}", c.keys);
-        // --check-config passes, without the secrets and with them.
-        let path = path.to_str().unwrap();
-        config_source::load_file(path, Secrets::Skip).unwrap();
-        for s in &export.secrets {
-            std::env::set_var(&s.env, export.secret_value(&s.name).unwrap());
-        }
-        let loaded = config_source::load_file(path, Secrets::Require).unwrap();
+        // The export names its secrets by variable, which the gateway refuses; with each pointed
+        // at a file, --check-config passes, without the secrets and with them.
+        let text_err = format!(
+            "{:#}",
+            config_source::load_file(path.to_str().unwrap(), Secrets::Skip).unwrap_err()
+        );
+        assert!(text_err.contains("files only"), "{text_err}");
+        let (_dir, files) = as_files(&format!("parsers-{network}"), &text, &export);
+        config_source::load_file(&files, Secrets::Skip).unwrap();
+        let loaded = config_source::load_file(&files, Secrets::Require).unwrap();
         assert_eq!(loaded.policy, rendered, "{network}");
+        assert_eq!(loaded.run_in(|| views(&env)), from_env, "{network}");
     }
 }
 
@@ -314,6 +319,48 @@ impl Drop for TempFile {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.0);
     }
+}
+
+/// A directory in the temporary directory, removed on drop.
+struct TempDir(PathBuf);
+
+impl TempDir {
+    fn new(name: &str) -> Self {
+        let path =
+            std::env::temp_dir().join(format!("config-file-test-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).unwrap();
+        Self(path)
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// The file of an export (`text`, `export`) as the gateway reads it: every `{ env = "VAR" }`
+/// secret pointed at a file that holds the value the export gives it (secrets from files only).
+/// The directory and the file's path.
+fn as_files(name: &str, text: &str, export: &policy_file::Export) -> (TempDir, String) {
+    let dir = TempDir::new(name);
+    let mut out = text.to_string();
+    for s in &export.secrets {
+        let secret = dir.0.join(&s.name);
+        std::fs::write(&secret, export.secret_value(&s.name).unwrap()).unwrap();
+        let from = format!("{} = {{ env = \"{}\" }}", s.name, s.env);
+        assert!(out.contains(&from), "{from}");
+        out = out.replace(
+            &from,
+            &format!("{} = {{ file = {:?} }}", s.name, secret.to_str().unwrap()),
+        );
+    }
+    assert!(!out.contains("{ env ="), "{out}");
+    let path = dir.0.join("gateway.toml");
+    std::fs::write(&path, out).unwrap();
+    let path = path.to_str().unwrap().to_string();
+    (dir, path)
 }
 
 const BASE: &str = "schema = 1\ngateway_hosts = [\"gw.example\"]\n";
@@ -363,8 +410,13 @@ fn check_config_refuses_what_the_policy_cannot_be() {
         ),
         (
             "missing-secret",
-            format!("{BASE}[secrets]\nk = {{ env = \"CONFIG_TEST_UNSET_SECRET\" }}\n{a}headers = [{{ name = \"X-Key\", value = \"{{secret}}\", secret = \"k\" }}]\n"),
-            "variable CONFIG_TEST_UNSET_SECRET is not set",
+            format!("{BASE}[secrets]\nk = {{ file = \"/nonexistent/config-test-secret\" }}\n{a}headers = [{{ name = \"X-Key\", value = \"{{secret}}\", secret = \"k\" }}]\n"),
+            "secret 'k': file /nonexistent/config-test-secret",
+        ),
+        (
+            "env-secret",
+            format!("{BASE}[secrets]\nk = {{ env = \"CONFIG_TEST_KEY\" }}\n{a}headers = [{{ name = \"X-Key\", value = \"{{secret}}\", secret = \"k\" }}]\n"),
+            "secret 'k' is an { env = ... } reference",
         ),
     ] {
         let file = TempFile::new(name, &body);
@@ -375,29 +427,37 @@ fn check_config_refuses_what_the_policy_cannot_be() {
         assert!(text.contains(expected), "{name}: {text}");
         assert!(text.contains(file.path()), "{name}: {text}");
     }
-    // A missing secret passes with --secrets=skip; a missing file never does.
+    // A missing secret passes with --secrets=skip; a missing file never does, nor does an
+    // `{ env = ... }` secret.
     let file = TempFile::new(
         "skip",
-        &format!("{BASE}[secrets]\nk = {{ env = \"CONFIG_TEST_UNSET_SECRET\" }}\n{a}headers = [{{ name = \"X-Key\", value = \"{{secret}}\", secret = \"k\" }}]\n"),
+        &format!("{BASE}[secrets]\nk = {{ file = \"/nonexistent/config-test-secret\" }}\n{a}headers = [{{ name = \"X-Key\", value = \"{{secret}}\", secret = \"k\" }}]\n"),
     );
     config_source::load_file(file.path(), Secrets::Skip).unwrap();
+    let file = TempFile::new(
+        "skip-env",
+        &format!("{BASE}[secrets]\nk = {{ env = \"CONFIG_TEST_KEY\" }}\n{a}headers = [{{ name = \"X-Key\", value = \"{{secret}}\", secret = \"k\" }}]\n"),
+    );
+    assert!(config_source::load_file(file.path(), Secrets::Skip).is_err());
     assert!(config_source::load_file("/nonexistent/gateway.toml", Secrets::Skip).is_err());
 }
 
 #[test]
-fn secrets_come_from_variables_and_files_and_are_never_printed() {
+fn secrets_come_from_files_and_are_never_printed() {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     apply_env(&[("CONFIG_TEST_KEY".to_string(), "key-from-env".to_string())]);
+    let first = TempFile::new("secret-first", "key-from-first\n");
     let secret = TempFile::new("secret", "key-from-file\n");
     let body = format!(
-        "{BASE}[secrets]\ne = {{ env = \"CONFIG_TEST_KEY\" }}\nf = {{ file = {:?} }}\n[integrations.a]\nalias = \"a.example\"\nupstream = \"https://a-api.example\"\nroutes = [\"GET /v1/a\"]\nheaders = [{{ name = \"X-Key\", value = \"{{secret}}\", secret = \"e\" }}, {{ name = \"Authorization\", value = \"Bearer {{secret}}\", secret = \"f\" }}]\n",
+        "{BASE}[secrets]\ne = {{ file = {:?} }}\nf = {{ file = {:?} }}\n[integrations.a]\nalias = \"a.example\"\nupstream = \"https://a-api.example\"\nroutes = [\"GET /v1/a\"]\nheaders = [{{ name = \"X-Key\", value = \"{{secret}}\", secret = \"e\" }}, {{ name = \"Authorization\", value = \"Bearer {{secret}}\", secret = \"f\" }}]\n",
+        first.path(),
         secret.path()
     );
     let file = TempFile::new("secrets", &body);
     let loaded = config_source::load_file(file.path(), Secrets::Require).unwrap();
     assert_eq!(
         loaded.policy["BACKEND_HEADERS"],
-        "a.example=X-Key:key-from-env,a.example=Authorization:Bearer key-from-file"
+        "a.example=X-Key:key-from-first,a.example=Authorization:Bearer key-from-file"
     );
     let printed =
         policy_file::canonical_json(&config_source::file_canonical(&loaded.file).unwrap());
@@ -446,7 +506,7 @@ fn compare_names_the_differing_keys() {
 }
 
 #[test]
-fn with_the_file_in_force_the_policy_variables_of_the_environment_are_ignored() {
+fn the_environment_is_never_read() {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let vars: Vec<(String, String)> = [
         ("BACKENDS", "env.example=https://env-api.example"),
@@ -464,24 +524,40 @@ fn with_the_file_in_force_the_policy_variables_of_the_environment_are_ignored() 
         ),
     );
     let loaded = config_source::load_file(file.path(), Secrets::Require).unwrap();
-    let config = config_source::with_policy(loaded.policy.clone(), || Config::from_env().unwrap());
+    let config = loaded.run_in(|| Config::from_env().unwrap());
     assert_eq!(
         config.backends.keys().collect::<Vec<_>>(),
         vec!["a.example"]
     );
     assert_eq!(config.gateway_hosts, vec!["gw.example".to_string()]);
-    // A deployment variable still comes from the environment.
-    assert_eq!(config.lwd_addr, "lwd.example:9067");
+    // A setting the files leave out is its default, whatever the environment says.
+    assert_eq!(config.lwd_addr, "localhost:9067");
     assert_eq!(
-        config_source::ignored_env_keys(&config_source::env_policy()),
-        vec!["BACKENDS".to_string(), "GATEWAY_HOSTS".to_string()]
+        config_source::ignored_env_variables(),
+        vec![
+            "BACKENDS".to_string(),
+            "GATEWAY_HOSTS".to_string(),
+            "LWD_ADDR".to_string()
+        ]
     );
-    // Outside the scope the environment is in force again.
+    // A serving process would not start: the file leaves LWD_ADDR out (the other two it sets).
+    assert_eq!(
+        config_source::left_out_env_variables(&loaded, &config_source::ignored_env_variables()),
+        vec!["LWD_ADDR".to_string()]
+    );
+    // A value that is not UTF-8 is named too (never read, never shown).
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        std::env::set_var("NETWORK", std::ffi::OsStr::from_bytes(b"main\xffnet"));
+        let names = config_source::ignored_env_variables();
+        std::env::remove_var("NETWORK");
+        assert!(names.contains(&"NETWORK".to_string()), "{names:?}");
+    }
+    // Outside the scope, nothing installed: nothing at all, never the environment.
     let config = Config::from_env().unwrap();
-    assert_eq!(
-        config.backends.keys().collect::<Vec<_>>(),
-        vec!["env.example"]
-    );
+    assert!(config.backends.is_empty() && config.gateway_hosts.is_empty());
+    assert_eq!(config.lwd_addr, "localhost:9067");
 }
 
 /// The binary's command line on the fixtures: the actions print what the library computes and
@@ -493,23 +569,47 @@ fn the_command_line_actions() {
     let vars = read_env("mainnet");
     let toml_path = fixtures().join("mainnet.toml");
     let toml_path = toml_path.to_str().unwrap();
+    // Each run is killed (and reaped) after 60 seconds (a serving process would never exit by
+    // itself); its output goes to files, so a long one cannot block it.
+    let runs = TempDir::new("cli-runs");
+    let n = std::cell::Cell::new(0u32);
     let run = |args: &[&str], extra: &[(&str, &str)]| {
+        n.set(n.get() + 1);
+        let out_path = runs.0.join(format!("{}.out", n.get()));
+        let err_path = runs.0.join(format!("{}.err", n.get()));
         let mut cmd = std::process::Command::new(bin);
-        cmd.env_clear().args(args);
+        cmd.env_clear()
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::fs::File::create(&out_path).unwrap())
+            .stderr(std::fs::File::create(&err_path).unwrap());
         for (k, v) in &vars {
             cmd.env(k, v);
         }
         for (k, v) in extra {
             cmd.env(k, v);
         }
-        let out = cmd.output().unwrap();
+        let mut child = cmd.spawn().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if std::time::Instant::now() > deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("{args:?} did not exit within 60 s");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
         (
-            out.status.code(),
-            String::from_utf8_lossy(&out.stdout).into_owned(),
-            String::from_utf8_lossy(&out.stderr).into_owned(),
+            status.code(),
+            std::fs::read_to_string(&out_path).unwrap(),
+            std::fs::read_to_string(&err_path).unwrap(),
         )
     };
     let committed = std::fs::read_to_string(toml_path).unwrap();
+    // The export (a migration tool) reads the environment.
     let (code, stdout, _) = run(&["--export-config"], &[]);
     assert_eq!((code, stdout.as_str()), (Some(0), committed.as_str()));
     let snapshot: Value = serde_json::from_str(
@@ -517,31 +617,101 @@ fn the_command_line_actions() {
     )
     .unwrap();
     let canonical = policy_file::canonical_json(&snapshot) + "\n";
-    let (code, stdout, _) = run(&["--print-effective-config"], &[]);
-    assert_eq!((code, stdout.as_str()), (Some(0), canonical.as_str()));
-    let (code, stdout, _) = run(
-        &["--config", toml_path, "--print-effective-config"],
-        &[("CONFIG_SOURCE", "file")],
+    // Everything else reads the files only.
+    let (code, _, stderr) = run(&["--print-effective-config"], &[]);
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(stderr.contains("needs a configuration file"), "{stderr}");
+    let (_dir, files) = as_files("cli", &committed, &export_of(&vars));
+    let (code, stdout, stderr) = run(
+        &["--config", files.as_str(), "--print-effective-config"],
+        &[],
     );
     assert_eq!((code, stdout.as_str()), (Some(0), canonical.as_str()));
+    assert!(!stderr.contains("CONFIG_SOURCE"), "{stderr}");
+    // CONFIG_SOURCE set to anything but `file`: refused (its name, never its value).
+    for args in [
+        &["--config", files.as_str(), "--print-effective-config"][..],
+        &[
+            "--config",
+            files.as_str(),
+            "--check-config",
+            "--secrets=skip",
+        ],
+        &["--config", files.as_str()],
+    ] {
+        let (code, stdout, stderr) = run(args, &[("CONFIG_SOURCE", "envx-7c1d")]);
+        assert_eq!(code, Some(1), "{args:?}: {stdout}{stderr}");
+        assert!(
+            stderr.contains("CONFIG_SOURCE is set to something other than `file`"),
+            "{args:?}: {stderr}"
+        );
+        assert!(!stdout.contains("envx-7c1d") && !stderr.contains("envx-7c1d"));
+    }
     let env: BTreeMap<String, String> = vars.iter().cloned().collect();
     let digest = config_source::env_digest(&env).unwrap();
-    let (code, stdout, _) = run(
+    // The path from GATEWAY_CONFIG_FILE: refused without CONFIG_SOURCE=file, for serving and
+    // for --check-config alike.
+    for args in [&["--check-config", "--secrets=skip"][..], &[]] {
+        let (code, stdout, stderr) = run(args, &[("GATEWAY_CONFIG_FILE", files.as_str())]);
+        assert_eq!(code, Some(1), "{args:?}: {stdout}{stderr}");
+        assert!(
+            stderr.contains(
+                "would come from GATEWAY_CONFIG_FILE, which is read only with CONFIG_SOURCE=file"
+            ),
+            "{args:?}: {stderr}"
+        );
+        assert!(!stderr.contains(files.as_str()), "{stderr}");
+    }
+    // With CONFIG_SOURCE=file, for one release, with a warning; the variables of the
+    // environment the policy-only file leaves out are named (a warning here).
+    let (code, stdout, stderr) = run(
         &["--check-config", "--secrets=skip"],
-        &[("GATEWAY_CONFIG_FILE", toml_path)],
+        &[
+            ("CONFIG_SOURCE", "file"),
+            ("GATEWAY_CONFIG_FILE", files.as_str()),
+        ],
     );
-    assert_eq!(code, Some(0), "{stdout}");
+    assert_eq!(code, Some(0), "{stdout}{stderr}");
     assert!(
-        stdout.starts_with(&format!("config OK: {toml_path}")) && stdout.contains(&digest),
+        stdout.starts_with(&format!("config OK: {files}")) && stdout.contains(&digest),
         "{stdout}"
     );
-    // Without the secrets' variables the default (require) refuses, naming the variable.
+    assert!(
+        stderr.contains("comes from GATEWAY_CONFIG_FILE")
+            && stderr.contains("warning: variables of the environment that the files leave out")
+            && stderr.contains("LWD_ADDR"),
+        "{stderr}"
+    );
+    // The export's own file names its secrets by variable: refused, by name.
     let (code, _, stderr) = run(&["--config", toml_path, "--check-config"], &[]);
     assert_eq!(code, Some(1), "{stderr}");
     assert!(
-        stderr.contains("config INVALID") && stderr.contains("is not set"),
+        stderr.contains("config INVALID") && stderr.contains("files only"),
         "{stderr}"
     );
+    // Serving without a configuration file: no start; the variables of the environment that
+    // are not read are named first.
+    let (code, stdout, stderr) = run(&[], &[]);
+    assert_eq!(code, Some(1), "{stdout}{stderr}");
+    assert!(
+        stderr.contains("needs a configuration file"),
+        "{stdout}{stderr}"
+    );
+    assert!(
+        stdout.contains("These variables of the environment are not read"),
+        "{stdout}"
+    );
+    // Serving from the policy-only file with the environment's settings still set: no start,
+    // the variables named, never a value.
+    let (code, stdout, stderr) = run(&["--config", files.as_str()], &[]);
+    assert_eq!(code, Some(1), "{stdout}{stderr}");
+    assert!(
+        stderr.contains("which the configuration files leave out") && stderr.contains("LWD_ADDR"),
+        "{stdout}{stderr}"
+    );
+    for (k, v) in vars.iter().filter(|(_, v)| v.len() >= 12) {
+        assert!(!stderr.contains(v.as_str()), "the value of {k}: {stderr}");
+    }
     let bad = TempFile::new("cli-bad", "schema = 1\ncolor = 1\n");
     let (code, _, stderr) = run(
         &["--config", bad.path(), "--check-config", "--secrets=skip"],
@@ -580,9 +750,11 @@ fn the_example_file_is_valid() {
 #[test]
 fn the_digest_is_the_behaviour_of_the_policy() {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    apply_env(&[("QUOTES_KEY".to_string(), "quotes-key-1".to_string())]);
+    apply_env(&[]);
+    let key = TempFile::new("digest-key", "quotes-key-1");
     let body = format!(
-        "{BASE}[secrets]\nk = {{ env = \"QUOTES_KEY\" }}\n[integrations.q]\nalias = \"q.example\"\nupstream = \"https://q-api.example\"\nkind = \"swapkit\"\nroutes = [\"get /tokens\", \"POST /v1/quote\"]\nheaders = [{{ name = \"x-api-key\", value = \"{{secret}}\", secret = \"k\" }}]\nquery_rules = [\"GET /tokens?provider=EXAMPLE\", \"POST /v1/quote?\"]\n"
+        "{BASE}[secrets]\nk = {{ file = {:?} }}\n[integrations.q]\nalias = \"q.example\"\nupstream = \"https://q-api.example\"\nkind = \"swapkit\"\nroutes = [\"get /tokens\", \"POST /v1/quote\"]\nheaders = [{{ name = \"x-api-key\", value = \"{{secret}}\", secret = \"k\" }}]\nquery_rules = [\"GET /tokens?provider=EXAMPLE\", \"POST /v1/quote?\"]\n",
+        key.path()
     );
     let file = TempFile::new("digest", &body);
     let loaded = config_source::load_file(file.path(), Secrets::Require).unwrap();
@@ -626,26 +798,25 @@ fn the_digest_is_the_behaviour_of_the_policy() {
 #[test]
 fn a_secret_must_be_a_usable_value() {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    apply_env(&[
-        ("BLANK".to_string(), "  ".to_string()),
-        ("BREAK".to_string(), "a\nb".to_string()),
-        ("GOOD".to_string(), "good-value".to_string()),
-    ]);
+    apply_env(&[("GOOD".to_string(), "good-value".to_string())]);
     let header = "[integrations.a]\nalias = \"a.example\"\nupstream = \"https://a-api.example\"\nheaders = [{ name = \"X-Key\", value = \"{secret}\", secret = \"used\" }]\n";
     let two_lines = TempFile::new("secret-two-lines", "a\nb\n");
     let crlf = TempFile::new("secret-crlf", "crlf-value\r\n");
+    let blank = TempFile::new("blank-secret-value", "  \n");
+    let good = TempFile::new("good-secret-value", "good-value\n");
     let dir = std::env::temp_dir();
     for (name, source, expected) in [
-        ("blank", "{ env = \"BLANK\" }".to_string(), "is empty"),
         (
-            "break",
-            "{ env = \"BREAK\" }".to_string(),
-            "control character",
+            "blank",
+            format!("{{ file = {:?} }}", blank.path()),
+            "is empty",
         ),
+        // A variable is never read, set or not.
+        ("env", "{ env = \"GOOD\" }".to_string(), "files only"),
         (
             "unset",
             "{ env = \"CONFIG_TEST_UNSET\" }".to_string(),
-            "is not set",
+            "files only",
         ),
         (
             "lines",
@@ -687,7 +858,10 @@ fn a_secret_must_be_a_usable_value() {
         "a.example=X-Key:crlf-value"
     );
     // Every declared secret must resolve, used or not; --secrets=skip reads none.
-    let body = format!("{BASE}[secrets]\nused = {{ env = \"GOOD\" }}\nspare = {{ env = \"CONFIG_TEST_UNSET\" }}\n{header}");
+    let body = format!(
+        "{BASE}[secrets]\nused = {{ file = {:?} }}\nspare = {{ file = \"/nonexistent/config-test-spare\" }}\n{header}",
+        good.path()
+    );
     let file = TempFile::new("secret-spare", &body);
     let text = format!(
         "{:#}",
@@ -776,7 +950,7 @@ fn generated_environments_read_the_same_from_their_file() {
         }
         apply_env(&vars);
         let env = process_env();
-        let from_env = views(&env);
+        let from_env = config_source::with_policy(config_source::env_policy(), || views(&env));
         let (text, export) = config_source::export_checked(&config_source::env_policy()).unwrap();
         let file = policy_file::parse(&text).unwrap().file;
         let rendered: BTreeMap<String, String> =
@@ -827,6 +1001,7 @@ fn a_fifo_secret_is_refused_without_waiting() {
         }
         if start.elapsed() > std::time::Duration::from_secs(20) {
             let _ = child.kill();
+            let _ = child.wait();
             let _ = std::fs::remove_file(&fifo);
             panic!("--check-config waited on the FIFO");
         }

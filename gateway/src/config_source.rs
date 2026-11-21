@@ -14,32 +14,30 @@
 //
 // Commercial licensing: see COMMERCIAL-LICENSE.md.
 
-//! Where the routing policy comes from: the environment variables, or the configuration file
-//! ([`zodl_ohttp_integrations::core::config`]).
+//! Where the configuration comes from: the files given on the command line, and nothing else.
 //!
-//! `CONFIG_SOURCE` (default `env`):
-//! - `env`: the environment, as before; no file is read.
-//! - `compare`: the environment is in force; the file (`--config <path>` or
-//!   `GATEWAY_CONFIG_FILE`) is loaded and checked as well and both policies are compared:
-//!   `ohttp_config_compare_match` 1 or 0, and one log line naming the differing keys (never a
-//!   value). A file that does not load is logged and counts as a mismatch; it never stops the
-//!   gateway.
-//! - `file`: the file is in force; the policy variables ([`POLICY_ENV_KEYS`]) of the
-//!   environment are ignored, with one warning naming those that are set.
+//! `zodl-ohttp-gateway --config <common> [--host-config <host>]`: the common file holds the
+//! routing policy ([`zodl_ohttp_integrations::core::config`]) and a `[settings]` table, the host
+//! file (`schema`, `[settings]`, `[secrets]`) the settings of one host, merged after the common
+//! file (a key in both is an error). A setting the files leave out is unset (its default). No
+//! policy variable and no setting ([`crate::settings::SETTINGS`]) is read from the environment,
+//! and a secret only from a file (`{ file = "/path" }`; an `{ env = ... }` reference is refused
+//! when the files are loaded).
 //!
-//! The settings other than the policy ([`crate::settings::SETTINGS`]: tuning, deployment,
-//! secrets) come from the environment as well, unless the files carry them: a `[settings]`
-//! table in the common file, or a host file (`--host-config <path>` or
-//! `GATEWAY_HOST_CONFIG_FILE`, `[settings]` and `[secrets]` only, merged after the common file;
-//! a key in both is an error). Then `file` takes every setting from the files too (the
-//! environment's are ignored, with one warning naming those that are set; a secret is read
-//! where its `[secrets]` entry points), and `compare` compares them as well
-//! (`ohttp_config_settings_compare_match`). A process in `file` mode then needs no variable but
-//! `CONFIG_SOURCE` and the two paths ([`crate::settings::BOOTSTRAP_ENV_KEYS`]).
+//! For one release, without `--config` (`--host-config`) and with `CONFIG_SOURCE=file`, the path
+//! is taken from `GATEWAY_CONFIG_FILE` (`GATEWAY_HOST_CONFIG_FILE`), with a warning. The gateway
+//! does not start (and `--check-config` fails) without a common file, with a `CONFIG_SOURCE` set
+//! to anything but `file`, with a path taken from a variable without `CONFIG_SOURCE=file`, and
+//! with a policy or setting variable in the environment that the files leave out (one they set
+//! too is a warning). Errors and warnings name variables, never values.
 //!
 //! The files are turned into the values of the variables they stand for, which every parser
-//! reads through [`var`]; the parsers are the same in all three modes.
-//! `ohttp_config_info{source, digest, tuning_digest}` names the policy and the tuning in force.
+//! reads through [`var`]. `ohttp_config_info{source="file", digest, tuning_digest}` names the
+//! policy and the tuning in force.
+//!
+//! Two readers of the environment remain, neither of them a serving process: `--export-config`
+//! (a migration tool: the files equivalent to an environment) and the `backfill` subcommand
+//! ([`install_environment`]).
 //!
 //! The command line (`zodl-ohttp-gateway [--config <path>] [--host-config <path>]
 //! [--check-config [--secrets=require|skip] | --print-effective-config | --export-config
@@ -58,22 +56,28 @@ use zodl_ohttp_integrations::core::config::{
 
 use crate::settings::{self, FileValue};
 
-/// The variable naming the policy source.
+/// The variable that chose the policy source before the files were the only one: refused unless
+/// it is `file` (which the path variables of the transition need).
 pub const SOURCE_ENV: &str = "CONFIG_SOURCE";
-/// The variable naming the configuration file (`--config` wins).
+/// The path of the common file when `--config` is not given (for one release, with a warning,
+/// and with `CONFIG_SOURCE=file` only).
 pub const FILE_ENV: &str = "GATEWAY_CONFIG_FILE";
-/// The variable naming the host file (`--host-config` wins).
+/// The path of the host file when `--host-config` is not given (for one release, with a warning,
+/// and with `CONFIG_SOURCE=file` only).
 pub const HOST_FILE_ENV: &str = "GATEWAY_HOST_CONFIG_FILE";
 
-/// The policy in force for the whole process when the file is (`CONFIG_SOURCE=file`).
+/// The policy in force for the whole process ([`install_command`]).
 static FILE_POLICY: OnceLock<BTreeMap<String, String>> = OnceLock::new();
-/// The settings in force for the whole process when the files carry them and are in force.
+/// The settings in force for the whole process ([`install_command`]).
 static FILE_SETTINGS: OnceLock<BTreeMap<String, String>> = OnceLock::new();
 
 /// The variables of a [`with_policy`] / [`with_config`] scope.
 struct Scope {
+    /// Whether the scope stands for the process's own configuration (a test of what the
+    /// startup puts in force), not for a validation ([`in_scope`]).
+    in_force: bool,
     policy: BTreeMap<String, String>,
-    /// `None`: the settings of the process (the environment, or the files in force).
+    /// `None`: the settings of the process (those of the files in force, else none).
     settings: Option<BTreeMap<String, String>>,
 }
 
@@ -82,33 +86,27 @@ thread_local! {
     static SCOPED: RefCell<Option<Arc<Scope>>> = const { RefCell::new(None) };
 }
 
-/// A variable as the gateway's parsers read it: a policy variable from the policy in force
-/// (the file's, when it is), a setting from the settings in force (the files', when they carry
-/// them and are in force), anything else from the environment.
+/// A variable as the gateway's parsers read it: a policy variable from the policy in force, a
+/// setting from the settings in force (a [`with_policy`] / [`with_config`] scope on this thread,
+/// else the files of the process, [`install_command`]). Never from the environment: a variable
+/// that is neither, or that nothing has installed, is not present.
 pub fn var(key: &str) -> Result<String, std::env::VarError> {
-    let from = |map: &BTreeMap<String, String>| {
-        map.get(key).cloned().ok_or(std::env::VarError::NotPresent)
-    };
-    if POLICY_ENV_KEYS.contains(&key) {
-        let scoped = SCOPED.with(|s| s.borrow().clone());
-        let policy = scoped
+    let scoped = SCOPED.with(|s| s.borrow().clone());
+    let map = if POLICY_ENV_KEYS.contains(&key) {
+        scoped
             .as_deref()
             .map(|s| &s.policy)
-            .or_else(|| FILE_POLICY.get());
-        if let Some(policy) = policy {
-            return from(policy);
-        }
+            .or_else(|| FILE_POLICY.get())
     } else if crate::settings::setting(key).is_some() {
-        let scoped = SCOPED.with(|s| s.borrow().clone());
-        let settings = scoped
+        scoped
             .as_deref()
             .and_then(|s| s.settings.as_ref())
-            .or_else(|| FILE_SETTINGS.get());
-        if let Some(settings) = settings {
-            return from(settings);
-        }
-    }
-    std::env::var(key)
+            .or_else(|| FILE_SETTINGS.get())
+    } else {
+        None
+    };
+    map.and_then(|m| m.get(key).cloned())
+        .ok_or(std::env::VarError::NotPresent)
 }
 
 /// An entry of the policy in force that is no environment variable (the settings of the
@@ -127,7 +125,7 @@ pub fn file_value(key: &str) -> Option<String> {
 /// of those the files read once; wiped when dropped.
 pub(crate) type ProviderSecrets = Arc<BTreeMap<String, zeroize::Zeroizing<String>>>;
 
-/// The [`ProviderSecrets`] of the files in force (`CONFIG_SOURCE=file`).
+/// The [`ProviderSecrets`] of the files in force.
 static FILE_SECRETS: OnceLock<ProviderSecrets> = OnceLock::new();
 
 thread_local! {
@@ -200,12 +198,14 @@ fn with_scope<T>(scope: Scope, f: impl FnOnce() -> T) -> T {
 }
 
 /// Run `f` with `policy` (variable -> value) as the policy variables of this thread: what
-/// `--check-config` and `compare` use to run the parsers on a file without making it the
+/// `--check-config` and the export use to run the parsers on a file without making it the
 /// process's policy. Parsers that set process-wide state (the dynamic hosts' deny list) only
 /// validate inside such a scope ([`in_scope`]). The settings stay those of the process.
+#[allow(dead_code)] // the tests
 pub fn with_policy<T>(policy: BTreeMap<String, String>, f: impl FnOnce() -> T) -> T {
     with_scope(
         Scope {
+            in_force: false,
             policy,
             settings: None,
         },
@@ -221,6 +221,55 @@ pub fn with_config<T>(
 ) -> T {
     with_scope(
         Scope {
+            in_force: false,
+            policy,
+            settings: Some(settings),
+        },
+        f,
+    )
+}
+
+/// [`with_config`] with `vars` (variable -> value, in any order) split into the policy
+/// variables and the settings: the parsers of this thread read exactly these, as they read the
+/// values the files render. For tests and tools that state a configuration as variables; a
+/// variable that is neither policy nor a setting is an error (it would be read by nothing).
+#[allow(dead_code)] // the tests and the fuzz targets
+pub fn with_vars<T>(
+    vars: impl IntoIterator<Item = (impl Into<String>, impl Into<String>)>,
+    f: impl FnOnce() -> T,
+) -> T {
+    let mut policy = BTreeMap::new();
+    let mut settings = BTreeMap::new();
+    for (k, v) in vars {
+        let (k, v) = (k.into(), v.into());
+        if POLICY_ENV_KEYS.contains(&k.as_str()) {
+            policy.insert(k, v);
+        } else if crate::settings::setting(&k).is_some() {
+            settings.insert(k, v);
+        } else {
+            panic!("{k} is neither a policy variable nor a setting");
+        }
+    }
+    with_config(policy, settings, f)
+}
+
+/// [`with_vars`] as the process's own configuration: what the startup puts in force process-wide
+/// (the dynamic hosts' deny list) is put in force ([`in_scope`] is false).
+#[cfg(test)]
+#[allow(dead_code)] // the library's tests
+pub(crate) fn with_vars_in_force<T>(vars: &[(&str, &str)], f: impl FnOnce() -> T) -> T {
+    let (mut policy, mut settings) = (BTreeMap::new(), BTreeMap::new());
+    for (k, v) in vars {
+        let map = if POLICY_ENV_KEYS.contains(k) {
+            &mut policy
+        } else {
+            &mut settings
+        };
+        map.insert(k.to_string(), v.to_string());
+    }
+    with_scope(
+        Scope {
+            in_force: true,
             policy,
             settings: Some(settings),
         },
@@ -230,40 +279,13 @@ pub fn with_config<T>(
 
 /// Whether this thread runs inside [`with_policy`]: a validation, not the process's startup.
 pub fn in_scope() -> bool {
-    SCOPED.with(|s| s.borrow().is_some())
-}
-
-/// `CONFIG_SOURCE`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Source {
-    Env,
-    Compare,
-    File,
-}
-
-impl Source {
-    pub fn parse(raw: Option<&str>) -> Result<Self> {
-        match raw.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
-            None | Some("") | Some("env") => Ok(Self::Env),
-            Some("compare") => Ok(Self::Compare),
-            Some("file") => Ok(Self::File),
-            Some(other) => bail!("Invalid {SOURCE_ENV} '{other}': must be env, compare or file"),
-        }
-    }
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Env => "env",
-            Self::Compare => "compare",
-            Self::File => "file",
-        }
-    }
+    SCOPED.with(|s| s.borrow().as_ref().is_some_and(|s| !s.in_force))
 }
 
 /// What `--check-config` does with the secrets the file names.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Secrets {
-    /// Each must resolve (its variable set, its file readable).
+    /// Each must resolve (its file readable).
     Require,
     /// None is read (a CI check without the secrets).
     Skip,
@@ -275,7 +297,7 @@ const SKIPPED_SECRET: &str = "secret-not-read";
 /// The largest secret file read.
 pub const MAX_SECRET_FILE_BYTES: u64 = 64 * 1024;
 
-/// The value of secret `name` of `file`: its variable, or its file (a regular file of at most
+/// The value of secret `name` of `file`: its file (a regular file of at most
 /// [`MAX_SECRET_FILE_BYTES`], exactly one final `\n` or `\r\n` removed). Empty, blank, or
 /// holding a line break or another control character, it does not resolve. The error names the
 /// secret and its source, never a value. No permission of the file is checked.
@@ -298,22 +320,35 @@ pub fn resolve_secret_in(
     read_secret(name, r.env.as_deref(), r.file.as_deref())
 }
 
-/// The value of the secret `name` read from its variable `env` or its file `file` (exactly one),
-/// with the rules of [`resolve_secret`]. The buffers it is read into are wiped (on error paths
-/// too); the value returned is the one the files keep ([`LoadedFile`]).
+/// The value of the secret `name` read from its file `file`, with the rules of
+/// [`resolve_secret`]; an `env` reference is refused ([`check_secret_ref`]). The buffers it is
+/// read into are wiped (on error paths too); the value returned is the one the files keep
+/// ([`LoadedFile`]).
 fn read_secret(name: &str, env: Option<&str>, file: Option<&str>) -> Result<String> {
-    let (value, source) = match (env, file) {
-        (Some(var), None) => (
-            zeroize::Zeroizing::new(
-                std::env::var(var)
-                    .map_err(|_| anyhow!("secret '{name}': variable {var} is not set"))?,
-            ),
-            format!("variable {var}"),
+    check_secret_ref(name, env, file)?;
+    let path = file.unwrap_or_default();
+    let value = read_secret_file(name, path)?;
+    usable_secret(name, &format!("file {path}"), String::clone(&value))
+}
+
+/// A `[secrets]` entry must be `{ file = "/path" }`: an `{ env = ... }` reference is refused
+/// (the gateway reads no secret from the environment), naming the secret, never a value.
+fn check_secret_ref(name: &str, env: Option<&str>, file: Option<&str>) -> Result<()> {
+    match (env, file) {
+        (None, Some(_)) => Ok(()),
+        (Some(_), None) => bail!(
+            "secret '{name}' is an {{ env = ... }} reference: the gateway reads its secrets from files only; write {name} = {{ file = \"/run/secrets/<file>\" }} and mount the secret there"
         ),
-        (None, Some(path)) => (read_secret_file(name, path)?, format!("file {path}")),
-        _ => bail!("secret '{name}' needs exactly one of env or file"),
-    };
-    usable_secret(name, &source, String::clone(&value))
+        _ => bail!("secret '{name}' needs a file ({name} = {{ file = \"/path\" }})"),
+    }
+}
+
+/// [`check_secret_ref`] for every entry of `secrets`.
+fn check_secret_refs(secrets: &BTreeMap<String, SecretRef>) -> Result<()> {
+    for (name, r) in secrets {
+        check_secret_ref(name, r.env.as_deref(), r.file.as_deref())?;
+    }
+    Ok(())
 }
 
 /// A secret's value as read from `source`, refused (by name and source only) when it is empty,
@@ -384,19 +419,20 @@ pub struct LoadedFile {
     pub policy: BTreeMap<String, String>,
     /// The host file, when one was given.
     pub host_path: Option<String>,
-    /// Whether the files carry the settings (a `[settings]` table in the common file, or a
-    /// host file): then they are in force with the policy, else the environment's are.
+    /// Whether the files carry settings (a `[settings]` table in the common file, an empty one
+    /// too, or a host file): then the startup checks of the settings run on them as well. The
+    /// settings in force are the files' in any case (none: every setting at its default).
     pub carries_settings: bool,
     /// The settings of both files, as written (variable -> value).
     pub setting_values: BTreeMap<&'static str, FileValue>,
     /// The `[secrets]` entries of both files.
+    #[allow(dead_code)] // the tests
     pub secrets: BTreeMap<String, SecretRef>,
     /// The settings variables, secrets resolved (with [`Secrets::Skip`]: a whole secret left
     /// out, a template with a placeholder).
     pub settings: BTreeMap<String, String>,
-    /// The value of every secret, read once (with [`Secrets::Require`]).
-    pub(crate) secret_values: BTreeMap<String, String>,
-    /// Of those, the ones the coinbase integrations name ([`secret_value`]).
+    /// Of the secret values read (with [`Secrets::Require`]), the ones the coinbase
+    /// integrations name ([`secret_value`]).
     pub(crate) provider_secrets: ProviderSecrets,
 }
 
@@ -415,41 +451,36 @@ impl std::fmt::Debug for LoadedFile {
 
 impl LoadedFile {
     /// Run `f` with these files as the configuration of this thread: their policy, their
-    /// settings when they carry them, and the secret values they read.
+    /// settings (none: every setting unset) and the secret values they read.
     pub fn run_in<T>(&self, f: impl FnOnce() -> T) -> T {
         with_secret_values(self.provider_secrets.clone(), || {
-            if self.carries_settings {
-                with_config(self.policy.clone(), self.settings.clone(), f)
-            } else {
-                with_policy(self.policy.clone(), f)
-            }
+            with_config(self.policy.clone(), self.settings.clone(), f)
         })
-    }
-
-    /// The variables the `[secrets]` entries of the files read (they stay readable whatever
-    /// the source).
-    pub fn secret_variables(&self) -> Vec<String> {
-        self.secrets
-            .values()
-            .filter_map(|r| r.env.clone())
-            .collect()
     }
 }
 
 /// Read, parse, check and render the file at `path`, and run the gateway's own parsers on the
-/// result (every startup check of the environment applies to the file too). With
-/// [`Secrets::Require`] every declared secret must resolve, used or not. `quiet`: the parsers'
-/// warnings are not logged (a serving process logs them on its real pass).
+/// result (every startup check applies to the file). With [`Secrets::Require`] every declared
+/// secret must resolve, used or not.
 #[allow(dead_code)] // the binary calls load_files
 pub fn load_file(path: &str, secrets: Secrets) -> Result<LoadedFile> {
-    load_files_with(path, None, secrets, false)
+    load_files_with(path, None, secrets, false, true)
 }
 
 /// [`load_file`] for the common file at `path` and the host file at `host`: both parsed, the
 /// host file's settings and secrets merged after the common file's (a key in both is an error),
-/// and, when they carry settings, every startup parser run on the policy and settings of both.
+/// and every startup parser run on the policy (when the files carry settings, on the policy and
+/// the settings of both, with the mandatory startup checks).
 pub fn load_files(path: &str, host: Option<&str>, secrets: Secrets) -> Result<LoadedFile> {
-    load_files_with(path, host, secrets, false)
+    load_files_with(path, host, secrets, false, true)
+}
+
+/// [`load_files`] without the startup parsers and checks: the files parsed, merged and
+/// rendered, their secrets resolved (with [`Secrets::Require`]). For a configuration that is
+/// not meant to serve (a fixture of the policy alone); a serving process loads with the checks.
+#[allow(dead_code)] // the tests
+pub fn read_files(path: &str, host: Option<&str>, secrets: Secrets) -> Result<LoadedFile> {
+    load_files_with(path, host, secrets, false, false)
 }
 
 /// A host file: `schema = 1`, `[settings]`, `[secrets]` and nothing else.
@@ -473,25 +504,32 @@ fn parse_host_file(text: &str) -> Result<(toml::Table, BTreeMap<String, SecretRe
             policy_file::SCHEMA
         );
     }
-    // The same structural check as the common file's, whether or not the secrets are read.
+    // Each entry names one source (the export writes `env`, which the loader then refuses:
+    // [`check_secret_refs`]).
     for (name, r) in &file.secrets {
-        match (&r.env, &r.file) {
-            (Some(_), None) | (None, Some(_)) => {}
-            _ => bail!("Invalid host file: secret '{name}' needs exactly one of env or file"),
+        if r.env.is_some() == r.file.is_some() {
+            bail!(
+                "Invalid host file: secret '{name}' needs a file ({name} = {{ file = \"/path\" }})"
+            );
         }
     }
     Ok((file.settings, file.secrets))
 }
 
+/// The loader: `quiet` = the parsers' warnings are not logged (a serving process logs them on
+/// its real pass); `check` = run the startup parsers and checks ([`read_files`]: not).
 fn load_files_with(
     path: &str,
     host: Option<&str>,
     secrets: Secrets,
     quiet: bool,
+    check: bool,
 ) -> Result<LoadedFile> {
     let text =
         std::fs::read_to_string(path).map_err(|e| anyhow!("config file {path}: {}", e.kind()))?;
     let loaded = policy_file::parse(&text).with_context(|| format!("config file {path}"))?;
+    // Files only: an `{ env = ... }` secret is refused whether or not the secrets are read.
+    check_secret_refs(&loaded.file.secrets).with_context(|| format!("config file {path}"))?;
     // Every secret is read once, here; the policy and the settings use these values.
     let mut secret_values: BTreeMap<String, String> = BTreeMap::new();
     if secrets == Secrets::Require {
@@ -531,6 +569,8 @@ fn load_files_with(
             .map_err(|e| anyhow!("host config file {host}: {}", e.kind()))?;
         let (table, host_secrets) =
             parse_host_file(&text).with_context(|| format!("host config file {host}"))?;
+        // Files only, whether or not the secrets are read.
+        check_secret_refs(&host_secrets).with_context(|| format!("host config file {host}"))?;
         let values =
             settings::parse_table(&table).with_context(|| format!("host config file {host}"))?;
         for (env, v) in values {
@@ -588,7 +628,9 @@ fn load_files_with(
     // The checks see the secrets read above (a coinbase provider takes its key from them).
     let provider_secrets = provider_secrets(&policy, &secret_values);
     with_secret_values(provider_secrets.clone(), || -> Result<()> {
-        if carries_settings {
+        if !check {
+            Ok(())
+        } else if carries_settings {
             check_config_values(
                 &policy,
                 &rendered_settings,
@@ -598,7 +640,8 @@ fn load_files_with(
             )
             .with_context(|| files.clone())
         } else {
-            check_policy(&policy, quiet).with_context(|| format!("config file {path}"))
+            check_policy(&policy, &rendered_settings, quiet)
+                .with_context(|| format!("config file {path}"))
         }
     })?;
     Ok(LoadedFile {
@@ -611,7 +654,6 @@ fn load_files_with(
         setting_values,
         secrets: all_secrets,
         settings: rendered_settings,
-        secret_values,
         provider_secrets,
     })
 }
@@ -640,11 +682,15 @@ fn skip_coinbase_keys(policy: &mut BTreeMap<String, String>) -> Result<()> {
 }
 
 /// The startup parsers of the policy variables, run on `policy` (the dynamic host sources
-/// through their production parser, the deny list validated without being put in force);
-/// `quiet`: their warnings are not logged.
-fn check_policy(policy: &BTreeMap<String, String>, quiet: bool) -> Result<()> {
+/// through their production parser, the deny list validated without being put in force) with
+/// `settings`; `quiet`: their warnings are not logged.
+fn check_policy(
+    policy: &BTreeMap<String, String>,
+    settings: &BTreeMap<String, String>,
+    quiet: bool,
+) -> Result<()> {
     quietly(quiet, || {
-        with_policy(policy.clone(), || -> Result<()> {
+        with_config(policy.clone(), settings.clone(), || -> Result<()> {
             let config = crate::config::Config::from_env()?;
             crate::origin::OriginSettings::from_env()?;
             crate::third_party_cache::ThirdParty::from_env(
@@ -756,7 +802,8 @@ pub fn check_startup_parsers(omitted: &[&str]) -> Result<()> {
     Ok(())
 }
 
-/// The policy variables of the process environment (set ones only).
+/// The policy variables of the process environment (set ones only): read by the export and by
+/// `backfill` only.
 pub fn env_policy() -> BTreeMap<String, String> {
     POLICY_ENV_KEYS
         .iter()
@@ -764,8 +811,17 @@ pub fn env_policy() -> BTreeMap<String, String> {
         .collect()
 }
 
-/// The canonical effective policy of the environment `env`, as declared
-/// (`--print-effective-config`).
+/// The settings variables of `env` (set ones only), as given.
+fn env_setting_values(env: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+    env.iter()
+        .filter(|(k, _)| settings::setting(k).is_some())
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect()
+}
+
+/// The canonical effective policy of the environment `env`, as declared (the form
+/// `--print-effective-config` prints for the files that stand for it).
+#[allow(dead_code)] // the tests
 pub fn env_canonical(env: &BTreeMap<String, String>) -> Result<serde_json::Value> {
     let export = policy_file::export(env)?;
     policy_file::canonical(&export.file, HeaderValues::Redacted, false, &|n: &str| {
@@ -792,11 +848,12 @@ pub fn policy_digest(file: &PolicyFile) -> Result<String> {
 }
 
 /// [`policy_digest`] of the environment `env`.
+#[allow(dead_code)] // the tests
 pub fn env_digest(env: &BTreeMap<String, String>) -> Result<String> {
     policy_digest(&policy_file::export(env)?.file)
 }
 
-/// The result of `compare`: whether the two policies are the same, and where they differ.
+/// The result of [`compare`]: whether the two policies are the same, and where they differ.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Comparison {
     pub matches: bool,
@@ -806,7 +863,7 @@ pub struct Comparison {
 
 /// Compare the policy of the environment `env` with `file` (its secrets resolved by
 /// `resolve`): the same routes, kinds (a keyed kind counts as generic, it behaves as one),
-/// header values and everything else.
+/// header values and everything else. The check of the export.
 pub fn compare(
     env: &BTreeMap<String, String>,
     file: &PolicyFile,
@@ -824,42 +881,119 @@ pub fn compare(
     })
 }
 
-/// The policy variables `env` sets that the file replaces.
-pub fn ignored_env_keys(env: &BTreeMap<String, String>) -> Vec<String> {
-    env.keys().cloned().collect()
-}
-
-/// The policy source of this process, chosen at startup ([`install`]).
+/// The configuration of this process, installed at startup ([`install_command`]).
 #[derive(Clone)]
 pub struct Installed {
-    pub source: Source,
-    /// The file, for `compare` (when it loaded) and `file`.
-    pub file: Option<LoadedFile>,
-    /// Why the file did not load (`compare`).
-    pub file_error: Option<String>,
-    /// The host file given (`--host-config` or `GATEWAY_HOST_CONFIG_FILE`).
-    pub host_path: Option<String>,
-    /// Whether the files carry the settings (a host file, or a `[settings]` table in the
-    /// common file), known even when they do not load.
-    pub carries_settings: bool,
+    /// The files in force.
+    pub file: LoadedFile,
 }
 
-/// The configuration file path: `--config`, else `GATEWAY_CONFIG_FILE`.
-fn file_path(cli: &Cli) -> Option<String> {
-    cli.config
-        .clone()
-        .or_else(|| std::env::var(FILE_ENV).ok())
-        .map(|p| p.trim().to_string())
-        .filter(|p| !p.is_empty())
+/// The two paths of the files and the variables of the environment they were taken from (the
+/// one-release fallback).
+struct Paths {
+    config: Option<String>,
+    host: Option<String>,
+    from_env: Vec<&'static str>,
+    /// An option given while its path variable holds another path (with `CONFIG_SOURCE=file`).
+    differ: Vec<&'static str>,
 }
 
-/// The host file path: `--host-config`, else `GATEWAY_HOST_CONFIG_FILE`.
-fn host_path(cmd: &Command) -> Option<String> {
-    cmd.host_config
-        .clone()
-        .or_else(|| std::env::var(HOST_FILE_ENV).ok())
-        .map(|p| p.trim().to_string())
-        .filter(|p| !p.is_empty())
+/// Whether `CONFIG_SOURCE` is set to `file` (`Some(true)`), to anything else (`Some(false)`: an
+/// empty or non-UTF-8 value too) or not at all (`None`).
+fn config_source_is_file() -> Option<bool> {
+    std::env::var_os(SOURCE_ENV).map(|v| {
+        v.to_str()
+            .is_some_and(|v| v.trim().eq_ignore_ascii_case("file"))
+    })
+}
+
+/// The configuration file paths: `--config`, else `GATEWAY_CONFIG_FILE`; `--host-config`, else
+/// `GATEWAY_HOST_CONFIG_FILE`. Refused (the process does not start, `--check-config` fails): a
+/// `CONFIG_SOURCE` set to anything but `file` (a deployment still configured by its
+/// environment), and a path taken from a variable without `CONFIG_SOURCE=file` (the variables
+/// of the transition are read with it only). The errors name variables only, never a value.
+fn paths(cmd: &Command) -> Result<Paths> {
+    let source = config_source_is_file();
+    if source == Some(false) {
+        bail!(
+            "{SOURCE_ENV} is set to something other than `file`: the gateway reads its configuration from the files only (its env and compare modes are removed) and does not start with it; unset {SOURCE_ENV} and pass --config <path> (and --host-config <path>)"
+        );
+    }
+    let mut from_env = Vec::new();
+    let mut differ = Vec::new();
+    let mut pick = |given: &Option<String>,
+                    var: &'static str,
+                    flag: &str|
+     -> Result<Option<String>> {
+        if let Some(given) = given {
+            let given = given.trim();
+            if given.is_empty() {
+                bail!("{flag} needs a path");
+            }
+            // The option wins; a different path in the variable is named (never shown).
+            let other = std::env::var_os(var);
+            let differs = other.is_some_and(|v| match v.to_str().map(str::trim) {
+                Some(p) => !p.is_empty() && p != given,
+                None => true,
+            });
+            if source == Some(true) && differs {
+                differ.push(var);
+            }
+            return Ok(Some(given.to_string()));
+        }
+        let Some(raw) = std::env::var_os(var) else {
+            return Ok(None);
+        };
+        let Some(p) = raw.to_str().map(str::trim).filter(|p| !p.is_empty()) else {
+            bail!("{var} is set but holds no path (or one that is not UTF-8): pass {flag} <path>");
+        };
+        if source != Some(true) {
+            bail!(
+                "the path of {flag} would come from {var}, which is read only with {SOURCE_ENV}=file (for one release): pass {flag} <path>"
+            );
+        }
+        from_env.push(var);
+        Ok(Some(p.to_string()))
+    };
+    let config = pick(&cmd.cli.config, FILE_ENV, "--config")?;
+    let host = pick(&cmd.host_config, HOST_FILE_ENV, "--host-config")?;
+    Ok(Paths {
+        config,
+        host,
+        from_env,
+        differ,
+    })
+}
+
+/// The warnings about the variables of the transition, one line each (names only): a path taken
+/// from the environment (with `CONFIG_SOURCE=file`, for one release), an option whose path
+/// variable holds another path.
+fn transition_warnings(p: &Paths) -> Vec<String> {
+    let flag = |var: &str| {
+        if var == FILE_ENV {
+            "--config"
+        } else {
+            "--host-config"
+        }
+    };
+    p.from_env
+        .iter()
+        .map(|var| {
+            let flag = flag(var);
+            format!("the path of {flag} comes from {var}, which a later release no longer reads: pass {flag} <path>")
+        })
+        .chain(p.differ.iter().map(|var| {
+            let flag = flag(var);
+            format!("{flag} and {var} name different paths: {flag} is read, {var} is not (unset it)")
+        }))
+        .collect()
+}
+
+/// The common file's path, or the error of a command line without one.
+fn require_config(p: &Paths, what: &str) -> Result<String> {
+    p.config.clone().ok_or_else(|| {
+        anyhow!("{what} needs a configuration file: --config <path> (and --host-config <path> for the host file)")
+    })
 }
 
 /// The process environment (variables that are not UTF-8 are no configuration).
@@ -869,254 +1003,142 @@ fn process_env() -> BTreeMap<String, String> {
         .collect()
 }
 
-/// The setting variables `env` sets that the files replace (those a `[secrets]` entry reads,
-/// `secret_variables`, are read as secrets, not ignored).
-pub fn ignored_env_settings(
-    env: &BTreeMap<String, String>,
-    secret_variables: &[String],
-) -> Vec<String> {
-    env.keys()
-        .filter(|k| settings::setting(k).is_some() && !secret_variables.contains(k))
+/// Whether `key` is a policy variable or a setting.
+fn recognised(key: &str) -> bool {
+    POLICY_ENV_KEYS.contains(&key) || settings::setting(key).is_some()
+}
+
+/// The policy and setting variables the process environment sets, sorted: none is read (names
+/// only, for a warning or a refusal). A variable whose value is empty or blank counts as unset
+/// (as a key the files leave out) and is not one; a value that is not UTF-8 counts as set.
+pub fn ignored_env_variables() -> Vec<String> {
+    let mut names: Vec<String> = std::env::vars_os()
+        .filter(|(_, v)| !v.to_str().is_some_and(|v| v.trim().is_empty()))
+        .filter_map(|(k, _)| k.into_string().ok())
+        .filter(|k| recognised(k))
+        .collect();
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// Of `names` (variables the environment sets, [`ignored_env_variables`]), those the files
+/// `loaded` leave out: a policy variable the files do not stand for, a setting they do not set.
+/// `PROXY_ALLOW_SUFFIXES` (read by no code, no key in the files) is never one. A blank
+/// variable is not in `names` ([`ignored_env_variables`] counts it as unset, whatever
+/// `--export-config` does with it: CONFIG.md, "Blank values").
+pub fn left_out_env_variables(loaded: &LoadedFile, names: &[String]) -> Vec<String> {
+    names
+        .iter()
+        .filter(|k| {
+            if POLICY_ENV_KEYS.contains(&k.as_str()) {
+                k.as_str() != "PROXY_ALLOW_SUFFIXES" && !loaded.policy.contains_key(k.as_str())
+            } else {
+                !loaded.setting_values.contains_key(k.as_str())
+            }
+        })
         .cloned()
         .collect()
 }
 
-/// [`install_command`] for a command line without host file options.
-#[allow(dead_code)] // the binary calls install_command
-pub fn install(cli: &Cli) -> Result<Installed> {
-    install_command(&Command::from(cli.clone()))
-}
-
-/// Choose the policy source (`CONFIG_SOURCE`) before any configuration is read; for `file`,
-/// make the file the process's policy (and the files' settings the process's settings, when
-/// they carry them). A `file` source whose files do not load is a startup error; `compare`
-/// only logs it.
+/// Load the files of the command line (`--config`, `--host-config`) with their secrets and
+/// make them the configuration of the process, before any configuration is read. The gateway
+/// does not start without a common file, with files that do not load (or a secret that does
+/// not resolve), with a variable of the transition it refuses ([`paths`]), or with a policy or
+/// setting variable in the environment that the files leave out (a deployment that still
+/// configures it by its environment would serve without it). A variable the files also set is
+/// a warning only: the files' value is in force.
 pub fn install_command(cmd: &Command) -> Result<Installed> {
-    let source = Source::parse(std::env::var(SOURCE_ENV).ok().as_deref())?;
-    let path = file_path(&cmd.cli);
-    let host = host_path(cmd);
-    // Only where the files are read: with CONFIG_SOURCE=env no file is opened.
-    let carries_settings = source != Source::Env
-        && (host.is_some() || path.as_deref().is_some_and(common_has_settings));
-    match source {
-        Source::Env => {
-            if let Some(path) = path {
-                info!(
-                    path = %path,
-                    "Configuration file given but {SOURCE_ENV} is env: the environment's policy is in force, the file is not read"
-                );
-            }
-            if let Some(host) = &host {
-                info!(
-                    path = %host,
-                    "Host file given but {SOURCE_ENV} is env: the environment's settings are in force, the file is not read"
-                );
-            }
-            Ok(Installed {
-                source,
-                file: None,
-                file_error: None,
-                host_path: host,
-                carries_settings,
-            })
-        }
-        Source::File => {
-            let path = path.ok_or_else(|| {
-                anyhow!(
-                    "{SOURCE_ENV}=file needs a configuration file (--config <path> or {FILE_ENV})"
-                )
-            })?;
-            let loaded = load_files_with(&path, host.as_deref(), Secrets::Require, true)?;
-            for w in &loaded.warnings {
-                warn!(path = %path, "{w}");
-            }
-            let ignored = ignored_env_keys(&env_policy());
-            if !ignored.is_empty() {
-                warn!(
-                    path = %path,
-                    ignored = %ignored.join(","),
-                    "{SOURCE_ENV}=file: these policy variables of the environment are ignored"
-                );
-            }
-            FILE_POLICY
-                .set(loaded.policy.clone())
-                .map_err(|_| anyhow!("the policy source was installed twice"))?;
-            FILE_SECRETS
-                .set(loaded.provider_secrets.clone())
-                .map_err(|_| anyhow!("the secrets were installed twice"))?;
-            if loaded.carries_settings {
-                let ignored = ignored_env_settings(&process_env(), &loaded.secret_variables());
-                if !ignored.is_empty() {
-                    warn!(
-                        path = %path,
-                        ignored = %ignored.join(","),
-                        "{SOURCE_ENV}=file: the configuration files carry the settings; these setting variables of the environment are ignored"
-                    );
-                }
-                FILE_SETTINGS
-                    .set(loaded.settings.clone())
-                    .map_err(|_| anyhow!("the settings source was installed twice"))?;
-            }
-            Ok(Installed {
-                source,
-                file: Some(loaded),
-                file_error: None,
-                host_path: host,
-                carries_settings,
-            })
-        }
-        Source::Compare => {
-            let loaded = match path {
-                None => Err(anyhow!(
-                    "no configuration file (--config <path> or {FILE_ENV})"
-                )),
-                Some(path) => load_files_with(&path, host.as_deref(), Secrets::Require, true),
-            };
-            match loaded {
-                Ok(loaded) => {
-                    for w in &loaded.warnings {
-                        warn!(path = %loaded.path, "{w}");
-                    }
-                    Ok(Installed {
-                        source,
-                        file: Some(loaded),
-                        file_error: None,
-                        host_path: host,
-                        carries_settings,
-                    })
-                }
-                Err(e) => Ok(Installed {
-                    source,
-                    file: None,
-                    file_error: Some(format!("{e:#}")),
-                    host_path: host,
-                    carries_settings,
-                }),
-            }
-        }
+    let p = paths(cmd)?;
+    for w in transition_warnings(&p) {
+        warn!("{w}");
     }
+    // Before the files are read: a load error then comes with this hint too.
+    let ignored = ignored_env_variables();
+    if !ignored.is_empty() {
+        warn!(
+            ignored = %ignored.join(","),
+            "These variables of the environment are not read: the configuration comes from the files only"
+        );
+    }
+    let path = require_config(&p, "The gateway")?;
+    let loaded = load_files_with(&path, p.host.as_deref(), Secrets::Require, true, true)?;
+    for w in &loaded.warnings {
+        warn!(path = %path, "{w}");
+    }
+    let left_out = left_out_env_variables(&loaded, &ignored);
+    if !left_out.is_empty() {
+        bail!(
+            "the environment sets {}, which the configuration files leave out: the gateway reads its configuration from the files only and does not start without them; put each in the files (or unset it)",
+            left_out.join(",")
+        );
+    }
+    FILE_POLICY
+        .set(loaded.policy.clone())
+        .map_err(|_| anyhow!("the configuration was installed twice"))?;
+    FILE_SETTINGS
+        .set(loaded.settings.clone())
+        .map_err(|_| anyhow!("the configuration was installed twice"))?;
+    FILE_SECRETS
+        .set(loaded.provider_secrets.clone())
+        .map_err(|_| anyhow!("the configuration was installed twice"))?;
+    Ok(Installed { file: loaded })
 }
 
-/// Whether the common file at `path` has a `[settings]` table (read as TOML only; `false` when
-/// it cannot be read).
-fn common_has_settings(path: &str) -> bool {
-    std::fs::read_to_string(path)
-        .ok()
-        .and_then(|t| toml::from_str::<toml::Table>(&t).ok())
-        .is_some_and(|t| t.get("settings").is_some_and(toml::Value::is_table))
+/// `backfill`: its configuration from the environment, as before (the one subcommand that still
+/// reads it): the policy variables and the settings of the environment become the process's.
+pub fn install_environment() -> Result<()> {
+    let env = process_env();
+    FILE_POLICY
+        .set(env_policy())
+        .map_err(|_| anyhow!("the configuration was installed twice"))?;
+    FILE_SETTINGS
+        .set(env_setting_values(&env))
+        .map_err(|_| anyhow!("the configuration was installed twice"))?;
+    Ok(())
 }
 
-/// The `tracing` filter of a serving process, read before anything else: `None` = the
-/// environment's `RUST_LOG` (as before); `Some(value)` = the files are in force and carry the
-/// settings, `value` = their `rust_log` (`None`: unset). A file that cannot be read here is
-/// `None`: [`install_command`] reports it.
-pub fn log_filter(cmd: &Command) -> Option<Option<String>> {
-    if Source::parse(std::env::var(SOURCE_ENV).ok().as_deref()).ok()? != Source::File {
-        return None;
-    }
+/// The `tracing` filter of a serving process, read before anything else: the files' `rust_log`
+/// (the common file's `[settings]`, else the host file's); `None` when they leave it out or
+/// cannot be read here ([`install_command`] reports that).
+pub fn log_filter(cmd: &Command) -> Option<String> {
+    let p = paths(cmd).ok()?;
     let read = |path: &str| -> Option<toml::Table> {
         toml::from_str(&std::fs::read_to_string(path).ok()?).ok()
     };
-    let common = read(&file_path(&cmd.cli)?)?;
-    let host = match host_path(cmd) {
-        Some(p) => Some(read(&p)?),
-        None => None,
-    };
-    let common_settings = common.get("settings").and_then(toml::Value::as_table);
-    if common_settings.is_none() && host.is_none() {
-        return None;
-    }
     let rust_log = |t: Option<&toml::Table>| {
-        t.and_then(|t| t.get("rust_log"))
+        t.and_then(|t| t.get("settings"))
+            .and_then(toml::Value::as_table)
+            .and_then(|t| t.get("rust_log"))
             .and_then(toml::Value::as_str)
             .map(str::to_string)
     };
-    let host_settings = host
-        .as_ref()
-        .and_then(|h| h.get("settings"))
-        .and_then(toml::Value::as_table);
-    Some(rust_log(common_settings).or_else(|| rust_log(host_settings)))
+    let common = read(p.config.as_deref()?);
+    let host = p.host.as_deref().and_then(read);
+    rust_log(common.as_ref()).or_else(|| rust_log(host.as_ref()))
 }
 
-/// After the configuration loaded: `ohttp_config_info`, and for `compare` the comparison.
+/// After the configuration loaded: `ohttp_config_info{source="file", digest, tuning_digest}`.
 pub fn report(installed: &Installed) {
-    let env = env_policy();
-    let digest = match &installed.file {
-        Some(f) if installed.source == Source::File => policy_digest(&f.file),
-        _ => env_digest(&env),
-    };
-    let digest = match digest {
+    let f = &installed.file;
+    let digest = match policy_digest(&f.file) {
         Ok(d) => d,
         Err(e) => {
             warn!(error = %format!("{e:#}"), "The canonical effective policy could not be built; ohttp_config_info has digest 'unavailable'");
             "unavailable".to_string()
         }
     };
-    let process = process_env();
-    let settings_from_files = matches!(&installed.file, Some(f) if installed.source == Source::File && f.carries_settings);
-    let tuning_digest = match &installed.file {
-        Some(f) if settings_from_files => settings::tuning_digest(&f.settings),
-        _ => settings::tuning_digest(&settings::env_settings(&process)),
-    };
-    crate::health::set_config_info(installed.source.as_str(), &digest, &tuning_digest);
-    match (installed.source, &installed.file) {
-        (Source::File, Some(f)) if f.carries_settings => info!(
-            path = %f.path,
-            digest = %digest,
-            host_path = f.host_path.as_deref().unwrap_or("-"),
-            tuning_digest = %tuning_digest,
-            settings = "files",
-            "Routing policy from the configuration file ({SOURCE_ENV}=file)"
-        ),
-        (Source::File, Some(f)) => info!(
-            path = %f.path,
-            digest = %digest,
-            "Routing policy from the configuration file ({SOURCE_ENV}=file)"
-        ),
-        (Source::Compare, Some(f)) => {
-            let resolve = |name: &str| {
-                f.secret_values
-                    .get(name)
-                    .cloned()
-                    .ok_or_else(|| anyhow!("no value for secret '{name}'"))
-            };
-            match compare(&env, &f.file, &resolve) {
-                Ok(c) if c.matches => {
-                    crate::health::set_config_compare_match(true);
-                    info!(path = %f.path, digest = %digest, "{SOURCE_ENV}=compare: the configuration file's policy equals the environment's");
-                }
-                Ok(c) => {
-                    crate::health::set_config_compare_match(false);
-                    warn!(path = %f.path, differing = %c.keys.join(","), "{SOURCE_ENV}=compare: the configuration file's policy differs from the environment's (the environment is in force)");
-                }
-                Err(e) => {
-                    crate::health::set_config_compare_match(false);
-                    warn!(path = %f.path, error = %format!("{e:#}"), "{SOURCE_ENV}=compare: the policies could not be compared (the environment is in force)");
-                }
-            }
-            if f.carries_settings {
-                let keys = settings::differing(&settings::env_settings(&process), &f.settings);
-                crate::health::set_config_settings_compare_match(keys.is_empty());
-                if keys.is_empty() {
-                    info!(path = %f.path, host_path = f.host_path.as_deref().unwrap_or("-"), tuning_digest = %tuning_digest, "{SOURCE_ENV}=compare: the configuration files' settings equal the environment's");
-                } else {
-                    warn!(path = %f.path, host_path = f.host_path.as_deref().unwrap_or("-"), differing = %keys.join(","), "{SOURCE_ENV}=compare: the configuration files' settings differ from the environment's (the environment is in force)");
-                }
-            }
-        }
-        (Source::Compare, None) => {
-            crate::health::set_config_compare_match(false);
-            if installed.carries_settings {
-                crate::health::set_config_settings_compare_match(false);
-            }
-            warn!(
-                error = installed.file_error.as_deref().unwrap_or(""),
-                host_path = installed.host_path.as_deref().unwrap_or("-"),
-                "{SOURCE_ENV}=compare: the configuration file did not load (the environment is in force)"
-            );
-        }
-        _ => {}
-    }
+    let tuning_digest = settings::tuning_digest(&f.settings);
+    crate::health::set_config_info("file", &digest, &tuning_digest);
+    info!(
+        path = %f.path,
+        host_path = f.host_path.as_deref().unwrap_or("-"),
+        digest = %digest,
+        tuning_digest = %tuning_digest,
+        settings = "files",
+        settings_count = f.setting_values.len(),
+        "Configuration from the files"
+    );
 }
 
 /// What the command line asks for.
@@ -1155,8 +1177,8 @@ pub struct Command {
     /// `--host <path>` (`--export-config` only): write the host file there and print the
     /// common file with the settings.
     pub host_out: Option<String>,
-    /// `--strict` (`--check-config` only): a setting of the environment the files leave out
-    /// is an error.
+    /// `--strict` (`--check-config` only): a policy or setting variable the environment sets and
+    /// the files leave out is an error (a check of a move from the environment to the files).
     pub strict: bool,
 }
 
@@ -1172,21 +1194,23 @@ impl From<Cli> for Command {
 }
 
 /// The usage text.
-pub const USAGE: &str = "usage: zodl-ohttp-gateway [--config <path>] [--host-config <path>] [--check-config [--secrets=require|skip] [--strict] | --print-effective-config | --export-config [--host <path>]]
+pub const USAGE: &str = "usage: zodl-ohttp-gateway --config <path> [--host-config <path>] [--check-config [--secrets=require|skip] [--strict] | --print-effective-config]
+       zodl-ohttp-gateway --export-config [--host <path>]
        zodl-ohttp-gateway backfill
 
-  (no flag)                 serve; CONFIG_SOURCE=env|compare|file (default env) chooses the policy
-                            (and the settings, when the files carry them)
-  --config <path>           the configuration file (else GATEWAY_CONFIG_FILE)
-  --host-config <path>      the host file: per-host settings and secrets (else GATEWAY_HOST_CONFIG_FILE)
+  (no flag)                 serve, configured by the files only (no policy or setting from the environment)
+  --config <path>           the common configuration file: policy and common settings (required)
+  --host-config <path>      the host file: the settings and secrets of this host
   --check-config            load and check the files, their secrets and the configuration built from them; exit 0 or 1
-  --secrets=require|skip    --check-config: resolve every secret (default) or none
-  --strict                  --check-config: a setting of the environment the files leave out is an error
-  --print-effective-config  print the policy in force as canonical JSON (header values redacted;
-                            with CONFIG_SOURCE=file and files that carry settings, the settings too)
-  --export-config           print the configuration file equivalent to the environment's policy
+  --secrets=require|skip    --check-config: read every secret file (default) or none
+  --strict                  --check-config: a variable the environment sets and the files leave out is an error
+  --print-effective-config  print the policy of the files as canonical JSON (header values redacted;
+                            with files that carry settings, the settings too)
+  --export-config           migration: print the configuration file equivalent to the environment's policy
+                            (reads the environment; secrets as { env = ... } references to point at files)
   --host <path>             --export-config: also the settings: the common file (policy and common
                             settings) on stdout, the host file written to <path> (a new file)
+  backfill                  fill the permanent block tier from the environment's settings and exit
 ";
 
 impl Cli {
@@ -1281,13 +1305,13 @@ impl Command {
         if host_out.is_some() && cli.action != Action::ExportConfig {
             return Err(format!("--host only goes with --export-config\n{USAGE}"));
         }
-        if cli.config.as_deref().is_some_and(str::is_empty) {
+        if cli.config.as_deref().is_some_and(|p| p.trim().is_empty()) {
             return Err(format!("--config needs a path\n{USAGE}"));
         }
-        if host_config.as_deref().is_some_and(str::is_empty) {
+        if host_config.as_deref().is_some_and(|p| p.trim().is_empty()) {
             return Err(format!("--host-config needs a path\n{USAGE}"));
         }
-        if host_out.as_deref().is_some_and(str::is_empty) {
+        if host_out.as_deref().is_some_and(|p| p.trim().is_empty()) {
             return Err(format!("--host needs a path\n{USAGE}"));
         }
         Ok(Self {
@@ -1327,12 +1351,20 @@ pub fn run_command(cmd: &Command) -> i32 {
     }
 }
 
+/// The paths of `cmd` for a command-line action, the warnings of the transition on stderr.
+fn action_paths(cmd: &Command) -> Result<Paths> {
+    let p = paths(cmd).map_err(|e| anyhow!("config INVALID: {e:#}"))?;
+    for w in transition_warnings(&p) {
+        eprintln!("warning: {w}");
+    }
+    Ok(p)
+}
+
 fn check_config(cmd: &Command) -> Result<()> {
     let cli = &cmd.cli;
-    let path = file_path(cli).ok_or_else(|| {
-        anyhow!("--check-config needs a configuration file (--config <path> or {FILE_ENV})")
-    })?;
-    let host = host_path(cmd);
+    let p = action_paths(cmd)?;
+    let path = require_config(&p, "--check-config")?;
+    let host = p.host;
     let loaded = load_files(&path, host.as_deref(), cli.secrets)
         .map_err(|e| anyhow!("config INVALID: {e:#}"))?;
     // Strict where serving is lenient: a coinbase key that does not read as a key is an error
@@ -1359,23 +1391,21 @@ fn check_config(cmd: &Command) -> Result<()> {
         "config OK: {path} (schema {}, digest {digest}, secrets {secrets})",
         policy_file::SCHEMA,
     );
-    if loaded.carries_settings {
-        // The settings the environment sets and the files leave out (names only): with
-        // CONFIG_SOURCE=file they would be unset.
-        let missing: Vec<String> = ignored_env_settings(&process_env(), &loaded.secret_variables())
-            .into_iter()
-            .filter(|env| !loaded.setting_values.contains_key(env.as_str()))
-            .collect();
-        if !missing.is_empty() {
-            eprintln!(
-                "{}: settings of the environment that the files leave out (unset with {SOURCE_ENV}=file): {}",
-                if cmd.strict { "error" } else { "warning" },
-                missing.join(",")
-            );
-            if cmd.strict {
-                bail!("config INVALID: --strict: the files leave out settings of the environment");
-            }
+    // The variables the environment sets and the files leave out (names only), whatever the
+    // files carry: none is read, so a move from the environment to the files would lose them,
+    // and a serving process with this environment does not start.
+    let missing = left_out_env_variables(&loaded, &ignored_env_variables());
+    if !missing.is_empty() {
+        eprintln!(
+            "{}: variables of the environment that the files leave out (not read; a gateway serving with them set does not start): {}",
+            if cmd.strict { "error" } else { "warning" },
+            missing.join(",")
+        );
+        if cmd.strict {
+            bail!("config INVALID: --strict: the files leave out variables of the environment");
         }
+    }
+    if loaded.carries_settings {
         println!(
             "settings OK: {} settings from {path}{} (tuning digest {}, secrets {secrets})",
             loaded.setting_values.len(),
@@ -1389,54 +1419,35 @@ fn check_config(cmd: &Command) -> Result<()> {
 }
 
 fn print_effective_config(cmd: &Command) -> Result<()> {
-    let cli = &cmd.cli;
-    let source = Source::parse(std::env::var(SOURCE_ENV).ok().as_deref())?;
-    let canonical = match source {
-        Source::File => {
-            let path = file_path(cli).ok_or_else(|| {
-                anyhow!(
-                    "{SOURCE_ENV}=file needs a configuration file (--config <path> or {FILE_ENV})"
-                )
-            })?;
-            // The checks of --check-config --secrets=skip first.
-            let loaded = load_files(&path, host_path(cmd).as_deref(), Secrets::Skip)
-                .map_err(|e| anyhow!("config INVALID: {e:#}"))?;
-            let mut canonical = file_canonical(&loaded.file)?;
-            if loaded.carries_settings {
-                // The settings as written: a secret as `<secret:name>`.
-                let settings: serde_json::Map<String, serde_json::Value> = loaded
-                    .setting_values
-                    .iter()
-                    .map(|(env, v)| {
-                        let shown = match v {
-                            FileValue::Plain(p) => p.clone(),
-                            FileValue::Secret { name, template } => {
-                                let marker = format!("<secret:{name}>");
-                                match template {
-                                    Some(t) => t.replace(settings::SECRET_PLACEHOLDER, &marker),
-                                    None => marker,
-                                }
-                            }
-                        };
-                        (env.to_string(), serde_json::Value::String(shown))
-                    })
-                    .collect();
-                if let Some(obj) = canonical.as_object_mut() {
-                    obj.insert("settings".to_string(), serde_json::Value::Object(settings));
-                }
-            }
-            canonical
+    let p = action_paths(cmd)?;
+    let path = require_config(&p, "--print-effective-config")?;
+    // The checks of --check-config --secrets=skip first.
+    let loaded = load_files(&path, p.host.as_deref(), Secrets::Skip)
+        .map_err(|e| anyhow!("config INVALID: {e:#}"))?;
+    let mut canonical = file_canonical(&loaded.file)?;
+    if loaded.carries_settings {
+        // The settings as written: a secret as `<secret:name>`.
+        let settings: serde_json::Map<String, serde_json::Value> = loaded
+            .setting_values
+            .iter()
+            .map(|(env, v)| {
+                let shown = match v {
+                    FileValue::Plain(p) => p.clone(),
+                    FileValue::Secret { name, template } => {
+                        let marker = format!("<secret:{name}>");
+                        match template {
+                            Some(t) => t.replace(settings::SECRET_PLACEHOLDER, &marker),
+                            None => marker,
+                        }
+                    }
+                };
+                (env.to_string(), serde_json::Value::String(shown))
+            })
+            .collect();
+        if let Some(obj) = canonical.as_object_mut() {
+            obj.insert("settings".to_string(), serde_json::Value::Object(settings));
         }
-        Source::Env | Source::Compare => {
-            if let Some(path) = file_path(cli) {
-                eprintln!(
-                    "note: {SOURCE_ENV} is {}: the environment's policy is printed, not {path}",
-                    source.as_str()
-                );
-            }
-            env_canonical(&env_policy())?
-        }
-    };
+    }
     println!("{}", policy_file::canonical_json(&canonical));
     Ok(())
 }
@@ -1456,7 +1467,8 @@ pub fn export_checked(env: &BTreeMap<String, String>) -> Result<(String, policy_
         .into_iter()
         .map(|(k, v)| (k.to_string(), v))
         .collect();
-    check_policy(&skipped, true)
+    // With the settings of the environment, as the environment itself is read.
+    check_policy(&skipped, &env_setting_values(env), true)
         .map_err(|e| anyhow!("the exported file does not pass the checks: {e:#}"))?;
     // The header values the file renders are the ones the production parser reads from the
     // environment, in order.
@@ -1485,7 +1497,8 @@ pub fn export_checked(env: &BTreeMap<String, String>) -> Result<(String, policy_
 /// The two files equivalent to the environment `env` (`policy_text`, `export`: its checked
 /// policy export, [`export_checked`]): the common file (the policy, the common settings and
 /// every secret they name) and the host file (the host settings and their secrets). A secret is
-/// mapped to the variable that holds it today (`{ env = "VAR" }`). Checked before it is
+/// mapped to the variable that holds it today (`{ env = "VAR" }`, which the gateway refuses: the
+/// operator points each at a file before use). Checked before it is
 /// returned: both files parse, stand for exactly the environment's settings and pass the
 /// startup checks.
 pub fn export_files(
@@ -1602,11 +1615,19 @@ pub fn export_files(
     Ok((common, host))
 }
 
+/// The note of an export whose output names a secret by its variable.
+const EXPORT_SECRETS_NOTE: &str = "note: each [secrets] entry names the variable that holds it today ({ env = ... }); the gateway reads secrets from files only: point each at a file ({ file = \"/run/secrets/<name>\" }) before using the files";
+
 fn export_config(cmd: &Command) -> Result<()> {
     let env = process_env();
     let (text, export) = export_checked(&env)?;
     let text = match &cmd.host_out {
-        None => text,
+        None => {
+            if text.contains("{ env = ") {
+                eprintln!("{EXPORT_SECRETS_NOTE}");
+            }
+            text
+        }
         Some(out) => {
             let (common, host) = export_files(&env, &text, &export)?;
             // A new file: never over a host file in use.
@@ -1619,16 +1640,16 @@ fn export_config(cmd: &Command) -> Result<()> {
             f.write_all(host.as_bytes())
                 .map_err(|e| anyhow!("--host {out}: {}", e.kind()))?;
             eprintln!("note: host file written to {out}");
-            eprintln!(
-                "note: each [secrets] entry of a setting reads the variable that holds it today; for the files-only setup point it at a file instead ({{ file = \"/run/secrets/<name>\" }})"
-            );
+            if common.contains("{ env = ") || host.contains("{ env = ") {
+                eprintln!("{EXPORT_SECRETS_NOTE}");
+            }
             common
         }
     };
     print!("{text}");
     for s in export.secrets.iter().filter(|s| !s.found) {
         eprintln!(
-            "note: secret '{}' maps to a new variable {}; set it to the header value it stands for",
+            "note: secret '{}' maps to a new variable {}: write the header value it stands for into a file and point the secret at it",
             s.name, s.env
         );
     }
@@ -1705,6 +1726,10 @@ mod tests {
             &["--config"],
             &["--config", "--check-config"],
             &["--config="],
+            &["--config= "],
+            &["--config", "  "],
+            &["--host-config", " "],
+            &["--host-config= ", "--check-config"],
             &["--secrets=skip"],
             &["--secrets=maybe", "--check-config"],
             &["--unknown"],
@@ -1715,12 +1740,14 @@ mod tests {
     }
 
     #[test]
-    fn sources() {
-        assert_eq!(Source::parse(None).unwrap(), Source::Env);
-        assert_eq!(Source::parse(Some(" ")).unwrap(), Source::Env);
-        assert_eq!(Source::parse(Some("Compare")).unwrap(), Source::Compare);
-        assert_eq!(Source::parse(Some("file")).unwrap(), Source::File);
-        assert!(Source::parse(Some("files")).is_err());
+    fn an_env_secret_reference_is_refused_by_name() {
+        let e = format!(
+            "{:#}",
+            read_secret("k", Some("SOME_VAR"), None).unwrap_err()
+        );
+        assert!(e.contains("secret 'k'") && e.contains("files only"), "{e}");
+        assert!(read_secret("k", None, None).is_err());
+        assert!(check_secret_ref("k", None, Some("/x")).is_ok());
     }
 
     #[test]
@@ -1730,10 +1757,21 @@ mod tests {
         with_policy(policy, || {
             assert_eq!(var("BACKENDS").as_deref(), Ok("a.example=https://a"));
             assert_eq!(var("BACKENDS_POLICY"), Err(std::env::VarError::NotPresent));
-            // Not a policy variable: the environment.
-            assert_eq!(var("PATH").is_ok(), std::env::var("PATH").is_ok());
+            // Neither policy nor a setting: never read, not even from the environment.
+            assert_eq!(var("PATH"), Err(std::env::VarError::NotPresent));
         });
-        // Outside the scope: the environment.
-        assert_eq!(var("BACKENDS").ok(), std::env::var("BACKENDS").ok());
+        // Outside a scope, with nothing installed: nothing (never the environment).
+        assert_eq!(var("BACKENDS"), Err(std::env::VarError::NotPresent));
+        with_vars(
+            [
+                ("LWD_ADDR", "lwd.example:9067"),
+                ("BACKENDS", "b=https://b"),
+            ],
+            || {
+                assert_eq!(var("LWD_ADDR").as_deref(), Ok("lwd.example:9067"));
+                assert_eq!(var("BACKENDS").as_deref(), Ok("b=https://b"));
+                assert_eq!(var("MAX_BLOCK_RANGE"), Err(std::env::VarError::NotPresent));
+            },
+        );
     }
 }

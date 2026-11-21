@@ -14,17 +14,18 @@
 //
 // Commercial licensing: see COMMERCIAL-LICENSE.md.
 
-//! The gateway's configuration file, stage 1: the routing policy of the environment variables
+//! The gateway's configuration file: the routing policy of the former environment variables
 //! ([`POLICY_ENV_KEYS`]) as TOML, grouped by authority, every list entry in the grammar of its
-//! variable. Deployment keys (addresses, stores, identity, sizing, secrets: [`DEPLOYMENT_ENV_KEYS`])
-//! stay in the environment.
+//! variable. The gateway's other settings are its `[settings]` table (the gateway's `settings`
+//! module). A `[secrets]` entry names a file; the `env` form is parsed (the export of an
+//! environment writes it) but the gateway refuses it when it loads a file.
 //!
 //! ```toml
 //! schema = 1
 //! gateway_hosts = ["gateway.example"]
 //!
 //! [secrets]
-//! prices_key = { env = "PRICES_API_KEY" }          # or { file = "/run/secrets/prices_key" }
+//! prices_key = { file = "/run/secrets/prices_key" }
 //!
 //! [integrations.prices]
 //! alias = "prices.example"                          # BACKENDS
@@ -850,7 +851,9 @@ impl PolicyFile {
         for (name, s) in &self.secrets {
             match (&s.env, &s.file) {
                 (Some(_), None) | (None, Some(_)) => {}
-                _ => bail!("Invalid config file: secret '{name}' needs exactly one of env or file"),
+                _ => bail!(
+                    "Invalid config file: secret '{name}' needs a file ({name} = {{ file = \"/path\" }})"
+                ),
             }
         }
         for (name, s) in &self.value_sources {

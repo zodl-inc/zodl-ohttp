@@ -22,9 +22,11 @@
 //!   characterisation fixtures and on `fixtures/settings/full.vars` (every setting set);
 //! - every boolean variable is read the same in each spelling;
 //! - every variable is read through `config_source::var` and classified;
-//! - the binary: `CONFIG_SOURCE=file` with an empty environment except the source and the two
-//!   paths, `compare` of the settings, `--check-config` of both files, `--export-config --host`;
-//!   no secret value in any output.
+//! - the binary: serving from `--config` / `--host-config` with an empty environment, the
+//!   environment's settings never read (a variable the files leave out refused),
+//!   `CONFIG_SOURCE` and the path variables of the transition (refused without
+//!   `CONFIG_SOURCE=file`), `--check-config` of both files, `--export-config --host`; no secret
+//!   value in any output.
 //!
 //! Every subprocess runs with a deadline and its output in files (no pipe can fill).
 
@@ -363,6 +365,59 @@ fn export_files(name: &str) -> (TempFile, TempFile, String, String) {
     )
 }
 
+/// A directory in the temporary directory, removed on drop.
+struct TempDir(PathBuf);
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// The two exported files (`common`, `host`) as the gateway reads them: each `[secrets]` entry
+/// `name = { env = "VAR" }` pointed at a file holding `values[VAR]` (secrets from files only).
+/// The directory and the two paths.
+fn as_files(
+    name: &str,
+    common: &str,
+    host: &str,
+    values: &BTreeMap<String, String>,
+) -> (TempDir, String, String) {
+    let dir = TempDir(TempFile::path_for(&format!("{name}-files")));
+    let _ = std::fs::remove_dir_all(&dir.0);
+    std::fs::create_dir_all(&dir.0).unwrap();
+    let convert = |text: &str| -> String {
+        let mut out = String::new();
+        for line in text.split_inclusive('\n') {
+            let entry = line
+                .trim_end()
+                .split_once(" = { env = \"")
+                .and_then(|(k, rest)| Some((k, rest.strip_suffix("\" }")?)));
+            match entry {
+                Some((secret, var)) => {
+                    let path = dir.0.join(secret.trim_matches('"'));
+                    std::fs::write(&path, &values[var]).unwrap();
+                    out.push_str(&format!(
+                        "{secret} = {{ file = {:?} }}\n",
+                        path.to_str().unwrap()
+                    ));
+                }
+                None => out.push_str(line),
+            }
+        }
+        assert!(!out.contains("{ env ="), "{out}");
+        out
+    };
+    let (c, h) = (dir.0.join("gateway.toml"), dir.0.join("host.toml"));
+    std::fs::write(&c, convert(common)).unwrap();
+    std::fs::write(&h, convert(host)).unwrap();
+    let (c, h) = (
+        c.to_str().unwrap().to_string(),
+        h.to_str().unwrap().to_string(),
+    );
+    (dir, c, h)
+}
+
 /// The secret values of an environment (whole secrets, and the passwords of store URLs).
 fn secret_values(vars: &[(String, String)]) -> Vec<String> {
     let mut out = Vec::new();
@@ -405,9 +460,11 @@ fn every_setting_reads_the_same_from_the_files_as_from_the_environment() {
     let _guard = lock();
     for (name, vars) in fixtures() {
         apply_env(&vars);
-        let (common, host, common_text, host_text) = export_files(name);
-        let from_env = view();
-        let loaded = config_source::load_files(common.path(), Some(host.path()), Secrets::Require)
+        let (_common, _host, common_text, host_text) = export_files(name);
+        // The gateway's parsers on the environment's variables (the gateway never reads them).
+        let from_env = config_source::with_vars(vars.clone(), view);
+        let (_dir, common, host) = as_files(name, &common_text, &host_text, &process_env());
+        let loaded = config_source::load_files(&common, Some(host.as_str()), Secrets::Require)
             .unwrap_or_else(|e| panic!("{name}: {e:#}"));
         assert!(loaded.carries_settings);
         // The files stand for every setting of the environment, and nothing more.
@@ -562,8 +619,13 @@ fn a_key_in_both_files_and_a_policy_key_in_the_host_file_are_errors() {
         ),
         (
             "both-secrets",
-            "schema = 1\n[secrets]\nk = { env = \"X\" }\n",
+            "schema = 1\n[secrets]\nk = { file = \"/x\" }\n",
             "",
+        ),
+        (
+            "env-secret",
+            "schema = 1\n[secrets]\nk = { env = \"X\" }\n",
+            "files only",
         ),
     ] {
         let host = TempFile::new(&format!("both-{name}.toml"), body);
@@ -578,11 +640,11 @@ fn a_key_in_both_files_and_a_policy_key_in_the_host_file_are_errors() {
     // A secret declared in both files.
     let common = TempFile::new(
         "both-secret-common.toml",
-        "schema = 1\ngateway_hosts = [\"gw.example\"]\n[secrets]\nk = { env = \"X\" }\n",
+        "schema = 1\ngateway_hosts = [\"gw.example\"]\n[secrets]\nk = { file = \"/x\" }\n",
     );
     let host = TempFile::new(
         "both-secret-host.toml",
-        "schema = 1\n[secrets]\nk = { env = \"Y\" }\n",
+        "schema = 1\n[secrets]\nk = { file = \"/y\" }\n",
     );
     let e = format!(
         "{:#}",
@@ -592,7 +654,7 @@ fn a_key_in_both_files_and_a_policy_key_in_the_host_file_are_errors() {
 }
 
 #[test]
-fn a_policy_only_file_leaves_the_settings_to_the_environment() {
+fn a_policy_only_file_sets_no_setting_and_the_environment_none_either() {
     let _guard = lock();
     apply_env(&[("LWD_ADDR".to_string(), "env-lwd.example:9067".to_string())]);
     let common = TempFile::new(
@@ -601,8 +663,8 @@ fn a_policy_only_file_leaves_the_settings_to_the_environment() {
     );
     let loaded = config_source::load_file(common.path(), Secrets::Require).unwrap();
     assert!(!loaded.carries_settings && loaded.settings.is_empty());
-    let config = config_source::with_policy(loaded.policy.clone(), || Config::from_env().unwrap());
-    assert_eq!(config.lwd_addr, "env-lwd.example:9067");
+    let config = loaded.run_in(|| Config::from_env().unwrap());
+    assert_eq!(config.lwd_addr, "localhost:9067");
     // A [settings] table: the files carry the settings, every one left out at its default.
     let common = TempFile::new(
         "stage2-empty.toml",
@@ -610,9 +672,7 @@ fn a_policy_only_file_leaves_the_settings_to_the_environment() {
     );
     let loaded = config_source::load_file(common.path(), Secrets::Require).unwrap();
     assert!(loaded.carries_settings);
-    let config = config_source::with_config(loaded.policy.clone(), loaded.settings.clone(), || {
-        Config::from_env().unwrap()
-    });
+    let config = loaded.run_in(|| Config::from_env().unwrap());
     assert_eq!(config.lwd_addr, "localhost:9067");
 }
 
@@ -797,12 +857,13 @@ struct Server {
 }
 
 impl Server {
-    fn start(env: &[(&str, &str)]) -> Self {
+    fn start(args: &[&str], env: &[(&str, &str)]) -> Self {
         let out = TempFile::new(&format!("serve-out-{}", unique()), "");
         let err = TempFile::new(&format!("serve-err-{}", unique()), "");
         let child = Command::new(bin())
             .env_clear()
             .envs(env.iter().copied())
+            .args(args)
             .stdin(Stdio::null())
             .stdout(std::fs::File::create(&out.0).unwrap())
             .stderr(std::fs::File::create(&err.0).unwrap())
@@ -886,18 +947,29 @@ fn proxy_files(name: &str, origin: &str) -> ProxyFiles {
     }
 }
 
+impl ProxyFiles {
+    /// The command line of these files.
+    fn args(&self) -> [&str; 4] {
+        [
+            "--config",
+            self.common.path(),
+            "--host-config",
+            self.host.path(),
+        ]
+    }
+}
+
 #[test]
-fn file_mode_serves_with_an_empty_environment() {
+fn serves_from_its_files_with_an_empty_environment() {
     let files = proxy_files("empty-env", "origin-files");
-    let env = [
-        ("CONFIG_SOURCE", "file"),
-        ("GATEWAY_CONFIG_FILE", files.common.path()),
-        ("GATEWAY_HOST_CONFIG_FILE", files.host.path()),
-    ];
-    // --check-config with the same environment: both files, the secret file read.
-    let (code, stdout, stderr) = run(&["--check-config"], &env);
+    // --check-config of the same files: both files, the secret file read.
+    let mut check = files.args().to_vec();
+    check.push("--check-config");
+    let (code, stdout, stderr) = run(&check, &[]);
     assert_eq!(code, Some(0), "{stdout}{stderr}");
     assert!(stdout.contains("settings OK: 9 settings from"), "{stdout}");
+    // No warning of the transition: the paths are on the command line.
+    assert!(!stderr.contains("GATEWAY_CONFIG_FILE"), "{stderr}");
     assert!(!stdout.contains(SENTINEL) && !stderr.contains(SENTINEL));
     let tuning = stdout
         .split("tuning digest ")
@@ -906,126 +978,268 @@ fn file_mode_serves_with_an_empty_environment() {
         .unwrap()
         .to_string();
 
-    let mut server = Server::start(&env);
+    let mut server = Server::start(&files.args(), &[]);
     let metrics = server.wait_for(&files.internal, "/metrics");
     assert!(metrics.contains("source=\"file\""), "{metrics}");
     assert!(
         metrics.contains(&format!("tuning_digest=\"{tuning}\"")),
         "{metrics}"
     );
+    // The compare metrics are gone.
+    assert!(!metrics.contains("compare_match"), "{metrics}");
     // The host file's ORIGIN_ID.
     assert!(metrics.contains("origin=\"origin-files\""), "{metrics}");
     let logs = server.logs();
     drop(server);
+    assert!(logs.contains("Configuration from the files"), "{logs}");
     assert!(
-        logs.contains("Routing policy from the configuration file"),
+        !logs.contains("not read") && !logs.contains("ignored"),
         "{logs}"
     );
-    assert!(!logs.contains("are ignored"), "{logs}");
     assert!(!logs.contains(SENTINEL) && !metrics.contains(SENTINEL));
 }
 
 #[test]
-fn file_mode_ignores_the_settings_of_the_environment() {
+fn the_settings_of_the_environment_are_not_read() {
     let files = proxy_files("ignored", "origin-files");
     let other = format!("127.0.0.1:{}", free_port());
     let env = [
-        ("CONFIG_SOURCE", "file"),
-        ("GATEWAY_CONFIG_FILE", files.common.path()),
-        ("GATEWAY_HOST_CONFIG_FILE", files.host.path()),
         ("INTERNAL_BIND_ADDR", other.as_str()),
         ("ORIGIN_ID", "origin-env"),
         ("RUST_LOG", "error"),
     ];
-    let mut server = Server::start(&env);
+    let mut server = Server::start(&files.args(), &env);
     let metrics = server.wait_for(&files.internal, "/metrics");
     assert!(metrics.contains("origin=\"origin-files\""), "{metrics}");
     assert!(http_get(&other, "/metrics").is_none());
     let logs = server.logs();
     drop(server);
-    // RUST_LOG=error of the environment is ignored too: the info lines are there.
+    // RUST_LOG=error of the environment is not read either: the info lines are there.
+    assert!(logs.contains("Configuration from the files"), "{logs}");
     assert!(
-        logs.contains("Routing policy from the configuration file"),
-        "{logs}"
-    );
-    assert!(
-        logs.contains("these setting variables of the environment are ignored")
+        logs.contains("These variables of the environment are not read")
             && logs.contains("INTERNAL_BIND_ADDR,ORIGIN_ID,RUST_LOG"),
         "{logs}"
     );
 }
 
+/// The transition: the paths from GATEWAY_CONFIG_FILE / GATEWAY_HOST_CONFIG_FILE with
+/// CONFIG_SOURCE=file (for one release, with a warning).
 #[test]
-fn a_policy_only_file_in_file_mode_keeps_the_settings_of_the_environment() {
+fn the_path_variables_still_work_with_config_source_file() {
+    let files = proxy_files("transition", "origin-a");
+    let env = [
+        ("CONFIG_SOURCE", "file"),
+        ("GATEWAY_CONFIG_FILE", files.common.path()),
+        ("GATEWAY_HOST_CONFIG_FILE", files.host.path()),
+    ];
+    let mut server = Server::start(&[], &env);
+    let metrics = server.wait_for(&files.internal, "/metrics");
+    assert!(metrics.contains("source=\"file\""), "{metrics}");
+    assert!(!metrics.contains("compare_match"), "{metrics}");
+    let logs = server.logs();
+    drop(server);
+    assert!(
+        logs.contains("comes from GATEWAY_CONFIG_FILE")
+            && logs.contains("comes from GATEWAY_HOST_CONFIG_FILE")
+            && !logs.contains("CONFIG_SOURCE is"),
+        "{logs}"
+    );
+    // The startup line keeps settings="files"; the count is a field of its own.
+    assert!(
+        logs.contains("\"settings\":\"files\"") && logs.contains("\"settings_count\":9"),
+        "{logs}"
+    );
+    // CONFIG_SOURCE=file with the options: no warning.
+    let mut check = files.args().to_vec();
+    check.extend(["--check-config", "--secrets=skip"]);
+    let (code, _, stderr) = run(&check, &[("CONFIG_SOURCE", "file")]);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(
+        !stderr.contains("CONFIG_SOURCE") && !stderr.contains("warning"),
+        "{stderr}"
+    );
+    // The options and their variables naming the same paths: no warning; another path: the
+    // option is read, the pair named (never the paths).
+    let same = [
+        ("CONFIG_SOURCE", "file"),
+        ("GATEWAY_CONFIG_FILE", files.common.path()),
+        ("GATEWAY_HOST_CONFIG_FILE", files.host.path()),
+    ];
+    let (code, _, stderr) = run(&check, &same);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(!stderr.contains("warning"), "{stderr}");
+    let other = [
+        ("CONFIG_SOURCE", "file"),
+        ("GATEWAY_CONFIG_FILE", "/other/gateway.toml"),
+        ("GATEWAY_HOST_CONFIG_FILE", "/other/host.toml"),
+    ];
+    let (code, stdout, stderr) = run(&check, &other);
+    assert_eq!(code, Some(0), "{stdout}{stderr}");
+    assert!(
+        stderr.contains("--config and GATEWAY_CONFIG_FILE name different paths")
+            && stderr.contains("--host-config and GATEWAY_HOST_CONFIG_FILE name different paths")
+            && !stderr.contains("/other/"),
+        "{stderr}"
+    );
+}
+
+/// A deployment still configured by its environment does not start, and --check-config fails
+/// the same way (exit 1, the variable named, never its value): CONFIG_SOURCE set to anything
+/// but `file`, a path taken from a variable without CONFIG_SOURCE=file.
+#[test]
+fn the_variables_of_the_transition_are_refused_without_config_source_file() {
+    let files = proxy_files("transition-refused", "origin-a");
+    let common = ("GATEWAY_CONFIG_FILE", files.common.path());
+    let host = ("GATEWAY_HOST_CONFIG_FILE", files.host.path());
+    let source = "CONFIG_SOURCE is set to something other than `file`";
+    let from_var =
+        |var: &str| format!("would come from {var}, which is read only with CONFIG_SOURCE=file");
+    type Case<'a> = (Vec<&'a str>, Vec<(&'a str, &'a str)>, String);
+    let cases: Vec<Case> = vec![
+        (
+            vec![],
+            vec![("CONFIG_SOURCE", "compare"), common, host],
+            source.to_string(),
+        ),
+        (
+            vec![],
+            vec![("CONFIG_SOURCE", "env"), common, host],
+            source.to_string(),
+        ),
+        (
+            vec![],
+            vec![("CONFIG_SOURCE", ""), common, host],
+            source.to_string(),
+        ),
+        (
+            files.args().to_vec(),
+            vec![("CONFIG_SOURCE", "env")],
+            source.to_string(),
+        ),
+        (vec![], vec![common, host], from_var("GATEWAY_CONFIG_FILE")),
+        (
+            vec!["--config", files.common.path()],
+            vec![host],
+            from_var("GATEWAY_HOST_CONFIG_FILE"),
+        ),
+        // A path variable that is set but blank: refused (fail closed), with or without
+        // CONFIG_SOURCE=file.
+        (
+            vec![],
+            vec![("CONFIG_SOURCE", "file"), ("GATEWAY_CONFIG_FILE", "  ")],
+            "GATEWAY_CONFIG_FILE is set but holds no path".to_string(),
+        ),
+        (
+            vec![],
+            vec![("GATEWAY_CONFIG_FILE", "")],
+            "GATEWAY_CONFIG_FILE is set but holds no path".to_string(),
+        ),
+        (
+            vec!["--config", files.common.path()],
+            vec![("CONFIG_SOURCE", "file"), ("GATEWAY_HOST_CONFIG_FILE", " ")],
+            "GATEWAY_HOST_CONFIG_FILE is set but holds no path".to_string(),
+        ),
+        (
+            vec!["--config", files.common.path()],
+            vec![("GATEWAY_HOST_CONFIG_FILE", "")],
+            "GATEWAY_HOST_CONFIG_FILE is set but holds no path".to_string(),
+        ),
+    ];
+    for (args, env, expected) in &cases {
+        for check in [false, true] {
+            let mut args = args.clone();
+            if check {
+                args.push("--check-config");
+            }
+            let (code, stdout, stderr) = run(&args, env);
+            assert_eq!(code, Some(1), "{args:?} {env:?}: {stdout}{stderr}");
+            assert!(
+                stderr.contains(expected.as_str()),
+                "{args:?} {env:?}: {stderr}"
+            );
+            if check {
+                assert!(stderr.contains("config INVALID"), "{stderr}");
+            }
+            // Names only: no path, no value.
+            assert!(
+                !stderr.contains(files.common.path()) && !stderr.contains(files.host.path()),
+                "{args:?} {env:?}: {stderr}"
+            );
+        }
+    }
+    // The options with CONFIG_SOURCE unset: fine.
+    let mut check = files.args().to_vec();
+    check.push("--check-config");
+    let (code, stdout, stderr) = run(&check, &[]);
+    assert_eq!(code, Some(0), "{stdout}{stderr}");
+}
+
+/// Without a common file the gateway does not start; with a policy or setting variable in the
+/// environment that the files leave out it does not either (it would serve without it), the
+/// variables named before the files are read (a load error carries the hint too).
+#[test]
+fn without_its_files_the_gateway_does_not_start() {
+    let (code, stdout, stderr) = run(&[], &[("GATEWAY_MODE", "proxy")]);
+    assert_eq!(code, Some(1), "{stdout}{stderr}");
+    assert!(stderr.contains("needs a configuration file"), "{stderr}");
+    assert!(
+        stdout.contains("These variables of the environment are not read")
+            && stdout.contains("GATEWAY_MODE"),
+        "{stdout}"
+    );
+    let (code, stdout, stderr) = run(
+        &["--config", "/nonexistent/gateway.toml"],
+        &[("LWD_ADDR", "127.0.0.1:1")],
+    );
+    assert_eq!(code, Some(1), "{stdout}{stderr}");
+    assert!(
+        stderr.contains("config file /nonexistent/gateway.toml"),
+        "{stderr}"
+    );
+    assert!(
+        stdout.contains("These variables of the environment are not read")
+            && stdout.contains("LWD_ADDR"),
+        "{stdout}"
+    );
     let common = TempFile::new(
         "stage1-serve.toml",
         "schema = 1\ngateway_hosts = [\"gateway.example\"]\n",
     );
-    let internal = format!("127.0.0.1:{}", free_port());
     let port = free_port().to_string();
-    let env = [
-        ("CONFIG_SOURCE", "file"),
-        ("GATEWAY_CONFIG_FILE", common.path()),
-        ("GATEWAY_MODE", "proxy"),
-        ("PORT", port.as_str()),
-        ("INTERNAL_BIND_ADDR", internal.as_str()),
-        ("LWD_ADDR", "127.0.0.1:1"),
-        ("ORIGIN_ID", "origin-env"),
-    ];
-    let mut server = Server::start(&env);
-    let metrics = server.wait_for(&internal, "/metrics");
-    assert!(metrics.contains("origin=\"origin-env\""), "{metrics}");
-}
-
-#[test]
-fn compare_mode_compares_the_settings() {
-    for (lwd_timeout, expected) in [("30", "1"), ("31", "0")] {
-        let files = proxy_files(&format!("compare-{lwd_timeout}"), "origin-a");
-        let host = std::fs::read_to_string(&files.host.0).unwrap();
-        let value = |key: &str| {
-            host.lines()
-                .find_map(|l| l.strip_prefix(&format!("{key} = ")))
-                .unwrap()
-                .trim_matches('"')
-                .to_string()
-        };
-        let (port, internal) = (value("port"), value("internal_bind_addr"));
-        let relay = format!("edge={SENTINEL}");
-        let env = [
-            ("CONFIG_SOURCE", "compare"),
-            ("GATEWAY_CONFIG_FILE", files.common.path()),
-            ("GATEWAY_HOST_CONFIG_FILE", files.host.path()),
-            ("GATEWAY_HOSTS", "gateway.example"),
+    let (code, stdout, stderr) = run(
+        &["--config", common.path()],
+        &[
             ("GATEWAY_MODE", "proxy"),
-            ("RUST_LOG", "info"),
-            ("LWD_TIMEOUT_SECS", lwd_timeout),
-            ("RELAY_SECRETS", relay.as_str()),
             ("PORT", port.as_str()),
-            ("INTERNAL_BIND_ADDR", internal.as_str()),
-            ("NETWORK", "testnet"),
             ("LWD_ADDR", "127.0.0.1:1"),
-            ("ORIGIN_ID", "origin-a"),
-        ];
-        let mut server = Server::start(&env);
-        let metrics = server.wait_for(&files.internal, "/metrics");
-        assert!(
-            metrics.contains(&format!("ohttp_config_settings_compare_match {expected}")),
-            "{lwd_timeout}: {metrics}"
-        );
-        assert!(
-            metrics.contains("ohttp_config_compare_match 1"),
-            "{metrics}"
-        );
-        let logs = server.logs();
-        drop(server);
-        if expected == "0" {
-            assert!(logs.contains("settings.lwd_timeout_secs"), "{logs}");
-        }
-        assert!(!logs.contains(SENTINEL) && !metrics.contains(SENTINEL));
-    }
+            ("ALLOW_UNAUTHENTICATED_RELAY", "1"),
+            ("GATEWAY_HOSTS", "env-gw.example"),
+        ],
+    );
+    assert_eq!(code, Some(1), "{stdout}{stderr}");
+    // GATEWAY_HOSTS is in the file: not named.
+    assert!(
+        stderr.contains(
+            "the environment sets ALLOW_UNAUTHENTICATED_RELAY,GATEWAY_MODE,LWD_ADDR,PORT, which the configuration files leave out"
+        ),
+        "{stdout}{stderr}"
+    );
+    assert!(
+        !stderr.contains("127.0.0.1:1") && !stderr.contains("env-gw.example"),
+        "{stderr}"
+    );
+    // The same file with an empty environment starts as an `ohttp` gateway without its keys:
+    // the gateway's own startup error.
+    let (code, stdout, stderr) = run(&["--config", common.path()], &[]);
+    assert_eq!(code, Some(1), "{stdout}{stderr}");
+    assert!(
+        !stderr.contains("leave out") && stderr.contains("is required in OHTTP mode"),
+        "{stderr}"
+    );
 }
 
-/// `CONFIG_SOURCE=file` in `ohttp` mode with an empty environment: the keys, the relay secret
+/// `ohttp` mode with an empty environment: the keys, the relay secret
 /// and the signing seed from secret files, the stores from the host file (the test Redis, a
 /// database of its own); the key configuration is served.
 #[test]
@@ -1064,14 +1278,12 @@ fn file_mode_serves_ohttp_with_secret_files() {
             public.rsplit(':').next().unwrap()
         ),
     );
-    let env = [
-        ("CONFIG_SOURCE", "file"),
-        ("GATEWAY_CONFIG_FILE", common.path()),
-        ("GATEWAY_HOST_CONFIG_FILE", host.path()),
-    ];
-    let (code, stdout, stderr) = run(&["--check-config", "--secrets=require"], &env);
+    let args = ["--config", common.path(), "--host-config", host.path()];
+    let mut check = args.to_vec();
+    check.extend(["--check-config", "--secrets=require"]);
+    let (code, stdout, stderr) = run(&check, &[]);
     assert_eq!(code, Some(0), "{stdout}{stderr}");
-    let mut server = Server::start(&env);
+    let mut server = Server::start(&args, &[]);
     let configs = server.wait_for(&public, "/ohttp-configs");
     assert!(configs.contains("application/ohttp-keys"), "{configs}");
     let metrics = server.wait_for(&internal, "/metrics");
@@ -1088,6 +1300,7 @@ fn check_config_of_both_files_and_its_refusals_never_show_a_secret() {
     let files = proxy_files("check", "origin-a");
     let env = |extra: &[(&'static str, String)]| {
         let mut v: Vec<(&str, String)> = vec![
+            ("CONFIG_SOURCE", "file".to_string()),
             ("GATEWAY_CONFIG_FILE", files.common.path().to_string()),
             ("GATEWAY_HOST_CONFIG_FILE", files.host.path().to_string()),
         ];
@@ -1186,21 +1399,39 @@ fn export_config_with_host_writes_the_two_files() {
     let (code, policy_only, _) = run(&["--export-config"], &refs);
     assert_eq!(code, Some(0));
     assert!(!policy_only.contains("[settings]"));
-    // The files pass --check-config with the environment's secrets (and of the new variable
-    // the policy export names).
+    // The export names each secret by the variable that holds it, which the gateway refuses.
     let common_file = TempFile::new("export-common.toml", &common);
-    let mut env = refs.clone();
-    let generated: Vec<(String, String)> = stderr
-        .lines()
-        .filter_map(|l| l.strip_prefix("note: secret '"))
-        .filter_map(|l| l.split_once("maps to a new variable "))
-        .filter_map(|(_, rest)| rest.split(';').next())
-        .map(|var| (var.to_string(), "prices-key-fake-1".to_string()))
-        .collect();
-    env.extend(generated.iter().map(|(k, v)| (k.as_str(), v.as_str())));
-    env.push(("GATEWAY_CONFIG_FILE", common_file.path()));
-    env.push(("GATEWAY_HOST_CONFIG_FILE", host_arg));
-    let (code, stdout, stderr) = run(&["--check-config"], &env);
+    let (code, _, stderr) = run(
+        &[
+            "--config",
+            common_file.path(),
+            "--host-config",
+            host_arg,
+            "--check-config",
+        ],
+        &refs,
+    );
+    assert_eq!(code, Some(1));
+    assert!(stderr.contains("files only"), "{stderr}");
+    // With each pointed at a file of its value (and of the new variable the policy export
+    // names), the files pass --check-config, with an empty environment.
+    let mut values: BTreeMap<String, String> = vars.iter().cloned().collect();
+    values.extend(
+        stderr_export_notes(&run(&["--export-config"], &refs).2)
+            .into_iter()
+            .map(|var| (var, "prices-key-fake-1".to_string())),
+    );
+    let (_dir, c, h) = as_files("export", &common, &host, &values);
+    let (code, stdout, stderr) = run(
+        &[
+            "--config",
+            c.as_str(),
+            "--host-config",
+            h.as_str(),
+            "--check-config",
+        ],
+        &[],
+    );
     assert_eq!(code, Some(0), "{stdout}{stderr}");
     assert!(stdout.contains("settings OK"), "{stdout}");
     // Never over an existing file.
@@ -1210,6 +1441,18 @@ fn export_config_with_host_writes_the_two_files() {
         stderr.contains("AlreadyExists") || stderr.contains("already exists"),
         "{stderr}"
     );
+}
+
+/// The new variables the policy export names on stderr (`note: secret '<name>' maps to a new
+/// variable <VAR>: ...`).
+fn stderr_export_notes(stderr: &str) -> Vec<String> {
+    stderr
+        .lines()
+        .filter_map(|l| l.strip_prefix("note: secret '"))
+        .filter_map(|l| l.split_once("maps to a new variable "))
+        .filter_map(|(_, rest)| rest.split(':').next())
+        .map(str::to_string)
+        .collect()
 }
 
 #[test]
@@ -1264,6 +1507,7 @@ fn check_config_runs_the_startup_checks_and_never_shows_a_malformed_secret() {
     ] {
         let file = TempFile::new(&format!("startup-{name}.toml"), &common(body));
         let env = [
+            ("CONFIG_SOURCE", "file"),
             ("GATEWAY_CONFIG_FILE", file.path()),
             ("GATEWAY_HOST_CONFIG_FILE", host.path()),
         ];
@@ -1286,6 +1530,7 @@ fn check_config_runs_the_startup_checks_and_never_shows_a_malformed_secret() {
     let (code, _, stderr) = run(
         &["--check-config", "--secrets=skip"],
         &[
+            ("CONFIG_SOURCE", "file"),
             ("GATEWAY_CONFIG_FILE", file.path()),
             ("GATEWAY_HOST_CONFIG_FILE", empty_host.path()),
         ],
@@ -1301,6 +1546,7 @@ fn check_config_runs_the_startup_checks_and_never_shows_a_malformed_secret() {
 fn check_config_names_the_settings_the_files_leave_out_and_strict_refuses_them() {
     let files = proxy_files("strict", "origin-a");
     let env = [
+        ("CONFIG_SOURCE", "file"),
         ("GATEWAY_CONFIG_FILE", files.common.path()),
         ("GATEWAY_HOST_CONFIG_FILE", files.host.path()),
         ("MAX_BLOCK_RANGE", "12000"),
@@ -1309,9 +1555,10 @@ fn check_config_names_the_settings_the_files_leave_out_and_strict_refuses_them()
     let (code, stdout, stderr) = run(&["--check-config"], &env);
     assert_eq!(code, Some(0), "{stdout}{stderr}");
     assert!(
-        stderr.contains("warning: settings of the environment that the files leave out")
+        stderr.contains("warning: variables of the environment that the files leave out")
             && stderr.contains("MAX_BLOCK_RANGE")
-            && !stderr.contains("LWD_TIMEOUT_SECS"),
+            && !stderr.contains("LWD_TIMEOUT_SECS")
+            && !stderr.contains("12000"),
         "{stderr}"
     );
     let (code, _, stderr) = run(&["--check-config", "--strict"], &env);
@@ -1319,6 +1566,60 @@ fn check_config_names_the_settings_the_files_leave_out_and_strict_refuses_them()
     assert!(stderr.contains("--strict"), "{stderr}");
     let (code, _, stderr) = run(&["--export-config", "--strict"], &env);
     assert_eq!(code, Some(2), "{stderr}");
+    // A policy-only file (no [settings], no host file): the settings of the environment it
+    // leaves out are named all the same.
+    let policy_only = TempFile::new(
+        "strict-policy-only.toml",
+        "schema = 1\ngateway_hosts = [\"gateway.example\"]\n",
+    );
+    let env = [("LWD_ADDR", "lwd.example:9067")];
+    let args = [
+        "--config",
+        policy_only.path(),
+        "--check-config",
+        "--secrets=skip",
+    ];
+    let (code, stdout, stderr) = run(&args, &env);
+    assert_eq!(code, Some(0), "{stdout}{stderr}");
+    assert!(
+        stderr.contains("warning: variables of the environment that the files leave out")
+            && stderr.contains("LWD_ADDR")
+            && !stderr.contains("lwd.example"),
+        "{stderr}"
+    );
+    let mut strict = args.to_vec();
+    strict.push("--strict");
+    let (code, _, stderr) = run(&strict, &env);
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(
+        stderr.contains("error: variables of the environment") && stderr.contains("--strict"),
+        "{stderr}"
+    );
+    // An empty or blank variable is unset: not named, not refused, --strict passes, and a
+    // gateway serving with it starts.
+    let blank = [("HPKE_ACCEPT_ONLY_KEYS", ""), ("MAX_BLOCK_RANGE", "  ")];
+    let mut strict = files.args().to_vec();
+    strict.extend(["--check-config", "--strict"]);
+    let (code, stdout, stderr) = run(&strict, &blank);
+    assert_eq!(code, Some(0), "{stdout}{stderr}");
+    assert!(
+        !stderr.contains("leave out")
+            && !stderr.contains("HPKE_ACCEPT_ONLY_KEYS")
+            && !stderr.contains("MAX_BLOCK_RANGE"),
+        "{stderr}"
+    );
+    let mut server = Server::start(&files.args(), &blank);
+    let metrics = server.wait_for(&files.internal, "/metrics");
+    assert!(metrics.contains("source=\"file\""), "{metrics}");
+    let logs = server.logs();
+    drop(server);
+    // Not named in the startup warning either.
+    assert!(
+        !logs.contains("These variables of the environment are not read")
+            && !logs.contains("HPKE_ACCEPT_ONLY_KEYS")
+            && !logs.contains("MAX_BLOCK_RANGE"),
+        "{logs}"
+    );
 }
 
 #[test]
@@ -1338,54 +1639,28 @@ fn print_effective_config_shows_the_settings_with_secret_names_only() {
 }
 
 #[test]
-fn a_host_secret_needs_exactly_one_source_even_when_secrets_are_skipped() {
+fn a_host_secret_needs_a_file_even_when_secrets_are_skipped() {
     let _guard = lock();
     apply_env(&[]);
     let common = TempFile::new(
         "secret-shape-common.toml",
         "schema = 1\ngateway_hosts = [\"gw.example\"]\n",
     );
-    for body in [
-        "schema = 1\n[secrets]\nk = { env = \"X\", file = \"/x\" }\n",
-        "schema = 1\n[secrets]\nk = {}\n",
+    for (body, expected) in [
+        (
+            "schema = 1\n[secrets]\nk = { env = \"X\", file = \"/x\" }\n",
+            "needs a file",
+        ),
+        ("schema = 1\n[secrets]\nk = {}\n", "needs a file"),
+        ("schema = 1\n[secrets]\nk = { env = \"X\" }\n", "files only"),
     ] {
         let host = TempFile::new("secret-shape-host.toml", body);
         let e = format!(
             "{:#}",
             config_source::load_files(common.path(), Some(host.path()), Secrets::Skip).unwrap_err()
         );
-        assert!(e.contains("needs exactly one of env or file"), "{e}");
+        assert!(e.contains(expected) && e.contains("secret 'k'"), "{e}");
     }
-}
-
-#[test]
-fn compare_mode_reports_a_settings_mismatch_when_a_settings_file_does_not_load() {
-    let internal = format!("127.0.0.1:{}", free_port());
-    let port = free_port().to_string();
-    // A [settings] table and no host file; a value no parser takes.
-    let common = TempFile::new(
-        "compare-broken.toml",
-        "schema = 1\ngateway_hosts = [\"gateway.example\"]\n[settings]\nchunk_size = 10\n",
-    );
-    let env = [
-        ("CONFIG_SOURCE", "compare"),
-        ("GATEWAY_CONFIG_FILE", common.path()),
-        ("GATEWAY_HOSTS", "gateway.example"),
-        ("GATEWAY_MODE", "proxy"),
-        ("PORT", port.as_str()),
-        ("INTERNAL_BIND_ADDR", internal.as_str()),
-        ("LWD_ADDR", "127.0.0.1:1"),
-    ];
-    let mut server = Server::start(&env);
-    let metrics = server.wait_for(&internal, "/metrics");
-    assert!(
-        metrics.contains("ohttp_config_settings_compare_match 0"),
-        "{metrics}"
-    );
-    assert!(
-        metrics.contains("ohttp_config_compare_match 0"),
-        "{metrics}"
-    );
 }
 
 /// The export reads each secret as the serving process would: a value it refuses (a control

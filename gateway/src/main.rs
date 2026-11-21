@@ -101,30 +101,31 @@ async fn main() -> anyhow::Result<()> {
         cli.action,
         config_source::Action::Serve | config_source::Action::Backfill
     ) {
+        // Diagnostics of the command-line tools; only the export (a migration tool that reads
+        // the environment anyway) takes RUST_LOG from it.
+        let filter = match cli.action {
+            config_source::Action::ExportConfig => {
+                tracing_subscriber::EnvFilter::try_from_default_env().ok()
+            }
+            _ => None,
+        };
         tracing_subscriber::fmt()
-            .with_env_filter(
-                tracing_subscriber::EnvFilter::try_from_default_env()
-                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
-            )
+            .with_env_filter(filter.unwrap_or_else(|| tracing_subscriber::EnvFilter::new("warn")))
             .with_writer(std::io::stderr)
             .init();
         std::process::exit(config_source::run_command(&command));
     }
 
-    // RUST_LOG: the environment's, or the files' when they are in force and carry the
-    // settings (`backfill` reads the environment only).
-    let log_filter = match cli.action {
-        config_source::Action::Backfill => None,
-        _ => config_source::log_filter(&command),
+    // RUST_LOG: the files' `rust_log` (default `info`); `backfill` reads the environment's.
+    let filter = match cli.action {
+        config_source::Action::Backfill => tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        _ => config_source::log_filter(&command)
+            .and_then(|d| tracing_subscriber::EnvFilter::try_new(d).ok())
+            .unwrap_or_else(|| tracing_subscriber::EnvFilter::new("info")),
     };
     tracing_subscriber::fmt()
-        .with_env_filter(match log_filter {
-            None => tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-            Some(directives) => directives
-                .and_then(|d| tracing_subscriber::EnvFilter::try_new(d).ok())
-                .unwrap_or_else(|| tracing_subscriber::EnvFilter::new("info")),
-        })
+        .with_env_filter(filter)
         .json()
         .init();
 
@@ -133,10 +134,11 @@ async fn main() -> anyhow::Result<()> {
     // `zodl-ohttp-gateway backfill`: fill the permanent block tier and exit (as before: from
     // the environment, whatever follows on the command line).
     if cli.action == config_source::Action::Backfill {
+        config_source::install_environment()?;
         return backfill::main().await;
     }
 
-    // CONFIG_SOURCE: the environment (default), or the configuration file.
+    // The configuration: the files of the command line, and nothing else.
     let policy_source = config_source::install_command(&command)?;
 
     let config = Config::from_env()?;
@@ -1659,6 +1661,7 @@ async fn open_request(
     body: &bytes::Bytes,
     request_id: Uuid,
     network: &str,
+    relay: &str,
 ) -> Result<(Vec<u8>, hpke::ResponseContext), axum::response::Response> {
     let Some(hpke_state) = &state.hpke else {
         warn!(
@@ -1667,7 +1670,7 @@ async fn open_request(
             "OHTTP mode not enabled"
         );
         health::record_request_detailed(
-            "disabled", "ohttp", network, "ohttp", "-", 503, "-", "-", "other",
+            "disabled", "ohttp", network, "ohttp", "-", 503, "-", "-", "other", relay,
         );
         return Err((StatusCode::SERVICE_UNAVAILABLE, "OHTTP mode disabled").into_response());
     };
@@ -1696,6 +1699,7 @@ async fn open_request(
                 "-",
                 "-",
                 "other",
+                relay,
             );
             health::record_upstream_error(network, "-", "decrypt");
             Err((
@@ -1743,7 +1747,8 @@ async fn write_forward_handler(
         );
         response
     };
-    let declined = |status: &str, http: u16| {
+    // `relay`: the forwarding secret's name once it matched, `-` before.
+    let declined = |status: &str, http: u16, relay: &str| {
         health::record_request_detailed(
             status,
             "forwarded",
@@ -1754,13 +1759,14 @@ async fn write_forward_handler(
             "-",
             "-",
             "other",
+            relay,
         );
     };
     let Some(i) = write_forward::authenticated(&forward.secrets, &headers) else {
         if health::warn_due(&network, "forward_unauthorized") {
             warn!(network = %network, "Unauthorized forwarded WRITE (forwarding secret missing, duplicated or invalid)");
         }
-        declined("unauthorized", 401);
+        declined("unauthorized", 401, "-");
         return lasting((StatusCode::UNAUTHORIZED, "Unauthorized").into_response());
     };
     // Declined while not every replay peer and standby store is connected (at startup, or a
@@ -1772,7 +1778,7 @@ async fn write_forward_handler(
         .as_ref()
         .is_some_and(|c| !c.replay_stores_connected())
     {
-        declined("not_ready", 503);
+        declined("not_ready", 503, &forward.secrets[i].name);
         return lasting((StatusCode::SERVICE_UNAVAILABLE, "Not ready").into_response());
     }
     // What the read origin's own decision requires: this gateway must meet each of it, or the
@@ -1796,7 +1802,7 @@ async fn write_forward_handler(
         if health::warn_due(&network, "forward_requirement") {
             warn!(network = %network, reason = %why, "Forwarded WRITE declined: this gateway cannot decide it as the read origin would; decided there");
         }
-        declined("requirement_unmet", 503);
+        declined("requirement_unmet", 503, &forward.secrets[i].name);
         return lasting((StatusCode::SERVICE_UNAVAILABLE, "Requirement not met").into_response());
     }
     health::as_forwarded(handle_ohttp(
@@ -1935,6 +1941,7 @@ async fn handle_ohttp(
                 "-",
                 "-",
                 "other",
+                "-",
             );
             return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
         }
@@ -1967,6 +1974,7 @@ async fn handle_ohttp(
                         "-",
                         "-",
                         "other",
+                        "-",
                     );
                     return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
                 }
@@ -1987,6 +1995,7 @@ async fn handle_ohttp(
                     "-",
                     "-",
                     "other",
+                    "-",
                 );
                 return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
             }
@@ -2008,6 +2017,7 @@ async fn handle_ohttp(
             "-",
             "-",
             "other",
+            "-",
         );
         return (StatusCode::SERVICE_UNAVAILABLE, "Service misconfigured").into_response();
     }
@@ -2039,6 +2049,7 @@ async fn handle_ohttp(
             "-",
             "-",
             "other",
+            relay_name,
         );
         return (
             StatusCode::UPGRADE_REQUIRED,
@@ -2070,6 +2081,7 @@ async fn handle_ohttp(
                 "-",
                 "-",
                 "other",
+                relay_name,
             );
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -2110,6 +2122,7 @@ async fn handle_ohttp(
                 "-",
                 "-",
                 "other",
+                relay_name,
             );
             return (StatusCode::PAYLOAD_TOO_LARGE, "Request entity too large").into_response();
         }
@@ -2127,6 +2140,7 @@ async fn handle_ohttp(
                 "-",
                 "-",
                 "other",
+                relay_name,
             );
             return (StatusCode::BAD_REQUEST, "Request body unreadable").into_response();
         }
@@ -2178,7 +2192,7 @@ async fn handle_ohttp(
     // is taken, so the read origin can still decide it itself.
     let mut opened = None;
     if let Entry::Forwarded { .. } = &entry {
-        match open_request(&state, &body, request_id, &network).await {
+        match open_request(&state, &body, request_id, &network, relay_name).await {
             Ok(v) => opened = Some(v),
             Err(response) => return response,
         }
@@ -2217,7 +2231,7 @@ async fn handle_ohttp(
                     "Replay detected"
                 );
                 health::record_request_detailed(
-                    "replay", "ohttp", &network, "ohttp", "-", 409, "-", "-", "other",
+                    "replay", "ohttp", &network, "ohttp", "-", 409, "-", "-", "other", relay_name,
                 );
                 health::record_replay_rejected(&network);
                 return (
@@ -2248,6 +2262,7 @@ async fn handle_ohttp(
                     "-",
                     "-",
                     "other",
+                    relay_name,
                 );
                 let mut response = (
                     StatusCode::SERVICE_UNAVAILABLE,
@@ -2282,6 +2297,7 @@ async fn handle_ohttp(
             "-",
             "-",
             "other",
+            relay_name,
         );
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -2296,7 +2312,7 @@ async fn handle_ohttp(
     // WRITE was opened before the replay check.
     let (plaintext, response_ctx) = match opened.take() {
         Some(v) => v,
-        None => match open_request(&state, &body, request_id, &network).await {
+        None => match open_request(&state, &body, request_id, &network, relay_name).await {
             Ok(v) => v,
             Err(response) => return response,
         },
@@ -2325,6 +2341,7 @@ async fn handle_ohttp(
                 "-",
                 "-",
                 "other",
+                relay_name,
             );
             return responder.text(400, "Bad Request");
         }
@@ -2359,6 +2376,7 @@ async fn handle_ohttp(
                 "-",
                 "-",
                 "other",
+                relay_name,
             );
             return responder.collected(ohttp::InnerResponse {
                 status: 400,
@@ -2466,6 +2484,7 @@ async fn handle_ohttp(
             "-",
             "lwd",
             "other",
+            relay_name,
         );
         return responder.collected(ohttp::InnerResponse {
             status: 403,
@@ -2516,6 +2535,7 @@ async fn handle_ohttp(
                     "-",
                     &backend,
                     "other",
+                    relay_name,
                 );
                 info!(
                     request_id = %request_id,
@@ -2541,13 +2561,14 @@ async fn handle_ohttp(
                 if inner_request.is_grpc() {
                     health::record_request_detailed(
                         "replay", "ohttp", &network, "ohttp", "-", 200, "10", "-", "other",
+                        relay_name,
                     );
                     log.served("replay", "10", 0);
                     return responder
                         .grpc_error("10", "Request aborted: replay detected at peer origin");
                 }
                 health::record_request_detailed(
-                    "replay", "ohttp", &network, "ohttp", "-", 409, "-", "-", "other",
+                    "replay", "ohttp", &network, "ohttp", "-", 409, "-", "-", "other", relay_name,
                 );
                 log.served("replay", "-", 0);
                 return responder.collected(ohttp::InnerResponse {
@@ -2580,6 +2601,7 @@ async fn handle_ohttp(
                         "14",
                         "-",
                         "other",
+                        relay_name,
                     );
                     log.served("replay_unavailable", "14", 0);
                     return responder
@@ -2595,6 +2617,7 @@ async fn handle_ohttp(
                     "-",
                     "-",
                     "other",
+                    relay_name,
                 );
                 log.served("replay_unavailable", "-", 0);
                 return responder.collected(ohttp::InnerResponse {
@@ -2652,6 +2675,7 @@ async fn handle_ohttp(
                 if inner_request.is_grpc() {
                     health::record_request_detailed(
                         "replay", "ohttp", &network, "ohttp", "-", 200, "10", "-", "other",
+                        relay_name,
                     );
                     log.served("replay", "10", 0);
                     return responder
@@ -2659,6 +2683,7 @@ async fn handle_ohttp(
                 } else {
                     health::record_request_detailed(
                         "replay", "ohttp", &network, "ohttp", "-", 409, "-", "-", "other",
+                        relay_name,
                     );
                     log.served("replay", "-", 0);
                     return responder.collected(ohttp::InnerResponse {
@@ -2688,6 +2713,7 @@ async fn handle_ohttp(
                         "14",
                         "-",
                         "other",
+                        relay_name,
                     );
                     log.served("replay_unavailable", "14", 0);
                     return responder.grpc_error(
@@ -2705,6 +2731,7 @@ async fn handle_ohttp(
                         "-",
                         "-",
                         "other",
+                        relay_name,
                     );
                     log.served("replay_unavailable", "-", 0);
                     return responder.collected(ohttp::InnerResponse {
@@ -2746,6 +2773,7 @@ async fn handle_ohttp(
                 if inner_request.is_grpc() {
                     health::record_request_detailed(
                         "replay", "ohttp", &network, "ohttp", "-", 200, "10", "-", "other",
+                        relay_name,
                     );
                     log.served("replay", "10", 0);
                     return responder
@@ -2753,6 +2781,7 @@ async fn handle_ohttp(
                 } else {
                     health::record_request_detailed(
                         "replay", "ohttp", &network, "ohttp", "-", 409, "-", "-", "other",
+                        relay_name,
                     );
                     log.served("replay", "-", 0);
                     return responder.collected(ohttp::InnerResponse {
@@ -2781,6 +2810,7 @@ async fn handle_ohttp(
                         "14",
                         "-",
                         "other",
+                        relay_name,
                     );
                     log.served("replay_unavailable", "14", 0);
                     return responder.grpc_error(
@@ -2798,6 +2828,7 @@ async fn handle_ohttp(
                         "-",
                         "-",
                         "other",
+                        relay_name,
                     );
                     log.served("replay_unavailable", "-", 0);
                     return responder.collected(ohttp::InnerResponse {
@@ -2846,6 +2877,7 @@ async fn handle_ohttp(
             "-",
             "gateway",
             "other",
+            relay_name,
         );
         health::record_duration(
             &network,
@@ -2885,6 +2917,7 @@ async fn handle_ohttp(
                 "3",
                 "lwd",
                 "other",
+                relay_name,
             );
             log.served(label, "3", 0);
             return responder.grpc_error("3", &error_msg);
@@ -2932,6 +2965,7 @@ async fn handle_ohttp(
             "3",
             "lwd",
             "other",
+            relay_name,
         );
         log.served("range_error", "3", 0);
         return responder.grpc_error("3", &message);
@@ -2978,6 +3012,7 @@ async fn handle_ohttp(
             "-",
             &backend,
             "mapped",
+            relay_name,
         );
         health::record_duration(
             &network,
@@ -3038,6 +3073,7 @@ async fn handle_ohttp(
                 "-",
                 &backend,
                 "mapped",
+                relay_name,
             );
             health::record_duration(
                 &network,
@@ -3094,6 +3130,7 @@ async fn handle_ohttp(
                     "-",
                     &backend,
                     "other",
+                    relay_name,
                 );
                 health::record_upstream_error(&network, &backend, "request_failed");
                 return responder.text(502, "Bad Gateway");
@@ -3109,6 +3146,7 @@ async fn handle_ohttp(
             "-",
             &backend,
             "mapped",
+            relay_name,
         );
         health::record_duration(
             &network,
@@ -3137,6 +3175,7 @@ async fn handle_ohttp(
             grpc_status,
             &backend,
             route,
+            relay_name,
         );
         health::record_duration(
             &network,
@@ -3359,6 +3398,7 @@ async fn handle_ohttp(
                 "14",
                 "lwd",
                 "lwd",
+                relay_name,
             );
             log.served("lwd_busy", "14", 0);
             return responder.grpc_error("14", "Service unavailable: too many concurrent requests");
@@ -3382,6 +3422,7 @@ async fn handle_ohttp(
                 "14",
                 "lwd",
                 "upstream",
+                relay_name,
             );
             health::record_upstream_error(&network, "lwd", "request_failed");
             log.served("lwd_error", "14", 0);
@@ -3774,13 +3815,22 @@ mod handler_tests {
         origin: origin::OriginSettings,
         cache: cache::ResponseCache,
     ) -> Arc<AppState> {
+        app_state_with(config, origin, Some(cache))
+    }
+
+    /// [`app_state`] with `cache` optional (`None`: no store, for checks before the replay one).
+    fn app_state_with(
+        config: Config,
+        origin: origin::OriginSettings,
+        cache: Option<cache::ResponseCache>,
+    ) -> Arc<AppState> {
         let lwd_semaphore = Arc::new(Semaphore::new(config.max_inflight_lwd));
         let sources = Arc::new(lwd::LwdSources::new(config.clone(), lwd_semaphore.clone()));
         let network = config.network.clone();
         Arc::new(AppState {
             hpke: Some(hpke::KeyState::new(&config).unwrap()),
             origin,
-            cache: Some(cache),
+            cache,
             block_cache: None,
             subtree_cache: None,
             follower: None,
@@ -3803,6 +3853,88 @@ mod handler_tests {
             write_forward: None,
             config,
         })
+    }
+
+    /// `ohttp_requests_total{relay}`: the `RELAY_SECRETS` entry that authenticated the request, the
+    /// same name as `ohttp_relay_requests_total`; `-` for a request refused before (a missing,
+    /// unknown or duplicated secret). Only configured names appear.
+    #[tokio::test]
+    async fn requests_are_counted_by_the_relay_that_authenticated_them() {
+        health::init_metrics();
+        let net = "testnet-relay-label";
+        let mut cfg = config(
+            net,
+            "redis://127.0.0.1:1",
+            "127.0.0.1:1",
+            "http://127.0.0.1:1",
+        );
+        cfg.allow_unauthenticated_relay = false;
+        cfg.relay_secrets = config::parse_relay_secrets("edge-a=secret-a,edge-b=secret-b").unwrap();
+        let state = app_state_with(cfg, read_routes_origin(), None);
+        let send = |secrets: &[&str], content_type: &str| {
+            let state = state.clone();
+            let mut headers = axum::http::HeaderMap::new();
+            headers.insert("content-type", content_type.parse().unwrap());
+            for s in secrets {
+                headers.append("x-relay-secret", s.parse().unwrap());
+            }
+            async move {
+                gateway_handler(
+                    State(state),
+                    axum::extract::ConnectInfo("127.0.0.1:9".parse().unwrap()),
+                    headers,
+                    Body::from(vec![0u8; 8]),
+                )
+                .await
+                .into_response()
+                .status()
+            }
+        };
+        let chunked = ohttp_chunked::CONTENT_TYPE_CHUNKED_REQ;
+        assert_eq!(send(&["secret-b"], "text/plain").await, 426);
+        // Authenticated, then refused: no replay store here.
+        assert_eq!(send(&["secret-a"], chunked).await, 503);
+        assert_eq!(send(&["wrong"], chunked).await, 401);
+        assert_eq!(send(&[], chunked).await, 401);
+        assert_eq!(send(&["secret-a", "secret-b"], chunked).await, 401);
+
+        let at = |status: &str, relay: &str| {
+            counter(
+                "ohttp_requests_total",
+                &[("network", net), ("status", status), ("relay", relay)],
+            )
+        };
+        assert_eq!(at("invalid_content_type", "edge-b"), 1.0);
+        assert_eq!(at("replay_unavailable", "edge-a"), 1.0);
+        assert_eq!(at("unauthorized", "-"), 3.0);
+        assert_eq!(
+            counter(
+                "ohttp_relay_requests_total",
+                &[("network", net), ("relay", "edge-a")]
+            ),
+            1.0,
+            "the same name as ohttp_relay_requests_total"
+        );
+        // Bounded: the configured names and `-` only.
+        let relays: std::collections::BTreeSet<String> = health::REGISTRY
+            .gather()
+            .iter()
+            .filter(|f| f.get_name() == "ohttp_requests_total")
+            .flat_map(|f| f.get_metric().iter())
+            .filter(|m| {
+                m.get_label()
+                    .iter()
+                    .any(|l| l.get_name() == "network" && l.get_value() == net)
+            })
+            .flat_map(|m| m.get_label().iter())
+            .filter(|l| l.get_name() == "relay")
+            .map(|l| l.get_value().to_string())
+            .collect();
+        assert_eq!(
+            relays,
+            ["-", "edge-a", "edge-b"].map(String::from).into(),
+            "{relays:?}"
+        );
     }
 
     /// The two requests of every case: the third-party WRITE refused (path `refused_path`,
@@ -4252,17 +4384,17 @@ mod handler_tests {
             .unwrap();
         let origin = origin::OriginSettings::default();
         let cache = base_cache(&config, &origin, None).await;
-        // ThirdParty::from_env (in app_state) reads both variables; nothing awaits here.
-        let _env = config::test_env_lock();
-        std::env::set_var(
-            "THIRD_PARTY_CACHE_ROUTES",
-            "quotes.example=GET /v1/quotes@300",
-        );
-        std::env::set_var("THIRD_PARTY_RATE_LIMITS", "quotes.example=1/3600s");
-        let state = app_state(config, origin, cache);
-        std::env::remove_var("THIRD_PARTY_CACHE_ROUTES");
-        std::env::remove_var("THIRD_PARTY_RATE_LIMITS");
-        state
+        // ThirdParty::from_env (in app_state) reads both variables.
+        config_source::with_vars(
+            [
+                (
+                    "THIRD_PARTY_CACHE_ROUTES",
+                    "quotes.example=GET /v1/quotes@300",
+                ),
+                ("THIRD_PARTY_RATE_LIMITS", "quotes.example=1/3600s"),
+            ],
+            || app_state(config, origin, cache),
+        )
     }
 
     /// `ohttp_third_party_cache_total` (hits + misses) and `ohttp_third_party_limited_total` of
@@ -4884,6 +5016,29 @@ mod handler_tests {
                 "ohttp_requests_total",
                 &[("network", net), ("mode", "forwarded")]
             ) >= 2.0
+        );
+        // The receiving gateway's series carry the forwarding secret's name; the read origin
+        // (no relay secrets) counts `-`.
+        assert_eq!(
+            counter(
+                "ohttp_requests_total",
+                &[("network", net), ("mode", "forwarded")]
+            ),
+            counter(
+                "ohttp_requests_total",
+                &[
+                    ("network", net),
+                    ("mode", "forwarded"),
+                    ("relay", "origin-a")
+                ]
+            )
+        );
+        assert_eq!(
+            counter(
+                "ohttp_requests_total",
+                &[("network", net), ("status", "forwarded"), ("relay", "-")]
+            ),
+            2.0
         );
 
         // A READ is decided and served at the read origin.

@@ -7,44 +7,76 @@ keeps its own log in [client/CHANGELOG.md](client/CHANGELOG.md).
 
 ### Configuration file
 
-- The routing policy can come from a TOML configuration file (`schema = 1`): the variables
+- **Breaking: the gateway reads its configuration from its files only.** A serving process needs
+  `--config <common file>` (and `--host-config <host file>` for the per-host settings); without a
+  common file it does not start. No policy variable and no setting is read from the environment
+  any more: a key the files leave out is its default (`RUST_LOG` is the files' `rust_log`). The
+  policy and setting variables still set are named in one startup warning (names only, before the
+  files are read); a serving gateway refuses to start when one of them is a key the files leave
+  out (it would run without it), and `--check-config` names those in a warning (an error with
+  `--strict`; a check before a start in the serving environment needs `--strict`), whatever the
+  files carry. An empty or blank policy or setting variable counts as unset: neither named nor
+  refused. Secrets are files only: a `[secrets]` entry must be `{ file = "/path" }`; an `{ env =
+  "VAR" }` entry is refused when the files are loaded (by `--check-config --secrets=skip` too),
+  naming the secret, and an entry with neither (or both) now reads `needs a file`. Deployments
+  must pass the two options and mount every secret as a file. For one release the paths are still
+  read from `GATEWAY_CONFIG_FILE` / `GATEWAY_HOST_CONFIG_FILE` when the options are not given and
+  `CONFIG_SOURCE=file` is set, with a warning. A path taken from either variable without
+  `CONFIG_SOURCE=file`, a `GATEWAY_CONFIG_FILE` / `GATEWAY_HOST_CONFIG_FILE` that is set but blank
+  where its option is not given, and a `CONFIG_SOURCE` set to anything but `file` (empty too),
+  stop the gateway and fail `--check-config` / `--print-effective-config` (exit 1); with
+  `CONFIG_SOURCE=file`, an option whose variable names another path is a warning (the option is
+  read). `CONFIG_SOURCE`'s `env` and `compare` modes are removed, and with them the metrics
+  `ohttp_config_compare_match` and `ohttp_config_settings_compare_match`; `ohttp_config_info`
+  stays, always with `source="file"`. A blank `--config` / `--host-config` path is a usage error.
+  The startup line is now `Configuration from the files` (was `Routing policy from the
+  configuration file (CONFIG_SOURCE=file)`), with `settings="files"` as before and the number of
+  settings in a new field `settings_count`. `--print-effective-config` prints the files' policy
+  (it needs `--config`). Two readers of the environment remain, neither a serving process: the
+  `backfill` subcommand (unchanged) and `--export-config` (with `--host`), now a migration tool
+  whose output names each secret as `{ env = "VAR" }` to be pointed at a file before use (a note
+  on stderr says so). New image label `org.zodl.ohttp-gateway.files-only=1`. The characterisation
+  fixtures are read from files (`<network>.gateway.toml`, `<network>.host.toml`, secret files)
+  checked to stand for exactly their `.vars`, with unchanged baselines.
+- (Superseded by the breaking entry above: the files are now the only source; the `CONFIG_SOURCE`
+  modes, the compare metric and the path variables without `CONFIG_SOURCE=file` are gone.) The
+  routing policy can come from a TOML configuration file (`schema = 1`): the variables
   `GATEWAY_HOSTS`, `BACKENDS`, `BACKENDS_POLICY(_DEFAULT)`, `BACKEND_HEADERS`, `FLEXA_ALIAS`,
   `NEAR_ALIAS`, `THIRD_PARTY_*` (cache routes, rate limits, query rules, value sources, host
   list), `REPLAY_READ_ROUTES`, `REPLAY_ONE_SIDED_WRITE_ROUTES`, `DYNAMIC_HOST_SOURCES`,
-  `DYNAMIC_HOSTS_DENY_CIDRS` and `RELAY_SECRET_ON_KEY_CONFIG`, grouped by alias, each entry in
-  its variable's grammar, header secrets named in `[secrets]` (a variable or a file). The file
-  is turned into those variables, which the same parsers read. `CONFIG_SOURCE=env|compare|file`
+  `DYNAMIC_HOSTS_DENY_CIDRS` and `RELAY_SECRET_ON_KEY_CONFIG`, grouped by alias, each entry in its
+  variable's grammar, header secrets named in `[secrets]` (a variable or a file). The file is
+  turned into those variables, which the same parsers read. `CONFIG_SOURCE=env|compare|file`
   chooses the source; the default `env` is the behaviour so far (no file is read). New command
   line actions `--check-config [--secrets=require|skip]`, `--print-effective-config` and
-  `--export-config` (with `--config <path>` or `GATEWAY_CONFIG_FILE`); without a flag the
-  binary serves as before, `backfill` (and whatever follows it) is unchanged. An unknown
-  option, or two actions, now exit with 2 (arguments that are no option are still ignored).
-  New metrics `ohttp_config_info{source,digest}`
-  (every process) and `ohttp_config_compare_match` (`compare` only). The image carries the label
-  `org.zodl.ohttp-gateway.check-config=1`. See `gateway/CONFIG.md` and
-  `gateway/config.example.toml`.
-- Every other setting can come from the configuration files too: a `[settings]` table (the
-  variable in lower case, typed values: integers, numbers, booleans, strings, arrays of strings)
-  in the common file for the settings common to a network, and a new host file
-  (`--host-config <path>` or `GATEWAY_HOST_CONFIG_FILE`: `schema`, `[settings]`, `[secrets]`)
-  for the per-host ones, merged after the common file (a key in both is an error). Secrets only
-  as `{ secret = "<name>" }` references to `[secrets]` (`{ file = ... }` or `{ env = ... }`); a
-  store URL with a password as a whole secret or a `value` template whose `{secret}` is the
-  whole password (percent-encoded into the URL). When the
-  files carry settings (a `[settings]` table, an empty one too, or a host file),
-  `CONFIG_SOURCE=file` reads every setting from them and ignores the environment's (one
-  warning naming them; `RUST_LOG` as `rust_log` too), so a process needs no variable but
-  `CONFIG_SOURCE` and the two paths; `compare` compares them as well (new
+  `--export-config` (with `--config <path>` or `GATEWAY_CONFIG_FILE`); without a flag the binary
+  serves as before, `backfill` (and whatever follows it) is unchanged. An unknown option, or two
+  actions, now exit with 2 (arguments that are no option are still ignored). New metrics
+  `ohttp_config_info{source,digest}` (every process) and `ohttp_config_compare_match` (`compare`
+  only). The image carries the label `org.zodl.ohttp-gateway.check-config=1`. See
+  `gateway/CONFIG.md` and `gateway/config.example.toml`.
+- (Superseded by the breaking entry above, as the previous one: every setting now comes from the
+  files only.) Every other setting can come from the configuration files too: a `[settings]` table
+  (the variable in lower case, typed values: integers, numbers, booleans, strings, arrays of
+  strings) in the common file for the settings common to a network, and a new host file
+  (`--host-config <path>` or `GATEWAY_HOST_CONFIG_FILE`: `schema`, `[settings]`, `[secrets]`) for
+  the per-host ones, merged after the common file (a key in both is an error). Secrets only as `{
+  secret = "<name>" }` references to `[secrets]` (`{ file = ... }` or `{ env = ... }`); a store
+  URL with a password as a whole secret or a `value` template whose `{secret}` is the whole
+  password (percent-encoded into the URL). When the files carry settings (a `[settings]` table, an
+  empty one too, or a host file), `CONFIG_SOURCE=file` reads every setting from them and ignores
+  the environment's (one warning naming them; `RUST_LOG` as `rust_log` too), so a process needs no
+  variable but `CONFIG_SOURCE` and the two paths; `compare` compares them as well (new
   `ohttp_config_settings_compare_match`). A policy-only file without a host file keeps every
   setting in the environment in every mode, as before; `CONFIG_SOURCE=env` (the default) is
   unchanged, and so is `backfill`. `--check-config` checks both files and runs every startup
   parser and the mandatory startup checks (shared with the serving process) on them, names the
-  settings of the environment the files leave out (`--strict`: an error); `--export-config --host <path>` writes the host file and prints the common
-  file with its settings (without `--host` the output is the policy file, as before).
-  `ohttp_config_info` gains the label `tuning_digest` (the digest of the tuning settings in
-  force; `digest` is unchanged). Every variable the gateway reads is classified (policy,
-  tuning, deployment, secret) in `gateway/CONFIG.md`. The image carries the label
-  `org.zodl.ohttp-gateway.host-config=1`. See `gateway/host.example.toml`.
+  settings of the environment the files leave out (`--strict`: an error); `--export-config --host
+  <path>` writes the host file and prints the common file with its settings (without `--host` the
+  output is the policy file, as before). `ohttp_config_info` gains the label `tuning_digest` (the
+  digest of the tuning settings in force; `digest` is unchanged). Every variable the gateway reads
+  is classified (policy, tuning, deployment, secret) in `gateway/CONFIG.md`. The image carries the
+  label `org.zodl.ohttp-gateway.host-config=1`. See `gateway/host.example.toml`.
 
 ### Integrations crate
 
@@ -94,8 +126,8 @@ keeps its own log in [client/CHANGELOG.md](client/CHANGELOG.md).
   `enabled`, `rate_limit` (`POST /v1/session`), `status_rate_limit` (`POST /v1/sell/status`),
   `redirect_url` (required when a country offers sell), `availability`; the key document a
   `[secrets]` entry, read when the provider is built and never part of the rendered policy):
-  no environment variable can configure it, `CONFIG_SOURCE=compare` reports such a table as a
-  difference, so it is in force with `CONFIG_SOURCE=file` only; without a table nothing
+  no environment variable can configure it (with the files the only source since the breaking
+  entry above, it is in force whenever the files hold it); without a table nothing
   changes. Routes `POST /v1/session`, `POST /v1/sell/status`, `GET /v1/availability` (WRITE
   class, never cached, method and path matched exactly): the provider validates the body (a
   mainnet P2PKH t-address by base58check, flow, ref, optional fiat preset), builds the
@@ -116,7 +148,7 @@ keeps its own log in [client/CHANGELOG.md](client/CHANGELOG.md).
 - The gateway crate is renamed `zodl-ohttp-gateway` (library `zodl_ohttp_gateway`, binary
   `zodl-ohttp-gateway`) and marked `publish = false`: the name `ohttp-gateway` on crates.io belongs
   to an unrelated crate. The image is still `ohttp-gateway`, its entrypoint is
-  `/app/zodl-ohttp-gateway`, and `/app/ohttp-gateway` stays as a link to it. Nothing on the wire
+  `/app/zodl-ohttp-gateway`. Nothing on the wire
   changes: the upstream `User-Agent`, the `/ohttp-gateway/...` paths, the metric names and the
   environment are the same. Two things a log or process reader sees change: the `target` of every
   log line is now `zodl_ohttp_gateway[::module]` (a per-module `RUST_LOG` directive must use that
@@ -124,6 +156,8 @@ keeps its own log in [client/CHANGELOG.md](client/CHANGELOG.md).
   (truncated to `zodl-ohttp-gate` by the kernel). The relay simulator and the e2e client are
   marked `publish = false` too. A release tag now looks for `zodl-ohttp-gateway` in the lock
   files; a commit from before the rename cannot be tagged with this check.
+- **Breaking:** the image no longer has `/app/ohttp-gateway`; use `/app/zodl-ohttp-gateway` or
+  the entrypoint.
 
 ### Images and releases
 
@@ -182,6 +216,14 @@ keeps its own log in [client/CHANGELOG.md](client/CHANGELOG.md).
 
 ### Gateway
 
+- `ohttp_requests_total` has a new label `relay`: the name of the `RELAY_SECRETS` entry that
+  authenticated the request (the value `ohttp_relay_requests_total{relay}` already has; for a
+  forwarded WRITE on the receiving gateway, the `WRITE_FORWARD_SECRETS` entry), `-` when relay
+  authentication is off or the request was refused before authentication. It is on every
+  status, the non-success ones included, so errors can be told apart by relay. Only configured
+  names (and `-`) appear; a relay entry named `-` is indistinguishable from the unauthenticated
+  `-`. Dashboards and alerts that `sum` the series keep working; a query
+  that matches an exact label set needs `relay`.
 - New, off by default: **WRITE forwarding** (`REPLAY_WRITE_FORWARD_URL`,
   `REPLAY_WRITE_FORWARD_SECRET`, `..._CONNECT_TIMEOUT_MS` 1000, `..._TIMEOUT_SECS` 90,
   `..._BACKOFF_MS` 5000 on a read origin, which must be `async-reads` with `REPLAY_PEER_URLS`

@@ -1,13 +1,11 @@
-# An example host file of the gateway (--host-config or GATEWAY_HOST_CONFIG_FILE; see CONFIG.md
-# "Configuration file"): the settings of one host (or of every replica of one deployment),
-# merged after the common file (config.example.toml); a key set in both files is an error.
-# Placeholder names and values only. A host file holds `schema`, [secrets] and [settings]
-# only, never policy. `zodl-ohttp-gateway --export-config --host host.toml` writes the host
-# file of the current environment.
+# An example host file of the gateway (--host-config; see CONFIG.md): the settings of one host
+# (or of every replica of one deployment), merged after the common file (config.example.toml); a
+# key set in both files is an error. Placeholder names and values only. A host file holds
+# `schema`, [secrets] and [settings] only, never policy.
 
 schema = 1
 
-# Secrets of this host: never in the file, only where to read them.
+# Secrets of this host: never in the file, only the file to read each from.
 [secrets]
 cache_password = { file = "/run/secrets/cache_password" }
 peer_urls = { file = "/run/secrets/replay_peer_urls" }

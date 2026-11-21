@@ -17,7 +17,7 @@
 // Health checks and metrics
 
 use prometheus::Histogram;
-use prometheus::{HistogramVec, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, Opts, Registry};
+use prometheus::{HistogramVec, IntCounter, IntCounterVec, IntGaugeVec, Opts, Registry};
 
 /// Buckets of `ohttp_request_duration_seconds` and `ohttp_upstream_request_duration_seconds`.
 /// Fine enough between 25 ms and 1.5 s that a quantile of a call crossing a long network path
@@ -140,8 +140,8 @@ lazy_static::lazy_static! {
     pub static ref REGISTRY: Registry = Registry::new();
 
     static ref OHTTP_REQUESTS_TOTAL: IntCounterVec = IntCounterVec::new(
-        Opts::new("ohttp_requests_total", "Total OHTTP requests by status and labels"),
-        &["status", "mode", "network", "hop", "method", "http_status", "grpc_status", "backend", "route_class"]
+        Opts::new("ohttp_requests_total", "Total OHTTP requests by status and labels; relay = the RELAY_SECRETS entry that authenticated the request (for a forwarded WRITE the WRITE_FORWARD_SECRETS entry), - when relay authentication is off or the request was refused before it"),
+        &["status", "mode", "network", "hop", "method", "http_status", "grpc_status", "backend", "route_class", "relay"]
     )
     .unwrap();
 
@@ -594,21 +594,11 @@ lazy_static::lazy_static! {
     .unwrap();
 }
 
-// Where the routing policy comes from (CONFIG_SOURCE).
+// The configuration in force (the files).
 lazy_static::lazy_static! {
     static ref OHTTP_CONFIG_INFO: IntGaugeVec = IntGaugeVec::new(
-        Opts::new("ohttp_config_info", "The routing policy in force, 1 on every serving process: its source (CONFIG_SOURCE: env, compare, file) and digest (the first 16 hex digits of the SHA-256 of the canonical behaviour form of the policy, the same for a file and the environment it stands for; not of the JSON --print-effective-config prints); tuning_digest: the same for the tuning settings in force (no deployment setting, no secret)"),
+        Opts::new("ohttp_config_info", "The configuration in force, 1 on every serving process: its source (always file: the configuration files) and digest (the first 16 hex digits of the SHA-256 of the canonical behaviour form of the policy; not of the JSON --print-effective-config prints); tuning_digest: the same for the tuning settings in force (no deployment setting, no secret)"),
         &["source", "digest", "tuning_digest"]
-    )
-    .unwrap();
-    static ref OHTTP_CONFIG_SETTINGS_COMPARE_MATCH: IntGauge = IntGauge::new(
-        "ohttp_config_settings_compare_match",
-        "CONFIG_SOURCE=compare, when the configuration files carry the settings (a [settings] table in the common file, or a host file): 1 when their settings equal the environment's, 0 when they differ or the files do not load"
-    )
-    .unwrap();
-    static ref OHTTP_CONFIG_COMPARE_MATCH: IntGauge = IntGauge::new(
-        "ohttp_config_compare_match",
-        "CONFIG_SOURCE=compare only: 1 when the configuration file's policy equals the environment's, 0 when it differs or the file does not load"
     )
     .unwrap();
 }
@@ -926,7 +916,7 @@ pub fn normalize_backend(
 // Legacy API for backward compatibility
 pub fn record_request(status: &str, mode: &str) {
     OHTTP_REQUESTS_TOTAL
-        .with_label_values(&[status, mode, "unknown", "-", "-", "-", "-", "-", "-"])
+        .with_label_values(&[status, mode, "unknown", "-", "-", "-", "-", "-", "-", "-"])
         .inc();
 }
 
@@ -966,6 +956,10 @@ pub fn record_replay_rejected_sealed(network: &str) {
     OHTTP_REPLAY_REJECTED.with_label_values(&[network]).inc();
 }
 
+/// Count a request in `ohttp_requests_total`. `relay`: the name of the `RELAY_SECRETS` entry that
+/// authenticated it (the `relay` label of `ohttp_relay_requests_total`; for a forwarded WRITE the
+/// `WRITE_FORWARD_SECRETS` entry), `-` when relay authentication is off or the request was
+/// refused before it. Only configured names: the label stays bounded.
 #[allow(clippy::too_many_arguments)]
 pub fn record_request_detailed(
     status: &str,
@@ -977,6 +971,7 @@ pub fn record_request_detailed(
     grpc_status: &str,
     backend: &str,
     route_class: &str,
+    relay: &str,
 ) {
     let mode = if forwarded() { "forwarded" } else { mode };
     OHTTP_REQUESTS_TOTAL
@@ -990,6 +985,7 @@ pub fn record_request_detailed(
             grpc_status,
             backend,
             route_class,
+            relay,
         ])
         .inc();
 }
@@ -2162,31 +2158,13 @@ pub fn record_query_value_source_success(network: &str, source: &str) {
         .set(now);
 }
 
-/// The routing policy in force: `source` (`env`, `compare`, `file`), its digest and the digest
-/// of the tuning settings in force.
+/// The configuration in force: `source` (`file`), the digest of its policy and the digest of
+/// its tuning settings.
 pub fn set_config_info(source: &str, digest: &str, tuning_digest: &str) {
     OHTTP_CONFIG_INFO.reset();
     OHTTP_CONFIG_INFO
         .with_label_values(&[source, digest, tuning_digest])
         .set(1);
-}
-
-/// `CONFIG_SOURCE=compare` with files that carry the settings: whether their settings equal
-/// the environment's. The series exists in that case only.
-pub fn set_config_settings_compare_match(matches: bool) {
-    REGISTRY
-        .register(Box::new(OHTTP_CONFIG_SETTINGS_COMPARE_MATCH.clone()))
-        .ok();
-    OHTTP_CONFIG_SETTINGS_COMPARE_MATCH.set(i64::from(matches));
-}
-
-/// `CONFIG_SOURCE=compare`: whether the file's policy equals the environment's. The series
-/// exists in that mode only.
-pub fn set_config_compare_match(matches: bool) {
-    REGISTRY
-        .register(Box::new(OHTTP_CONFIG_COMPARE_MATCH.clone()))
-        .ok();
-    OHTTP_CONFIG_COMPARE_MATCH.set(i64::from(matches));
 }
 
 /// `skipped` selected items of query value source `source` were not valid values.
@@ -2843,6 +2821,60 @@ mod multi_origin_tests {
         assert!(is_security_redis_connected(net));
         record_security_redis_connected(net, false);
         assert!(!is_security_redis_connected(net));
+    }
+
+    #[test]
+    fn requests_carry_the_relay_that_authenticated_them() {
+        init_metrics();
+        let net = "relay-label-test";
+        record_request_detailed(
+            "success", "ohttp", net, "ohttp", "POST", 200, "0", "lwd", "lwd", "edge-a",
+        );
+        record_request_detailed(
+            "unauthorized",
+            "ohttp",
+            net,
+            "ohttp",
+            "-",
+            401,
+            "-",
+            "-",
+            "other",
+            "-",
+        );
+        let family = REGISTRY
+            .gather()
+            .into_iter()
+            .find(|f| f.get_name() == "ohttp_requests_total")
+            .expect("ohttp_requests_total registered");
+        let series: Vec<(String, String)> = family
+            .get_metric()
+            .iter()
+            .filter(|m| m.get_label().iter().any(|l| l.get_value() == net))
+            .map(|m| {
+                let label = |name: &str| {
+                    m.get_label()
+                        .iter()
+                        .find(|l| l.get_name() == name)
+                        .map(|l| l.get_value().to_string())
+                        .unwrap_or_else(|| panic!("no {name} label"))
+                };
+                (label("status"), label("relay"))
+            })
+            .collect();
+        assert_eq!(series.len(), 2, "{series:?}");
+        assert!(series.contains(&("success".into(), "edge-a".into())));
+        assert!(series.contains(&("unauthorized".into(), "-".into())));
+        // Every series has the label, the legacy counter too.
+        record_request("rejected_plain", "ohttp");
+        for m in REGISTRY
+            .gather()
+            .into_iter()
+            .filter(|f| f.get_name() == "ohttp_requests_total")
+            .flat_map(|f| f.get_metric().to_vec())
+        {
+            assert!(m.get_label().iter().any(|l| l.get_name() == "relay"));
+        }
     }
 
     #[test]

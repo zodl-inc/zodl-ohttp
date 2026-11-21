@@ -100,8 +100,8 @@ nightly.
 ### Local Development
 
 ```bash
-# Run the gateway locally (environment: gateway/README.md, "Build and run"), in one terminal
-(cd gateway && cargo run)
+# Run the gateway locally (its files: gateway/README.md, "Build and run"), in one terminal
+(cd gateway && cargo run -- --config local/gateway.toml --host-config local/host.toml)
 
 # Run the relay simulator in front of it, in a second terminal
 (cd relay-simulator && GATEWAY_URL=http://localhost:8080/gateway RELAY_SECRET=change-me cargo run)

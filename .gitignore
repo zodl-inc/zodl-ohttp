@@ -18,6 +18,9 @@ target/
 .env.*
 secrets/
 
+# The local run of gateway/README.md (its files and secret files)
+gateway/local/
+
 # Logs
 *.log
 

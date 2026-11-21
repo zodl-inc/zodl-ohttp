@@ -38,7 +38,6 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::bail;
 use tracing::{info, warn};
 use zodl_ohttp_integrations::core::value_source::{self as core, Change};
 
@@ -70,14 +69,13 @@ impl std::ops::Deref for QueryValueSources {
 }
 
 impl QueryValueSources {
-    /// `THIRD_PARTY_QUERY_VALUE_SOURCES` from the environment. Unset or blank: no source; a
-    /// value that is not UTF-8 is an error.
+    /// `THIRD_PARTY_QUERY_VALUE_SOURCES` of the configuration in force
+    /// ([`crate::config_source::var`]). Unset or blank: no source.
     pub fn from_env() -> anyhow::Result<Self> {
         match crate::config_source::var(ENV) {
             Ok(raw) if raw.trim().is_empty() => Ok(Self::default()),
             Ok(raw) => Self::parse(&raw),
-            Err(std::env::VarError::NotPresent) => Ok(Self::default()),
-            Err(std::env::VarError::NotUnicode(_)) => bail!("Invalid {ENV}: not valid UTF-8"),
+            Err(_) => Ok(Self::default()),
         }
     }
 

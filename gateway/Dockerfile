@@ -42,10 +42,8 @@ RUN apk add --no-cache ca-certificates tzdata && \
 
 WORKDIR /app
 
-# Copy binary from builder. /app/ohttp-gateway, the binary's former name, stays as a link for
-# callers that still name it.
+# Copy binary from builder
 COPY --from=builder /build/gateway/target/release/zodl-ohttp-gateway /app/zodl-ohttp-gateway
-RUN ln -s zodl-ohttp-gateway /app/ohttp-gateway
 
 # Set ownership
 RUN chown -R gateway:gateway /app
@@ -67,5 +65,8 @@ HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
 LABEL org.zodl.ohttp-gateway.check-config=1
 # The image reads every setting from the files as well ([settings], --host-config).
 LABEL org.zodl.ohttp-gateway.host-config=1
+# The image reads its configuration from the files only (--config, --host-config, secrets as
+# files): a deployment that still configures it by environment variables must not run it.
+LABEL org.zodl.ohttp-gateway.files-only=1
 
 ENTRYPOINT ["/app/zodl-ohttp-gateway"]

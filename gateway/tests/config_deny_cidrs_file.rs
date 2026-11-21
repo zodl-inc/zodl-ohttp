@@ -14,17 +14,15 @@
 //
 // Commercial licensing: see COMMERCIAL-LICENSE.md.
 
-//! `CONFIG_SOURCE=file`: the file's deny list is the one in force.
+//! The file's deny list is the one in force; the environment's is not read (a variable the
+//! files set too is a warning only). One process: the list can only be set once, and the
+//! refusals before it install nothing.
 
 use std::net::IpAddr;
 
 use zodl_ohttp_gateway::config::Config;
-use zodl_ohttp_gateway::config_source::{self, Cli};
+use zodl_ohttp_gateway::config_source::{self, Command};
 use zodl_ohttp_gateway::dynamic_hosts::is_connectable;
-
-fn cli() -> Cli {
-    Cli::parse([std::ffi::OsString::from("gateway")]).unwrap()
-}
 
 fn ip(s: &str) -> IpAddr {
     s.parse().unwrap()
@@ -41,14 +39,39 @@ fn file() -> std::path::PathBuf {
     path
 }
 
+/// The error of an `install_command` that must refuse.
+fn refused(cmd: &Command) -> anyhow::Error {
+    match config_source::install_command(cmd) {
+        Ok(_) => panic!("installed"),
+        Err(e) => e,
+    }
+}
+
 #[test]
-fn file_mode_puts_the_files_deny_list_in_force() {
+fn the_files_deny_list_is_in_force_and_the_environments_is_not_read() {
     let path = file();
-    std::env::set_var("CONFIG_SOURCE", "file");
-    std::env::set_var("GATEWAY_CONFIG_FILE", &path);
+    // Only the variables of this test.
+    for name in config_source::ignored_env_variables() {
+        std::env::remove_var(name);
+    }
+    std::env::remove_var("GATEWAY_CONFIG_FILE");
+    std::env::remove_var("GATEWAY_HOST_CONFIG_FILE");
+    let cmd =
+        Command::parse(["gateway", "--config", path.to_str().unwrap()].map(Into::into)).unwrap();
+    // CONFIG_SOURCE set to anything but `file`: refused, nothing installed.
+    std::env::set_var("CONFIG_SOURCE", "compare");
+    let e = format!("{:#}", refused(&cmd));
+    assert!(e.contains("CONFIG_SOURCE"), "{e}");
+    std::env::remove_var("CONFIG_SOURCE");
+    // A setting of the environment the file leaves out: refused, by name, nothing installed.
+    std::env::set_var("LWD_ADDR", "lwd.example:9067");
+    let e = format!("{:#}", refused(&cmd));
+    assert!(e.contains("LWD_ADDR") && !e.contains("lwd.example"), "{e}");
+    std::env::remove_var("LWD_ADDR");
+    // A variable the file sets too: a warning, the file's value in force.
     std::env::set_var("DYNAMIC_HOSTS_DENY_CIDRS", "1.0.0.0/24");
-    let installed = config_source::install(&cli()).unwrap();
-    assert!(installed.file.is_some());
+    let installed = config_source::install_command(&cmd).unwrap();
+    assert_eq!(installed.file.path, path.to_str().unwrap());
     assert!(is_connectable(ip("9.9.9.9")));
     Config::from_env().unwrap();
     assert!(!is_connectable(ip("9.9.9.9")));

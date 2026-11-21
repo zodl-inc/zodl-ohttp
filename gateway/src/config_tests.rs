@@ -17,76 +17,63 @@
 #[cfg(test)]
 mod security_tests {
     use super::super::*;
-    use std::env;
+    use crate::config_source::with_vars;
+
+    /// No variable at all: the configuration of a process whose files set nothing.
+    const NONE: [(&str, &str); 0] = [];
 
     #[test]
     fn test_ohttp_defaults_have_no_relay_secret_and_no_bypass() {
-        let _env = crate::config::test_env_lock();
-        env::remove_var("RELAY_SECRET");
-        env::remove_var("RELAY_SECRETS");
-        env::remove_var("ALLOW_UNAUTHENTICATED_RELAY");
-        env::set_var("GATEWAY_MODE", "ohttp");
-
-        let config = Config::from_env().unwrap();
+        let config = with_vars([("GATEWAY_MODE", "ohttp")], Config::from_env).unwrap();
         // The parsed defaults: no secret and no bypass flag, which startup refuses in OHTTP mode
         assert!(config.relay_secrets.is_empty() && !config.allow_unauthenticated_relay);
     }
 
     #[test]
     fn test_hpke_keys_parsing() {
-        let _env = crate::config::test_env_lock();
-        env::set_var("HPKE_KEYS", "0:aabbccdd11223344556677889900112233445566778899001122334455667788,1:1122334455667788990011223344556677889900112233445566778899001122");
-        let config = Config::from_env().unwrap();
+        let config = with_vars([("HPKE_KEYS", "0:aabbccdd11223344556677889900112233445566778899001122334455667788,1:1122334455667788990011223344556677889900112233445566778899001122")], Config::from_env).unwrap();
         assert_eq!(config.hpke_keys.len(), 2);
         assert_eq!(config.hpke_keys[0].0, 0);
         assert_eq!(config.hpke_keys[1].0, 1);
-        env::remove_var("HPKE_KEYS");
     }
 
     #[test]
     fn test_hpke_keys_empty() {
-        let _env = crate::config::test_env_lock();
-        env::remove_var("HPKE_KEYS");
-        let config = Config::from_env().unwrap();
+        let config = with_vars(NONE, Config::from_env).unwrap();
         assert!(config.hpke_keys.is_empty());
     }
 
     #[test]
     fn test_hpke_keys_malformed() {
-        let _env = crate::config::test_env_lock();
         // Malformed HPKE_KEYS entries should cause a startup error instead of being silently ignored
-        env::set_var("HPKE_KEYS", "not:a:valid:format");
-        let result = Config::from_env();
+        let result = with_vars([("HPKE_KEYS", "not:a:valid:format")], Config::from_env);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("invalid key_id"));
-        env::remove_var("HPKE_KEYS");
     }
 
     #[test]
     fn test_invalid_method_rejected() {
-        let _env = crate::config::test_env_lock();
         // Invalid method should cause startup error (prevents silent denial)
-        env::set_var("BACKENDS_POLICY", "test.example=INVALID /api/*");
-        let result = Config::from_env();
+        let result = with_vars(
+            [("BACKENDS_POLICY", "test.example=INVALID /api/*")],
+            Config::from_env,
+        );
         assert!(result.is_err());
         assert!(result
             .unwrap_err()
             .to_string()
             .contains("Invalid BACKENDS_POLICY method"));
-        env::remove_var("BACKENDS_POLICY");
     }
 
     #[test]
     fn test_method_wildcard_accepted() {
-        let _env = crate::config::test_env_lock();
         // * wildcard should be accepted as valid method
-        env::set_var("BACKENDS_POLICY", "test.example=* /*");
-        let config = Config::from_env().unwrap();
+        let config =
+            with_vars([("BACKENDS_POLICY", "test.example=* /*")], Config::from_env).unwrap();
         assert_eq!(
             config.backends_policy.get("test.example").unwrap()[0].0,
             "*"
         );
-        env::remove_var("BACKENDS_POLICY");
     }
 
     #[test]
@@ -140,11 +127,9 @@ mod security_tests {
 
     #[test]
     fn gateway_hosts_empty_entries_count_as_unset() {
-        let _g = test_env_lock();
-        std::env::set_var("GATEWAY_HOSTS", " , ");
-        let hosts = Config::from_env().map(|c| c.gateway_hosts);
-        std::env::remove_var("GATEWAY_HOSTS");
-        let hosts = hosts.expect("config loads");
+        let hosts = with_vars([("GATEWAY_HOSTS", " , ")], Config::from_env)
+            .map(|c| c.gateway_hosts)
+            .expect("config loads");
         assert!(hosts.is_empty());
         assert!(require_gateway_hosts("ohttp", &hosts).is_err());
     }

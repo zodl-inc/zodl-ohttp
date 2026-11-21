@@ -2112,20 +2112,22 @@ fn a_shadowed_host_keeps_its_limits_for_its_source() {
 }
 
 #[test]
-fn deny_blocks_come_from_the_environment_once() {
+fn deny_blocks_come_from_the_configuration_once() {
     let _env = crate::config::test_env_lock();
     // Malformed: a startup error.
-    std::env::set_var("DYNAMIC_HOSTS_DENY_CIDRS", "203.0.115.0/40");
-    let malformed = DynamicHosts::from_env(Reserved::default(), "testnet", 4);
-    std::env::remove_var("DYNAMIC_HOSTS_DENY_CIDRS");
-    assert!(malformed.is_err());
-    // A block used by no other test of this process.
-    std::env::set_var(
-        "DYNAMIC_HOSTS_DENY_CIDRS",
-        "203.0.115.0/24, ::ffff:203.0.116.0/120",
+    let malformed = crate::config_source::with_vars_in_force(
+        &[("DYNAMIC_HOSTS_DENY_CIDRS", "203.0.115.0/40")],
+        || DynamicHosts::from_env(Reserved::default(), "testnet", 4),
     );
-    let hosts = DynamicHosts::from_env(Reserved::default(), "testnet", 4);
-    std::env::remove_var("DYNAMIC_HOSTS_DENY_CIDRS");
+    assert!(malformed.is_err());
+    // A block used by no other test of this process, read as the process's own startup does.
+    let hosts = crate::config_source::with_vars_in_force(
+        &[(
+            "DYNAMIC_HOSTS_DENY_CIDRS",
+            "203.0.115.0/24, ::ffff:203.0.116.0/120",
+        )],
+        || DynamicHosts::from_env(Reserved::default(), "testnet", 4),
+    );
     assert!(!hosts.unwrap().enabled());
     for denied in ["203.0.115.9", "203.0.116.200", "::ffff:203.0.115.9"] {
         assert!(!is_connectable(denied.parse().unwrap()), "{denied}");

@@ -880,74 +880,64 @@ mod security_tests {
 
     #[test]
     fn test_multiple_relay_secrets_parsed() {
-        let _env = crate::config::test_env_lock();
-        std::env::set_var("RELAY_SECRETS", "secret1,secret2,secret3");
-        let config = Config::from_env().unwrap();
+        let config = crate::config_source::with_vars(
+            [("RELAY_SECRETS", "secret1,secret2,secret3")],
+            Config::from_env,
+        )
+        .unwrap();
         assert_eq!(config.relay_secrets.len(), 3);
-        std::env::remove_var("RELAY_SECRETS");
     }
 
     #[test]
     fn test_backends_policy_parsed() {
-        let _env = crate::config::test_env_lock();
-        std::env::set_var(
-            "BACKENDS_POLICY",
-            "api1.example.com=GET /v1/info,POST /v1/data",
-        );
-        let config = Config::from_env().unwrap();
+        let config = crate::config_source::with_vars(
+            [(
+                "BACKENDS_POLICY",
+                "api1.example.com=GET /v1/info,POST /v1/data",
+            )],
+            Config::from_env,
+        )
+        .unwrap();
         assert!(config.backends_policy.contains_key("api1.example.com"));
         assert_eq!(config.backends_policy["api1.example.com"].len(), 2);
-        std::env::remove_var("BACKENDS_POLICY");
     }
 
     #[test]
     fn third_party_query_rules_are_parsed_and_checked_at_startup() {
-        // Every result is collected and the variables removed before any assertion, so that a
-        // failing one cannot leave them set for other tests.
-        let (valid, blank, errors, with_source, not_utf8, unset) = {
-            let _env = crate::config::test_env_lock();
-            std::env::set_var("BACKENDS", "api1.example.com=https://api.example.org");
-            std::env::set_var(
+        let base = [
+            ("BACKENDS", "api1.example.com=https://api.example.org"),
+            (
                 "BACKENDS_POLICY",
                 "api1.example.com=GET /v1/info,GET /v1/list,GET /v2/*",
-            );
-            let attempt = |rules: &str| {
-                std::env::set_var("THIRD_PARTY_QUERY_RULES", rules);
-                Config::from_env()
-            };
-            let valid = attempt("api1.example.com=GET /v1/info?id={in:ABC|XYZ},GET /v1/list?");
-            let blank = attempt("  ");
-            let errors = [
-                attempt("api1.example.com=GET /v1/info?id={lower:1-4}"),
-                attempt("api2.example.com=GET /v1/info?"),
-                attempt("api1.example.com=POST /v1/info?"),
-                attempt("api1.example.com=GET /v3/info?"),
-                attempt("api1.example.com=GET /v2/info?"),
-            ];
-            std::env::set_var(
+            ),
+        ];
+        let attempt_with = |extra: &[(&str, &str)]| {
+            crate::config_source::with_vars(
+                base.iter().chain(extra).map(|(k, v)| (*k, *v)),
+                Config::from_env,
+            )
+        };
+        let attempt = |rules: &str| attempt_with(&[("THIRD_PARTY_QUERY_RULES", rules)]);
+        let valid = attempt("api1.example.com=GET /v1/info?id={in:ABC|XYZ},GET /v1/list?");
+        let blank = attempt("  ");
+        let errors = [
+            attempt("api1.example.com=GET /v1/info?id={lower:1-4}"),
+            attempt("api2.example.com=GET /v1/info?"),
+            attempt("api1.example.com=POST /v1/info?"),
+            attempt("api1.example.com=GET /v3/info?"),
+            attempt("api1.example.com=GET /v2/info?"),
+        ];
+        let with_source = attempt_with(&[
+            (
                 "THIRD_PARTY_QUERY_VALUE_SOURCES",
                 "ids=api1.example.com GET /v1/list#/data/*@300@fallback=ABC",
-            );
-            let with_source = attempt("api1.example.com=GET /v1/info?id={from:ids}");
-            #[cfg(unix)]
-            let not_utf8 = {
-                use std::os::unix::ffi::OsStrExt;
-                let bad = std::ffi::OsStr::from_bytes(b"api1.example.com=GET /v1/info?id=\xff");
-                std::env::set_var("THIRD_PARTY_QUERY_VALUE_SOURCES", bad);
-                let sources = Config::from_env();
-                std::env::remove_var("THIRD_PARTY_QUERY_VALUE_SOURCES");
-                std::env::set_var("THIRD_PARTY_QUERY_RULES", bad);
-                vec![Config::from_env(), sources]
-            };
-            #[cfg(not(unix))]
-            let not_utf8: Vec<anyhow::Result<Config>> = Vec::new();
-            std::env::remove_var("THIRD_PARTY_QUERY_VALUE_SOURCES");
-            std::env::remove_var("THIRD_PARTY_QUERY_RULES");
-            let unset = Config::from_env();
-            std::env::remove_var("BACKENDS_POLICY");
-            std::env::remove_var("BACKENDS");
-            (valid, blank, errors, with_source, not_utf8, unset)
-        };
+            ),
+            (
+                "THIRD_PARTY_QUERY_RULES",
+                "api1.example.com=GET /v1/info?id={from:ids}",
+            ),
+        ]);
+        let unset = attempt_with(&[]);
 
         let rules = valid.unwrap().third_party_query_rules;
         assert_eq!(rules.len(), 2);
@@ -963,16 +953,6 @@ mod security_tests {
         assert_eq!(rules.sources().len(), 1);
         assert!(rules.admits("api1.example.com", "GET", "/v1/info?id=ABC"));
         assert!(!rules.admits("api1.example.com", "GET", "/v1/info?id=XYZ"));
-        for (result, var) in not_utf8
-            .into_iter()
-            .zip(["THIRD_PARTY_QUERY_RULES", "THIRD_PARTY_QUERY_VALUE_SOURCES"])
-        {
-            let text = result.unwrap_err().to_string();
-            assert!(
-                text.contains("not valid UTF-8") && text.contains(var),
-                "{text}"
-            );
-        }
         assert!(unset.unwrap().third_party_query_rules.is_empty());
     }
 }

@@ -14,11 +14,16 @@
 //
 // Commercial licensing: see COMMERCIAL-LICENSE.md.
 
-//! Characterisation of the routing policy the gateway derives from its environment.
+//! Characterisation of the routing policy the gateway derives from its configuration.
 //!
 //! `tests/fixtures/characterisation/<network>.vars` holds the policy environment of a mainnet
 //! and a testnet deployment with every host name, address and secret replaced by a placeholder
-//! (`*.example`, documentation addresses, fake keys). Two baselines are pinned against it:
+//! (`*.example`, documentation addresses, fake keys). The gateway reads files only: the same
+//! configuration as files, `<network>.gateway.toml` (policy and common settings) and
+//! `<network>.host.toml` (deployment settings), secrets in `fake-secrets/`, is what the policy is
+//! built from, and is checked to stand for exactly the `.vars` (the policy compared as the
+//! export compares it, every setting as rendered). The baselines were written from the
+//! environment; the files give the same verdicts. Two baselines are pinned:
 //!
 //! - `<network>.policy.json`: the effective policy (the parsed tables that have a public view,
 //!   and the verdicts of every request the configuration itself names: each policy, replay,
@@ -48,6 +53,7 @@ use std::sync::{Mutex, OnceLock};
 
 use serde_json::{json, Value};
 use zodl_ohttp_gateway::config::Config;
+use zodl_ohttp_gateway::config_source::{self, LoadedFile, Secrets};
 use zodl_ohttp_gateway::dynamic_hosts::parse_deny_cidrs;
 use zodl_ohttp_gateway::flexa;
 use zodl_ohttp_gateway::host_list;
@@ -57,8 +63,7 @@ use zodl_ohttp_gateway::origin::OriginSettings;
 use zodl_ohttp_gateway::proxy::{self, BackendTarget, RouteContext};
 use zodl_ohttp_gateway::third_party_cache::{self, Aliases, CacheRoutes, RateLimiters, ThirdParty};
 
-/// The process environment is global: every test of this file that sets or reads it (directly
-/// or through a gateway `from_env`) must hold this lock.
+/// The tests of this file run one at a time (the bless switch, the shared fixtures).
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 
 const NETWORKS: &[&str] = &["mainnet", "testnet"];
@@ -98,47 +103,85 @@ fn read_env(network: &str) -> Vec<(String, String)> {
 
 /// Everything the policy is built from, read from one fixture.
 struct Loaded {
+    /// The fixture's variables: the text the probes are made of.
     env: BTreeMap<String, String>,
+    /// The fixture's files, the configuration every parser reads.
+    files: LoadedFile,
     config: Config,
     origin: OriginSettings,
     cache: Option<CacheRoutes>,
     limits: Option<RateLimiters>,
 }
 
-/// Names a test process may keep: anything else is removed before a fixture is applied, so an
-/// ambient variable can never change a verdict.
-fn keep_var(name: &str) -> bool {
-    matches!(
-        name,
-        "PATH" | "HOME" | "TMPDIR" | "TMP" | "TEMP" | "USER" | "LANG" | "TERM"
-    ) || ["CARGO", "RUST", "LC_", "LD_", "DYLD_"]
+/// The files of `network` (`<network>.gateway.toml`, `<network>.host.toml`), their secrets read,
+/// checked to stand for exactly `vars`: the policy (as the export compares an environment with a
+/// file, header values included) and every setting.
+fn load_files(network: &str, vars: &BTreeMap<String, String>) -> LoadedFile {
+    // The secret paths of the files are relative to the crate directory.
+    std::env::set_current_dir(env!("CARGO_MANIFEST_DIR")).unwrap();
+    let path = |kind: &str| {
+        fixtures()
+            .join(format!("{network}.{kind}.toml"))
+            .to_str()
+            .unwrap()
+            .to_string()
+    };
+    // Without the startup checks: the fixture is a policy, not a serving configuration.
+    let (common, host) = (path("gateway"), path("host"));
+    let files = config_source::read_files(&common, Some(host.as_str()), Secrets::Require)
+        .unwrap_or_else(|e| panic!("{network}: {e:#}"));
+    let policy: BTreeMap<String, String> = vars
         .iter()
-        .any(|p| name.starts_with(p))
+        .filter(|(k, _)| {
+            zodl_ohttp_integrations::core::config::POLICY_ENV_KEYS.contains(&k.as_str())
+        })
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    let c = config_source::compare(&policy, &files.file, &|n: &str| {
+        config_source::resolve_secret(&files.file, n, Secrets::Require)
+    })
+    .unwrap();
+    assert!(
+        c.matches,
+        "{network}: the files' policy differs at {:?}",
+        c.keys
+    );
+    assert_eq!(
+        zodl_ohttp_gateway::settings::differing(
+            &zodl_ohttp_gateway::settings::env_settings(vars),
+            &files.settings
+        ),
+        Vec::<String>::new(),
+        "{network}: the files' settings differ"
+    );
+    // Every variable of the fixture is policy or a setting the files stand for.
+    for k in vars.keys() {
+        assert!(
+            policy.contains_key(k) || files.settings.contains_key(k),
+            "{network}: {k} is not in the files"
+        );
+    }
+    files
 }
 
 fn load(network: &str) -> Loaded {
-    bless(); // before the environment is replaced
+    bless();
     let vars = read_env(network);
-    for (name, _) in std::env::vars_os()
-        .filter_map(|(k, v)| Some((k.into_string().ok()?, v)))
-        .filter(|(k, _)| !keep_var(k))
-    {
-        std::env::remove_var(name);
-    }
-    for (k, v) in &vars {
-        std::env::set_var(k, v);
-    }
-    let config = Config::from_env().expect("fixture config parses");
-    let origin = OriginSettings::from_env().expect("fixture origin settings parse");
-    let cache = CacheRoutes::from_env(Aliases {
-        flexa: config.flexa_alias.as_deref(),
-        near: config.near_alias.as_deref(),
-    })
-    .expect("fixture cache routes parse");
-    let limits = RateLimiters::from_env().expect("fixture rate limits parse");
+    let env: BTreeMap<String, String> = vars.iter().cloned().collect();
+    let files = load_files(network, &env);
+    let (config, origin, cache, limits) = files.run_in(|| {
+        let config = Config::from_env().expect("fixture config parses");
+        let origin = OriginSettings::from_env().expect("fixture origin settings parse");
+        let cache = CacheRoutes::from_env(Aliases {
+            flexa: config.flexa_alias.as_deref(),
+            near: config.near_alias.as_deref(),
+        })
+        .expect("fixture cache routes parse");
+        let limits = RateLimiters::from_env().expect("fixture rate limits parse");
+        (config, origin, cache, limits)
+    });
     // Every route the fixture names was parsed: a key the gateway no longer reads (renamed,
     // misspelled) would otherwise fall back to a default while the probes still use its text.
-    let env: BTreeMap<String, String> = vars.iter().cloned().collect();
     let count = |k: &str| named_routes(env.get(k).map_or("", String::as_str)).len();
     let entries = |k: &str| {
         env.get(k).map_or(0, |v| {
@@ -213,6 +256,7 @@ fn load(network: &str) -> Loaded {
     );
     Loaded {
         env,
+        files,
         config,
         origin,
         cache,
@@ -347,11 +391,15 @@ fn caps(l: &Loaded) -> Value {
             alias.to_ascii_uppercase(),
             format!("{alias}:443"),
         ] {
-            let tp = ThirdParty::from_env(
-                l.config.flexa_alias.as_deref(),
-                l.config.near_alias.as_deref(),
-            )
-            .expect("third-party settings parse");
+            let tp = l
+                .files
+                .run_in(|| {
+                    ThirdParty::from_env(
+                        l.config.flexa_alias.as_deref(),
+                        l.config.near_alias.as_deref(),
+                    )
+                })
+                .expect("third-party settings parse");
             let mut passed = 0u64;
             let mut status = None;
             for _ in 0..n + 1 {

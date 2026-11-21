@@ -1,0 +1,9 @@
+# The characterisation fixture mainnet.vars as the gateway reads it: the host file (the
+# deployment settings). See mainnet.gateway.toml.
+schema = 1
+
+[settings]
+network = "mainnet"
+lwd_addr = "lwd.example:9067"
+max_inflight_lwd = 32
+max_inflight_lwd_heavy = 4
