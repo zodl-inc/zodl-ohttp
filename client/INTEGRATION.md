@@ -143,7 +143,12 @@ gateway-host rules apply to every relay.
   too, and released by a success through a relay that failed with it), and one paused by a `Retry-After` (`RelayBackoff::global()`) until the pause ends:
   a request that draws it goes to the next relay in list order, which gets the whole share
   meanwhile. With every relay out, the first relay in that order that
-  is only held (not paused) is used, and with every relay paused, the relay drawn. The selector
+  is only held (not paused) is used, and with every relay paused, the relay drawn. After a
+  hold ends one request at a time goes to the relay as a probe (`RELAY_PROBE_WINDOW`), and
+  failures set aside as older news (a later request succeeded) hold the relay after all once
+  `MASKED_FAILURES_TO_HOLD` of them fall within `MASKED_FAILURE_WINDOW`. Each
+  `choose_relay_for` call may make its request the probe, so call it only for a request you
+  will send. The selector
   never resends anything. A request may be sent again through another relay only when nothing
   was sent: the connection or TLS handshake failed, or the relay is paused before the post.
   Never after an outer error status (a relay or front end may answer one in place of an answer

@@ -1,6 +1,6 @@
 [package]
 name = "zodl-ohttp-client"
-version = "2.2.0"
+version = "2.3.0"
 license = "AGPL-3.0-only"
 edition = "2021"
 # reqwest's dependency tree (url, idna, icu) needs 1.88.
@@ -77,4 +77,9 @@ tokio-rustls = { version = "0.26", default-features = false }
 # items are `anyhow::Result<UpFrame>`).
 futures-util = "0.3"
 bytes = "1"
+# The HTTP/2 refusal test: a local HTTP/2 server that refuses a stream after reading it, and
+# the client's HTTP stack speaking HTTP/2 to it (in the tests only).
+h2 = "0.4"
+http = "1"
+reqwest = { version = "0.12.28", default-features = false, features = ["rustls-tls", "http2"] }
 anyhow = "1"

@@ -1985,6 +1985,7 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "futures-core",
+ "h2",
  "http",
  "http-body",
  "http-body-util",
@@ -3388,7 +3389,7 @@ checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
 
 [[package]]
 name = "zodl-ohttp-client"
-version = "2.2.0"
+version = "2.3.0"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -3397,9 +3398,11 @@ dependencies = [
  "bytes",
  "ed25519-dalek",
  "futures-util",
+ "h2",
  "hex",
  "hkdf",
  "hpke",
+ "http",
  "rand_core 0.9.5",
  "rcgen",
  "reqwest",

@@ -124,7 +124,7 @@ pub use chunked::{
     CONTENT_TYPE_CHUNKED_RES,
 };
 #[cfg(feature = "client")]
-pub use client::{Client, KeyConfigSource, ResponseStream};
+pub use client::{Client, KeyConfigSource, ResponseStream, DEFAULT_LIST_CONNECT_TIMEOUT};
 pub use config::{
     canonical_relay_url, ConfigError, ConfigField, OhttpConfig, OhttpConfigParams, OhttpNetworks,
 };
@@ -145,8 +145,8 @@ pub use outer::{
 };
 pub use profile::ClientProfile;
 pub use relays::{
-    relay_status_fails_over, Relay, RelaySelector, MAX_HELD_RELAYS, MAX_RELAYS,
-    MAX_RELAY_FAILOVER_HOLD, RELAY_FAILOVER_HOLD,
+    relay_status_fails_over, Relay, RelaySelector, MASKED_FAILURES_TO_HOLD, MASKED_FAILURE_WINDOW,
+    MAX_HELD_RELAYS, MAX_RELAYS, MAX_RELAY_FAILOVER_HOLD, RELAY_FAILOVER_HOLD, RELAY_PROBE_WINDOW,
 };
 pub use signed::{
     open_signed_config, verify_signed_config, verify_signed_config_with, Base64Decoding,
