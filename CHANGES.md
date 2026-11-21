@@ -5,6 +5,28 @@ keeps its own log in [client/CHANGELOG.md](client/CHANGELOG.md).
 
 ## Unreleased
 
+### Relay weights
+
+- **Gateway: the relay weights block in the signed key configuration.** New host setting
+  `relay_weights_file` (`RELAY_WEIGHTS_FILE`): the path of a relay weights block
+  (`docs/relay-weights.md`), served as the field `relay_weights` of every `/ohttp-configs/signed`
+  envelope, last, exactly as the file holds it (leading and trailing whitespace removed). The
+  gateway never signs, checks or edits the block (it is signed with a key the gateway does not
+  hold, and the envelope's signature does not cover it). It reads the file at startup and every
+  10 s in the background, so a new block needs no restart and no request waits for the file. A
+  missing or empty file serves no block; a file that is not a regular file holding one JSON object
+  of at most 4096 bytes is not served (a warning, and metric
+  `ohttp_relay_weights_block{network, state="served"|"absent"|"invalid"}`); a read that fails or
+  takes over 2 s keeps the last state. `ohttp_relay_weights_block_not_after_seconds{network}`: the
+  `not_after` the served block names. Unset: nothing
+  changes, no envelope carries the field. The DNS form of the key configuration is the envelope's
+  bytes, so it carries the block too.
+- **e2e client: `--split <network> <count> <authority> <path>`** sends `count` requests, each through
+  the relay the library chooses from the configured list (with the shares of a valid relay weights
+  block), reports the outcomes as a wallet does, and prints the relay weights in force and the
+  count per relay position. `OHTTP_E2E_RELAY_WEIGHTS_PUBKEY_<NET>` configures the relay weights
+  key (optional); the DNS mode prints the relay weights of the envelope it verified.
+
 ### Configuration file
 
 - **Breaking: the gateway reads its configuration from its files only.** A serving process needs

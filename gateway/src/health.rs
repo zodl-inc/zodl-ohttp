@@ -527,6 +527,17 @@ lazy_static::lazy_static! {
 
 // A second block: one more static in the first exceeds the macro recursion limit.
 lazy_static::lazy_static! {
+    static ref OHTTP_RELAY_WEIGHTS_NOT_AFTER: IntGaugeVec = IntGaugeVec::new(
+        Opts::new("ohttp_relay_weights_block_not_after_seconds", "The not_after (Unix seconds) the served relay weights block names, as read from it without checking it; 0 when no block is served."),
+        &["network"]
+    )
+    .unwrap();
+    static ref OHTTP_RELAY_WEIGHTS_BLOCK: IntGaugeVec = IntGaugeVec::new(
+        Opts::new("ohttp_relay_weights_block", "1 for the state of the relay weights block file as last read (state = served: one JSON object, not checked further, the gateway holds no key to check it; absent; invalid: present but not served), 0 for the others, per network. Only with relay_weights_file set."),
+        &["network", "state"]
+    )
+    .unwrap();
+
     static ref OHTTP_DYNAMIC_HOSTS: IntGaugeVec = IntGaugeVec::new(
         Opts::new("ohttp_dynamic_hosts", "Third-party hosts served from a dynamic host source (DYNAMIC_HOST_SOURCES)"),
         &["network", "source"]
@@ -772,6 +783,8 @@ pub fn init_metrics() {
         &*OHTTP_PERMANENT_STORE_CONNECTED,
         &*OHTTP_ORIGIN_INFO,
         &*OHTTP_KEY_CONFIG_INFO,
+        &*OHTTP_RELAY_WEIGHTS_BLOCK,
+        &*OHTTP_RELAY_WEIGHTS_NOT_AFTER,
         &*OHTTP_SECURITY_REDIS_CONNECTED,
         &*OHTTP_REPLAY_PEERS_CONFIGURED,
         &*OHTTP_REPLAY_STANDBY_STORES_CONFIGURED,
@@ -1244,6 +1257,22 @@ pub fn record_key_config_info(network: &str, fingerprint: &str, signing_key_id: 
     OHTTP_KEY_CONFIG_INFO
         .with_label_values(&[network, fingerprint, signing_key_id.unwrap_or("-")])
         .set(1);
+}
+
+/// The `not_after` the served relay weights block of `network` names (0: none served).
+pub fn record_relay_weights_not_after(network: &str, not_after: u64) {
+    OHTTP_RELAY_WEIGHTS_NOT_AFTER
+        .with_label_values(&[network])
+        .set(i64::try_from(not_after).unwrap_or(i64::MAX));
+}
+
+/// The state of the relay weights block file of `network`: `served`, `absent` or `invalid`.
+pub fn record_relay_weights(network: &str, state: &str) {
+    for each in ["served", "absent", "invalid"] {
+        OHTTP_RELAY_WEIGHTS_BLOCK
+            .with_label_values(&[network, each])
+            .set(i64::from(each == state));
+    }
 }
 
 pub fn record_replay_peers_configured(network: &str, n: usize) {

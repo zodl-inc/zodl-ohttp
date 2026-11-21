@@ -229,6 +229,7 @@ pub const SETTINGS: &[Setting] = &[
     deployment("PORT", Int),
     deployment("INTERNAL_BIND_ADDR", Str),
     deployment("ORIGIN_ID", Str),
+    deployment("RELAY_WEIGHTS_FILE", Str),
     deployment("LWD_ADDR", Str),
     deployment("LWD_ENDPOINTS", Str),
     deployment("LWD_CONNECTION_POOL", Bool(Flag::OneTrueOn)),

@@ -21,10 +21,15 @@ use anyhow::{bail, Result};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use zodl_ohttp_client::{
     canonical_relay_url, decode_bhttp_response, doh_query_url, encapsulate_chunked_request,
-    encode_request, envelope_from_doh_json, open_signed_config, verify_signed_config, ConfigError,
-    DecodeOptions, KeyConfig, Network, OhttpConfig, OhttpConfigParams, OhttpNetworks, OuterHeaders,
-    Request, SignedConfigPolicy, VerifyingKey, CONTENT_TYPE_CHUNKED_RES, DOH_RESOLVERS,
+    encode_request, envelope_from_doh_json, open_signed_config, relay_status_answered,
+    relay_status_fails_over, signed_config_url, verify_signed_config, ConfigError, DecodeOptions,
+    KeyConfig, Network, OhttpConfig, OhttpConfigParams, OhttpNetworks, OuterHeaders, RelaySelector,
+    RelayWeightsStatus, Request, SignedConfigPolicy, SignedConfigUrlRule, VerifyingKey,
+    CONTENT_TYPE_CHUNKED_RES, DOH_RESOLVERS,
 };
+
+/// The optional relay weights key of a network: `OHTTP_E2E_RELAY_WEIGHTS_PUBKEY_<NET>`.
+const WEIGHTS_VAR: &str = "OHTTP_E2E_RELAY_WEIGHTS_PUBKEY";
 
 /// The runtime OHTTP configuration of each network, from the environment: the four variables
 /// `OHTTP_E2E_GATEWAY_HOST_<NET>`, `OHTTP_E2E_RELAY_URL_<NET>`, `OHTTP_E2E_KEYS_DNS_NAME_<NET>`
@@ -67,14 +72,22 @@ fn networks_from(
             );
         }
         let [host, relay, dns, key] = values.map(Option::unwrap_or_default);
-        OhttpConfig::new(OhttpConfigParams {
+        let config = OhttpConfig::new(OhttpConfigParams {
             gateway_host: &host,
             relay_url: &relay,
             keys_dns_name: &dns,
             signing_pubkey: &key,
         })
-        .map(Some)
-        .map_err(|e| anyhow::anyhow!("{}: {e}", network.as_str()))
+        .map_err(|e| anyhow::anyhow!("{}: {e}", network.as_str()))?;
+        // The relay weights key is optional: without it no relay weights block is read.
+        let weights = format!("{WEIGHTS_VAR}_{}", network.as_str().to_ascii_uppercase());
+        match setting(&weights, var(&weights))? {
+            Some(key) => config
+                .with_relay_weights_key(&key)
+                .map(Some)
+                .map_err(|e| anyhow::anyhow!("{}: {e}", network.as_str())),
+            None => Ok(Some(config)),
+        }
     };
     Ok(OhttpNetworks::new(
         network(Network::Mainnet)?,
@@ -313,6 +326,7 @@ fn doh_headers(headers: &OuterHeaders) -> Vec<(&'static str, String)> {
 fn usage() -> ! {
     eprintln!("usage: ohttp-e2e <config_url> <relay_url> <authority> <method> <path> [trace_id] [grpc|http] [body_hex]");
     eprintln!("       ohttp-e2e --key-config-source dns <network>");
+    eprintln!("       ohttp-e2e --split <network> <count> <authority> <path>");
     eprintln!(
         "  <relay_url>: an https:// relay URL the configuration rules accept (others are refused)"
     );
@@ -341,6 +355,13 @@ fn usage() -> ! {
     eprintln!("  env: OHTTP_E2E_{{GATEWAY_HOST,RELAY_URL,KEYS_DNS_NAME,SIGNING_PUBKEY}}_{{MAINNET,TESTNET}}:");
     eprintln!("       the OHTTP configuration of each network, needed for signed configs and DNS");
     eprintln!("  --key-config-source dns: fetch and verify envelope from DNS-over-HTTPS");
+    eprintln!(
+        "  --split: <count> gRPC POSTs of an empty message to <authority><path>, each through"
+    );
+    eprintln!("       the relay the library chooses (OHTTP_E2E_RELAY_URL_<NET> may list relays);");
+    eprintln!("       prints the relay weights in force and the count per relay position");
+    eprintln!("  env: OHTTP_E2E_RELAY_WEIGHTS_PUBKEY_<NET>: the relay weights key (optional)");
+    eprintln!("  env: OHTTP_E2E_SPLIT_KEYS=dns: --split reads the envelope from DNS, not a relay");
     std::process::exit(2)
 }
 
@@ -350,6 +371,9 @@ fn main() -> Result<()> {
     // DNS key config test mode
     if a.len() == 4 && a[1] == "--key-config-source" && a[2] == "dns" {
         return dns_key_config_test(&a[3]);
+    }
+    if a.len() == 6 && a[1] == "--split" {
+        return split_test(&a[2], &a[3], &a[4], &a[5]);
     }
 
     if a.len() < 6 {
@@ -699,6 +723,9 @@ fn dns_key_config_test(network_str: &str) -> Result<()> {
                     Ok(keys) => {
                         println!("    Signature: OK");
                         println!("    not_after: {}", keys.not_after);
+                        if let Some(config) = networks.get(network) {
+                            print_relay_weights(config);
+                        }
 
                         match KeyConfig::select(&keys.document) {
                             Ok(_) => {
@@ -723,6 +750,164 @@ fn dns_key_config_test(network_str: &str) -> Result<()> {
     }
 
     bail!("All DNS resolvers failed")
+}
+
+/// The relay weights in force for `config`: the block's id, `seq`, weights and end, or the
+/// application's defaults.
+fn print_relay_weights(config: &OhttpConfig) {
+    match config.relay_weights() {
+        RelayWeightsStatus::Block(block) => println!(
+            "    relay weights: block {} seq {} weights {:?} not_after {}",
+            block.id(),
+            block.seq(),
+            block.weights(),
+            block.not_after()
+        ),
+        _ => println!("    relay weights: app defaults"),
+    }
+}
+
+/// The signed envelope of `config`'s gateway, through its relays in list order (the first that
+/// answers it).
+fn envelope_through_relays(
+    http: &reqwest::blocking::Client,
+    config: &OhttpConfig,
+) -> Result<Vec<u8>> {
+    for (i, relay) in config.relays().iter().enumerate() {
+        let url = signed_config_url(relay.url(), SignedConfigUrlRule::ReplaceRelaySuffix)?;
+        let mut get = http.get(&url);
+        for (k, v) in OuterHeaders::LIBRARY.key_fetch_signed(None) {
+            get = get.header(k, v)
+        }
+        match get.send() {
+            Ok(resp) if resp.status().is_success() => return Ok(net(resp.bytes())?.to_vec()),
+            Ok(resp) => println!("    relay[{i}] envelope: HTTP {}", resp.status()),
+            Err(e) => println!("    relay[{i}] envelope: {}", transport_failure(&e)),
+        }
+    }
+    bail!("no relay served the signed key configuration")
+}
+
+/// The signed envelope of `network` from the first DNS-over-HTTPS resolver that gives one.
+fn envelope_from_dns(
+    http: &reqwest::blocking::Client,
+    networks: &OhttpNetworks,
+    network: Network,
+) -> Result<Vec<u8>> {
+    for resolver in DOH_RESOLVERS {
+        let Some(url) = doh_query_url(networks, resolver, network) else {
+            bail!("no key-configuration DNS name for {}", network.as_str());
+        };
+        let mut query = http.get(&url);
+        for (k, v) in doh_headers(&OuterHeaders::LIBRARY) {
+            query = query.header(k, v)
+        }
+        let Ok(resp) = query.send() else { continue };
+        if !resp.status().is_success() {
+            continue;
+        }
+        let Ok(body) = resp.bytes() else { continue };
+        if let Ok(envelope) = envelope_from_doh_json(networks, &body, network) {
+            println!("    envelope from DNS ({})", resolver_label(resolver));
+            return Ok(envelope);
+        }
+    }
+    bail!("no resolver gave the signed key configuration")
+}
+
+/// `--split <network> <count> <authority> <path>`: `count` gRPC POSTs of an empty message, each
+/// through the relay the library chooses (with the shares of a relay weights block when the
+/// envelope carries a valid one and a key is configured), the outcome reported back to the
+/// selector as a wallet does. Prints the relay weights in force and, per relay position (never
+/// a URL), the requests answered with a sealed 200 and the others.
+fn split_test(network: &str, count: &str, authority: &str, path: &str) -> Result<()> {
+    let network = network_named(network)?;
+    let count: usize = count
+        .parse()
+        .map_err(|_| anyhow::anyhow!("count must be a number"))?;
+    let networks = networks()?;
+    let Some(config) = networks.get(network) else {
+        bail!("no OHTTP configuration for {}", network.as_str());
+    };
+    let http = http_client(60)?;
+    let from_dns = env_setting("OHTTP_E2E_SPLIT_KEYS")?.as_deref() == Some("dns");
+    let envelope = if from_dns {
+        envelope_from_dns(&http, &networks, network)?
+    } else {
+        envelope_through_relays(&http, config)?
+    };
+    let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+    let keys = verify_signed_config(
+        &networks,
+        &envelope,
+        network,
+        now,
+        &SignedConfigPolicy::LIBRARY,
+    )?;
+    println!(
+        "split: {} relays, envelope OK (not_after {})",
+        config.relays().len(),
+        keys.not_after
+    );
+    print_relay_weights(config);
+    let key = KeyConfig::select(&keys.document)?;
+    let request = Request::new("POST", authority, path)
+        .header("content-type", "application/grpc")
+        .header("te", "trailers")
+        .body(vec![0; 5]);
+    let selector = RelaySelector::global();
+    // (answered with a sealed 200, other outcomes) per relay position.
+    let mut counts = vec![(0usize, 0usize); config.relays().len()];
+    for _ in 0..count {
+        let Some((url, probe)) = config.choose_relay_where(|_| true) else {
+            bail!("no relay can take the request");
+        };
+        let index = config
+            .relays()
+            .iter()
+            .position(|relay| relay.url() == url)
+            .unwrap_or_default();
+        let (sealed, opener) = encapsulate_chunked_request(&key, &encode_request(&request)?)?;
+        let mut post = http.post(url).body(sealed);
+        for (k, v) in OuterHeaders::LIBRARY.relay_post(None) {
+            post = post.header(k, v)
+        }
+        let sent_at = Instant::now();
+        let answered = match post.send() {
+            Ok(resp) => {
+                let status = resp.status().as_u16();
+                let sealed_answer = resp
+                    .headers()
+                    .get("content-type")
+                    .and_then(|v| v.to_str().ok())
+                    .is_some_and(|ct| ct.contains(CONTENT_TYPE_CHUNKED_RES));
+                let opened = status == 200
+                    && sealed_answer
+                    && resp.bytes().is_ok_and(|body| opener.open(&body).is_ok());
+                if opened {
+                    selector.note_success_of_probe(url, sent_at, probe);
+                } else if relay_status_fails_over(status) || status == 200 {
+                    selector.note_failure_of_probe(url, sent_at, probe);
+                } else if relay_status_answered(status) {
+                    selector.note_answered_of(url, probe);
+                }
+                opened
+            }
+            Err(_) => {
+                selector.note_failure_of_probe(url, sent_at, probe);
+                false
+            }
+        };
+        if answered {
+            counts[index].0 += 1;
+        } else {
+            counts[index].1 += 1;
+        }
+    }
+    for (i, (ok, failed)) in counts.iter().enumerate() {
+        println!("split: relay[{i}] {ok} answered, {failed} other");
+    }
+    Ok(())
 }
 
 /// A resolver as printed: the host of its URL only (`https://dns.example:8443/dns-query` is
@@ -1316,6 +1501,32 @@ mod tests {
         );
         assert!(networks.get(Network::Mainnet).is_none());
         assert!(signer(&networks, Network::Testnet).is_ok());
+    }
+
+    #[test]
+    fn the_relay_weights_key_is_optional_and_checked() {
+        let networks = networks_from(env(&testnet())).unwrap();
+        assert!(networks
+            .get(Network::Testnet)
+            .unwrap()
+            .relay_weights_key()
+            .is_none());
+        let mut with_key = testnet();
+        with_key.push(("OHTTP_E2E_RELAY_WEIGHTS_PUBKEY_TESTNET", key_hex(3)));
+        let networks = networks_from(env(&with_key)).unwrap();
+        assert!(networks
+            .get(Network::Testnet)
+            .unwrap()
+            .relay_weights_key()
+            .is_some());
+        // Malformed, or the signing key itself: refused, naming the field only.
+        for bad in ["zz".to_string(), key_hex(1)] {
+            let mut refused = testnet();
+            refused.push(("OHTTP_E2E_RELAY_WEIGHTS_PUBKEY_TESTNET", bad.clone()));
+            let error = networks_from(env(&refused)).unwrap_err().to_string();
+            assert!(error.contains("relay_weights_pubkey"), "{error}");
+            assert!(!error.contains(&bad), "{error}");
+        }
     }
 
     #[test]

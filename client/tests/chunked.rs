@@ -73,6 +73,7 @@ fn gateway_config(key_id: u8, private_key_hex: &str) -> Config {
         log_outer_header_names: false,
         gateway_hosts: vec![],
         configs_signing_seed: None,
+        relay_weights_file: None,
         chunk_size: 16384,
         chunk_flush_ms: 50,
         flexa_publishable_key: None,

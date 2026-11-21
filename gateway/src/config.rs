@@ -265,6 +265,9 @@ pub struct Config {
     pub gateway_hosts: Vec<String>,
     /// Ed25519 seed for signing /ohttp-configs/signed (32-byte hex, 64 chars)
     pub configs_signing_seed: Option<String>,
+    /// The relay weights block file served in /ohttp-configs/signed (`crate::relay_weights`);
+    /// unset: no block.
+    pub relay_weights_file: Option<String>,
     /// Chunked OHTTP response chunk size in bytes (default 16384, 1024..=65536)
     pub chunk_size: usize,
     /// Chunked OHTTP response flush interval in milliseconds (default 50)
@@ -532,6 +535,9 @@ impl Config {
             configs_signing_seed: crate::config_source::var("CONFIGS_SIGNING_SEED_HEX")
                 .ok()
                 .filter(|s| !s.is_empty()),
+            relay_weights_file: crate::config_source::var("RELAY_WEIGHTS_FILE")
+                .ok()
+                .filter(|s| !s.is_empty()),
             chunk_size: parse_chunk_size(crate::config_source::var("CHUNK_SIZE").ok().as_deref())?,
             chunk_flush_ms: crate::config_source::var("CHUNK_FLUSH_MS")
                 .ok()
@@ -698,6 +704,7 @@ impl std::fmt::Debug for Config {
             .field("redis_url", &"<REDACTED>")
             .field("redis_security_url", &"<REDACTED>")
             .field("configs_signing_seed", &"<REDACTED>")
+            .field("relay_weights_file", &self.relay_weights_file)
             .field("flexa_publishable_key", &"<REDACTED>")
             .field("flexa_alias", &self.flexa_alias)
             .field("near_alias", &self.near_alias)
@@ -758,6 +765,7 @@ pub(crate) fn test_config() -> Config {
         log_outer_header_names: false,
         gateway_hosts: vec!["ohttp-gateway.example".to_string()],
         configs_signing_seed: None,
+        relay_weights_file: None,
         max_upstream_response_bytes: 1024 * 1024,
         max_inflight_upstream: 256,
         max_inflight_per_backend: 64,

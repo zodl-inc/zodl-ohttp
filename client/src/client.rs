@@ -122,6 +122,8 @@ pub struct Client {
     /// the other relays of a list, in list order (any of them is as good: the envelope is
     /// signed).
     other_key_urls: Vec<String>,
+    /// The position in the relay list of the relay each of `other_key_urls` goes through.
+    other_key_relays: Vec<usize>,
     http: reqwest::Client,
     config: Mutex<KeyCache>,
 }
@@ -155,7 +157,9 @@ impl Relays {
     fn choose(&self) -> (usize, RelayProbe) {
         match self {
             Relays::Fixed(_) => (0, RelayProbe::NONE),
-            Relays::Configured(config) => RelaySelector::global().choose_probe(config.relays()),
+            Relays::Configured(config) => {
+                RelaySelector::global().choose_probe(&config.weighted_relays())
+            }
         }
     }
 
@@ -164,6 +168,22 @@ impl Relays {
         match self {
             Relays::Fixed(url) => url,
             Relays::Configured(config) => config.relays()[index].url(),
+        }
+    }
+
+    /// Whether the relays are a configured list with a relay weights key.
+    fn has_weights_key(&self) -> bool {
+        matches!(self, Relays::Configured(config) if config.relay_weights_key().is_some())
+    }
+
+    /// Whether every relay is paused by a `Retry-After`.
+    fn all_paused(&self) -> bool {
+        match self {
+            Relays::Fixed(url) => RelayBackoff::global().remaining(url).is_some(),
+            Relays::Configured(config) => config
+                .relays()
+                .iter()
+                .all(|relay| RelayBackoff::global().remaining(relay.url()).is_some()),
         }
     }
 
@@ -178,7 +198,7 @@ impl Relays {
         match self {
             Relays::Fixed(_) => None,
             Relays::Configured(config) => {
-                RelaySelector::global().alternative(config.relays(), index)
+                RelaySelector::global().alternative(&config.weighted_relays(), index)
             }
         }
     }
@@ -353,10 +373,11 @@ impl Client {
             builder,
         )?;
         if config.relays().len() > 1 {
-            for relay in &config.relays()[1..] {
+            for (i, relay) in config.relays().iter().enumerate().skip(1) {
                 let other = signed_config_url(relay.url(), url_rule)?;
                 if !client.other_key_urls.contains(&other) && other != client.keys.url() {
                     client.other_key_urls.push(other);
+                    client.other_key_relays.push(i);
                 }
             }
             client.relays = Relays::Configured(Box::new(config.clone()));
@@ -428,6 +449,7 @@ impl Client {
             relays: Relays::Fixed(relay_url),
             keys,
             other_key_urls: Vec::new(),
+            other_key_relays: Vec::new(),
             http,
             config: Mutex::new(KeyCache::default()),
         })
@@ -560,6 +582,12 @@ impl Client {
         let encoded = encode_request(request)?;
         // Whether the request has moved to another relay already: at most once.
         let mut moved = false;
+        // With a relay weights key, the key configuration first: the envelope may carry the
+        // block that sets the shares this choice uses (a cached configuration costs nothing).
+        // Not while every relay is paused: that request fails on the pause, nothing sent.
+        if self.relays.has_weights_key() && !self.relays.all_paused() {
+            self.key_config(remaining()).await?;
+        }
         let (mut index, mut probe) = self.relays.choose();
         loop {
             let relay_url = self.relays.url(index);
@@ -718,26 +746,50 @@ impl Client {
         if self.other_key_urls.is_empty() {
             return self.fetch_from(self.keys.url(), timeout).await;
         }
+        let sources = self.key_sources();
         // The first source gets half the time (at least 3 s, at most 10 s), each other one an
         // equal part of what is left, so that one that does not answer leaves time for the next.
         let first_budget = (timeout / 2)
             .max(timeout.min(MIN_FIRST_KEY_SOURCE_TIMEOUT))
             .min(FIRST_KEY_SOURCE_TIMEOUT);
-        let first = self.fetch_from(self.keys.url(), first_budget).await;
+        let first = self.fetch_from(sources[0], first_budget).await;
         if first.is_ok() {
             return first;
         }
-        for (i, url) in self.other_key_urls.iter().enumerate() {
+        let others = &sources[1..];
+        for (i, url) in others.iter().enumerate() {
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
                 break;
             }
-            let sources_left = (self.other_key_urls.len() - i) as u32;
+            let sources_left = (others.len() - i) as u32;
             if let Ok(fetched) = self.fetch_from(url, left / sources_left).await {
                 return Ok(fetched);
             }
         }
         first
+    }
+
+    /// The envelope URLs in the order they are tried: the first relay's, then the others' in
+    /// list order; while a relay weights block is held, those of the relays it gives weight 0
+    /// go last (a relay can withhold the block, which its envelope signature does not cover).
+    fn key_sources(&self) -> Vec<&str> {
+        let mut sources: Vec<(&str, usize)> = std::iter::once((self.keys.url(), 0))
+            .chain(
+                self.other_key_urls
+                    .iter()
+                    .map(String::as_str)
+                    .zip(self.other_key_relays.iter().copied()),
+            )
+            .collect();
+        if let Relays::Configured(config) = &self.relays {
+            if let crate::RelayWeightsStatus::Block(block) = config.relay_weights() {
+                let weights = block.weights();
+                // Stable: list order among the relays of weight above 0, and among those of 0.
+                sources.sort_by_key(|&(_, i)| weights.get(i).is_some_and(|&w| w == 0));
+            }
+        }
+        sources.into_iter().map(|(url, _)| url).collect()
     }
 
     async fn fetch_from(&self, url: &str, timeout: Duration) -> Result<Fetched, Error> {
@@ -773,7 +825,19 @@ impl Client {
             KeyConfigSource::Signed {
                 network, signer, ..
             } => {
-                let keys = open_signed_config(&body, network.as_str(), signer, unix_now())?;
+                let now = unix_now();
+                let keys = open_signed_config(&body, network.as_str(), signer, now)?;
+                // The relay weights block the envelope may carry, for a client of a configured
+                // relay list (ignored when it does not check out; the keys stand either way).
+                if let Relays::Configured(config) = &self.relays {
+                    let _ = crate::weights::take_from_envelope(
+                        config,
+                        &body,
+                        *network,
+                        now,
+                        crate::SignatureCheck::Strict,
+                    );
+                }
                 Ok(Fetched {
                     config: KeyConfig::select(&keys.document)?,
                     not_after: Some(keys.not_after),
@@ -2039,5 +2103,120 @@ mod tests {
         };
         assert_eq!(http.kind(), HttpErrorKind::Status(404));
         assert_shows_no_peer(&error, port);
+    }
+
+    /// A client of the relays `/a` and `/b` on one local server, with the relay weights key of
+    /// the seed `[weights_seed; 32]`, whose envelope (fetched through `/a`) carries the block
+    /// `block(config)` when it gives one; and the requests the server saw by path.
+    async fn weighted_client(
+        weights_seed: u8,
+        block: impl Fn(&crate::OhttpConfig) -> Option<Vec<u8>>,
+    ) -> (
+        Client,
+        crate::OhttpConfig,
+        std::sync::Arc<Mutex<std::collections::HashMap<String, usize>>>,
+    ) {
+        let (envelope, signer) = signed_envelope();
+        let seen = std::sync::Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let counter = seen.clone();
+        let served = std::sync::Arc::new(Mutex::new(envelope));
+        let answer_with = served.clone();
+        let (port, _) = tls::serve(
+            true,
+            std::sync::Arc::new(move |path: &str| {
+                *counter.lock().unwrap().entry(path.to_string()).or_insert(0) += 1;
+                Some(match path {
+                    "/a/ohttp-configs/signed" | "/b/ohttp-configs/signed" => tls::response(
+                        "200 OK",
+                        &[("content-type", "application/json")],
+                        &answer_with.lock().unwrap(),
+                    ),
+                    _ => refused("413 Payload Too Large"),
+                })
+            }),
+        )
+        .await;
+        let base = format!("https://localhost:{port}");
+        let config = crate::OhttpConfig::new(crate::OhttpConfigParams {
+            gateway_host: "ohttp-gateway-testnet.example",
+            relay_url: &format!("{base}/a,{base}/b"),
+            keys_dns_name: "testnet.ohttp-keys.example",
+            signing_pubkey: &hex::encode(signer.as_bytes()),
+        })
+        .unwrap()
+        .with_relay_weights_key(&crate::config::tests::key_hex(weights_seed))
+        .unwrap();
+        if let Some(block) = block(&config) {
+            let mut envelope = served.lock().unwrap().clone();
+            envelope.pop();
+            envelope.extend_from_slice(b",\"relay_weights\":");
+            envelope.extend_from_slice(&block);
+            envelope.push(b'}');
+            *served.lock().unwrap() = envelope;
+        }
+        let networks = OhttpNetworks::new(None, Some(config.clone())).unwrap();
+        let client = Client::for_network_with(
+            &networks,
+            Network::Testnet,
+            SignedConfigUrlRule::ReplaceRelaySuffix,
+            tls::builder(),
+            DEFAULT_LIST_CONNECT_TIMEOUT,
+        )
+        .unwrap();
+        (client, config, seen)
+    }
+
+    /// The block changes where requests go and nothing else: the same requests, of the same
+    /// shape, are made with and without it.
+    #[tokio::test]
+    async fn a_relay_weights_block_adds_no_request_and_steers_the_posts() {
+        let request = Request::new("GET", "backend.example", "/v1/info");
+        let (with, config, seen_with) = weighted_client(40, |config| {
+            Some(crate::weights::tests::Fields::new(config, unix_now(), &[0, 100]).signed(40))
+        })
+        .await;
+        for _ in 0..6 {
+            let Err(Error::Refused { status: 413 }) =
+                with.send(&request, Duration::from_secs(10)).await
+            else {
+                panic!("the request was not posted");
+            };
+        }
+        let crate::RelayWeightsStatus::Block(held) = config.relay_weights() else {
+            panic!("the client did not take the block");
+        };
+        assert_eq!(held.weights(), vec![0, 100]);
+        let seen_with = seen_with.lock().unwrap().clone();
+        assert_eq!(seen_with.get("/b"), Some(&6), "{seen_with:?}");
+        assert_eq!(seen_with.get("/a"), None, "{seen_with:?}");
+
+        let (without, config, seen_without) = weighted_client(41, |_| None).await;
+        for _ in 0..6 {
+            let Err(Error::Refused { status: 413 }) =
+                without.send(&request, Duration::from_secs(10)).await
+            else {
+                panic!("the request was not posted");
+            };
+        }
+        assert_eq!(
+            config.relay_weights(),
+            crate::RelayWeightsStatus::AppDefaults
+        );
+        let seen_without = seen_without.lock().unwrap().clone();
+        // One envelope fetch through the first relay, six posts, with or without the block.
+        let fetches = |seen: &std::collections::HashMap<String, usize>| {
+            seen.iter()
+                .filter(|(path, _)| path.ends_with("/ohttp-configs/signed"))
+                .map(|(path, &n)| (path.clone(), n))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            fetches(&seen_with),
+            vec![("/a/ohttp-configs/signed".to_string(), 1)]
+        );
+        assert_eq!(fetches(&seen_with), fetches(&seen_without));
+        let total = |seen: &std::collections::HashMap<String, usize>| seen.values().sum::<usize>();
+        assert_eq!(total(&seen_with), total(&seen_without));
+        assert_eq!(total(&seen_with), 7);
     }
 }

@@ -2,6 +2,57 @@
 
 [Keep a Changelog](https://keepachangelog.com).
 
+## 2.5.0
+
+No breaking change (a minor release: new public items). Without a relay weights key nothing
+changes.
+
+### Added
+
+- Relay weights: the shares of a network's relays from a separately signed block, `relay_weights`,
+  that the gateway's signed key-configuration envelope may carry (`docs/relay-weights.md`). The
+  block names no relay: `n`, the fingerprint `set` of the configured list and one integer weight
+  per position, adding up to 100. Its Ed25519 signature (RFC 8032) covers a message of its own
+  (domain `zodl-ohttp-relay-weights-v1`, network, `seq`, validity, `n`, `set`, weights), under a
+  key of its own; the envelope's signature does not cover it.
+  - `OhttpConfig::with_relay_weights_key(hex)` (an empty value: none; refused if it is the
+    key-configuration signing key, `RelayWeightsKeyError`), `relay_weights_key()`,
+    `relay_set()`, and `relay_weights()` / `relay_weights_at(now)`: `RelayWeightsStatus::AppDefaults`
+    or `RelayWeightsStatus::Block(RelayWeights)` (`id()`, the block id for a diagnostics screen;
+    `seq()`, `not_before()`, `not_after()`, `weights()`, `valid_at(now)`).
+  - `relay_set(urls)` and the constants `RELAY_WEIGHTS_DOMAIN`,
+    `RELAY_WEIGHTS_FIELD`, `RELAY_WEIGHTS_TOTAL`, `MAX_RELAY_WEIGHTS_BLOCK_BYTES`,
+    `MAX_RELAY_WEIGHTS_VALIDITY_SECS`.
+  - `docs/relay-weights-test-vector.json`: key, relay list, set, signed message, signature,
+    block and block id.
+
+### Changed
+
+- `verify_signed_config` (and the envelopes `Client::for_network` fetches) also check the block
+  when the network's configuration has a relay weights key, under the envelope's signature
+  check. A valid block is held in memory (nothing is persisted) and applies, from then on and
+  at every choice, while it is valid: `choose_relay`, `choose_relay_where`,
+  `choose_relay_for(_where)` and `Client` draw by its weights; the failover order follows them,
+  and a relay of weight 0 is never drawn, only taken over to while the others are out. Probes,
+  holds and failover are unchanged, and no choice leaves the configured list.
+- A block is ignored (the block held, if any, stays in force; otherwise equal shares) when: no
+  key is configured (the block is not read); it is over 4096 bytes, not a JSON object of exactly its ten fields (each once), or a
+  field has another type (weights must be JSON integers); `v` is not 1; it names the other
+  network; `n` or the number of weights is not the number of relays; `set` is not the list's
+  fingerprint; a weight is over 100 or the weights do not add up to 100; it is valid for more
+  than 30 days, or not now (60 s of skew on each end); `seq` is more than 60 s ahead of the
+  clock; the signature does not verify; or `seq` is lower than that of the block held, or equal
+  to it with another block id. An ignored block never makes the envelope fail, and neither it nor
+  an envelope without a block drops the block held. An expired block stops applying at once,
+  without a new fetch.
+- `Client`: with a relay weights key, the key configuration is fetched before the first relay
+  choice (so that the block it carries applies to that choice), and while a block is held the
+  envelope is fetched through the relays of weight 0 last.
+- `OhttpNetworks::new` refuses a relay weights key that is the other network's weights or signing
+  key (`ConfigError::SharedAcrossNetworks` of `ConfigField::SigningPubkey`). A process holds the
+  blocks of at most 16 keys and relay lists; a block for another one is then ignored (nothing held
+  is ever forgotten, so no older block can come back).
+
 ## 2.4.0
 
 No breaking change (a minor release: new public items).
