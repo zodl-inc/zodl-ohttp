@@ -57,6 +57,14 @@ pub const MAX_RELAY_FAILOVER_HOLD: Duration = Duration::from_secs(16 * 60);
 /// Where a relay list's next entry begins: a `,` followed by the next URL's scheme.
 pub(crate) const LIST_SEPARATOR: &str = ",https://";
 
+/// Whether an outer refusal with `status` is about the request itself (`400`, `409`, `413`,
+/// `415`, `422`, `426`): the relay answered, though the status does not prove it delivered
+/// (a front end may write one too). Report it with [`RelaySelector::note_answered_of`], which
+/// ends the relay's probe after a hold without counting a success or a failure.
+pub const fn relay_status_answered(status: u16) -> bool {
+    matches!(status, 400 | 409 | 413 | 415 | 422 | 426)
+}
+
 /// Whether an outer answer with `status` holds its relay out of the choice
 /// ([`RelaySelector::note_failure`]): `429`, any `5xx`, a redirect (never followed), and the
 /// refusals that say the relay cannot deliver to the gateway at all (`401`, `403`, `404`,
@@ -206,6 +214,103 @@ struct SelectorState {
     /// like older news; [`MASKED_FAILURES_TO_HOLD`] of them within [`MASKED_FAILURE_WINDOW`]
     /// count after all.
     masked: HashMap<String, Vec<Instant>>,
+    /// The last probe handed out ([`RelayProbe`]); never 0 once one was.
+    probes: u64,
+}
+
+impl SelectorState {
+    /// Records `relays` as the list each of them was chosen from.
+    fn remember(&mut self, relays: &[Relay]) {
+        use std::hash::{Hash as _, Hasher as _};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        for relay in relays {
+            relay.key.hash(&mut hasher);
+        }
+        let id = hasher.finish();
+        let state = self;
+        if relays.iter().all(|r| state.lists.get(&r.key) == Some(&id)) {
+            return;
+        }
+        if state.lists.len() + relays.len() > MAX_HELD_RELAYS {
+            state.lists.clear();
+        }
+        for relay in relays {
+            state.lists.insert(relay.key.clone(), id);
+        }
+    }
+
+    /// Whether the relay of key `key` is held out at `now`: during its hold, and after it
+    /// while the one probe let through has not reported (for at most [`RELAY_PROBE_WINDOW`]).
+    /// When it is not, and its hold has just ended, this request becomes the probe.
+    fn admit(&mut self, key: &str, now: Instant) -> Option<RelayProbe> {
+        let state = self;
+        let Some(h) = state.held.get_mut(key) else {
+            return Some(RelayProbe::NONE);
+        };
+        if h.until > now {
+            return None;
+        }
+        // A probe out keeps the others away, however old the hold.
+        if h.probe
+            .is_some_and(|(at, _)| now.saturating_duration_since(at) < RELAY_PROBE_WINDOW)
+        {
+            return None;
+        }
+        if !h.remembered(now) {
+            return Some(RelayProbe::NONE);
+        }
+        // A counter that never hands out a value twice: once spent (never, in practice), the
+        // request goes through as no probe.
+        let Some(id) = state.probes.checked_add(1) else {
+            return Some(RelayProbe::NONE);
+        };
+        state.probes = id;
+        h.probe = Some((now, id));
+        Some(RelayProbe(id))
+    }
+
+    /// Whether the relay at index `i` of `relays` may take a request at `now` (letting it
+    /// through as the probe after a hold when it is the one).
+    fn available(
+        &mut self,
+        relays: &[Relay],
+        i: usize,
+        now: Instant,
+        pauses: &Pauses<'_>,
+    ) -> Option<RelayProbe> {
+        if pauses.paused(relays, i, now) {
+            return None;
+        }
+        self.admit(&relays[i].key, now)
+    }
+
+    /// Whether the relay at index `i` of `relays` may be sent to at `now` at all: not paused
+    /// (a hold is advice, a `Retry-After` pause is the relay's own refusal).
+    fn unpaused(&self, relays: &[Relay], i: usize, now: Instant, pauses: &Pauses<'_>) -> bool {
+        !pauses.paused(relays, i, now) && !self.probing(&relays[i].key, now)
+    }
+
+    /// Whether the relay of key `key` has a probe out (let through after its hold, not yet
+    /// reported, within [`RELAY_PROBE_WINDOW`]): the fallback that ignores holds leaves it alone
+    /// too, so that one request at a time stays one.
+    fn probing(&self, key: &str, now: Instant) -> bool {
+        // Whether the hold has ended or not: a probe kept while a later failure holds the relay
+        // again is still out.
+        self.held.get(key).is_some_and(|h| {
+            h.probe
+                .is_some_and(|(at, _)| now.saturating_duration_since(at) < RELAY_PROBE_WINDOW)
+        })
+    }
+
+    /// Whether a report of a request the choice gave `probe` counts: one that was no probe,
+    /// or the current probe of the relay of key `key`.
+    fn current(&self, key: &str, probe: RelayProbe) -> bool {
+        !probe.is_probe()
+            || self
+                .held
+                .get(key)
+                .is_some_and(|h| h.probe.is_some_and(|(_, id)| id == probe.0))
+    }
 }
 
 /// How many failures set aside as older news (a later request had succeeded) hold a relay
@@ -221,6 +326,44 @@ pub const MASKED_FAILURE_WINDOW: Duration = Duration::from_secs(5 * 60);
 /// still go elsewhere until it reports or this long has passed.
 pub const RELAY_PROBE_WINDOW: Duration = Duration::from_secs(30);
 
+/// Which probe a relay choice let through after the relay's hold, if it let one through: an
+/// opaque value the caller keeps with the request and passes back with its report
+/// ([`RelaySelector::note_failure_of_probe`], [`RelaySelector::note_success_of_probe`],
+/// [`RelaySelector::note_answered_of`]), so that only the report of the relay's current probe
+/// ends it. The report of a probe a newer one has replaced (a request chosen as the probe but
+/// sent late) never ends the newer probe: its answer changes nothing, its success only makes
+/// older failures older news, and its failure counts as any failure.
+/// [`RelayProbe::NONE`] for a request that was no probe.
+///
+/// It carries no relay URL and no time: a counter, for passing through a foreign-function
+/// interface as [`to_raw`](Self::to_raw) / [`from_raw`](Self::from_raw) (an unsigned 64-bit
+/// value: `ULong` in Kotlin, `UInt64` in Swift).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct RelayProbe(u64);
+
+impl RelayProbe {
+    /// A request that was no probe.
+    pub const NONE: RelayProbe = RelayProbe(0);
+
+    /// Whether the choice let the request through as a relay's probe.
+    pub const fn is_probe(self) -> bool {
+        self.0 != 0
+    }
+
+    /// The value as a number, for passing it through a foreign-function interface.
+    pub const fn to_raw(self) -> u64 {
+        self.0
+    }
+
+    /// The value [`to_raw`](Self::to_raw) gave, passed back unchanged to the selector and for
+    /// the relay it came from (`0` is [`RelayProbe::NONE`]). The value is no secret and no
+    /// proof: a number made up by the caller may match a current probe, and each
+    /// [`RelaySelector`] counts its own.
+    pub const fn from_raw(raw: u64) -> Self {
+        RelayProbe(raw)
+    }
+}
+
 /// A relay held out of the choice.
 #[derive(Clone, Copy, Debug)]
 struct Hold {
@@ -235,8 +378,8 @@ struct Hold {
     last: Instant,
     /// The list the relay was last chosen from, if it was.
     list: Option<u64>,
-    /// When the probe after the hold was let through, if one was.
-    probe: Option<Instant>,
+    /// When the probe after the hold was let through, and which one, if one was.
+    probe: Option<(Instant, u64)>,
 }
 
 impl Hold {
@@ -248,7 +391,7 @@ impl Hold {
             .is_none_or(|end| end > now)
             || self
                 .probe
-                .is_some_and(|at| now.saturating_duration_since(at) < RELAY_PROBE_WINDOW)
+                .is_some_and(|(at, _)| now.saturating_duration_since(at) < RELAY_PROBE_WINDOW)
     }
 }
 
@@ -317,8 +460,23 @@ impl RelaySelector {
     /// relay's current hold began, or during a hold that has ended since, changes nothing (one
     /// sent during a hold that still runs, when every relay was out, failed anew and extends
     /// it).
+    ///
+    /// A request a choice let through as a probe reports with
+    /// [`note_failure_of_probe`](Self::note_failure_of_probe) instead.
     pub fn note_failure_of(&self, relay_url: &str, sent_at: Instant) {
         self.note_failure_with(relay_url, sent_at, Instant::now());
+    }
+
+    /// [`note_failure_of`](Self::note_failure_of) for a request the choice gave `probe`
+    /// ([`crate::OhttpConfig::choose_relay_where`]): the failure of the relay's current probe
+    /// ends that probe and holds the relay again, twice as long. The failure of a probe no
+    /// longer current (replaced by a newer one after [`RELAY_PROBE_WINDOW`], or ended by
+    /// another report) counts as any failure of a request sent at `sent_at` (so that a relay
+    /// whose every probe hangs past the window is still held), but never ends the newer probe:
+    /// that one's own report still counts. With [`RelayProbe::NONE`], exactly
+    /// [`note_failure_of`](Self::note_failure_of).
+    pub fn note_failure_of_probe(&self, relay_url: &str, sent_at: Instant, probe: RelayProbe) {
+        self.note_failure_probe_with(relay_url, sent_at, Instant::now(), probe);
     }
 
     /// [`note_failure`](Self::note_failure) at `now`, for a request sent then.
@@ -326,9 +484,35 @@ impl RelaySelector {
         self.note_failure_with(relay_url, now, now);
     }
 
+    /// [`note_failure_of_probe`](Self::note_failure_of_probe) at `now`, for a request sent
+    /// then, for tests.
+    #[cfg(test)]
+    fn note_failure_probe_at(&self, relay_url: &str, now: Instant, probe: RelayProbe) {
+        self.note_failure_probe_with(relay_url, now, now, probe);
+    }
+
     fn note_failure_with(&self, relay_url: &str, sent_at: Instant, now: Instant) {
+        self.note_failure_probe_with(relay_url, sent_at, now, RelayProbe::NONE);
+    }
+
+    fn note_failure_probe_with(
+        &self,
+        relay_url: &str,
+        sent_at: Instant,
+        now: Instant,
+        probe: RelayProbe,
+    ) {
         let key = held_key(relay_url);
         let mut state = self.state();
+        // A probe no longer current failed all the same: the failure counts, but the newer
+        // probe stays the relay's, its own report still to come.
+        let current = state.current(&key, probe);
+        // The probe's own report ends it, whatever the rest of its failure counts for.
+        if current && probe.is_probe() {
+            if let Some(h) = state.held.get_mut(&key) {
+                h.probe = None;
+            }
+        }
         if state.failed.get(&key).is_some_and(|&last| sent_at < last) {
             return;
         }
@@ -391,7 +575,11 @@ impl RelaySelector {
         entry.since = since;
         entry.last = sent_at;
         entry.list = list;
-        entry.probe = None;
+        // Only the probe's own failure ends it; any other starts a hold longer than the probe
+        // window, which keeps the relay out all the same.
+        if current && probe.is_probe() {
+            entry.probe = None;
+        }
         if entry.until < until {
             entry.until = until;
         }
@@ -410,9 +598,38 @@ impl RelaySelector {
 
     /// [`note_success`](Self::note_success) for a request sent at `sent_at`: a hold that began
     /// after the request was sent (another request failed meanwhile) is left as it is.
+    ///
+    /// A request a choice let through as a probe reports with
+    /// [`note_success_of_probe`](Self::note_success_of_probe) instead.
     pub fn note_success_of(&self, relay_url: &str, sent_at: Instant) {
+        self.note_success_of_probe(relay_url, sent_at, RelayProbe::NONE);
+    }
+
+    /// [`note_success_of`](Self::note_success_of) for a request the choice gave `probe`
+    /// ([`crate::OhttpConfig::choose_relay_where`]): the success of the relay's current probe
+    /// ends its hold. That of a probe no longer current (replaced by a newer one after
+    /// [`RELAY_PROBE_WINDOW`], or ended by another report) ends neither the hold nor the newer
+    /// probe; it only makes the failures of requests sent before it older news. With
+    /// [`RelayProbe::NONE`], exactly [`note_success_of`](Self::note_success_of).
+    pub fn note_success_of_probe(&self, relay_url: &str, sent_at: Instant, probe: RelayProbe) {
         let key = held_key(relay_url);
         let mut state = self.state();
+        if !state.current(&key, probe) {
+            // A probe no longer current got its answer: older failures are older news, but
+            // the hold and the newer probe are left to that probe's own report.
+            let newest = state
+                .cleared
+                .get(&key)
+                .map_or(sent_at, |&ok| ok.max(sent_at));
+            bounded_insert(&mut state.cleared, key, newest);
+            return;
+        }
+        // The probe's own report ends it, whatever the rest of its success counts for.
+        if probe.is_probe() {
+            if let Some(h) = state.held.get_mut(&key) {
+                h.probe = None;
+            }
+        }
         // Recorded for every success (the table is bounded): a request sent earlier may still
         // report a failure, which is older news.
         let newest = state
@@ -429,13 +646,18 @@ impl RelaySelector {
         }
         state.held.remove(&key);
         // Others of the list that failed with it (not one held longer, down on its own).
+        // One with its probe out is left to that probe's own report.
         if mine.list.is_some() {
             let mut released = Vec::new();
             state.held.retain(|k, h| {
                 let keep = h.list != mine.list
                     || h.since > sent_at
                     || h.last > sent_at
-                    || h.hold > RELAY_FAILOVER_HOLD;
+                    || h.hold > RELAY_FAILOVER_HOLD
+                    // (out when this request was sent: the report's own clock)
+                    || h.probe.is_some_and(|(at, _)| {
+                        sent_at.saturating_duration_since(at) < RELAY_PROBE_WINDOW
+                    });
                 if !keep {
                     released.push(k.clone());
                 }
@@ -451,71 +673,54 @@ impl RelaySelector {
         }
     }
 
-    /// Records `relays` as the list each of them was chosen from.
-    fn remember(&self, relays: &[Relay]) {
-        use std::hash::{Hash as _, Hasher as _};
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        for relay in relays {
-            relay.key.hash(&mut hasher);
-        }
-        let id = hasher.finish();
+    /// A request through the relay at `relay_url`, to which the choice gave `probe`, was
+    /// refused with an outer status for which [`relay_status_answered`] holds: an answer about
+    /// the request itself, which shows the relay answered but not that it delivered (a front end
+    /// may write such a status too). Neither a success nor a failure: if `probe` is the relay's
+    /// current probe after its hold, the probe ends and the next request may probe the relay, so
+    /// that it does not stay at one request per [`RELAY_PROBE_WINDOW`]. The hold and its
+    /// doubling are left as they are. A probe no longer current (replaced by a newer one, or
+    /// ended by another report), and [`RelayProbe::NONE`], change nothing. Nothing is resent.
+    pub fn note_answered_of(&self, relay_url: &str, probe: RelayProbe) {
+        let key = held_key(relay_url);
         let mut state = self.state();
-        if relays.iter().all(|r| state.lists.get(&r.key) == Some(&id)) {
+        if !probe.is_probe() || !state.current(&key, probe) {
             return;
         }
-        if state.lists.len() + relays.len() > MAX_HELD_RELAYS {
-            state.lists.clear();
-        }
-        for relay in relays {
-            state.lists.insert(relay.key.clone(), id);
+        if let Some(h) = state.held.get_mut(&key) {
+            h.probe = None;
         }
     }
 
-    /// Whether the relay of key `key` is held out at `now`: during its hold, and after it
-    /// while the one probe let through has not reported (for at most [`RELAY_PROBE_WINDOW`]).
-    /// When it is not, and its hold has just ended, this request becomes the probe.
-    fn admit(&self, key: &str, now: Instant) -> bool {
-        let mut state = self.state();
-        let Some(h) = state.held.get_mut(key) else {
-            return true;
-        };
-        if h.until > now {
-            return false;
-        }
-        // A probe out keeps the others away, however old the hold.
-        if h.probe
-            .is_some_and(|at| now.saturating_duration_since(at) < RELAY_PROBE_WINDOW)
-        {
-            return false;
-        }
-        if !h.remembered(now) {
-            return true;
-        }
-        h.probe = Some(now);
-        true
+    /// [`SelectorState::unpaused`] under the lock, for tests.
+    #[cfg(test)]
+    fn unpaused(&self, relays: &[Relay], i: usize, now: Instant, pauses: &Pauses<'_>) -> bool {
+        self.state().unpaused(relays, i, now, pauses)
     }
 
-    /// Whether the relay at index `i` of `relays` may take a request at `now` (letting it
-    /// through as the probe after a hold when it is the one).
-    fn available(&self, relays: &[Relay], i: usize, now: Instant, backoff: &RelayBackoff) -> bool {
-        backoff.remaining_at(relays[i].url(), now).is_none() && self.admit(&relays[i].key, now)
+    /// Whether `probe` is the current probe of the relay at `relay_url`, for tests.
+    #[cfg(test)]
+    fn is_current(&self, relay_url: &str, probe: RelayProbe) -> bool {
+        probe.is_probe() && self.state().current(&held_key(relay_url), probe)
     }
 
-    /// Whether the relay at index `i` of `relays` may be sent to at `now` at all: not paused
-    /// (a hold is advice, a `Retry-After` pause is the relay's own refusal).
-    fn unpaused(&self, relays: &[Relay], i: usize, now: Instant, backoff: &RelayBackoff) -> bool {
-        backoff.remaining_at(relays[i].url(), now).is_none() && !self.probing(&relays[i].key, now)
+    /// [`note_failure_of_probe`](Self::note_failure_of_probe) for a request sent at
+    /// `sent_at`, reported at `now`, for tests.
+    #[cfg(test)]
+    fn note_failure_of_probe_with(
+        &self,
+        relay_url: &str,
+        sent_at: Instant,
+        now: Instant,
+        probe: RelayProbe,
+    ) {
+        self.note_failure_probe_with(relay_url, sent_at, now, probe);
     }
 
-    /// Whether the relay of key `key` has a probe out (let through after its hold, not yet
-    /// reported, within [`RELAY_PROBE_WINDOW`]): the fallback that ignores holds leaves it alone
-    /// too, so that one request at a time stays one.
+    /// [`SelectorState::probing`] under the lock, for tests.
+    #[cfg(test)]
     fn probing(&self, key: &str, now: Instant) -> bool {
-        self.state().held.get(key).is_some_and(|h| {
-            h.until <= now
-                && h.probe
-                    .is_some_and(|at| now.saturating_duration_since(at) < RELAY_PROBE_WINDOW)
-        })
+        self.state().probing(key, now)
     }
 
     /// The hold of the relay at `relay_url`, for tests.
@@ -554,42 +759,161 @@ impl RelaySelector {
         if relays.len() < 2 {
             return 0;
         }
-        self.remember(relays);
+        self.choose_among(relays, draw, now, backoff, None)
+            .map_or(0, |(i, _)| i)
+    }
+
+    /// [`choose`](Self::choose), with the probe the choice let through, if any. With every
+    /// relay's probe out, the relay drawn as no probe (the one case where a request that is no
+    /// probe goes to a relay while its probe is out; see `Client::for_network`).
+    #[cfg_attr(not(feature = "client"), allow(dead_code))]
+    pub(crate) fn choose_probe(&self, relays: &[Relay]) -> (usize, RelayProbe) {
+        if relays.len() < 2 {
+            return (0, RelayProbe::NONE);
+        }
+        self.choose_among(
+            relays,
+            random_draw(),
+            Instant::now(),
+            RelayBackoff::global(),
+            None,
+        )
+        .unwrap_or((0, RelayProbe::NONE))
+    }
+
+    /// [`choose_with_where`](Self::choose_with_where) without the probe, for tests.
+    #[cfg(test)]
+    fn choose_index_where(
+        &self,
+        relays: &[Relay],
+        draw: u64,
+        now: Instant,
+        backoff: &RelayBackoff,
+        eligible: &dyn Fn(&str) -> bool,
+    ) -> Option<usize> {
+        self.choose_with_where(relays, draw, now, backoff, eligible)
+            .map(|(i, _)| i)
+    }
+
+    /// [`choose_with`](Self::choose_with), with the probe the choice let through, for tests.
+    #[cfg(test)]
+    fn choose_probe_with(
+        &self,
+        relays: &[Relay],
+        draw: u64,
+        now: Instant,
+        backoff: &RelayBackoff,
+    ) -> (usize, RelayProbe) {
+        self.choose_among(relays, draw, now, backoff, None)
+            .unwrap_or((0, RelayProbe::NONE))
+    }
+
+    /// The index of the relay a request goes to, as [`choose`](Self::choose), with the
+    /// caller's criterion: `eligible` is asked once per relay, before anything else, and a
+    /// relay for which it is false is treated as paused (the caller cannot send there, a pause
+    /// of its own that the selector does not see, say). Such a relay is passed over, never let
+    /// through as the probe after its hold, and never returned. `None` when no relay eligible
+    /// can take the request: none is eligible, or every eligible one has a probe out. A relay
+    /// eligible but paused by `Retry-After` may be returned (the caller's pause check then
+    /// fails the request locally, nothing sent), as [`choose`](Self::choose) does.
+    pub(crate) fn choose_where(
+        &self,
+        relays: &[Relay],
+        eligible: &dyn Fn(&str) -> bool,
+    ) -> Option<(usize, RelayProbe)> {
+        self.choose_with_where(
+            relays,
+            random_draw(),
+            Instant::now(),
+            RelayBackoff::global(),
+            eligible,
+        )
+    }
+
+    /// [`choose_where`](Self::choose_where) with the draw `draw`, at `now`, against the pauses
+    /// of `backoff`.
+    pub(crate) fn choose_with_where(
+        &self,
+        relays: &[Relay],
+        draw: u64,
+        now: Instant,
+        backoff: &RelayBackoff,
+        eligible: &dyn Fn(&str) -> bool,
+    ) -> Option<(usize, RelayProbe)> {
+        // Asked once per relay, so that the answer cannot change between the choice and the
+        // probe it may let through.
+        let eligible: Vec<bool> = relays.iter().map(|r| eligible(r.url())).collect();
+        if relays.len() < 2 {
+            return eligible
+                .first()
+                .copied()
+                .unwrap_or(false)
+                .then_some((0, RelayProbe::NONE));
+        }
+        self.choose_among(relays, draw, now, backoff, Some(&eligible))
+    }
+
+    /// The choice of [`choose_with`](Self::choose_with) (`eligible` `None`: every relay) or
+    /// [`choose_with_where`](Self::choose_with_where) (only the relays marked eligible).
+    fn choose_among(
+        &self,
+        relays: &[Relay],
+        draw: u64,
+        now: Instant,
+        backoff: &RelayBackoff,
+        eligible: Option<&[bool]>,
+    ) -> Option<(usize, RelayProbe)> {
+        let pauses = Pauses { backoff, eligible };
+        let pauses = &pauses;
+        // One lock for the whole choice, so that no report changes what it saw half way.
+        let mut guard = self.state();
+        let state = &mut *guard;
+        state.remember(relays);
         let weights: Vec<u32> = relays.iter().map(Relay::weight).collect();
         let drawn = pick(&weights, draw).unwrap_or(0);
         let order = failover_order(&weights, drawn);
-        order
-            .iter()
-            .copied()
-            .find(|&i| self.available(relays, i, now, backoff))
-            .or_else(|| {
-                order
-                    .iter()
-                    .copied()
-                    .find(|&i| self.unpaused(relays, i, now, backoff))
-            })
-            // Every relay paused or with a probe out: a paused one (the request then fails
-            // locally, nothing posted) rather than one whose probe is out; the relay drawn only
-            // when every relay has a probe out.
-            .or_else(|| {
-                order
-                    .iter()
-                    .copied()
-                    .find(|&i| !self.probing(&relays[i].key, now))
-            })
-            .unwrap_or(drawn)
+        let allowed = |i: usize| eligible.is_none_or(|e| e[i]);
+        let first = order.iter().copied().find_map(|i| {
+            state
+                .available(relays, i, now, pauses)
+                .map(|probe| (i, probe))
+        });
+        first.or_else(|| {
+            order
+                .iter()
+                .copied()
+                .find(|&i| state.unpaused(relays, i, now, pauses))
+                // Every relay paused or with a probe out: a paused one (the request then fails
+                // locally, nothing posted) rather than one whose probe is out. Never one the
+                // caller cannot send to.
+                .or_else(|| {
+                    order
+                        .iter()
+                        .copied()
+                        .find(|&i| allowed(i) && !state.probing(&relays[i].key, now))
+                })
+                // Every relay with a probe out: the relay drawn, unless the caller has a
+                // criterion.
+                .or_else(|| eligible.is_none().then_some(drawn))
+                .map(|i| (i, RelayProbe::NONE))
+        })
     }
 
     /// The relay of `relays` to take over a request that could not go through the one at
     /// index `failed`: the next one in its failover order that is neither held out nor paused,
     /// else one held but neither paused nor with a probe out, or `None`.
     #[cfg_attr(not(feature = "client"), allow(dead_code))]
-    pub(crate) fn alternative(&self, relays: &[Relay], failed: usize) -> Option<usize> {
-        self.alternative_with(relays, failed, Instant::now(), RelayBackoff::global())
+    pub(crate) fn alternative(
+        &self,
+        relays: &[Relay],
+        failed: usize,
+    ) -> Option<(usize, RelayProbe)> {
+        self.alternative_probe_with(relays, failed, Instant::now(), RelayBackoff::global())
     }
 
-    /// [`alternative`](Self::alternative) at `now`, against the pauses of `backoff`.
-    #[cfg_attr(not(any(feature = "client", test)), allow(dead_code))]
+    /// [`alternative`](Self::alternative) at `now`, against the pauses of `backoff`, without
+    /// the probe, for tests.
+    #[cfg(test)]
     pub(crate) fn alternative_with(
         &self,
         relays: &[Relay],
@@ -597,23 +921,60 @@ impl RelaySelector {
         now: Instant,
         backoff: &RelayBackoff,
     ) -> Option<usize> {
+        self.alternative_probe_with(relays, failed, now, backoff)
+            .map(|(i, _)| i)
+    }
+
+    /// [`alternative`](Self::alternative) at `now`, against the pauses of `backoff`.
+    #[cfg_attr(not(any(feature = "client", test)), allow(dead_code))]
+    fn alternative_probe_with(
+        &self,
+        relays: &[Relay],
+        failed: usize,
+        now: Instant,
+        backoff: &RelayBackoff,
+    ) -> Option<(usize, RelayProbe)> {
+        let pauses = Pauses {
+            backoff,
+            eligible: None,
+        };
+        let backoff = &pauses;
         let weights: Vec<u32> = relays.iter().map(Relay::weight).collect();
         let order: Vec<usize> = failover_order(&weights, failed)
             .into_iter()
             .skip(1)
             .collect();
         // One that is neither held nor paused; else one only held (a hold is advice, and
-        // nothing was sent yet), as for the first choice.
-        order
-            .iter()
-            .copied()
-            .find(|&i| self.available(relays, i, now, backoff))
-            .or_else(|| {
-                order
-                    .iter()
-                    .copied()
-                    .find(|&i| self.unpaused(relays, i, now, backoff))
-            })
+        // nothing was sent yet), as for the first choice. One lock for the whole choice.
+        let mut guard = self.state();
+        let state = &mut *guard;
+        let first = order.iter().copied().find_map(|i| {
+            state
+                .available(relays, i, now, backoff)
+                .map(|probe| (i, probe))
+        });
+        first.or_else(|| {
+            order
+                .iter()
+                .copied()
+                .find(|&i| state.unpaused(relays, i, now, backoff))
+                .map(|i| (i, RelayProbe::NONE))
+        })
+    }
+}
+
+/// What keeps a request from a relay before anything is sent: a `Retry-After` pause, or the
+/// caller's own criterion.
+struct Pauses<'a> {
+    backoff: &'a RelayBackoff,
+    /// Per relay, whether the caller can send there; `None`: every relay.
+    eligible: Option<&'a [bool]>,
+}
+
+impl Pauses<'_> {
+    fn paused(&self, relays: &[Relay], i: usize, now: Instant) -> bool {
+        self.eligible.is_some_and(|e| !e[i])
+            || self.backoff.remaining_at(relays[i].url(), now).is_some()
     }
 }
 
@@ -1303,7 +1664,11 @@ mod tests {
         backoff.note_at(B, Duration::from_secs(10), after);
         // A has its probe out, B is paused: the choice is B (the request fails locally on its
         // pause, nothing is posted), never A again.
-        assert!(!selector.unpaused(&relays, 0, after, &backoff));
+        let pauses = Pauses {
+            backoff: &backoff,
+            eligible: None,
+        };
+        assert!(!selector.unpaused(&relays, 0, after, &pauses));
         for draw in [0, u64::MAX] {
             assert_eq!(selector.choose_with(&relays, draw, after, &backoff), 1);
         }
@@ -1326,6 +1691,382 @@ mod tests {
         selector.note_failure_at(B, later);
         assert_eq!(selector.choose_with(&relays, 0, later, &backoff), 1);
         assert!(selector.probing(&held_key(A), later));
+    }
+
+    /// A relay the caller cannot send to is passed over, and never let through as a probe.
+    #[test]
+    fn an_ineligible_relay_is_passed_over_and_never_probed() {
+        let relays = weighted(&[(A, 70), (B, 30)]);
+        let selector = RelaySelector::new();
+        let backoff = RelayBackoff::new();
+        let t0 = Instant::now();
+        let not_a = |url: &str| url != A;
+        assert_eq!(
+            selector.choose_index_where(&relays, 0, t0, &backoff, &not_a),
+            Some(1)
+        );
+        // After A's hold, a draw that would make it the probe passes it over instead...
+        selector.note_failure_at(A, t0);
+        let after = t0 + RELAY_FAILOVER_HOLD;
+        assert_eq!(
+            selector.choose_index_where(&relays, 0, after, &backoff, &not_a),
+            Some(1)
+        );
+        // ...so the probe is still there for a request that can go to A.
+        assert_eq!(selector.choose_with(&relays, 0, after, &backoff), 0);
+    }
+
+    /// A probe answered with a refusal about the request ends, neither success nor failure:
+    /// the next request probes again, the hold stays as it was. An answer that is no probe's
+    /// ends nothing.
+    #[test]
+    fn an_answered_probe_ends_and_the_next_request_probes() {
+        let relays = weighted(&[(A, 70), (B, 30)]);
+        let selector = RelaySelector::new();
+        let backoff = RelayBackoff::new();
+        let t0 = Instant::now();
+        selector.note_failure_at(A, t0);
+        let after = t0 + RELAY_FAILOVER_HOLD;
+        let (chosen, probe) = selector.choose_probe_with(&relays, 0, after, &backoff);
+        assert_eq!(chosen, 0, "the probe");
+        assert!(probe.is_probe());
+        assert_eq!(selector.choose_with(&relays, 0, after, &backoff), 1);
+        // A request that was no probe does not end it.
+        selector.note_answered_of(A, RelayProbe::NONE);
+        assert_eq!(selector.choose_with(&relays, 0, after, &backoff), 1);
+        // The probe's own answer does (any spelling of the relay).
+        selector.note_answered_of("https://RELAY-A.example/relay/", probe);
+        let (chosen, again) = selector.choose_probe_with(&relays, 0, after, &backoff);
+        assert_eq!(chosen, 0, "probe again");
+        assert!(again.is_probe());
+        assert_ne!(again, probe);
+        assert_eq!(selector.choose_with(&relays, 0, after, &backoff), 1);
+        assert_eq!(selector.hold_of(A).unwrap().hold, RELAY_FAILOVER_HOLD);
+    }
+
+    /// A request chosen as a probe but sent only after a replacement probe began reports for
+    /// a probe that is no longer current: its answer or success never ends the newer probe nor
+    /// the hold, its failure counts as a failure (the relay is held again, a probe that hangs
+    /// past the window included) without ending the newer probe; the replacement's own report
+    /// still counts.
+    #[test]
+    fn a_late_report_never_ends_a_newer_probe() {
+        let relays = weighted(&[(A, 70), (B, 30)]);
+        let t0 = Instant::now();
+        let after = t0 + RELAY_FAILOVER_HOLD;
+        let replaced = after + RELAY_PROBE_WINDOW;
+        let late = replaced + Duration::from_secs(1);
+        // Each kind of late report, against a fresh selector.
+        for kind in ["answered", "success", "failure"] {
+            let selector = RelaySelector::new();
+            let backoff = RelayBackoff::new();
+            selector.note_failure_at(A, t0);
+            let (_, first) = selector.choose_probe_with(&relays, 0, after, &backoff);
+            let (chosen, second) = selector.choose_probe_with(&relays, 0, replaced, &backoff);
+            assert_eq!(chosen, 0, "{kind}: the replacement");
+            assert!(first.is_probe() && second.is_probe() && first != second);
+            // The first probe reports only now (sent at its choice, or late).
+            match kind {
+                "answered" => selector.note_answered_of(A, first),
+                "success" => selector.note_success_of_probe(A, late, first),
+                _ => selector.note_failure_of_probe_with(A, after, late, first),
+            }
+            // The replacement is still the relay's probe, and no further request goes to A.
+            assert!(selector.is_current(A, second), "{kind}");
+            assert!(!selector.is_current(A, first), "{kind}");
+            assert_eq!(
+                selector.choose_with(&relays, 0, late, &backoff),
+                1,
+                "{kind}"
+            );
+            let hold = selector.hold_of(A).unwrap().hold;
+            if kind == "failure" {
+                // The probe that hung past the window failed: held again, twice as long.
+                assert_eq!(hold, 2 * RELAY_FAILOVER_HOLD, "{kind}");
+            } else {
+                assert_eq!(hold, RELAY_FAILOVER_HOLD, "{kind}");
+                assert!(selector.probing(&held_key(A), late), "{kind}");
+            }
+            // The replacement's own report counts.
+            match kind {
+                "answered" => {
+                    selector.note_answered_of(A, second);
+                    assert_eq!(
+                        selector.choose_with(&relays, 0, late, &backoff),
+                        0,
+                        "{kind}"
+                    );
+                }
+                "success" => {
+                    selector.note_success_of_probe(A, late, second);
+                    assert!(selector.hold_of(A).is_none(), "{kind}");
+                }
+                _ => {
+                    selector.note_failure_probe_at(A, late, second);
+                    assert!(!selector.is_current(A, second), "{kind}");
+                    assert_eq!(
+                        selector.hold_of(A).unwrap().hold,
+                        2 * RELAY_FAILOVER_HOLD,
+                        "{kind}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A probe value no relay has, or one of another relay, never ends a probe; nor does a
+    /// retired one (its probe ended), after a new hold and a new probe either.
+    #[test]
+    fn a_stale_probe_value_is_ignored() {
+        let relays = weighted(&[(A, 50), (B, 50)]);
+        let selector = RelaySelector::new();
+        let backoff = RelayBackoff::new();
+        let t0 = Instant::now();
+        selector.note_failure_at(A, t0);
+        selector.note_failure_at(B, t0 + Duration::from_secs(1));
+        // A's hold has ended, B's still runs.
+        let after = t0 + RELAY_FAILOVER_HOLD + Duration::from_millis(500);
+        let (chosen, a_probe) = selector.choose_probe_with(&relays, 0, after, &backoff);
+        assert_eq!(chosen, 0);
+        // Unknown values, and B's success with A's probe: A's probe stays, so does its hold.
+        for raw in [a_probe.to_raw() + 1, u64::MAX] {
+            let stale = RelayProbe::from_raw(raw);
+            selector.note_answered_of(A, stale);
+            selector.note_success_of_probe(A, after, stale);
+        }
+        selector.note_success_of_probe(B, after, a_probe);
+        assert!(selector.is_current(A, a_probe));
+        assert!(selector.probing(&held_key(A), after));
+        assert_eq!(selector.hold_of(A).unwrap().hold, RELAY_FAILOVER_HOLD);
+        assert!(selector.hold_of(B).is_some());
+        // A report without a probe still counts as before: A answers, its hold ends.
+        selector.note_success_of(A, after);
+        assert!(selector.hold_of(A).is_none());
+        assert!(!selector.is_current(A, a_probe));
+        // A fails anew, and after that hold a new probe goes: the retired value ends nothing.
+        let again = after + Duration::from_secs(1);
+        selector.note_failure_at(A, again);
+        let next = again + RELAY_FAILOVER_HOLD;
+        let (chosen, b_probe) = selector.choose_probe_with(&relays, 0, next, &backoff);
+        assert_eq!(chosen, 0);
+        assert!(b_probe.is_probe() && b_probe != a_probe);
+        selector.note_answered_of(A, a_probe);
+        selector.note_success_of_probe(A, next, a_probe);
+        assert!(selector.is_current(A, b_probe));
+        assert!(selector.probing(&held_key(A), next));
+        assert_eq!(RelayProbe::from_raw(0), RelayProbe::NONE);
+        assert!(!RelayProbe::default().is_probe());
+    }
+
+    /// When a shared outage ends by another relay's success, a relay of the list with its
+    /// probe out keeps it: that probe's own report decides.
+    #[test]
+    fn a_probe_out_outlives_the_end_of_its_outage() {
+        let relays = weighted(&[(A, 50), (B, 50)]);
+        let selector = RelaySelector::new();
+        let backoff = RelayBackoff::new();
+        let t0 = Instant::now();
+        selector.choose_with(&relays, 0, t0, &backoff);
+        selector.note_failure_at(A, t0);
+        selector.note_failure_at(B, t0);
+        let after = t0 + RELAY_FAILOVER_HOLD;
+        let (chosen, a_probe) = selector.choose_probe_with(&relays, 0, after, &backoff);
+        assert_eq!(chosen, 0);
+        let (chosen, b_probe) = selector.choose_probe_with(&relays, 0, after, &backoff);
+        assert_eq!(chosen, 1);
+        // B's probe answers: B's hold ends, A's probe is still out.
+        selector.note_success_of_probe(B, after, b_probe);
+        assert!(selector.hold_of(B).is_none());
+        assert!(selector.is_current(A, a_probe));
+        assert!(selector.probing(&held_key(A), after));
+        assert_eq!(selector.choose_with(&relays, 0, after, &backoff), 1);
+        // A's probe answers: A is back.
+        selector.note_success_of_probe(A, after, a_probe);
+        assert!(selector.hold_of(A).is_none());
+        assert_eq!(selector.choose_with(&relays, 0, after, &backoff), 0);
+    }
+
+    /// A probe chosen first but sent after its replacement, failing first: the replacement
+    /// is still out (and still keeps fallback requests away while the relay is held again),
+    /// and its own report, whatever it is, ends it.
+    #[test]
+    fn a_late_sent_stale_failure_leaves_the_replacement_to_its_own_report() {
+        let relays = weighted(&[(A, 50), (B, 50)]);
+        let t0 = Instant::now();
+        let s = |secs: u64| t0 + Duration::from_secs(secs);
+        for kind in ["answered", "success", "failure"] {
+            let selector = RelaySelector::new();
+            let backoff = RelayBackoff::new();
+            selector.note_failure_at(A, t0);
+            // P1 chosen at 60 s, P2 at 90 s and sent at once; P1 sent only at 92 s.
+            let (_, p1) = selector.choose_probe_with(&relays, 0, s(60), &backoff);
+            let (chosen, p2) = selector.choose_probe_with(&relays, 0, s(90), &backoff);
+            assert_eq!(chosen, 0, "{kind}");
+            selector.note_failure_of_probe_with(A, s(92), s(95), p1);
+            assert!(
+                selector.hold_of(A).unwrap().until > s(95),
+                "{kind}: held again"
+            );
+            assert!(selector.is_current(A, p2), "{kind}");
+            // B paused, only A eligible: nothing goes to A while P2 is out.
+            backoff.note_at(B, Duration::from_secs(60), s(96));
+            assert_eq!(
+                selector.choose_index_where(&relays, 0, s(96), &backoff, &|url| url == A),
+                None,
+                "{kind}"
+            );
+            // P2 reports (sent at 90 s, before the new hold began): it ends all the same.
+            match kind {
+                "answered" => selector.note_answered_of(A, p2),
+                "success" => selector.note_success_of_probe(A, s(90), p2),
+                _ => selector.note_failure_of_probe_with(A, s(90), s(97), p2),
+            }
+            assert!(!selector.is_current(A, p2), "{kind}");
+            assert!(!selector.probing(&held_key(A), s(97)), "{kind}");
+        }
+    }
+
+    /// The one case where a request that is no probe goes to a relay with its probe out: a
+    /// choice with no criterion when every relay has one. Its success ends that relay's hold
+    /// (the relay answered), and the displaced probe's later report is a stale one.
+    #[test]
+    fn with_every_relay_probing_a_choice_without_criterion_still_sends() {
+        let relays = weighted(&[(A, 50), (B, 50)]);
+        let t0 = Instant::now();
+        let after = t0 + RELAY_FAILOVER_HOLD;
+        for kind in ["success", "failure"] {
+            let selector = RelaySelector::new();
+            let backoff = RelayBackoff::new();
+            selector.choose_with(&relays, 0, t0, &backoff);
+            selector.note_failure_at(A, t0);
+            selector.note_failure_at(B, t0);
+            let (_, a_probe) = selector.choose_probe_with(&relays, 0, after, &backoff);
+            let (_, b_probe) = selector.choose_probe_with(&relays, 0, after, &backoff);
+            assert!(selector.is_current(A, a_probe) && selector.is_current(B, b_probe));
+            // With a criterion: nothing. Without: the relay drawn, as no probe.
+            assert_eq!(
+                selector.choose_index_where(&relays, 0, after, &backoff, &|_| true),
+                None
+            );
+            let (chosen, none) = selector.choose_probe_with(&relays, 0, after, &backoff);
+            assert_eq!((chosen, none), (0, RelayProbe::NONE));
+            // Its success ends A's hold, and A's probe with it; B's probe stays out.
+            let sent = after + Duration::from_secs(1);
+            selector.note_success_of(A, sent);
+            assert!(selector.hold_of(A).is_none());
+            assert!(!selector.is_current(A, a_probe));
+            assert!(selector.is_current(B, b_probe));
+            // The displaced probe reports late (sent before that success): older news.
+            match kind {
+                "success" => selector.note_success_of_probe(A, after, a_probe),
+                _ => selector.note_failure_of_probe_with(A, after, sent, a_probe),
+            }
+            assert!(selector.hold_of(A).is_none(), "{kind}");
+            assert_eq!(
+                selector.choose_with(&relays, 0, sent, &backoff),
+                0,
+                "{kind}"
+            );
+        }
+    }
+
+    /// With the caller's criterion: an eligible relay with its probe out is never returned,
+    /// nor an ineligible one; an eligible relay paused by `Retry-After` may be.
+    #[test]
+    fn a_choice_where_returns_only_an_eligible_relay_without_a_probe_out() {
+        let relays = weighted(&[(A, 50), (B, 50)]);
+        let only_a = |url: &str| url == A;
+        let t0 = Instant::now();
+        // A has its probe out, B is ineligible: nothing.
+        let selector = RelaySelector::new();
+        let backoff = RelayBackoff::new();
+        selector.note_failure_at(A, t0);
+        let after = t0 + RELAY_FAILOVER_HOLD;
+        assert_eq!(
+            selector.choose_with(&relays, 0, after, &backoff),
+            0,
+            "the probe"
+        );
+        for draw in [0, u64::MAX / 2, u64::MAX] {
+            assert_eq!(
+                selector.choose_index_where(&relays, draw, after, &backoff, &only_a),
+                None
+            );
+        }
+        // A is paused, B is ineligible: A, whatever the draw (the pause then fails it).
+        let selector = RelaySelector::new();
+        let backoff = RelayBackoff::new();
+        backoff.note_at(A, Duration::from_secs(60), t0);
+        for draw in [0, u64::MAX / 2, u64::MAX] {
+            assert_eq!(
+                selector.choose_index_where(&relays, draw, t0, &backoff, &only_a),
+                Some(0)
+            );
+        }
+    }
+
+    /// The criterion is asked once per relay and choice, whatever it answers next.
+    #[test]
+    fn the_criterion_is_asked_once_per_relay() {
+        let relays = weighted(&[(A, 50), (B, 50)]);
+        let selector = RelaySelector::new();
+        let backoff = RelayBackoff::new();
+        let t0 = Instant::now();
+        selector.note_failure_at(A, t0);
+        let after = t0 + RELAY_FAILOVER_HOLD;
+        let asked = std::cell::Cell::new(0u32);
+        // True the first time for each relay, false afterwards.
+        let flips = |_: &str| {
+            asked.set(asked.get() + 1);
+            asked.get() <= 2
+        };
+        let (chosen, probe) = selector
+            .choose_with_where(&relays, 0, after, &backoff, &flips)
+            .unwrap();
+        assert_eq!(chosen, 0);
+        assert!(probe.is_probe());
+        assert_eq!(asked.get(), 2);
+        assert!(selector.probing(&held_key(A), after));
+    }
+
+    /// A relay the caller passes over takes no part in its list's outage: being passed over
+    /// fails nothing, and a success of the other relay clears the hold it had from the same
+    /// outage.
+    #[test]
+    fn an_ineligible_relay_takes_no_part_in_an_outage() {
+        let relays = weighted(&[(A, 50), (B, 50)]);
+        let selector = RelaySelector::new();
+        let backoff = RelayBackoff::new();
+        let t0 = Instant::now();
+        let not_a = |url: &str| url != A;
+        selector.choose_with(&relays, 0, t0, &backoff);
+        // Both fail together (the device was offline).
+        selector.note_failure_at(A, t0);
+        selector.note_failure_at(B, t0);
+        let later = t0 + Duration::from_secs(1);
+        for draw in [0, u64::MAX] {
+            assert_eq!(
+                selector.choose_index_where(&relays, draw, later, &backoff, &not_a),
+                Some(1),
+                "B, held but eligible"
+            );
+        }
+        assert_eq!(selector.hold_of(A).unwrap().hold, RELAY_FAILOVER_HOLD);
+        // B answers: the outage is over for A too.
+        selector.note_success_of(B, later);
+        assert!(selector.hold_of(A).is_none());
+        assert_eq!(selector.choose_with(&relays, 0, later, &backoff), 0);
+    }
+
+    #[test]
+    fn the_statuses_that_answer_about_the_request() {
+        for status in [400, 409, 413, 415, 422, 426] {
+            assert!(relay_status_answered(status), "{status}");
+            assert!(!relay_status_fails_over(status), "{status}");
+        }
+        for status in [200, 204, 301, 401, 403, 404, 405, 407, 421, 429, 500, 503] {
+            assert!(!relay_status_answered(status), "{status}");
+        }
     }
 
     #[test]

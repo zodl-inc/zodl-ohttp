@@ -136,8 +136,10 @@ gateway-host rules apply to every relay.
   sealed answer (wrong media type), or an outer status for which `relay_status_fails_over(status)`
   holds (`429`, any `5xx`, a redirect, and `401`/`403`/`404`/`405`/`407`/`421`, a relay that
   cannot deliver). Report one whose sealed answer completed with `note_success(url)`. Prefer
-  `note_failure_of` / `note_success_of(url, sent_at)` with the instant the request was sent, so
-  that a late report neither ends nor lengthens a newer hold. A relay that failed is held out
+  `note_failure_of_probe` / `note_success_of_probe(url, sent_at, probe)` with the instant the
+  request was sent and the `RelayProbe` of its choice (below): a report of a request sent
+  before the relay's current hold began changes that hold in no way, and only the relay's
+  current probe's own report ends that probe. A relay that failed is held out
   of the choice for `RELAY_FAILOVER_HOLD` (60 s, doubling while it keeps failing on requests
   sent after each hold, up to `MAX_RELAY_FAILOVER_HOLD`; not doubled while other relays fail
   too, and released by a success through a relay that failed with it), and one paused by a `Retry-After` (`RelayBackoff::global()`) until the pause ends:
@@ -146,9 +148,26 @@ gateway-host rules apply to every relay.
   is only held (not paused) is used, and with every relay paused, the relay drawn. After a
   hold ends one request at a time goes to the relay as a probe (`RELAY_PROBE_WINDOW`), and
   failures set aside as older news (a later request succeeded) hold the relay after all once
-  `MASKED_FAILURES_TO_HOLD` of them fall within `MASKED_FAILURE_WINDOW`. Each
-  `choose_relay_for` call may make its request the probe, so call it only for a request you
-  will send. The selector
+  `MASKED_FAILURES_TO_HOLD` of them fall within `MASKED_FAILURE_WINDOW`. Each choice may
+  make its request the probe, so choose only for a request you will send, and use
+  `choose_relay_for_where(host, eligible)`: it returns the relay and a `RelayProbe`. Keep the
+  `RelayProbe` with the request and pass it back with its report (`note_failure_of_probe`,
+  `note_success_of_probe`, `note_answered_of`), so that only the relay's current probe ends
+  it: the report of a request chosen as a probe but sent late, after a newer probe replaced
+  it, never ends the newer probe (its failure still counts as a failure, its success only
+  makes older failures older news). Over a foreign-function interface pass it as `to_raw()` /
+  `from_raw()` (an unsigned 64-bit value). `choose_relay_for` returns no `RelayProbe`: its
+  reports count as in 2.3.0 (a late one may end a newer probe), so use it only where nothing
+  reports. A transport that keeps pauses of its own (one per Tor or direct route, say)
+  passes `|url| !my_pause(url)` as `eligible`, so that a relay it cannot send to is never
+  drawn, nor as a probe (with no such pause, `|_| true`); `None` means no eligible relay can
+  take the request: fail it locally, nothing sent (the crate's own `Client`, with no
+  criterion, sends to the relay drawn as no probe when every relay has its probe out, and
+  that request's success ends the relay's hold). An eligible relay paused by `Retry-After`
+  may still come back: keep checking the pause before sending. Report an outer status for
+  which `relay_status_answered` holds (400, 409, 413, 415, 422, 426) with
+  `note_answered_of(url, probe)`: it ends the relay's current probe, neither a success nor a
+  failure; the request itself is still refused and never resent. The selector
   never resends anything. A request may be sent again through another relay only when nothing
   was sent: the connection or TLS handshake failed, or the relay is paused before the post.
   Never after an outer error status (a relay or front end may answer one in place of an answer
