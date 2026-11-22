@@ -3,7 +3,14 @@
 Behaviour changes of the gateway, the relay simulator and the e2e client. The client library
 keeps its own log in [client/CHANGELOG.md](client/CHANGELOG.md).
 
-## Unreleased
+## 2.0.0
+
+Breaking for operators: the gateway reads its configuration from its files only (`--config` /
+`--host-config`, "Configuration file"), the image no longer has `/app/ohttp-gateway`, and the
+`coinbase` session request is signed by the wallet. New: the relay weights block of a block file in
+the signed key configuration, hedged lightwalletd reads, one-sided WRITE routes, and the provider
+integrations. The relay simulator follows the gateway's version; the client library (2.5.0) keeps
+its own changelog.
 
 ### Relay weights
 
