@@ -29,7 +29,7 @@
 //! or not a new envelope was fetched.
 
 use std::collections::HashMap;
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::sync::{Mutex, MutexGuard};
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
@@ -66,9 +66,6 @@ const BLOCK_FIELDS: [&str; 10] = [
     "sig",
 ];
 /// The most weights keys and relay lists whose block is held at once.
-// The unit tests that go through the process's store use a weights key of their own each, so
-// that none sees another's block; keep them under this many (a test of the cap itself uses a
-// store of its own).
 const MAX_HELD_BLOCKS: usize = 16;
 
 /// The time now, in Unix seconds (0 before 1970).
@@ -404,8 +401,20 @@ pub(crate) struct WeightsStore {
 impl WeightsStore {
     /// The store [`crate::OhttpConfig::choose_relay`] and the envelope checks share.
     pub(crate) fn global() -> &'static WeightsStore {
-        static GLOBAL: OnceLock<WeightsStore> = OnceLock::new();
-        GLOBAL.get_or_init(WeightsStore::default)
+        // In the unit tests each test thread has a store of its own, so that no test sees
+        // another's blocks or fills the store for it (each test runs on a thread of its own).
+        #[cfg(test)]
+        {
+            thread_local! {
+                static STORE: &'static WeightsStore = Box::leak(Box::default());
+            }
+            STORE.with(|store| *store)
+        }
+        #[cfg(not(test))]
+        {
+            static GLOBAL: std::sync::OnceLock<WeightsStore> = std::sync::OnceLock::new();
+            GLOBAL.get_or_init(WeightsStore::default)
+        }
     }
 
     fn held(&self) -> MutexGuard<'_, HashMap<HeldKey, RelayWeights>> {
@@ -1816,5 +1825,24 @@ pub(crate) mod tests {
             config.relay_weights_at(NOW),
             RelayWeightsStatus::AppDefaults
         );
+    }
+
+    #[test]
+    fn each_test_thread_has_a_store_of_its_own() {
+        let config = two();
+        let block = check(
+            &config,
+            &Fields::new(&config, NOW, &[70, 30]).signed(9),
+            NOW,
+        )
+        .unwrap();
+        let key = *config.relay_weights_key().unwrap();
+        let set = config.relay_set_bytes();
+        WeightsStore::global().offer(&key, &set, block).unwrap();
+        assert!(WeightsStore::global().active(&key, &set, NOW).is_some());
+        let elsewhere = std::thread::spawn(move || WeightsStore::global().active(&key, &set, NOW))
+            .join()
+            .unwrap();
+        assert!(elsewhere.is_none());
     }
 }
