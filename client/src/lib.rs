@@ -48,6 +48,14 @@
 //! signing key) per network, both held by an [`OhttpNetworks`]. A network without one has
 //! OHTTP off.
 //!
+//! A network may list several relays. Each request goes to one of them, chosen at random by
+//! share ([`OhttpConfig::choose_relay`]): equal shares, unless a relay weights block, signed
+//! with a key of its own ([`OhttpConfig::with_relay_weights_key`]) and carried in the gateway's
+//! signed key-configuration envelope, sets others for its validity (at most 30 days). The block
+//! names no relay (one share per position of the application's list, and the list's
+//! fingerprint, [`relay_set`]); a block that does not check out is ignored and never affects
+//! the key configuration. `docs/relay-weights.md` describes the format.
+//!
 //! The gateway speaks chunked OHTTP (draft-ietf-ohai-chunked-ohttp-08) only, and so does this
 //! crate: a request is posted as `message/ohttp-chunked-req` ([`encapsulate_chunked_request`])
 //! and the `message/ohttp-chunked-res` answer is opened as it streams
@@ -113,6 +121,7 @@ mod relays;
 mod signed;
 mod third_party_hosts;
 mod trace;
+mod weights;
 
 pub use bhttp_codec::{
     decode_bhttp_response, encode_bhttp_request, pack_fields, unpack_fields, BhttpRequest,
@@ -127,6 +136,7 @@ pub use chunked::{
 pub use client::{Client, KeyConfigSource, ResponseStream, DEFAULT_LIST_CONNECT_TIMEOUT};
 pub use config::{
     canonical_relay_url, ConfigError, ConfigField, OhttpConfig, OhttpConfigParams, OhttpNetworks,
+    RelayWeightsKeyError,
 };
 pub use dns::{doh_query_url, envelope_from_doh_json, DOH_RESOLVERS};
 /// The key type of [`open_signed_config`]'s signer, so callers need not pin `ed25519-dalek`.
@@ -163,6 +173,11 @@ pub use third_party_hosts::{
     UNKNOWN_AUTHORITY_REFRESH_INTERVAL,
 };
 pub use trace::{ClientTrace, PrefixSanitization, TraceIdFormat, TracePolicy};
+pub use weights::{
+    relay_set, RelayWeights, RelayWeightsStatus, MAX_RELAY_WEIGHTS_BLOCK_BYTES,
+    MAX_RELAY_WEIGHTS_VALIDITY_SECS, RELAY_WEIGHTS_DOMAIN, RELAY_WEIGHTS_FIELD,
+    RELAY_WEIGHTS_TOTAL,
+};
 
 /// The media type of a sealed request, which the relay is posted.
 pub const REQUEST_MEDIA_TYPE: &str = "message/ohttp-chunked-req";

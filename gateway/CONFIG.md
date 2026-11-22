@@ -443,6 +443,7 @@ gateway itself):
 | `port` | deployment | host | integer | `PORT` |
 | `internal_bind_addr` | deployment | host | string | `INTERNAL_BIND_ADDR` |
 | `origin_id` | deployment | host | string | `ORIGIN_ID` |
+| `relay_weights_file` | deployment | host | string | `RELAY_WEIGHTS_FILE` |
 | `lwd_addr` | deployment | host | string | `LWD_ADDR` |
 | `lwd_endpoints` | deployment | host | string | `LWD_ENDPOINTS` |
 | `lwd_connection_pool` | deployment | host | boolean | `LWD_CONNECTION_POOL` |
@@ -509,6 +510,7 @@ gateway itself):
 | `hpke_key_id` (`HPKE_KEY_ID`) | `1` | Key id (0 to 255) of `HPKE_PRIVATE_KEY`. |
 | `hpke_accept_only_keys` (`HPKE_ACCEPT_ONLY_KEYS`) | unset | Keys accepted for decapsulation but not published, same format as `HPKE_KEYS`. Used during a rotation. Key ids must be distinct across both lists. |
 | `configs_signing_seed_hex` (`CONFIGS_SIGNING_SEED_HEX`) | unset | Ed25519 seed (64 hex characters) that signs `/ohttp-configs/signed`. Unset: that endpoint answers 503. An invalid seed is a startup error in `ohttp` mode. |
+| `relay_weights_file` (`RELAY_WEIGHTS_FILE`) | unset | Path of a relay weights block (`docs/relay-weights.md`) to serve as the field `relay_weights` of every `/ohttp-configs/signed` envelope, exactly as the file holds it (leading and trailing whitespace removed). The gateway never signs, checks or edits the block (it is signed with a key the gateway does not hold, and the envelope signature does not cover it); it reads the file at startup and every 10 s in the background (no request waits for it), so a new block needs no restart; replace the file by renaming a new one over it. A missing or empty file: no block. A file that is not a regular file holding one JSON object of at most 4096 bytes is not served (warning in the log, `ohttp_relay_weights_block{state="invalid"}`); a read that fails or takes over 2 s keeps what was read before. `ohttp_relay_weights_block_not_after_seconds` is the `not_after` the served block names (read, not checked). Unset: no block, nothing read. |
 
 ## Routing and backends
 

@@ -49,12 +49,19 @@ pub struct SignedConfig {
     pub not_after: u64,
     pub key_id: String, // 8 hex chars
     pub sig: String,    // base64 standard Ed25519 signature
+    /// The relay weights block, as the block file holds it (`crate::relay_weights`): signed by
+    /// someone else, not covered by `sig`, served byte for byte, last; absent when there is
+    /// none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_weights: Option<Box<serde_json::value::RawValue>>,
 }
 
 pub struct SigningState {
     signing_key: SigningKey,
     network: String,
     cached: Mutex<Option<(SignedConfig, u64, u64)>>, // (signed config, configs_hash, slot start)
+    /// The relay weights block file, if one is configured (`relay_weights_file`).
+    relay_weights: Option<std::sync::Arc<crate::relay_weights::RelayWeightsFile>>,
 }
 
 /// The validity window of an envelope issued at `now`: `(not_before, not_after)`, both derived
@@ -83,7 +90,36 @@ impl SigningState {
             signing_key,
             network,
             cached: Mutex::new(None),
+            relay_weights: None,
         })
+    }
+
+    /// Serves the relay weights block of the file at `path` in every envelope: read now, then
+    /// every [`crate::relay_weights::REREAD_INTERVAL`] in the background; none while the file
+    /// is missing or is no block.
+    pub async fn with_relay_weights_file(mut self, path: &str) -> Self {
+        let file = crate::relay_weights::RelayWeightsFile::new(path, self.network.clone());
+        self.relay_weights = Some(file.start().await);
+        self
+    }
+
+    /// The envelope to serve now: [`Self::get_signed_config`] with the relay weights block of
+    /// the block file, if there is one, as the file holds it. Never reads the file.
+    pub fn envelope(&self, configs_bytes: &[u8]) -> SignedConfig {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        self.envelope_at(configs_bytes, now)
+    }
+
+    /// [`Self::envelope`] at a given Unix time.
+    pub fn envelope_at(&self, configs_bytes: &[u8], now: u64) -> SignedConfig {
+        let mut envelope = self.get_signed_config_at(configs_bytes, now);
+        if let Some(file) = &self.relay_weights {
+            envelope.relay_weights = file.current();
+        }
+        envelope
     }
 
     #[allow(dead_code)]
@@ -147,6 +183,7 @@ impl SigningState {
             not_after,
             key_id: self.key_id(),
             sig: base64::engine::general_purpose::STANDARD.encode(signature.to_bytes()),
+            relay_weights: None,
         };
 
         *cached = Some((signed_config.clone(), configs_hash, slot_start));
@@ -388,6 +425,41 @@ mod tests {
         let hash = Sha256::digest(&pubkey_bytes);
         let computed_key_id = hex::encode(&hash[..4]);
         assert_eq!(key_id, computed_key_id, "key_id mismatch");
+    }
+
+    #[tokio::test]
+    async fn the_relay_weights_block_is_served_byte_for_byte_and_outside_the_signature() {
+        let block = r#"{"v":1,"network":"testnet","seq":1767225600,"not_before":1767225300,"not_after":1769817300,"n":2,"set":"377f979ac611fd84","weights":[70,30],"key_id":"6c8f8607","sig":"16NrlaikzHWg1hF9VcLm7gCq2FfA9bgkz1qIq+vhbUnxQnJxrt5T5eG3tK8CXtzM4Gdwz4lFiMZfSmdheFtrDg=="}"#;
+        let dir = std::env::temp_dir().join(format!("signing-weights-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("relay-weights.json");
+        std::fs::write(&path, format!("{block}\n")).unwrap();
+        let configs = b"test configs";
+        let plain = SigningState::new(TEST_SEED, "testnet".to_string()).unwrap();
+        let with = SigningState::new(TEST_SEED, "testnet".to_string())
+            .unwrap()
+            .with_relay_weights_file(path.to_str().unwrap())
+            .await;
+        let now = 1_700_000_000;
+        let without_block = serde_json::to_string(&plain.envelope_at(configs, now)).unwrap();
+        let with_block = serde_json::to_string(&with.envelope_at(configs, now)).unwrap();
+        // The same envelope, the block appended as the file holds it.
+        assert_eq!(
+            with_block,
+            format!(
+                "{},\"relay_weights\":{block}}}",
+                &without_block[..without_block.len() - 1]
+            )
+        );
+        // The same signature with and without the block: it does not cover the block.
+        let parsed: SignedConfig = serde_json::from_str(&with_block).unwrap();
+        assert_eq!(parsed.relay_weights.as_ref().unwrap().get(), block);
+        let unsigned: SignedConfig = serde_json::from_str(&without_block).unwrap();
+        assert_eq!(parsed.sig, unsigned.sig);
+        // With no file the field is left out entirely.
+        assert!(!without_block.contains("relay_weights"));
+        std::fs::remove_file(&path).unwrap();
+        let _ = std::fs::remove_dir(&dir);
     }
 
     #[test]

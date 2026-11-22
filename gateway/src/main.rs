@@ -69,6 +69,7 @@ mod prefetch;
 mod proxy;
 mod query_rules;
 mod query_value_sources;
+mod relay_weights;
 mod replication;
 mod request_id;
 mod rpc_cache;
@@ -643,6 +644,15 @@ async fn main() -> anyhow::Result<()> {
     let signing_state = if let Some(ref seed) = config.configs_signing_seed {
         match signing::SigningState::new(seed, config.network.clone()) {
             Ok(s) => {
+                let s = match config.relay_weights_file.as_deref() {
+                    Some(path) => {
+                        info!(
+                            "Relay weights block served from the block file (relay_weights_file)"
+                        );
+                        s.with_relay_weights_file(path).await
+                    }
+                    None => s,
+                };
                 info!(
                     "Ed25519 signing enabled for /ohttp-configs/signed, key_id={} (envelopes issued per {} s slot, valid {} s)",
                     s.key_id(),
@@ -1615,7 +1625,7 @@ async fn ohttp_configs_signed_handler(
     match (&state.hpke, &state.signing) {
         (Some(hpke_state), Some(signing_state)) => {
             let configs_bytes = hpke_state.public_config();
-            let signed_config = signing_state.get_signed_config(&configs_bytes);
+            let signed_config = signing_state.envelope(&configs_bytes);
 
             match serde_json::to_vec(&signed_config) {
                 Ok(json_bytes) => (
@@ -3581,6 +3591,7 @@ mod handler_tests {
             log_outer_header_names: false,
             gateway_hosts: vec!["lwd.example.com".to_string()],
             configs_signing_seed: None,
+            relay_weights_file: None,
             chunk_size: 16384,
             chunk_flush_ms: 50,
             flexa_publishable_key: None,

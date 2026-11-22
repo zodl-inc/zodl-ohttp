@@ -33,6 +33,14 @@ fn the_crates_test_vector_is_the_documented_one() {
 }
 
 #[test]
+fn the_crates_relay_weights_vector_is_the_documented_one() {
+    assert_eq!(
+        include_str!("../testdata/relay-weights-test-vector.json"),
+        include_str!("../../docs/relay-weights-test-vector.json")
+    );
+}
+
+#[test]
 fn a_request_encodes_as_the_gateway_reads_it() {
     let request = Request::new("POST", "backend.example", "/v1/slots/ab/entries?since=3")
         .header("content-type", "application/json")

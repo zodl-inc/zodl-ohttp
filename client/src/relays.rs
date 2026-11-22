@@ -84,7 +84,7 @@ pub struct Relay {
     /// The selector's key for it ([`relay_key`]).
     key: String,
     /// Its share of the requests, against the other relays' (every relay of a configured
-    /// list has the same).
+    /// list has the same; a relay weights block may set others for a choice).
     weight: u32,
 }
 
@@ -111,6 +111,14 @@ impl Relay {
     #[cfg(test)]
     pub(crate) fn weighted(target: RelayTarget, weight: u32) -> Self {
         Relay::new(target, weight)
+    }
+
+    /// This relay with the share `weight` (a relay weights block's).
+    pub(crate) fn with_weight(&self, weight: u32) -> Self {
+        Relay {
+            weight,
+            ..self.clone()
+        }
     }
 }
 

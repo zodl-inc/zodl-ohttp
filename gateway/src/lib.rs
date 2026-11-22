@@ -34,6 +34,7 @@ pub mod padding;
 pub mod proxy;
 pub mod query_rules;
 pub mod query_value_sources;
+pub mod relay_weights;
 pub mod request_id;
 pub mod signing;
 

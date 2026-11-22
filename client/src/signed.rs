@@ -38,8 +38,9 @@ pub const CLOCK_SKEW_SECS: u64 = 60;
 const HARD_MAX_CONFIGS_BYTES: usize = 1 << 20;
 /// An Ed25519 signature in base64, padded.
 const MAX_SIG_BASE64_CHARS: usize = 88;
-/// The envelope's fields.
-const ENVELOPE_FIELDS: [&str; 7] = [
+/// The envelope's fields; the last, the relay weights block, is optional and not covered by
+/// `sig` (`crate::weights`).
+const ENVELOPE_FIELDS: [&str; 8] = [
     "v",
     "network",
     "configs",
@@ -47,6 +48,7 @@ const ENVELOPE_FIELDS: [&str; 7] = [
     "not_after",
     "key_id",
     "sig",
+    "relay_weights",
 ];
 
 /// Base64 the way `java.util.Base64.getDecoder()` reads it: padding optional, stray trailing
@@ -185,8 +187,8 @@ pub struct SignedConfigPolicy {
     pub max_envelope_bytes: Option<usize>,
     /// The most bytes the decoded `application/ohttp-keys` document may have, if capped.
     pub max_configs_bytes: Option<usize>,
-    /// Envelope fields beyond the seven known. Every preset ignores them, so that the gateway
-    /// can add a field without a client release.
+    /// Envelope fields beyond the eight known (the seven signed ones and `relay_weights`).
+    /// Every preset ignores them, so that the gateway can add a field without a client release.
     pub unknown_fields: UnknownFields,
     /// Repeated keys.
     pub duplicate_keys: DuplicateKeys,
@@ -280,6 +282,12 @@ pub fn open_signed_config(
 /// for `network` by the signing key `networks` configures for it
 /// ([`crate::OhttpConfig::signing_pubkey`]). [`Error::KeyConfig`] when OHTTP is off for
 /// `network`.
+///
+/// When the network's configuration has a relay weights key
+/// ([`crate::OhttpConfig::with_relay_weights_key`]) and the envelope checks out, the relay
+/// weights block it carries (`relay_weights`) is checked too, under the same signature check
+/// as the envelope, and taken if it is valid ([`crate::OhttpConfig::relay_weights`]). A block
+/// that is absent or does not check out is ignored: it never makes this function fail.
 pub fn verify_signed_config(
     networks: &OhttpNetworks,
     json: &[u8],
@@ -287,8 +295,13 @@ pub fn verify_signed_config(
     now: u64,
     policy: &SignedConfigPolicy,
 ) -> Result<SignedKeys, Error> {
-    let signer = networks.require(network)?.signing_pubkey();
-    verify_signed_config_with(json, network.as_str(), signer, now, policy)
+    let config = networks.require(network)?;
+    let keys =
+        verify_signed_config_with(json, network.as_str(), config.signing_pubkey(), now, policy)?;
+    // The relay weights block the envelope may carry: taken when it checks out, else ignored.
+    // Either way the key configuration stands.
+    let _ = crate::weights::take_from_envelope(config, json, network, now, policy.signature);
+    Ok(keys)
 }
 
 /// [`verify_signed_config`] against a `signer` of the caller's choosing, for tests that sign
@@ -439,7 +452,7 @@ pub(crate) fn json_error(error: &serde_json::Error) -> String {
 }
 
 /// The top-level keys of the JSON object `json`, repeats included.
-fn top_level_keys(json: &[u8]) -> Result<Vec<String>, serde_json::Error> {
+pub(crate) fn top_level_keys(json: &[u8]) -> Result<Vec<String>, serde_json::Error> {
     struct Keys;
     impl<'de> Visitor<'de> for Keys {
         type Value = Vec<String>;

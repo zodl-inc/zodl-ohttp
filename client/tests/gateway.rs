@@ -88,6 +88,7 @@ fn gateway_config(key_id: u8, private_key_hex: &str) -> Config {
         log_outer_header_names: false,
         gateway_hosts: vec![],
         configs_signing_seed: None,
+        relay_weights_file: None,
         chunk_size: 16384,
         chunk_flush_ms: 50,
         flexa_publishable_key: None,
@@ -1087,4 +1088,73 @@ async fn a_refresh_that_stalls_or_is_dropped_does_not_block_the_next() {
         RefreshOutcome::NotDue
     );
     assert!(dropped.held().is_none() && dropped.is_carried("compiled.example.org"));
+}
+
+/// The gateway's envelope with the relay weights block of its block file, as the client reads
+/// it: the key configuration opens, and the block (the published vector's) is taken, at the
+/// vector's own time.
+#[test]
+fn the_gateways_envelope_with_a_block_gives_the_client_the_blocks_weights() {
+    #[derive(serde::Deserialize)]
+    struct Vector {
+        public_key_hex: String,
+        relay_urls_as_written: Vec<String>,
+        seq: u64,
+        block_json: String,
+        block_id: String,
+    }
+    let v: Vector =
+        serde_json::from_str(include_str!("../testdata/relay-weights-test-vector.json")).unwrap();
+    let signing = SigningState::new(SIGNING_SEED, NETWORK.to_string()).unwrap();
+    let document = key_state(1).public_config();
+    let mut envelope = signing.get_signed_config_at(&document, v.seq);
+    let zodl_ohttp_gateway::relay_weights::BlockFile::Block(block) =
+        zodl_ohttp_gateway::relay_weights::parse_block(format!("{}\n", v.block_json).as_bytes())
+    else {
+        panic!("the gateway does not serve the vector's block");
+    };
+    envelope.relay_weights = Some(block);
+    let bytes = serde_json::to_vec(&envelope).unwrap();
+    assert!(String::from_utf8_lossy(&bytes)
+        .ends_with(&format!(",\"relay_weights\":{}}}", v.block_json)));
+
+    let signer = SigningKey::from_bytes(&hex::decode(SIGNING_SEED).unwrap().try_into().unwrap())
+        .verifying_key();
+    let config = zodl_ohttp_client::OhttpConfig::new(zodl_ohttp_client::OhttpConfigParams {
+        gateway_host: "ohttp-gateway-testnet.example",
+        relay_url: &v.relay_urls_as_written.join(","),
+        keys_dns_name: "testnet.ohttp-keys.example",
+        signing_pubkey: &hex::encode(signer.as_bytes()),
+    })
+    .unwrap()
+    .with_relay_weights_key(&v.public_key_hex)
+    .unwrap();
+    let networks = zodl_ohttp_client::OhttpNetworks::new(None, Some(config.clone())).unwrap();
+    for policy in [
+        zodl_ohttp_client::SignedConfigPolicy::LIBRARY,
+        zodl_ohttp_client::SignedConfigPolicy::ANDROID,
+        zodl_ohttp_client::SignedConfigPolicy::IOS,
+        zodl_ohttp_client::SignedConfigPolicy::SLIPSTREAM,
+    ] {
+        let keys = zodl_ohttp_client::verify_signed_config(
+            &networks,
+            &bytes,
+            Network::Testnet,
+            v.seq,
+            &policy,
+        )
+        .unwrap();
+        assert_eq!(keys.document, document);
+    }
+    // Taken: its weights apply at the vector's time, and no longer once it has expired.
+    let zodl_ohttp_client::RelayWeightsStatus::Block(held) = config.relay_weights_at(v.seq) else {
+        panic!("the block was not taken");
+    };
+    assert_eq!(held.id(), v.block_id);
+    assert_eq!(held.weights(), vec![70, 30]);
+    assert_eq!(
+        config.relay_weights(),
+        zodl_ohttp_client::RelayWeightsStatus::AppDefaults,
+        "an expired block applies"
+    );
 }

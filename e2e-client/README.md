@@ -30,6 +30,10 @@ variables per network (`<NET>` is `MAINNET` or `TESTNET`):
 | `OHTTP_E2E_KEYS_DNS_NAME_<NET>` | the DNS TXT name of the signed key configuration |
 | `OHTTP_E2E_SIGNING_PUBKEY_<NET>` | the key-configuration signing key, 64 hex digits |
 
+Optionally, `OHTTP_E2E_RELAY_WEIGHTS_PUBKEY_<NET>` (64 hex digits) is the network's relay weights
+key: with it, a verified envelope's relay weights block (`../docs/relay-weights.md`) is checked and,
+when valid, printed and used by `--split`.
+
 A network is configured with all four or none (an empty variable counts as unset; one that is
 not Unicode fails every run before anything is sent, whatever the key source); the values
 are checked as `zodl_ohttp_client::OhttpConfig::new` checks them, and mainnet and testnet must
@@ -138,3 +142,19 @@ trace suffix `-r<i>`, numbers the sends in the order sent, so in `a,,b` an error
 entry 2 and the output calls it 1; a value that names no URL, such as `,`, fails the run),
 `OHTTP_E2E_EXPECT_OK=1` (exit non-zero unless the inner status is 200 and, for gRPC,
 `grpc-status` is 0; for scripted periodic checks).
+
+## Relay split
+
+```
+OHTTP_E2E_RELAY_URL_TESTNET=https://relay-a.example/relay,https://relay-b.example/relay \
+OHTTP_E2E_RELAY_WEIGHTS_PUBKEY_TESTNET=<64 hex digits> ... \
+  ohttp-e2e --split testnet 1000 ohttp-gateway-testnet.example \
+  /cash.z.wallet.sdk.rpc.CompactTxStreamer/GetLightdInfo
+```
+
+Fetches the signed envelope through the relays in list order (`OHTTP_E2E_SPLIT_KEYS=dns`: from
+DNS over HTTPS instead), verifies it, prints the relay weights in force (the block id, `seq`,
+weights and end, or `app defaults`), then sends `count` requests, each through the relay the
+library chooses, reporting each outcome back to the selector. It samples first attempts: it does
+not keep `Retry-After` pauses or move a request to another relay as a wallet's transport does. Prints, per relay position (never a
+URL), how many were answered with a sealed `200` and how many were not.

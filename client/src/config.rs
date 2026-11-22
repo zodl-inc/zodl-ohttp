@@ -32,8 +32,11 @@ use std::fmt;
 
 use ed25519_dalek::VerifyingKey;
 
+use std::borrow::Cow;
+
 use crate::relays::{parse_relay_list, Relay, RelayProbe, RelaySelector};
 use crate::signed::Network;
+use crate::weights::{relay_set_bytes, reweighted, RelayWeightsStatus, WeightsStore};
 
 /// One value of an [`OhttpConfig`], as a [`ConfigError`] names it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -180,6 +183,24 @@ pub struct OhttpConfig {
     signing_pubkey: VerifyingKey,
     /// The gateway host as the URL parser reads it, for comparisons with relay hosts.
     gateway_key: String,
+    /// The key relay weights blocks are signed with, if the application configures one.
+    relay_weights_key: Option<VerifyingKey>,
+    /// The fingerprint of the relay list ([`crate::relay_set`]).
+    relay_set: [u8; 8],
+}
+
+/// Why a relay weights key was refused ([`OhttpConfig::with_relay_weights_key`]). Names no
+/// value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum RelayWeightsKeyError {
+    /// Not a raw Ed25519 public key as 64 hex digits, a point on the curve and not of small
+    /// order.
+    #[error("OHTTP configuration: relay_weights_pubkey {0}")]
+    Invalid(&'static str),
+    /// The key-configuration signing key: the two keys must differ.
+    #[error("OHTTP configuration: relay_weights_pubkey must not be the signing_pubkey")]
+    SameAsSigningKey,
 }
 
 impl OhttpConfig {
@@ -216,13 +237,93 @@ impl OhttpConfig {
         check_host_name(keys_dns_name).map_err(invalid(ConfigField::KeysDnsName))?;
         let signing_pubkey =
             parse_signing_pubkey(signing_pubkey).map_err(invalid(ConfigField::SigningPubkey))?;
+        let relay_set = relay_set_bytes(relays.iter().map(Relay::url));
         Ok(OhttpConfig {
             gateway_host: gateway_host.to_owned(),
             relays,
             keys_dns_name: keys_dns_name.to_owned(),
             signing_pubkey,
             gateway_key,
+            relay_weights_key: None,
+            relay_set,
         })
+    }
+
+    /// This configuration with the key relay weights blocks are signed with: raw Ed25519 as 64
+    /// hex digits (either case), distinct from the key-configuration signing key. An empty
+    /// value means no key (it clears one set before). A key is one network's alone:
+    /// [`OhttpNetworks::new`] refuses (as [`ConfigError::SharedAcrossNetworks`] of
+    /// [`ConfigField::SigningPubkey`]) a weights key that is the other network's weights or
+    /// signing key.
+    ///
+    /// With a key, the relay weights block that a checked envelope carries
+    /// ([`crate::verify_signed_config`], and the envelopes [`crate::Client::for_network`]
+    /// fetches) is checked against it, and a valid one sets the shares of the relays for its
+    /// validity ([`relay_weights`](Self::relay_weights)). Without one, every relay of the list
+    /// gets an equal share, and no block is ever read.
+    pub fn with_relay_weights_key(mut self, key: &str) -> Result<Self, RelayWeightsKeyError> {
+        if key.is_empty() {
+            self.relay_weights_key = None;
+            return Ok(self);
+        }
+        let key = parse_signing_pubkey(key).map_err(RelayWeightsKeyError::Invalid)?;
+        if key == self.signing_pubkey {
+            return Err(RelayWeightsKeyError::SameAsSigningKey);
+        }
+        self.relay_weights_key = Some(key);
+        Ok(self)
+    }
+
+    /// The relay weights key, if one is configured.
+    pub fn relay_weights_key(&self) -> Option<&VerifyingKey> {
+        self.relay_weights_key.as_ref()
+    }
+
+    /// The fingerprint of the relay list as a relay weights block names it ([`crate::relay_set`]
+    /// of [`relays`](Self::relays)' URLs): 16 lower-case hex digits.
+    pub fn relay_set(&self) -> String {
+        hex::encode(self.relay_set)
+    }
+
+    pub(crate) fn relay_set_bytes(&self) -> [u8; 8] {
+        self.relay_set
+    }
+
+    /// The shares the relays get now: the block held for this configuration, while it is
+    /// valid, or the application's own (equal) shares. For a diagnostics screen, which shows
+    /// the block id ([`crate::RelayWeights::id`]) or "app defaults".
+    pub fn relay_weights(&self) -> RelayWeightsStatus {
+        self.relay_weights_at(crate::weights::unix_now())
+    }
+
+    /// [`relay_weights`](Self::relay_weights) at `now` (Unix seconds).
+    pub fn relay_weights_at(&self, now: u64) -> RelayWeightsStatus {
+        match self.held_block(now) {
+            Some(block) => RelayWeightsStatus::Block(block),
+            None => RelayWeightsStatus::AppDefaults,
+        }
+    }
+
+    fn held_block(&self, now: u64) -> Option<crate::RelayWeights> {
+        let key = self.relay_weights_key.as_ref()?;
+        WeightsStore::global().active(key, &self.relay_set, now)
+    }
+
+    /// The relays with the shares in force at `now`: those of the block held, else the
+    /// configuration's own.
+    pub(crate) fn weighted_relays_at(&self, now: u64) -> Cow<'_, [Relay]> {
+        match self.held_block(now) {
+            Some(block) => Cow::Owned(reweighted(&self.relays, &block)),
+            None => Cow::Borrowed(&self.relays),
+        }
+    }
+
+    /// [`weighted_relays_at`](Self::weighted_relays_at) now.
+    pub(crate) fn weighted_relays(&self) -> Cow<'_, [Relay]> {
+        if self.relay_weights_key.is_none() {
+            return Cow::Borrowed(&self.relays);
+        }
+        self.weighted_relays_at(crate::weights::unix_now())
     }
 
     /// The gateway host name.
@@ -243,7 +344,9 @@ impl OhttpConfig {
 
     /// The relay to post the next request to. With one relay, always
     /// [`relay_url`](Self::relay_url). With a list, a fresh random choice on every call (each
-    /// relay an equal share), passed on
+    /// relay an equal share, or the shares of a valid relay weights block held for this
+    /// configuration, see [`with_relay_weights_key`](Self::with_relay_weights_key); a relay of
+    /// share 0 is never drawn, only taken over to while the others are out), passed on
     /// down the failover order while the relay drawn is held out after a failure or paused by a
     /// `Retry-After` ([`crate::RelaySelector::global`]). Call it for each request, and report
     /// the outcome with [`crate::RelaySelector::note_failure`] /
@@ -255,7 +358,7 @@ impl OhttpConfig {
     /// [`crate::RELAY_PROBE_WINDOW`]). Prefer [`choose_relay_where`](Self::choose_relay_where)
     /// (`|_| true` with no criterion) and report with its [`RelayProbe`].
     pub fn choose_relay(&self) -> &str {
-        self.relays[RelaySelector::global().choose(&self.relays)].url()
+        self.relays[RelaySelector::global().choose(&self.weighted_relays())].url()
     }
 
     /// [`choose_relay`](Self::choose_relay), passing over a relay for which `eligible` is false
@@ -281,7 +384,7 @@ impl OhttpConfig {
         eligible: impl Fn(&str) -> bool,
     ) -> Option<(&str, RelayProbe)> {
         RelaySelector::global()
-            .choose_where(&self.relays, &eligible)
+            .choose_where(&self.weighted_relays(), &eligible)
             .map(|(i, probe)| (self.relays[i].url(), probe))
     }
 
@@ -318,6 +421,10 @@ impl fmt::Debug for OhttpConfig {
         let mut s = f.debug_struct("OhttpConfig");
         for field in ConfigField::ALL {
             s.field(field.as_str(), &Set);
+        }
+        // Named only when set, so that the output of a configuration without one is as before.
+        if self.relay_weights_key.is_some() {
+            s.field("relay_weights_pubkey", &Set);
         }
         s.finish()
     }
@@ -402,6 +509,18 @@ impl OhttpNetworks {
             ];
             if let Some(&(field, _)) = shared.iter().find(|&&(_, same)| same) {
                 return Err(ConfigError::SharedAcrossNetworks { field });
+            }
+            // A relay weights key is one network's alone: neither the other network's weights
+            // key nor its signing key.
+            let crossed = |config: &OhttpConfig, other: &OhttpConfig| {
+                config.relay_weights_key.is_some_and(|key| {
+                    Some(key) == other.relay_weights_key || key == other.signing_pubkey
+                })
+            };
+            if crossed(main, test) || crossed(test, main) {
+                return Err(ConfigError::SharedAcrossNetworks {
+                    field: ConfigField::SigningPubkey,
+                });
             }
         }
         Ok(OhttpNetworks { mainnet, testnet })

@@ -1,0 +1,102 @@
+{
+  "description": "Relay weights block: test vector (Ed25519 per RFC 8032 over the signed message; set and block id per docs/relay-weights.md)",
+  "seed_hex": "3333333333333333333333333333333333333333333333333333333333333333",
+  "public_key_hex": "17cb79fb2b4120f2b1ec65e4198d6e08b28e813feb01e4a400839b85e18080ce",
+  "key_id": "6c8f8607",
+  "relay_urls_as_written": [
+    "https://Relay-A.Example:443/relay/",
+    "https://relay-b.example:8443/gateway-path"
+  ],
+  "relay_urls_canonical": [
+    "https://relay-a.example/relay",
+    "https://relay-b.example:8443/gateway-path"
+  ],
+  "set": "377f979ac611fd84",
+  "network": "testnet",
+  "seq": 1767225600,
+  "not_before": 1767225300,
+  "not_after": 1769817300,
+  "weights": [
+    70,
+    30
+  ],
+  "signed_message_hex": "7a6f646c2d6f687474702d72656c61792d776569676874732d763100746573746e657400000000006955b900000000006955b7d400000000697d44d402377f979ac611fd84461e",
+  "signature_base64": "16NrlaikzHWg1hF9VcLm7gCq2FfA9bgkz1qIq+vhbUnxQnJxrt5T5eG3tK8CXtzM4Gdwz4lFiMZfSmdheFtrDg==",
+  "block_json": "{\"v\":1,\"network\":\"testnet\",\"seq\":1767225600,\"not_before\":1767225300,\"not_after\":1769817300,\"n\":2,\"set\":\"377f979ac611fd84\",\"weights\":[70,30],\"key_id\":\"6c8f8607\",\"sig\":\"16NrlaikzHWg1hF9VcLm7gCq2FfA9bgkz1qIq+vhbUnxQnJxrt5T5eG3tK8CXtzM4Gdwz4lFiMZfSmdheFtrDg==\"}",
+  "block_id": "8ab2b0d5118eeff43e2b560568b8f1fcfd86fe666e55f871906ca197be807123",
+  "negative": [
+    {
+      "name": "another relay list",
+      "block_json": "{\"v\":1,\"network\":\"testnet\",\"seq\":1767225600,\"not_before\":1767225300,\"not_after\":1769817300,\"n\":2,\"set\":\"0011223344556677\",\"weights\":[70,30],\"key_id\":\"6c8f8607\",\"sig\":\"bNG1J9vTUJyhKI9Y1dROGhqp7B2SRgJMg8ug6o3pQSMt5o0PrmaQxhmKlIyYlDVLd0wwmw+i5VTa5OV1UmGzAA==\"}",
+      "now": 1767225600,
+      "reason": "Set"
+    },
+    {
+      "name": "upper-case set",
+      "block_json": "{\"v\":1,\"network\":\"testnet\",\"seq\":1767225600,\"not_before\":1767225300,\"not_after\":1769817300,\"n\":2,\"set\":\"377F979AC611FD84\",\"weights\":[70,30],\"key_id\":\"6c8f8607\",\"sig\":\"16NrlaikzHWg1hF9VcLm7gCq2FfA9bgkz1qIq+vhbUnxQnJxrt5T5eG3tK8CXtzM4Gdwz4lFiMZfSmdheFtrDg==\"}",
+      "now": 1767225600,
+      "reason": "Set"
+    },
+    {
+      "name": "weights adding up to 99",
+      "block_json": "{\"v\":1,\"network\":\"testnet\",\"seq\":1767225600,\"not_before\":1767225300,\"not_after\":1769817300,\"n\":2,\"set\":\"377f979ac611fd84\",\"weights\":[70,29],\"key_id\":\"6c8f8607\",\"sig\":\"mZpcxAgYFtrZWHyMrBAPGrxG+T5BT6JeKp5PhNnP9mgLWk2bcpki4zu9QKgGOmSLqOsGe6UD0PgIhk0OCHgUBg==\"}",
+      "now": 1767225600,
+      "reason": "Bounds"
+    },
+    {
+      "name": "a weight as a float",
+      "block_json": "{\"v\":1,\"network\":\"testnet\",\"seq\":1767225600,\"not_before\":1767225300,\"not_after\":1769817300,\"n\":2,\"set\":\"377f979ac611fd84\",\"weights\":[70.0,30],\"key_id\":\"6c8f8607\",\"sig\":\"16NrlaikzHWg1hF9VcLm7gCq2FfA9bgkz1qIq+vhbUnxQnJxrt5T5eG3tK8CXtzM4Gdwz4lFiMZfSmdheFtrDg==\"}",
+      "now": 1767225600,
+      "reason": "Malformed"
+    },
+    {
+      "name": "a weight as a string",
+      "block_json": "{\"v\":1,\"network\":\"testnet\",\"seq\":1767225600,\"not_before\":1767225300,\"not_after\":1769817300,\"n\":2,\"set\":\"377f979ac611fd84\",\"weights\":[\"70\",30],\"key_id\":\"6c8f8607\",\"sig\":\"16NrlaikzHWg1hF9VcLm7gCq2FfA9bgkz1qIq+vhbUnxQnJxrt5T5eG3tK8CXtzM4Gdwz4lFiMZfSmdheFtrDg==\"}",
+      "now": 1767225600,
+      "reason": "Malformed"
+    },
+    {
+      "name": "a field repeated",
+      "block_json": "{\"v\":1,\"network\":\"testnet\",\"seq\":1767225600,\"not_before\":1767225300,\"not_after\":1769817300,\"n\":2,\"set\":\"377f979ac611fd84\",\"weights\":[70,30],\"key_id\":\"6c8f8607\",\"sig\":\"16NrlaikzHWg1hF9VcLm7gCq2FfA9bgkz1qIq+vhbUnxQnJxrt5T5eG3tK8CXtzM4Gdwz4lFiMZfSmdheFtrDg==\",\"v\":1}",
+      "now": 1767225600,
+      "reason": "Malformed"
+    },
+    {
+      "name": "an unknown field",
+      "block_json": "{\"v\":1,\"network\":\"testnet\",\"seq\":1767225600,\"not_before\":1767225300,\"not_after\":1769817300,\"n\":2,\"set\":\"377f979ac611fd84\",\"weights\":[70,30],\"key_id\":\"6c8f8607\",\"sig\":\"16NrlaikzHWg1hF9VcLm7gCq2FfA9bgkz1qIq+vhbUnxQnJxrt5T5eG3tK8CXtzM4Gdwz4lFiMZfSmdheFtrDg==\",\"x\":1}",
+      "now": 1767225600,
+      "reason": "UnknownField"
+    },
+    {
+      "name": "seq more than 60 s ahead",
+      "block_json": "{\"v\":1,\"network\":\"testnet\",\"seq\":1767225600,\"not_before\":1767225300,\"not_after\":1769817300,\"n\":2,\"set\":\"377f979ac611fd84\",\"weights\":[70,30],\"key_id\":\"6c8f8607\",\"sig\":\"16NrlaikzHWg1hF9VcLm7gCq2FfA9bgkz1qIq+vhbUnxQnJxrt5T5eG3tK8CXtzM4Gdwz4lFiMZfSmdheFtrDg==\"}",
+      "now": 1767225539,
+      "reason": "SeqAhead"
+    },
+    {
+      "name": "expired",
+      "block_json": "{\"v\":1,\"network\":\"testnet\",\"seq\":1767225600,\"not_before\":1767225300,\"not_after\":1769817300,\"n\":2,\"set\":\"377f979ac611fd84\",\"weights\":[70,30],\"key_id\":\"6c8f8607\",\"sig\":\"16NrlaikzHWg1hF9VcLm7gCq2FfA9bgkz1qIq+vhbUnxQnJxrt5T5eG3tK8CXtzM4Gdwz4lFiMZfSmdheFtrDg==\"}",
+      "now": 1769817361,
+      "reason": "Expired"
+    },
+    {
+      "name": "valid for more than 30 days",
+      "block_json": "{\"v\":1,\"network\":\"testnet\",\"seq\":1767225600,\"not_before\":1767225300,\"not_after\":1769817301,\"n\":2,\"set\":\"377f979ac611fd84\",\"weights\":[70,30],\"key_id\":\"6c8f8607\",\"sig\":\"CzM0a+Qwaz4M/QYav6R1zYBnQ4gIfM173tjlFOXbfa0eLnZpODRD6NpkKKvjzf/5Uj8IjiMUQwF9uPsFNZUmBQ==\"}",
+      "now": 1767225600,
+      "reason": "Validity"
+    },
+    {
+      "name": "signed over the key configuration's domain",
+      "block_json": "{\"v\":1,\"network\":\"testnet\",\"seq\":1767225600,\"not_before\":1767225300,\"not_after\":1769817300,\"n\":2,\"set\":\"377f979ac611fd84\",\"weights\":[70,30],\"key_id\":\"6c8f8607\",\"sig\":\"DEJYAVY3WtB3Wwda6PtuRZyYHyihSUecZ/tEq/SZ9l2xqBhdBuE+WA+QIihvWJpme8Jh3TOjysFoyVBiO2UsDg==\"}",
+      "now": 1767225600,
+      "reason": "Signature"
+    },
+    {
+      "name": "other weights than signed",
+      "block_json": "{\"v\":1,\"network\":\"testnet\",\"seq\":1767225600,\"not_before\":1767225300,\"not_after\":1769817300,\"n\":2,\"set\":\"377f979ac611fd84\",\"weights\":[70,30],\"key_id\":\"6c8f8607\",\"sig\":\"xJnEXSk893fMk+JHIWRerLZcrCSGiIBl6Mo6E+Wmkw2C4XxioI5TOh6sE1ozKz6oj6hN+GaMRcsJ2LOhlJCuBg==\"}",
+      "now": 1767225600,
+      "reason": "Signature"
+    }
+  ],
+  "negative_note": "Each negative block must be ignored at its now (and the envelope carrying it still accepted); reason = the check that refuses it."
+}

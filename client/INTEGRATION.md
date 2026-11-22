@@ -113,7 +113,8 @@ assert!(networks.get(Network::Mainnet).is_none());
 starting `https://`, for example `https://relay-a.example/relay,https://relay-b.example/gateway`.
 A value is a list only where a `,` is followed by `https://`; any other value is one relay URL,
 exactly as before. Each URL follows the rules above, a list has at most 8 relays and no relay
-twice, every relay gets an equal share of the requests, and the mainnet/testnet and
+twice, every relay gets an equal share of the requests (unless a relay weights block sets
+others, below), and the mainnet/testnet and
 gateway-host rules apply to every relay.
 
 - **Stable values stay stable.** `relay_url()` and `relay_for(host)` return the first relay
@@ -175,6 +176,25 @@ gateway-host rules apply to every relay.
 - **Order matters.** The first relay is the network's stable relay and the envelope source,
   relays fail over in list order, and the list's order is how its relays are referred to: keep
   it when the list changes otherwise.
+
+### Relay weights
+
+The gateway operator may change the shares (not the relays) with a signed block, `relay_weights`,
+inside the signed key-configuration envelope (`docs/relay-weights.md`). To accept it, configure
+the network's relay weights key: `OhttpConfig::new(params)?.with_relay_weights_key(hex)?` (64 hex
+digits; an empty value means none, and then no block is ever read). Nothing else changes for an
+integration that already verifies the envelope with `verify_signed_config(&networks, ...)` (or
+uses `Client::for_network`) and asks `choose_relay_for(_where)` per request: a valid block is
+taken when the envelope is checked, from a relay or from DNS alike, and every choice uses its
+weights while it is valid; once it expires, the shares are equal again without a new fetch. A
+relay of weight 0 is never drawn, but requests still fail over to it. A block that does not
+check out is ignored and never makes the envelope fail; nor does an envelope without one, or
+with an ignored one, drop the block held (only a higher `seq` replaces it, and expiry ends it).
+Fetch the envelope through the relays of weight 0 last while a block is held (a relay can withhold
+the block; `Client` does this). The block is held in memory only:
+persist nothing for it. For a diagnostics screen, `config.relay_weights()` gives
+`RelayWeightsStatus::Block(w)` (show `w.id()`, the block id the public log lists) or
+`RelayWeightsStatus::AppDefaults` ("app defaults").
 
 ## 2. Obtaining the key configuration
 
