@@ -87,11 +87,17 @@ cached. A relay of weight 0 is never drawn for a request, but
 requests still fail over to it; no request goes to a relay outside the configured list. Without a
 configured key the block is never read.
 
-## Test vector
+## Test vectors
 
-`relay-weights-test-vector.json`: the key (seed, public key, key id), a relay list as written and in
-canonical form, its `set`, the fields, the signed message, the signature, the block as JSON and the
-block id.
+- `relay-weights-test-vector.json`: the key (seed, public key, key id), a relay list as written and
+  in canonical form, its `set`, the fields, the signed message, the signature, the block as JSON and
+  the block id; and `negative`: blocks a client must ignore, each with the time to check it at and
+  the check that refuses it (wrong `set`, bounds, types such as `7e1` or `100.0`, repeated fields
+  also under an escaped name, unknown field, `seq` ahead, expiry, validity, domain, signature).
+- `relay-url-vectors.json`: relay URLs and their canonical form (case, default port, trailing
+  slash, dot segments, percent-encoding, IDNA punycode, IPv4 and IPv6 literals), URLs that are
+  refused, and relay lists with their `set`. An implementation that computes `set` itself must
+  give these values.
 
 ## Operating it
 
@@ -100,7 +106,8 @@ block id.
   validity. Outages are handled by the per-request failover, not by a block.
 - **Revocation.** Only a block with a higher `seq` replaces a held one. Removing the block from the
   gateway revokes nothing: clients that hold it keep it until it expires (new processes start with
-  equal shares). To undo a change, sign equal weights.
+  equal shares). To undo a change, sign weights as equal as integers adding up to 100 allow (with
+  3 relays, 34/33/33: within one point of the default 1/n), or delete the block and let it lapse.
 - **Rollback protection is per process.** Nothing is persisted, so after a restart a client takes
   any valid block, also an older one; keep validity short enough for that to be acceptable.
 - **Clock.** A client refuses a `seq` more than 60 s ahead of its clock; serve a block a little after

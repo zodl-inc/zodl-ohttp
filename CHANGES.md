@@ -3,6 +3,15 @@
 Behaviour changes of the gateway, the relay simulator and the e2e client. The client library
 keeps its own log in [client/CHANGELOG.md](client/CHANGELOG.md).
 
+## Unreleased
+
+### Gateway
+
+- `ohttp_relay_weights_refresh_failures_total{network, reason="unreadable"|"timeout"|"stalled"}`:
+  refreshes of the relay weights block file that kept the previous state; the first of a run of
+  failures is logged (and its end), and the `not_after` gauge is 0 when the file could never be
+  read.
+
 ## 2.0.0
 
 Breaking for operators: the gateway reads its configuration from its files only (`--config` /

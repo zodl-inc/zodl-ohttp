@@ -527,6 +527,11 @@ lazy_static::lazy_static! {
 
 // A second block: one more static in the first exceeds the macro recursion limit.
 lazy_static::lazy_static! {
+    static ref OHTTP_RELAY_WEIGHTS_REFRESH_FAILURES: IntCounterVec = IntCounterVec::new(
+        Opts::new("ohttp_relay_weights_refresh_failures_total", "Refreshes of the relay weights block file that kept the previous state, by reason (unreadable: an I/O error or a failed read task, timeout: a read over 2 s, stalled: an earlier read still running), per network."),
+        &["network", "reason"]
+    )
+    .unwrap();
     static ref OHTTP_RELAY_WEIGHTS_NOT_AFTER: IntGaugeVec = IntGaugeVec::new(
         Opts::new("ohttp_relay_weights_block_not_after_seconds", "The not_after (Unix seconds) the served relay weights block names, as read from it without checking it; 0 when no block is served."),
         &["network"]
@@ -677,6 +682,9 @@ pub fn init_metrics() {
         .ok();
     REGISTRY
         .register(Box::new(OHTTP_WRITE_FORWARD_TOTAL.clone()))
+        .ok();
+    REGISTRY
+        .register(Box::new(OHTTP_RELAY_WEIGHTS_REFRESH_FAILURES.clone()))
         .ok();
     REGISTRY
         .register(Box::new(OHTTP_REQUESTS_IN_FLIGHT.clone()))
@@ -1257,6 +1265,30 @@ pub fn record_key_config_info(network: &str, fingerprint: &str, signing_key_id: 
     OHTTP_KEY_CONFIG_INFO
         .with_label_values(&[network, fingerprint, signing_key_id.unwrap_or("-")])
         .set(1);
+}
+
+/// The refresh failure series of `network` at 0, so that the first failure is an increase.
+pub fn init_relay_weights_refresh_failures(network: &str) {
+    for reason in ["unreadable", "timeout", "stalled"] {
+        OHTTP_RELAY_WEIGHTS_REFRESH_FAILURES
+            .with_label_values(&[network, reason])
+            .inc_by(0);
+    }
+}
+
+/// The refresh failures of `network` counted for `reason` (for tests).
+#[cfg(test)]
+pub fn relay_weights_refresh_failures(network: &str, reason: &str) -> u64 {
+    OHTTP_RELAY_WEIGHTS_REFRESH_FAILURES
+        .with_label_values(&[network, reason])
+        .get()
+}
+
+/// A refresh of the relay weights block file of `network` that kept the previous state.
+pub fn record_relay_weights_refresh_failure(network: &str, reason: &str) {
+    OHTTP_RELAY_WEIGHTS_REFRESH_FAILURES
+        .with_label_values(&[network, reason])
+        .inc();
 }
 
 /// The `not_after` the served relay weights block of `network` names (0: none served).

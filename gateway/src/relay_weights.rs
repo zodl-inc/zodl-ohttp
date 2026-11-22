@@ -77,17 +77,25 @@ pub struct RelayWeightsFile {
     /// A blocking read still running (one that outlived [`READ_TIMEOUT`]): no other is started
     /// until it ends, so a stalled file costs one thread at most.
     in_flight: Arc<std::sync::atomic::AtomicBool>,
+    /// Whether the last refresh failed (logged once per run of failures, counted every time).
+    failing: std::sync::atomic::AtomicBool,
+    /// How the file is read ([`read_block`]; another in tests).
+    reader: fn(&std::path::Path) -> Option<BlockFile>,
 }
 
 impl RelayWeightsFile {
     /// The block file at `path`, for the logs and metrics of `network`. Nothing is read yet.
     pub fn new(path: impl Into<PathBuf>, network: impl Into<String>) -> Self {
+        let network = network.into();
+        crate::health::init_relay_weights_refresh_failures(&network);
         RelayWeightsFile {
             path: path.into(),
-            network: network.into(),
+            network,
             last: Mutex::new(None),
             reading: tokio::sync::Mutex::new(()),
             in_flight: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            failing: std::sync::atomic::AtomicBool::new(false),
+            reader: read_block,
         }
     }
 
@@ -127,9 +135,11 @@ impl RelayWeightsFile {
         let _reading = self.reading.lock().await;
         // The previous read has not ended (a stalled file): skip this one.
         if self.in_flight.swap(true, Ordering::AcqRel) {
+            self.failed("stalled");
             return;
         }
         let path = self.path.clone();
+        let reader = self.reader;
         // Released when the read ends, however it ends (a panic, or a task dropped unstarted).
         let release = scopeguard::guard(self.in_flight.clone(), |flag| {
             flag.store(false, Ordering::Release)
@@ -138,29 +148,48 @@ impl RelayWeightsFile {
             READ_TIMEOUT,
             tokio::task::spawn_blocking(move || {
                 let _release = release;
-                read_block(&path)
+                reader(&path)
             }),
         )
         .await;
         let read = match read {
             Ok(Ok(Some(read))) => read,
             // An I/O error, a stall, or a read task that did not finish: keep what was read.
-            Ok(Ok(None)) | Ok(Err(_)) | Err(_) => {
+            failed => {
+                self.failed(match failed {
+                    Err(_) => "timeout",
+                    _ => "unreadable",
+                });
                 if self.last.lock().is_none() {
-                    warn!(
-                        network = self.network.as_str(),
-                        "relay weights: the block file could not be read"
-                    );
                     *self.last.lock() = Some(BlockFile::Invalid("unreadable"));
                     crate::health::record_relay_weights(&self.network, "invalid");
+                    crate::health::record_relay_weights_not_after(&self.network, 0);
                 }
                 return;
             }
         };
+        if self.failing.swap(false, Ordering::AcqRel) {
+            info!(
+                network = self.network.as_str(),
+                "relay weights: the block file is readable again"
+            );
+        }
         let changed = self.last.lock().as_ref() != Some(&read);
         if changed {
             self.report(&read);
             *self.last.lock() = Some(read);
+        }
+    }
+
+    /// Counts a refresh that kept the previous state (`reason`: `unreadable`, `timeout` or
+    /// `stalled`), and logs the first of a run of them.
+    fn failed(&self, reason: &'static str) {
+        crate::health::record_relay_weights_refresh_failure(&self.network, reason);
+        if !self.failing.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            warn!(
+                network = self.network.as_str(),
+                reason, "relay weights: the block file could not be read; the last state is kept"
+            );
         }
     }
 
@@ -358,6 +387,52 @@ mod tests {
         file.refresh().await;
         assert!(file.current().is_none());
         let _ = std::fs::remove_dir(&dir);
+    }
+
+    /// A reader that serves the block, then blocks for well over the timeout once, then serves
+    /// the block again.
+    fn stalling_reader(_: &std::path::Path) -> Option<BlockFile> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static CALLS: AtomicUsize = AtomicUsize::new(0);
+        if CALLS.fetch_add(1, Ordering::SeqCst) == 1 {
+            std::thread::sleep(READ_TIMEOUT + Duration::from_secs(4));
+        }
+        Some(parse_block(BLOCK.as_bytes()))
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stalled_read_is_skipped_until_it_ends_and_keeps_the_last_state() {
+        use std::sync::atomic::Ordering;
+        let network = "relay-weights-stall-test";
+        let failures = |reason| crate::health::relay_weights_refresh_failures(network, reason);
+        let mut file = RelayWeightsFile::new("/nonexistent/relay-weights.json", network);
+        file.reader = stalling_reader;
+        assert_eq!((failures("timeout"), failures("stalled")), (0, 0));
+        // A block is served.
+        file.refresh().await;
+        assert_eq!(file.current().unwrap().get(), BLOCK);
+        // The next read stalls past the timeout: the block stays served.
+        let started = std::time::Instant::now();
+        file.refresh().await;
+        assert!(started.elapsed() < READ_TIMEOUT + Duration::from_secs(3));
+        assert_eq!(file.current().unwrap().get(), BLOCK);
+        assert!(file.in_flight.load(Ordering::Acquire));
+        assert!(file.failing.load(Ordering::Acquire));
+        assert_eq!(failures("timeout"), 1);
+        // While it still runs, a refresh starts no other read, returns at once, and is counted.
+        let started = std::time::Instant::now();
+        file.refresh().await;
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(failures("stalled"), 1);
+        assert_eq!(file.current().unwrap().get(), BLOCK);
+        // Once it has ended, the next refresh reads again.
+        while file.in_flight.load(Ordering::Acquire) {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        file.refresh().await;
+        assert_eq!(file.current().unwrap().get(), BLOCK);
+        assert!(!file.failing.load(Ordering::Acquire));
+        assert_eq!((failures("timeout"), failures("stalled")), (1, 1));
     }
 
     #[cfg(unix)]

@@ -102,15 +102,35 @@ pub enum ConfigError {
         /// The shared field.
         field: ConfigField,
     },
+    /// A network's relay weights key ([`OhttpConfig::with_relay_weights_key`]) is the other
+    /// network's relay weights key or signing key: a relay weights key is one network's alone.
+    /// When both networks' keys are crossed, mainnet is named.
+    #[error("OHTTP configuration: the {} relay_weights_pubkey must not be a key of the other network", .network.as_str())]
+    RelayWeightsKeyShared {
+        /// The network whose relay weights key is refused.
+        network: crate::Network,
+    },
 }
 
 impl ConfigError {
-    /// The field the error is about.
+    /// The field the error is about. [`ConfigError::RelayWeightsKeyShared`] concerns the relay
+    /// weights key, which is no [`ConfigField`]: it gives [`ConfigField::SigningPubkey`], the key
+    /// field closest to it; [`field_name`](Self::field_name) names it exactly.
     pub const fn field(&self) -> ConfigField {
         match *self {
             ConfigError::Empty { field }
             | ConfigError::Invalid { field, .. }
             | ConfigError::SharedAcrossNetworks { field } => field,
+            ConfigError::RelayWeightsKeyShared { .. } => ConfigField::SigningPubkey,
+        }
+    }
+
+    /// The name of the field the error is about, as the error message gives it:
+    /// [`ConfigField::as_str`] of [`field`](Self::field), or `relay_weights_pubkey`.
+    pub const fn field_name(&self) -> &'static str {
+        match *self {
+            ConfigError::RelayWeightsKeyShared { .. } => "relay_weights_pubkey",
+            _ => self.field().as_str(),
         }
     }
 }
@@ -252,9 +272,8 @@ impl OhttpConfig {
     /// This configuration with the key relay weights blocks are signed with: raw Ed25519 as 64
     /// hex digits (either case), distinct from the key-configuration signing key. An empty
     /// value means no key (it clears one set before). A key is one network's alone:
-    /// [`OhttpNetworks::new`] refuses (as [`ConfigError::SharedAcrossNetworks`] of
-    /// [`ConfigField::SigningPubkey`]) a weights key that is the other network's weights or
-    /// signing key.
+    /// [`OhttpNetworks::new`] refuses a weights key that is the other network's weights or
+    /// signing key ([`ConfigError::RelayWeightsKeyShared`], naming `relay_weights_pubkey`).
     ///
     /// With a key, the relay weights block that a checked envelope carries
     /// ([`crate::verify_signed_config`], and the envelopes [`crate::Client::for_network`]
@@ -517,10 +536,13 @@ impl OhttpNetworks {
                     Some(key) == other.relay_weights_key || key == other.signing_pubkey
                 })
             };
-            if crossed(main, test) || crossed(test, main) {
-                return Err(ConfigError::SharedAcrossNetworks {
-                    field: ConfigField::SigningPubkey,
-                });
+            for (network, config, other) in [
+                (crate::Network::Mainnet, main, test),
+                (crate::Network::Testnet, test, main),
+            ] {
+                if crossed(config, other) {
+                    return Err(ConfigError::RelayWeightsKeyShared { network });
+                }
             }
         }
         Ok(OhttpNetworks { mainnet, testnet })

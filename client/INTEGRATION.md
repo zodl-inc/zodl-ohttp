@@ -182,7 +182,9 @@ gateway-host rules apply to every relay.
 The gateway operator may change the shares (not the relays) with a signed block, `relay_weights`,
 inside the signed key-configuration envelope (`docs/relay-weights.md`). To accept it, configure
 the network's relay weights key: `OhttpConfig::new(params)?.with_relay_weights_key(hex)?` (64 hex
-digits; an empty value means none, and then no block is ever read). Nothing else changes for an
+digits; an empty value means none, and then no block is ever read). A weights key that is the other network's
+weights or signing key is refused by `OhttpNetworks::new` (`ConfigError::RelayWeightsKeyShared`,
+naming `relay_weights_pubkey`). Nothing else changes for an
 integration that already verifies the envelope with `verify_signed_config(&networks, ...)` (or
 uses `Client::for_network`) and asks `choose_relay_for(_where)` per request: a valid block is
 taken when the envelope is checked, from a relay or from DNS alike, and every choice uses its
