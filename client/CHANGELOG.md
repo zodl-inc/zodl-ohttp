@@ -2,6 +2,29 @@
 
 [Keep a Changelog](https://keepachangelog.com).
 
+## 2.6.0
+
+No breaking change (a minor release: new public items, and two behaviour changes below).
+
+### Added
+
+- `ConfigError::RelayWeightsKeyShared { network }` and `ConfigError::field_name()`.
+- `docs/relay-url-vectors.json`: relay URL canonical forms, refusals and relay list fingerprints
+  (`set`), for implementations outside this crate. Three more negative cases in
+  `docs/relay-weights-test-vector.json` (a weight `7e1`, a weight `100.0`, a field repeated under an
+  escaped name).
+
+### Changed
+
+- `OhttpNetworks::new` refuses a relay weights key that is the other network's weights or signing
+  key with `ConfigError::RelayWeightsKeyShared`, naming `relay_weights_pubkey` (2.5.0 returned
+  `SharedAcrossNetworks { field: SigningPubkey }`). `ConfigError::field()` still gives
+  `ConfigField::SigningPubkey` for it, the closest field; `field_name()` names it exactly. With
+  both networks' keys crossed, the error names mainnet.
+- `Client::for_network` takes the relay weights block of the envelopes it fetches also for a
+  network of a single relay (its diagnostics, `OhttpConfig::relay_weights`, now show the block;
+  with one relay there is no choice to weigh).
+
 ## 2.5.0
 
 No breaking change (a minor release: new public items). Without a relay weights key nothing
@@ -35,8 +58,8 @@ changes.
   `choose_relay_for(_where)` and `Client` draw by its weights; the failover order follows them,
   and a relay of weight 0 is never drawn, only taken over to while the others are out. Probes,
   holds and failover are unchanged, and no choice leaves the configured list.
-- A block is ignored (the block held, if any, stays in force; otherwise equal shares) when: no
-  key is configured (the block is not read); it is over 4096 bytes, not a JSON object of exactly its ten fields (each once), or a
+- A block is ignored (the block held, if any, stays in force; otherwise equal shares) when:
+  no key is configured (the block is not read); it is over 4096 bytes, not a JSON object of exactly its ten fields (each once), or a
   field has another type (weights must be JSON integers); `v` is not 1; it names the other
   network; `n` or the number of weights is not the number of relays; `set` is not the list's
   fingerprint; a weight is over 100 or the weights do not add up to 100; it is valid for more

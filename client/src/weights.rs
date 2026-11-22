@@ -66,6 +66,9 @@ const BLOCK_FIELDS: [&str; 10] = [
     "sig",
 ];
 /// The most weights keys and relay lists whose block is held at once.
+// The unit tests that go through the process's store use a weights key of their own each, so
+// that none sees another's block; keep them under this many (a test of the cap itself uses a
+// store of its own).
 const MAX_HELD_BLOCKS: usize = 16;
 
 /// The time now, in Unix seconds (0 before 1970).
@@ -697,7 +700,7 @@ pub(crate) mod tests {
         .unwrap()
         .with_relay_weights_key(&v.public_key_hex)
         .unwrap();
-        assert_eq!(v.negative.len(), 12);
+        assert_eq!(v.negative.len(), 15);
         for case in &v.negative {
             let why = check(&config, case.block_json.as_bytes(), case.now).unwrap_err();
             assert_eq!(format!("{why:?}"), case.reason, "{}", case.name);
@@ -1683,13 +1686,135 @@ pub(crate) mod tests {
         let testnet = config_with(&format!("{A},{B}"), 23);
         // Testnet's weights key (23), or testnet's signing key (2), as mainnet's weights key.
         for seed in [23, 2] {
+            let error = OhttpNetworks::new(Some(mainnet(seed)), Some(testnet.clone())).unwrap_err();
             assert_eq!(
-                OhttpNetworks::new(Some(mainnet(seed)), Some(testnet.clone())),
-                Err(crate::ConfigError::SharedAcrossNetworks {
-                    field: crate::ConfigField::SigningPubkey
-                })
+                error,
+                crate::ConfigError::RelayWeightsKeyShared {
+                    network: Network::Mainnet
+                }
+            );
+            assert_eq!(error.field_name(), "relay_weights_pubkey");
+            assert!(error.to_string().contains("relay_weights_pubkey"));
+        }
+        // The other way round: testnet's weights key is mainnet's signing key (1).
+        let testnet_on_mainnet_key = config_with(&format!("{A},{B}"), 1);
+        assert_eq!(
+            OhttpNetworks::new(Some(mainnet(24)), Some(testnet_on_mainnet_key)),
+            Err(crate::ConfigError::RelayWeightsKeyShared {
+                network: Network::Testnet
+            })
+        );
+        assert!(OhttpNetworks::new(Some(mainnet(24)), Some(testnet)).is_ok());
+    }
+
+    #[test]
+    fn the_url_vectors_canonicalize_and_fingerprint_as_published() {
+        #[derive(Deserialize)]
+        struct Urls {
+            canonical: Vec<Case>,
+            refused: Vec<Refused>,
+            lists: Vec<List>,
+        }
+        #[derive(Deserialize)]
+        struct Case {
+            input: String,
+            canonical: String,
+            note: String,
+        }
+        #[derive(Deserialize)]
+        struct Refused {
+            input: String,
+            note: String,
+        }
+        #[derive(Deserialize)]
+        struct List {
+            input: Vec<String>,
+            canonical: Vec<String>,
+            set: String,
+            note: String,
+        }
+        let v: Urls =
+            serde_json::from_str(include_str!("../testdata/relay-url-vectors.json")).unwrap();
+        for case in &v.canonical {
+            assert_eq!(
+                crate::canonical_relay_url(&case.input).as_deref(),
+                Ok(case.canonical.as_str()),
+                "{}",
+                case.note
+            );
+            // Canonical is a fixed point.
+            assert_eq!(
+                crate::canonical_relay_url(&case.canonical).as_deref(),
+                Ok(case.canonical.as_str()),
+                "{} (again)",
+                case.note
             );
         }
-        assert!(OhttpNetworks::new(Some(mainnet(24)), Some(testnet)).is_ok());
+        for case in &v.refused {
+            assert!(
+                crate::canonical_relay_url(&case.input).is_err(),
+                "{}",
+                case.note
+            );
+        }
+        for list in &v.lists {
+            let config = config_with(&list.input.join(","), 9);
+            let canonical: Vec<&str> = config.relays().iter().map(Relay::url).collect();
+            assert_eq!(canonical, list.canonical, "{}", list.note);
+            assert_eq!(config.relay_set(), list.set, "{}", list.note);
+            assert_eq!(
+                relay_set(list.canonical.iter().map(String::as_str)),
+                list.set
+            );
+        }
+    }
+
+    /// Values a block field may hold that no valid block has: the envelope still opens, also
+    /// with the block field nested 200 deep (the envelope's own fields are read without
+    /// descending into it).
+    #[test]
+    fn odd_values_in_the_block_field_leave_the_envelope_open() {
+        let config = config_with(&format!("{A},{B}"), 26);
+        let networks = OhttpNetworks::new(None, Some(config.clone())).unwrap();
+        let nested = format!("{}1{}", "[".repeat(100), "]".repeat(100));
+        let nested_object = format!("{}{{}}{}", "{\"a\":".repeat(100), "}".repeat(100));
+        for block in [
+            nested,
+            nested_object,
+            "1180591620717411303424".to_string(),
+            "-1".to_string(),
+            "true".to_string(),
+            "{}".to_string(),
+            r#"{"weights":[50,50],"v":1}"#.to_string(),
+        ] {
+            let envelope = with_block(block.as_bytes(), NOW);
+            for policy in [
+                SignedConfigPolicy::LIBRARY,
+                SignedConfigPolicy::ANDROID,
+                SignedConfigPolicy::IOS,
+                SignedConfigPolicy::SLIPSTREAM,
+            ] {
+                crate::verify_signed_config(&networks, &envelope, Network::Testnet, NOW, &policy)
+                    .unwrap_or_else(|e| panic!("{block:.40}: {e}"));
+            }
+            assert_eq!(
+                config.relay_weights_at(NOW),
+                RelayWeightsStatus::AppDefaults
+            );
+        }
+        let deep = format!("{}1{}", "[".repeat(200), "]".repeat(200));
+        let envelope = with_block(deep.as_bytes(), NOW);
+        crate::verify_signed_config(
+            &networks,
+            &envelope,
+            Network::Testnet,
+            NOW,
+            &SignedConfigPolicy::LIBRARY,
+        )
+        .unwrap();
+        assert_eq!(
+            config.relay_weights_at(NOW),
+            RelayWeightsStatus::AppDefaults
+        );
     }
 }

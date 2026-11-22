@@ -124,6 +124,9 @@ pub struct Client {
     other_key_urls: Vec<String>,
     /// The position in the relay list of the relay each of `other_key_urls` goes through.
     other_key_relays: Vec<usize>,
+    /// The network's configuration when it has a relay weights key: the envelopes fetched are
+    /// checked for its block (also with a single relay, for the diagnostics).
+    weights_config: Option<Box<crate::OhttpConfig>>,
     http: reqwest::Client,
     config: Mutex<KeyCache>,
 }
@@ -382,6 +385,9 @@ impl Client {
             }
             client.relays = Relays::Configured(Box::new(config.clone()));
         }
+        if config.relay_weights_key().is_some() {
+            client.weights_config = Some(Box::new(config.clone()));
+        }
         Ok(client)
     }
 
@@ -450,6 +456,7 @@ impl Client {
             keys,
             other_key_urls: Vec::new(),
             other_key_relays: Vec::new(),
+            weights_config: None,
             http,
             config: Mutex::new(KeyCache::default()),
         })
@@ -827,9 +834,9 @@ impl Client {
             } => {
                 let now = unix_now();
                 let keys = open_signed_config(&body, network.as_str(), signer, now)?;
-                // The relay weights block the envelope may carry, for a client of a configured
-                // relay list (ignored when it does not check out; the keys stand either way).
-                if let Relays::Configured(config) = &self.relays {
+                // The relay weights block the envelope may carry, when the network has a relay
+                // weights key (ignored when it does not check out; the keys stand either way).
+                if let Some(config) = &self.weights_config {
                     let _ = crate::weights::take_from_envelope(
                         config,
                         &body,
@@ -2116,6 +2123,20 @@ mod tests {
         crate::OhttpConfig,
         std::sync::Arc<Mutex<std::collections::HashMap<String, usize>>>,
     ) {
+        weighted_client_serving(weights_seed, block, |_| None).await
+    }
+
+    /// [`weighted_client`], the server answering a path with `override_answer`'s answer when it
+    /// gives one (a failing envelope source, say), else as `weighted_client`'s does.
+    async fn weighted_client_serving(
+        weights_seed: u8,
+        block: impl Fn(&crate::OhttpConfig) -> Option<Vec<u8>>,
+        override_answer: impl Fn(&str) -> Option<Vec<u8>> + Send + Sync + 'static,
+    ) -> (
+        Client,
+        crate::OhttpConfig,
+        std::sync::Arc<Mutex<std::collections::HashMap<String, usize>>>,
+    ) {
         let (envelope, signer) = signed_envelope();
         let seen = std::sync::Arc::new(Mutex::new(std::collections::HashMap::new()));
         let counter = seen.clone();
@@ -2125,6 +2146,9 @@ mod tests {
             true,
             std::sync::Arc::new(move |path: &str| {
                 *counter.lock().unwrap().entry(path.to_string()).or_insert(0) += 1;
+                if let Some(answer) = override_answer(path) {
+                    return Some(answer);
+                }
                 Some(match path {
                     "/a/ohttp-configs/signed" | "/b/ohttp-configs/signed" => tls::response(
                         "200 OK",
@@ -2218,5 +2242,149 @@ mod tests {
         let total = |seen: &std::collections::HashMap<String, usize>| seen.values().sum::<usize>();
         assert_eq!(total(&seen_with), total(&seen_without));
         assert_eq!(total(&seen_with), 7);
+    }
+
+    /// With a weights key and every relay paused, the first request fails on the pause: no key
+    /// configuration is fetched and nothing is sent.
+    #[tokio::test]
+    async fn a_weighted_client_fails_on_the_pause_before_any_fetch() {
+        let (client, config, seen) = weighted_client(42, |_| None).await;
+        for relay in config.relays() {
+            RelayBackoff::global().note(relay.url(), Duration::from_secs(30));
+        }
+        let request = Request::new("GET", "backend.example", "/v1/info");
+        let Err(Error::Backoff { .. }) = client.send(&request, Duration::from_secs(10)).await
+        else {
+            panic!("the request did not fail on the pause");
+        };
+        assert!(seen.lock().unwrap().is_empty(), "something was sent");
+    }
+
+    /// The envelope source failing (first relay), the key configuration and the block come
+    /// through the next relay, and the request goes out with the block's weights.
+    #[tokio::test]
+    async fn a_failing_first_envelope_source_falls_back_and_still_takes_the_block() {
+        let (client, config, seen) = weighted_client_serving(
+            43,
+            |config| {
+                Some(crate::weights::tests::Fields::new(config, unix_now(), &[0, 100]).signed(43))
+            },
+            |path| (path == "/a/ohttp-configs/signed").then(|| refused("503 Service Unavailable")),
+        )
+        .await;
+        let request = Request::new("GET", "backend.example", "/v1/info");
+        let Err(Error::Refused { status: 413 }) =
+            client.send(&request, Duration::from_secs(10)).await
+        else {
+            panic!("the request was not posted");
+        };
+        assert!(matches!(
+            config.relay_weights(),
+            crate::RelayWeightsStatus::Block(_)
+        ));
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(seen.get("/a/ohttp-configs/signed"), Some(&1), "{seen:?}");
+        assert_eq!(seen.get("/b/ohttp-configs/signed"), Some(&1), "{seen:?}");
+        assert_eq!(seen.get("/b"), Some(&1), "{seen:?}");
+        assert_eq!(seen.get("/a"), None, "{seen:?}");
+    }
+
+    /// Every envelope source failing: the key-configuration error is returned and nothing is
+    /// posted.
+    #[tokio::test]
+    async fn no_envelope_from_any_source_posts_nothing() {
+        let (client, config, seen) = weighted_client_serving(
+            44,
+            |_| None,
+            |path| {
+                path.ends_with("/ohttp-configs/signed")
+                    .then(|| refused("404 Not Found"))
+            },
+        )
+        .await;
+        let request = Request::new("GET", "backend.example", "/v1/info");
+        let Err(Error::Http(http)) = client.send(&request, Duration::from_secs(10)).await else {
+            panic!("not the envelope source's error");
+        };
+        assert_eq!(http.kind(), HttpErrorKind::Status(404));
+        assert_eq!(
+            config.relay_weights(),
+            crate::RelayWeightsStatus::AppDefaults
+        );
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(seen.get("/a"), None, "{seen:?}");
+        assert_eq!(seen.get("/b"), None, "{seen:?}");
+        assert!(seen.contains_key("/a/ohttp-configs/signed"), "{seen:?}");
+    }
+
+    /// While a block gives the first relay weight 0, the envelope is fetched through the
+    /// others first.
+    #[tokio::test]
+    async fn a_held_block_puts_weight_zero_envelope_sources_last() {
+        let (client, _config, _) = weighted_client(45, |config| {
+            Some(crate::weights::tests::Fields::new(config, unix_now(), &[0, 100]).signed(45))
+        })
+        .await;
+        let before = client.key_sources();
+        assert!(before[0].ends_with("/a/ohttp-configs/signed"), "{before:?}");
+        let request = Request::new("GET", "backend.example", "/v1/info");
+        let _ = client.send(&request, Duration::from_secs(10)).await;
+        let after = client.key_sources();
+        assert!(after[0].ends_with("/b/ohttp-configs/signed"), "{after:?}");
+        assert!(after[1].ends_with("/a/ohttp-configs/signed"), "{after:?}");
+    }
+
+    /// A single-relay client of a network with a weights key takes the block too (for the
+    /// diagnostics; with one relay there is no choice to weigh).
+    #[tokio::test]
+    async fn a_single_relay_client_takes_the_block_for_diagnostics() {
+        let (envelope, signer) = signed_envelope();
+        let served = std::sync::Arc::new(Mutex::new(envelope));
+        let answer_with = served.clone();
+        let (port, _) = tls::serve(
+            true,
+            std::sync::Arc::new(move |path: &str| {
+                Some(match path {
+                    "/a/ohttp-configs/signed" => tls::response(
+                        "200 OK",
+                        &[("content-type", "application/json")],
+                        &answer_with.lock().unwrap(),
+                    ),
+                    _ => refused("413 Payload Too Large"),
+                })
+            }),
+        )
+        .await;
+        let config = crate::OhttpConfig::new(crate::OhttpConfigParams {
+            gateway_host: "ohttp-gateway-testnet.example",
+            relay_url: &format!("https://localhost:{port}/a"),
+            keys_dns_name: "testnet.ohttp-keys.example",
+            signing_pubkey: &hex::encode(signer.as_bytes()),
+        })
+        .unwrap()
+        .with_relay_weights_key(&crate::config::tests::key_hex(46))
+        .unwrap();
+        let block = crate::weights::tests::Fields::new(&config, unix_now(), &[100]).signed(46);
+        let mut envelope = served.lock().unwrap().clone();
+        envelope.pop();
+        envelope.extend_from_slice(b",\"relay_weights\":");
+        envelope.extend_from_slice(&block);
+        envelope.push(b'}');
+        *served.lock().unwrap() = envelope;
+        let networks = OhttpNetworks::new(None, Some(config.clone())).unwrap();
+        let client = Client::for_network_with(
+            &networks,
+            Network::Testnet,
+            SignedConfigUrlRule::ReplaceRelaySuffix,
+            tls::builder(),
+            DEFAULT_LIST_CONNECT_TIMEOUT,
+        )
+        .unwrap();
+        let request = Request::new("GET", "backend.example", "/v1/info");
+        let _ = client.send(&request, Duration::from_secs(10)).await;
+        assert!(matches!(
+            config.relay_weights(),
+            crate::RelayWeightsStatus::Block(_)
+        ));
     }
 }

@@ -96,6 +96,24 @@
       "block_json": "{\"v\":1,\"network\":\"testnet\",\"seq\":1767225600,\"not_before\":1767225300,\"not_after\":1769817300,\"n\":2,\"set\":\"377f979ac611fd84\",\"weights\":[70,30],\"key_id\":\"6c8f8607\",\"sig\":\"xJnEXSk893fMk+JHIWRerLZcrCSGiIBl6Mo6E+Wmkw2C4XxioI5TOh6sE1ozKz6oj6hN+GaMRcsJ2LOhlJCuBg==\"}",
       "now": 1767225600,
       "reason": "Signature"
+    },
+    {
+      "name": "a weight in exponent form",
+      "block_json": "{\"v\":1,\"network\":\"testnet\",\"seq\":1767225600,\"not_before\":1767225300,\"not_after\":1769817300,\"n\":2,\"set\":\"377f979ac611fd84\",\"weights\":[7e1,30],\"key_id\":\"6c8f8607\",\"sig\":\"16NrlaikzHWg1hF9VcLm7gCq2FfA9bgkz1qIq+vhbUnxQnJxrt5T5eG3tK8CXtzM4Gdwz4lFiMZfSmdheFtrDg==\"}",
+      "now": 1767225600,
+      "reason": "Malformed"
+    },
+    {
+      "name": "a weight 100.0",
+      "block_json": "{\"v\":1,\"network\":\"testnet\",\"seq\":1767225600,\"not_before\":1767225300,\"not_after\":1769817300,\"n\":2,\"set\":\"377f979ac611fd84\",\"weights\":[100.0,0],\"key_id\":\"6c8f8607\",\"sig\":\"g+B/i64DtqP0Jmp6SD08PTHlBucUXZjdze5r9R2VlJcWA2bMWm77nUOomC+eCScwbb6LZ+QDdCbiOTCVVXblCg==\"}",
+      "now": 1767225600,
+      "reason": "Malformed"
+    },
+    {
+      "name": "a field repeated under an escaped name",
+      "block_json": "{\"v\":1,\"network\":\"testnet\",\"seq\":1767225600,\"not_before\":1767225300,\"not_after\":1769817300,\"n\":2,\"set\":\"377f979ac611fd84\",\"weights\":[70,30],\"key_id\":\"6c8f8607\",\"sig\":\"16NrlaikzHWg1hF9VcLm7gCq2FfA9bgkz1qIq+vhbUnxQnJxrt5T5eG3tK8CXtzM4Gdwz4lFiMZfSmdheFtrDg==\",\"\\u0076\":1}",
+      "now": 1767225600,
+      "reason": "Malformed"
     }
   ],
   "negative_note": "Each negative block must be ignored at its now (and the envelope carrying it still accepted); reason = the check that refuses it."

@@ -1,0 +1,211 @@
+{
+  "description": "Relay URL canonical form (zodl-ohttp-client canonical_relay_url) and the relay list fingerprint `set` of relay weights blocks (docs/relay-weights.md): SHA-256 over each canonical URL followed by one line feed, first 8 bytes, lower-case hex. Implementations computing `set` must give these values.",
+  "canonical": [
+    {
+      "input": "https://Relay.Example/relay",
+      "canonical": "https://relay.example/relay",
+      "note": "host in lower case"
+    },
+    {
+      "input": "https://RELAY.EXAMPLE/Relay",
+      "canonical": "https://relay.example/Relay",
+      "note": "path case is kept"
+    },
+    {
+      "input": "https://relay.example:443/relay",
+      "canonical": "https://relay.example/relay",
+      "note": "default port dropped"
+    },
+    {
+      "input": "https://relay.example:8443/relay",
+      "canonical": "https://relay.example:8443/relay",
+      "note": "other port kept"
+    },
+    {
+      "input": "https://relay.example/relay/",
+      "canonical": "https://relay.example/relay",
+      "note": "one trailing slash dropped"
+    },
+    {
+      "input": "https://relay.example/",
+      "canonical": "https://relay.example",
+      "note": "root path is empty"
+    },
+    {
+      "input": "https://relay.example",
+      "canonical": "https://relay.example",
+      "note": "no path"
+    },
+    {
+      "input": "https://relay.example/a/./b/../relay",
+      "canonical": "https://relay.example/a/relay",
+      "note": "dot segments resolved"
+    },
+    {
+      "input": "https://relay.example/%7erelay",
+      "canonical": "https://relay.example/~relay",
+      "note": "encoded unreserved decoded"
+    },
+    {
+      "input": "https://relay.example/%7Erelay",
+      "canonical": "https://relay.example/~relay",
+      "note": "encoded unreserved decoded, upper hex"
+    },
+    {
+      "input": "https://relay.example/%41b",
+      "canonical": "https://relay.example/Ab",
+      "note": "encoded letter decoded"
+    },
+    {
+      "input": "https://relay.example/a%c3%bcb",
+      "canonical": "https://relay.example/a%C3%BCb",
+      "note": "other escapes in upper-case hex"
+    },
+    {
+      "input": "https://relay.example/a%20b",
+      "canonical": "https://relay.example/a%20b",
+      "note": "encoded space kept"
+    },
+    {
+      "input": "https://xn--bcher-kva.example/relay",
+      "canonical": "https://xn--bcher-kva.example/relay",
+      "note": "IDNA: punycode accepted as is"
+    },
+    {
+      "input": "https://XN--BCHER-KVA.example/relay",
+      "canonical": "https://xn--bcher-kva.example/relay",
+      "note": "IDNA: punycode lower-cased"
+    },
+    {
+      "input": "https://192.0.2.1/relay",
+      "canonical": "https://192.0.2.1/relay",
+      "note": "IPv4 literal"
+    },
+    {
+      "input": "https://0xc0000201/relay",
+      "canonical": "https://192.0.2.1/relay",
+      "note": "IPv4 numeric alias in dotted decimal"
+    },
+    {
+      "input": "https://192.0.2.1:443/relay",
+      "canonical": "https://192.0.2.1/relay",
+      "note": "IPv4 default port dropped"
+    },
+    {
+      "input": "https://[2001:DB8::1]/relay",
+      "canonical": "https://[2001:db8::1]/relay",
+      "note": "IPv6 literal in standard form"
+    },
+    {
+      "input": "https://[2001:db8:0:0:0:0:0:1]:8443/relay/",
+      "canonical": "https://[2001:db8::1]:8443/relay",
+      "note": "IPv6 compressed, port kept, slash dropped"
+    },
+    {
+      "input": "https://[::ffff:192.0.2.1]/relay",
+      "canonical": "https://[::ffff:c000:201]/relay",
+      "note": "IPv4-mapped IPv6 as the URL standard writes it"
+    },
+    {
+      "input": "https://relay.example:00443/relay",
+      "canonical": "https://relay.example/relay",
+      "note": "default port with leading zeros dropped"
+    }
+  ],
+  "refused": [
+    {
+      "input": "http://relay.example/relay",
+      "note": "not https"
+    },
+    {
+      "input": "https://bücher.example/relay",
+      "note": "IDNA: a Unicode host must be written in punycode"
+    },
+    {
+      "input": "https://relay.example//relay",
+      "note": "empty path segment"
+    },
+    {
+      "input": "https://relay.example/relay//",
+      "note": "empty path segment after the one dropped slash"
+    },
+    {
+      "input": "https://relay.example/a%2fb",
+      "note": "encoded slash"
+    },
+    {
+      "input": "https://relay.example/a%2Fb",
+      "note": "encoded slash, upper-case hex"
+    },
+    {
+      "input": "https://relay.example/a%5Cb",
+      "note": "encoded backslash"
+    },
+    {
+      "input": "https://relay.example/a%zz",
+      "note": "% not followed by two hex digits"
+    },
+    {
+      "input": "https://relay.example/relay?x=1",
+      "note": "query"
+    },
+    {
+      "input": "https://relay.example/relay#f",
+      "note": "fragment"
+    },
+    {
+      "input": "https://user@relay.example/relay",
+      "note": "userinfo"
+    },
+    {
+      "input": "https://relay.example:0/relay",
+      "note": "port 0"
+    },
+    {
+      "input": "https://relay.example:/relay",
+      "note": "empty port"
+    },
+    {
+      "input": "https://relay.example/a b",
+      "note": "whitespace"
+    }
+  ],
+  "lists": [
+    {
+      "input": [
+        "https://Relay-A.Example:443/relay/",
+        "https://relay-b.example:8443/gateway-path"
+      ],
+      "canonical": [
+        "https://relay-a.example/relay",
+        "https://relay-b.example:8443/gateway-path"
+      ],
+      "set": "377f979ac611fd84",
+      "note": "the relay-weights vector's list"
+    },
+    {
+      "input": [
+        "https://relay.example/%7Er",
+        "https://[2001:DB8::1]/x/"
+      ],
+      "canonical": [
+        "https://relay.example/~r",
+        "https://[2001:db8::1]/x"
+      ],
+      "set": "46bec40d0ab8fb6e",
+      "note": "percent-encoding and IPv6"
+    },
+    {
+      "input": [
+        "https://0xc0000201/relay",
+        "https://XN--BCHER-KVA.example/r"
+      ],
+      "canonical": [
+        "https://192.0.2.1/relay",
+        "https://xn--bcher-kva.example/r"
+      ],
+      "set": "8b90eebd3e6472ef",
+      "note": "IPv4 alias and punycode"
+    }
+  ]
+}
