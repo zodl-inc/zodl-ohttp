@@ -28,12 +28,13 @@ RUN touch ../integrations/src/lib.rs src/main.rs src/lib.rs && \
     strip target/release/zodl-ohttp-gateway
 
 # Runtime stage
-FROM alpine:3.21@sha256:ce64758a109eb420d874a118f87920e625e12d3634e03b4a5573fd9f6e5d3507
+FROM alpine:3.24@sha256:f59abe656b692d901e184be3445e084786602108599d2a51d229c0f5a48c71bf
 
 # Install runtime dependencies. The emSign roots are distrusted: eight eMudhra intermediates'
 # private keys were disclosed (https://emudhra.we-have-a-problem.com/); drop this
 # once Alpine's ca-certificates removes them. Upstreams that chain to eMudhra will fail TLS.
-RUN apk add --no-cache ca-certificates tzdata && \
+RUN apk upgrade --no-cache && \
+    apk add --no-cache ca-certificates tzdata && \
     sed -i -E 's@^(mozilla/emSign[^/]*\.crt)$@!\1@' /etc/ca-certificates.conf && \
     update-ca-certificates 2>/dev/null && \
     ! grep -q '^mozilla/emSign' /etc/ca-certificates.conf && \

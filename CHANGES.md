@@ -5,6 +5,12 @@ keeps its own log in [client/CHANGELOG.md](client/CHANGELOG.md).
 
 ## Unreleased
 
+### Images
+
+- The gateway image's runtime stage moves from Alpine 3.21, which is no longer maintained, to Alpine
+  3.24 and upgrades its packages at build time; the relay simulator image takes the current
+  Debian 12 base and upgrades its packages at build time. No behaviour change.
+
 ### Gateway
 
 - `ohttp_relay_weights_refresh_failures_total{network, reason="unreadable"|"timeout"|"stalled"}`:
