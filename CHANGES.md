@@ -10,6 +10,9 @@ keeps its own log in [client/CHANGELOG.md](client/CHANGELOG.md).
 - The gateway image's runtime stage moves from Alpine 3.21, which is no longer maintained, to Alpine
   3.24 and upgrades its packages at build time; the relay simulator image takes the current
   Debian 12 base and upgrades its packages at build time. No behaviour change.
+- The relay simulator image's runtime stage and the e2e client image's runtime stage move from
+  Debian 12 to Debian 13, the release their binaries are already built on, and the e2e client
+  image upgrades its packages at build time. No behaviour change.
 
 ### Gateway
 

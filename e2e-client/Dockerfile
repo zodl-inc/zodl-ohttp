@@ -9,7 +9,8 @@ COPY e2e-client ./e2e-client
 # environment (OHTTP_E2E_*_MAINNET / _TESTNET, see e2e-client/README.md).
 RUN cd e2e-client && cargo build --release --locked
 
-FROM python:3.12-slim-bookworm@sha256:34386ef0cb081344d7ec1c103ba398e6e9f64e9ab3a1509accc92a4e24a07258
+FROM python:3.12-slim-trixie@sha256:191083cdf6c7bda8c76158983163ead5d5cf7b77cf3033e805bb0f5296f51b4b
+RUN apt-get update && apt-get upgrade -y && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /build/e2e-client/target/release/ohttp-e2e /usr/local/bin/ohttp-e2e
 USER 65534:65534
 ENTRYPOINT ["ohttp-e2e"]
