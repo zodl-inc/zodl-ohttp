@@ -27,38 +27,35 @@ RUN touch ../integrations/src/lib.rs src/main.rs src/lib.rs && \
     cargo build --release --locked --bin zodl-ohttp-gateway && \
     strip target/release/zodl-ohttp-gateway
 
-# Runtime stage
-FROM alpine:3.24@sha256:f59abe656b692d901e184be3445e084786602108599d2a51d229c0f5a48c71bf
-
-# Install runtime dependencies. The emSign roots are distrusted: eight eMudhra intermediates'
-# private keys were disclosed (https://emudhra.we-have-a-problem.com/); drop this
-# once Alpine's ca-certificates removes them. Upstreams that chain to eMudhra will fail TLS.
+# CA bundle stage: the emSign roots are distrusted: eight eMudhra intermediates' private keys
+# were disclosed (https://emudhra.we-have-a-problem.com/); they are dropped from the bundle the
+# runtime image carries. Remove this once the distribution's ca-certificates removes them.
+# Upstreams that chain to eMudhra will fail TLS.
+FROM alpine:3.24@sha256:f59abe656b692d901e184be3445e084786602108599d2a51d229c0f5a48c71bf AS certs
 RUN apk upgrade --no-cache && \
-    apk add --no-cache ca-certificates tzdata && \
+    apk add --no-cache ca-certificates && \
     sed -i -E 's@^(mozilla/emSign[^/]*\.crt)$@!\1@' /etc/ca-certificates.conf && \
     update-ca-certificates 2>/dev/null && \
     ! grep -q '^mozilla/emSign' /etc/ca-certificates.conf && \
     ! ls /etc/ssl/certs | grep -qi emsign && \
-    adduser -D -u 1000 gateway
+    [ "$(grep -c 'BEGIN CERTIFICATE' /etc/ssl/certs/ca-certificates.crt)" -gt 100 ]
+
+# Runtime stage: distroless, no shell and no package manager. The binary is statically linked
+# (musl), so the static base is enough; it carries the time zone data and the base files.
+FROM gcr.io/distroless/static-debian13:nonroot@sha256:8ce6dd87e9823c5b48dcfb2c8604714ccb351ce59607327bcc4957448da279b5
+
+COPY --from=certs /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 
 WORKDIR /app
 
 # Copy binary from builder
-COPY --from=builder /build/gateway/target/release/zodl-ohttp-gateway /app/zodl-ohttp-gateway
+COPY --from=builder --chmod=0555 /build/gateway/target/release/zodl-ohttp-gateway /app/zodl-ohttp-gateway
 
-# Set ownership
-RUN chown -R gateway:gateway /app
-
-# Switch to non-root user
-USER gateway
+# Non-root user: the numeric id the deployments run as (files they mount are owned by it)
+USER 1000:1000
 
 # Expose HTTP port
 EXPOSE 8080
-
-# Health check: /health/startup is on the public port (8080); /health lives on the metrics port.
-# Used by Docker itself; orchestrators that run their own probes ignore HEALTHCHECK.
-HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-    CMD wget --no-verbose --tries=1 --spider http://localhost:8080/health/startup || exit 1
 
 # Run
 # The image reads a configuration file (--config, --check-config): hosts that deliver one check
