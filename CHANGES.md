@@ -10,9 +10,8 @@ keeps its own log in [client/CHANGELOG.md](client/CHANGELOG.md).
 - The gateway image's runtime stage moves from Alpine 3.21, which is no longer maintained, to Alpine
   3.24 and upgrades its packages at build time; the relay simulator image takes the current
   Debian 12 base and upgrades its packages at build time. No behaviour change.
-- The relay simulator image's runtime stage and the e2e client image's runtime stage move from
-  Debian 12 to Debian 13, the release their binaries are already built on, and the e2e client
-  image upgrades its packages at build time. No behaviour change.
+- The e2e client image takes the current Python 3.12 Debian 12 base and upgrades its packages at
+  build time. No behaviour change.
 - The gateway image's runtime stage is distroless (static base, no shell, no package manager, no
   `wget`), still running as user 1000 with the same entrypoint, labels and ports. The built-in
   Docker `HEALTHCHECK` is gone (it ran `wget`): probe `/health/startup` on port 8080 from outside,
