@@ -82,6 +82,34 @@ pub fn write_forwards(network: &str, result: &str) -> u64 {
         .get()
 }
 
+// A block of its own, like the ones above.
+lazy_static::lazy_static! {
+    /// `ohttp_send_tx_results_total`: see `record_send_tx_result`.
+    static ref OHTTP_SEND_TX_RESULTS_TOTAL: IntCounterVec = IntCounterVec::new(
+        Opts::new(
+            "ohttp_send_tx_results_total",
+            "SendTransaction calls by the outcome of lightwalletd's SendResponse (send_outcome.rs): accepted (errorCode 0), duplicate (already in the node's mempool or queued), mined (already in the chain), expired, double_spend (an input or note already spent), fee, invalid (other validation failures), malformed (not a transaction), unavailable (the node could not take transactions), cancelled (verification cancelled), other (an unknown error), no_answer (no SendResponse: a gRPC error, a failed call or stream). relay: the relay that sent the request"
+        ),
+        &["network", "relay", "result"]
+    )
+    .unwrap();
+}
+
+/// One `SendTransaction` came to `result` (`send_outcome::SendOutcome::label`).
+pub fn record_send_tx_result(network: &str, relay: &str, result: &str) {
+    OHTTP_SEND_TX_RESULTS_TOTAL
+        .with_label_values(&[network, relay, result])
+        .inc();
+}
+
+/// `SendTransaction` outcomes of one label set so far (tests).
+#[cfg(test)]
+pub fn send_tx_results(network: &str, relay: &str, result: &str) -> u64 {
+    OHTTP_SEND_TX_RESULTS_TOTAL
+        .with_label_values(&[network, relay, result])
+        .get()
+}
+
 lazy_static::lazy_static! {
     /// `ohttp_replay_hub_check_total`: see `record_hub_check_path`.
     static ref OHTTP_REPLAY_HUB_CHECK_TOTAL: IntCounterVec = IntCounterVec::new(
@@ -679,6 +707,9 @@ pub fn init_metrics() {
         .ok();
     REGISTRY
         .register(Box::new(OHTTP_REPLAY_HUB_CHECK_TOTAL.clone()))
+        .ok();
+    REGISTRY
+        .register(Box::new(OHTTP_SEND_TX_RESULTS_TOTAL.clone()))
         .ok();
     REGISTRY
         .register(Box::new(OHTTP_WRITE_FORWARD_TOTAL.clone()))

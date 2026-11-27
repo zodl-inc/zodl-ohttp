@@ -21,6 +21,13 @@ keeps its own log in [client/CHANGELOG.md](client/CHANGELOG.md).
 
 ### Gateway
 
+- `ohttp_send_tx_results_total{network, relay, result}`: every `SendTransaction` by the verdict in
+  lightwalletd's `SendResponse` (`accepted`, `duplicate`, `mined`, `expired`, `double_spend`, `fee`,
+  `invalid`, `malformed`, `unavailable`, `cancelled`, `other`, `no_answer`). lightwalletd answers
+  gRPC OK whether or not the node took the transaction, so a failure ratio needs the body; a
+  repeated broadcast of a transaction already in the mempool or in the chain is told apart from a
+  real refusal. The answer is passed through unchanged, only its first 4 KiB are read, and only the
+  class is kept: nothing of the message is stored or logged.
 - `ohttp_relay_weights_refresh_failures_total{network, reason="unreadable"|"timeout"|"stalled"}`:
   refreshes of the relay weights block file that kept the previous state; the first of a run of
   failures is logged (and its end), and the `not_after` gauge is 0 when the file could never be
