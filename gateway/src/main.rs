@@ -73,6 +73,7 @@ mod relay_weights;
 mod replication;
 mod request_id;
 mod rpc_cache;
+mod send_outcome;
 mod server;
 mod settings;
 mod singleflight;
@@ -3411,6 +3412,9 @@ async fn handle_ohttp(
                 relay_name,
             );
             log.served("lwd_busy", "14", 0);
+            if rpc == "SendTransaction" {
+                send_outcome::record_no_answer(&network, relay_name);
+            }
             return responder.grpc_error("14", "Service unavailable: too many concurrent requests");
         }
         Err(e) => {
@@ -3436,6 +3440,9 @@ async fn handle_ohttp(
             );
             health::record_upstream_error(&network, "lwd", "request_failed");
             log.served("lwd_error", "14", 0);
+            if rpc == "SendTransaction" {
+                send_outcome::record_no_answer(&network, relay_name);
+            }
             return responder.grpc_error("14", "Service unavailable: lightwalletd call failed");
         }
     };
@@ -3462,6 +3469,15 @@ async fn handle_ohttp(
     );
     served(resp.status, &grpc_status, "lwd");
     let body = chunked_stream::ensure_grpc_status(grpc_status != "-", resp.body);
+    // The SendResponse's verdict, as a bounded label (send_outcome.rs); the answer itself is
+    // never kept or logged.
+    let body = send_outcome::observe(
+        rpc == "SendTransaction",
+        &network,
+        relay_name,
+        (grpc_status != "-").then(|| grpc_status.clone()),
+        body,
+    );
     let body = log.stream("lwd_stream", &grpc_status, body);
     responder.stream(resp.status, resp.headers, body)
 }
@@ -3996,6 +4012,8 @@ mod handler_tests {
             "nothing sent upstream"
         );
 
+        let no_answer_before = health::send_tx_results(&network, "-", "no_answer");
+
         // RawTransaction { data: <bytes> } in one gRPC frame.
         let mut raw = vec![0x0a, nonce.len() as u8];
         raw.extend_from_slice(nonce.as_bytes());
@@ -4021,6 +4039,11 @@ mod handler_tests {
         assert!(
             lwd.load(Ordering::SeqCst) >= 1,
             "SendTransaction went upstream: {answer}"
+        );
+        // The mock lightwalletd closes every connection: a SendTransaction without an answer.
+        assert!(
+            health::send_tx_results(&network, "-", "no_answer") > no_answer_before,
+            "counted as no_answer: {answer}"
         );
     }
 
